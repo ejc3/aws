@@ -42,6 +42,7 @@ FAILURE_REASONS = {
     "CodeBuild definitively rejected the request before starting": "start_rejected",
     "CodeBuild execution lease does not match its journal": "invalid_execution_lease",
     "publication lease expired": "publication_lease_expired",
+    "publication rolled back; automatic replay refused": "publication_rolled_back",
     "factory stopped or reached its fixed deadline": "build_failed_or_expired",
 }
 BUILD_STATUSES = ("FAILED", "FAULT", "STOPPED", "TIMED_OUT", "SUCCEEDED", "IN_PROGRESS", "QUEUED")
@@ -643,6 +644,15 @@ class Factory:
         except Exception as error:
             print(json.dumps({"failure_parameter_error": type(error).__name__}))
 
+    def queue_failure(self, record, journal=None, build=None):
+        # A publisher rollback can leave a request failed before the dispatcher sees it.
+        # Track the best-effort report separately from the request's terminal state.
+        if not self.env.get("FAILURE_PARAMETER") or record.get("failure_report_queued") is True:
+            return
+        record["failure_report_queued"] = True
+        self.save("/requests/" + record["request_id"], record)
+        self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
+
     def reconcile(self):
         self.failures = []
         try:
@@ -680,6 +690,7 @@ class Factory:
                     if control.get("pending") == start_record["request_id"]:
                         control["pending"] = None
                         pending = None
+                    self.queue_failure(start_record)
                     self.save("/control", control)
                     start_record = None
             elif active:
@@ -692,7 +703,7 @@ class Factory:
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
-                if succeeded:
+                if succeeded and record["status"] != "failed":
                     if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
                         raise Refused("successful build has no final execution receipt")
                     publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
@@ -700,7 +711,17 @@ class Factory:
                     if self.now() >= publication_deadline:
                         release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
-                if preempt or expired or failed or publication_expired or invalid_lease:
+                if record["status"] == "failed":
+                    # Preserve the publisher's rollback reason even after its lease expires.
+                    self.queue_failure(record, journal, build)
+                    if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
+                        self.client("codebuild").stop_build(id=active)
+                    self.cleanup(journal)
+                    if not self.gone(suffix, journal):
+                        return
+                    control["active"] = None
+                    self.save("/control", control)
+                elif preempt or expired or failed or publication_expired or invalid_lease:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
                     self.cleanup(journal)
@@ -708,18 +729,15 @@ class Factory:
                                "CodeBuild execution lease does not match its journal" if invalid_lease else
                                "publication lease expired" if publication_expired else
                                "factory stopped or reached its fixed deadline")
-                    first = record["status"] not in ("failed", "superseded")
                     record.update(status="superseded" if preempt else "failed", message=message)
                     self.save("/requests/" + record["request_id"], record)
-                    if record["status"] == "failed" and first:
-                        # Once per request (this branch repeats until its builders are gone),
-                        # published by reconcile() after the backend lock is released.
-                        self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
+                    if record["status"] == "failed":
+                        self.queue_failure(record, journal, build)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
                     self.save("/control", control)
-                elif record["status"] in ("promoted", "failed", "superseded"):
+                elif record["status"] in ("promoted", "superseded"):
                     self.cleanup(journal)
                     if not self.gone(suffix, journal):
                         return
@@ -772,12 +790,13 @@ class Factory:
                 record = self.request_record(start_record["request_id"])
                 record.update(status="failed", no_build=True, message="CodeBuild definitively rejected the request before starting")
                 self.save("/requests/" + record["request_id"], record)
-                # Published by reconcile() once the queue no longer holds this intent.
-                self.failures.append((copy.deepcopy(record),))
                 with self.control_lock() as acquired:
                     if acquired:
                         control = self.load("/control", {})
                         if control.get("active") == {"intent": record["request_id"]}:
+                            # Queue the failure while the durable no_build intent can still
+                            # recover it, then clear the intent before publishing outside the lock.
+                            self.queue_failure(record)
                             control["active"] = None
                             if control.get("pending") == record["request_id"]:
                                 control["pending"] = None

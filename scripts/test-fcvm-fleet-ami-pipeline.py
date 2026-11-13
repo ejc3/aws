@@ -1482,6 +1482,31 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.factory.executor_failure({"logs": {"groupName": "group", "streamName": "stream"}}),
                          ("viewer_path_failed", None))
 
+    def test_publisher_rollback_reports_once_during_repeated_cleanup(self):
+        for lease_expired in (False, True):
+            with self.subTest(lease_expired=lease_expired):
+                self.setUp()
+                path = "/fcvm-fleet/ami-factory-failure"
+                self.factory.env["FAILURE_PARAMETER"] = path
+                ended = self.succeed()
+                if lease_expired:
+                    self.time = ended + mod.PUBLICATION_SECONDS + 1
+                record = self.store.values["/factory/requests/" + INPUT_SHA]
+                record.update(status="failed", message="publication rolled back; automatic replay refused")
+                # EC2 termination has not settled on the first two reconciliation ticks.
+                self.factory.gone = lambda *args: False
+                self.factory.reconcile()
+                self.factory.reconcile()
+                self.factory.gone = lambda *args: True
+                self.factory.reconcile()
+                self.assertEqual(self.fleet_ssm.writes.count(path), 1)
+                status = self.fleet_ssm.values[path]
+                self.assertEqual((status["reason"], status["build_status"]), ("publication_rolled_back", "SUCCEEDED"))
+                self.assertEqual(self.factory.request_record(INPUT_SHA)["message"],
+                                 "publication rolled back; automatic replay refused")
+                self.assertIsNone(self.store.values["/factory/control"]["active"])
+                self.assertEqual(self.publisher.calls, [], "a rolled-back request cannot be replayed")
+
     def test_failures_are_published_newest_last_after_the_queue_settles(self):
         # A failed build is retired and the pending request's start is refused in one reconcile:
         # the parameter ends on the refused request, and it is written once the queue holds
