@@ -2559,6 +2559,22 @@ running `user-agents-seed`.
 
 ## Backups, safety, and cost controls
 
+A one-shot offline comparison of two restored, detached encrypted gp3 volumes is available
+in the staging recovery account. The default `offline_ebs_compare = null` creates nothing.
+Tag the two verified restore outputs with the same `Incident` and with
+`EvidencePhase=before` and `EvidencePhase=after`. Supply their exact IDs, size in GiB,
+and a UTC window of at most 24 hours using a private Terraform variable file. An optional
+lowercase SHA-256 of a hostname enables exact-match counting without putting the hostname in
+the configuration. Confirm the staged plan creates only the isolated lab and its attachments.
+
+The temporary inspector has no Internet route, public address, login key or IAM profile.
+It drops its network interface before mounting the volumes read-only with journal replay
+disabled. Read the `EVIDENCE_RESULT` line from the inspector's latest EC2 console output.
+It contains counts for selected persistence locations and bounded plain-text log tails;
+an empty result is not a comprehensive malware or log scan. Return the input to `null` and
+apply cleanup from main. The lab owns the attachments but does not own or delete the evidence
+volumes. Keep the variable file, plan and results private.
+
 - AWS Backup covers the ARM and x86 roots, the Next.js root, the original jumpbox home
   volume, and the `jumpbox-2` root with daily, weekly, and monthly retention.
 - The parallel box's persistent `/mnt/work` volume is protected from Terraform destroy but
