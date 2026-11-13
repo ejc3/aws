@@ -122,11 +122,18 @@ locals {
   # Minecraft view sockets on the host's IPv4 address (ejc3/fcvm#1833), the Windows bridges on an IPv6-enabled podman
   # network (ejc3/fcvm#1837), the bridges' unauthenticated /still route removed (ejc3/fcvm#1839), and the other changes
   # on fcvm main from 0e910245 to cad0ddad.
+  #
+  # 293325bd: built from ejc3/fcvm main 293325bd, revised from the cad0ddad image: everything in cad0ddad's, plus the
+  # public Minecraft join limits (ejc3/fcvm#1844: per-source connection and rate limits on the host, Pumpkin from the
+  # ejc3/Pumpkin fork with a login timeout), the declared port ranges and in-host viewer acceptance (ejc3/fcvm#1841,
+  # #1847, #1848), the bake's pruning of untagged images (ejc3/fcvm#1857), and the other changes on fcvm main from
+  # cad0ddad to 293325bd.
   fcvm_ami_build_region_reviewed = {
     "host/x86_64/fb2f5c36" = { image = "ami-0d176763f9f33416e", kind = "host", name = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303" }
     "host/x86_64/853eb034" = { image = "ami-0925206c2b9eac0fe", kind = "host", name = "fcvm-fleet-host-x86_64-853eb034-202611091050" }
     "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
     "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
+    "host/x86_64/293325bd" = { image = "ami-0784a83b0e32e6601", kind = "host", name = "fcvm-fleet-host-x86_64-293325bd-202611131727" }
   }
 }
 

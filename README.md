@@ -687,6 +687,15 @@ address (ejc3/fcvm#1833), its Windows bridges run on an IPv6-enabled network
 sequence; the second apply lists the copy in `windows_host_amis` and
 `minecraft_host_amis` beside the earlier ones.
 
+The fixed action `{"action":"activate-reviewed-join-limits-host-release"}`
+advances only the exact generation-eleven receipt to the signed 293325bd host
+(generation twelve), whose agent limits public Minecraft joins per source and
+whose Pumpkin closes a login that does not finish (ejc3/fcvm#1844). Its
+predecessor is generation eleven's receipt: `IPV4_HOST_COPY` and
+`IPV4_HOST_VERSION` in `publish.py` are that receipt's `host_amis` and the
+host's entry in `versions`, and any other live receipt is refused. It is
+released by the same apply, invoke, apply, invoke sequence.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

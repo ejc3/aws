@@ -397,6 +397,33 @@ class Publisher:
             },
         }, host_only=True)
 
+    # The generation-eleven receipt (/fcvm-fleet/ami-release, version 12, 2026-11-13): the publisher's
+    # us-east-1 copy of the cad0ddad host it names, and the host template version it selects.
+    IPV4_HOST_COPY = "ami-0ab1b335605d4902c"
+    IPV4_HOST_VERSION = 34
+
+    def reviewed_join_limits_host_release(self):
+        ipv4 = self.reviewed_ipv4_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # Generation twelve: the 293325bd host. Its agent limits public Minecraft joins per source
+        # on the host and its Pumpkin closes a login that does not finish (ejc3/fcvm#1844), and its
+        # recipe prunes untagged images before the bake (ejc3/fcvm#1857). Its predecessor is the
+        # generation-eleven receipt.
+        return self.reviewed_pair({
+            "source_sha": "293325bd00a4e6fb2e815c69095749138caf3048",
+            "images": {"host": "ami-0784a83b0e32e6601", "tile": ipv4["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 11, "source_sha": ipv4["source_sha"],
+                "build_id": "reviewed-ipv4-host-release:" + digest(encoded(ipv4)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**ipv4["expected"]["versions"], host_key: self.IPV4_HOST_VERSION},
+                "previous": {k: v for k, v in ipv4["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.IPV4_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": ipv4["images"]["tile"]}},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -619,6 +646,11 @@ class Publisher:
         need(event == {"action": "activate-reviewed-ipv4-host-release"},
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
+
+    def run_join_limits_host_release(self, event):
+        need(event == {"action": "activate-reviewed-join-limits-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_join_limits_host_release(), "reviewed-join-limits-host-release")
 
     def run_windows_host_release(self, event):
         need(event == {"action": "activate-reviewed-windows-host-release"},
@@ -1478,6 +1510,8 @@ class Publisher:
             return self.run_restore_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ipv4-host-release":
             return self.run_ipv4_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-join-limits-host-release":
+            return self.run_join_limits_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

@@ -1686,6 +1686,71 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values, before)
         self.assertEqual(self.ec2.selected, [])
 
+    LIMITS_SOURCE = "293325bd00a4e6fb2e815c69095749138caf3048"
+    LIMITS_IMAGE = "ami-0784a83b0e32e6601"
+    LIMITS_NAME = "fcvm-fleet-host-x86_64-293325bd-202611131727"
+
+    def reviewed_join_limits_host_fixture(self):
+        """Generation eleven live (the cad0ddad host, released after generation ten), and the 293325bd
+        host built by hand in us-west-2 and tagged validated there by Terraform."""
+        event, ten = self.reviewed_ipv4_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        eleven = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # Generation twelve's predecessor constants, as they are filled from the generation-eleven receipt.
+        for name, value in (("IPV4_HOST_COPY", eleven["host_amis"]["us-east-1"]["x86_64"]),
+                            ("IPV4_HOST_VERSION", eleven["versions"]["us-east-1/" + self.ids[0]])):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.LIMITS_SOURCE[:8]}"\s*=\s*{{ image = "{self.LIMITS_IMAGE}", kind = "host", '
+                                  rf'name = "{self.LIMITS_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.IPV4_IMAGE])
+        image.update(ImageId=self.LIMITS_IMAGE, Name=self.LIMITS_NAME, State="available",
+                     Description="fcvm fleet: " + self.LIMITS_NAME, SourceImageId=self.IPV4_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[self.LIMITS_IMAGE] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-join-limits-host-release"}, eleven
+
+    def test_reviewed_join_limits_host_releases_generation_twelve_after_generation_eleven(self):
+        event, eleven = self.reviewed_join_limits_host_fixture()
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher, copied, version = self.release_through_second_apply(self.windows_publisher, event, eleven, self.LIMITS_SOURCE)
+        self.assertEqual(self.ec2.copies[-1][0], self.LIMITS_IMAGE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 12})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (12, self.LIMITS_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-join-limits-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_join_limits_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["previous"], {k: v for k, v in eleven.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**eleven["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 12})
+
+    def test_reviewed_join_limits_host_names_the_generation_eleven_receipt(self):
+        # Filled from the live generation-eleven receipt: an image id and a template version.
+        self.assertRegex(MODULE.Publisher.IPV4_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertIs(type(MODULE.Publisher.IPV4_HOST_VERSION), int)
+        self.assertGreater(MODULE.Publisher.IPV4_HOST_VERSION, 0)
+
+    def test_reviewed_join_limits_host_refuses_a_predecessor_other_than_the_one_it_names(self):
+        event, eleven = self.reviewed_join_limits_host_fixture()
+        patcher = mock.patch.object(MODULE.Publisher, "IPV4_HOST_VERSION", eleven["versions"]["us-east-1/" + self.ids[0]] + 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, eleven, self.LIMITS_SOURCE)
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
