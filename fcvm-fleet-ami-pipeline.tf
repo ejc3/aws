@@ -151,10 +151,9 @@ resource "aws_ssm_parameter" "fcvm_ami_control" {
 
 # Why the latest factory request failed, readable in the fleet account, whose agents fix the image
 # code but cannot read the factory's state above (ejc3/aws#823). The dispatcher writes it
-# (dispatch.py publish_failure): the request, the build's status, the executor's last error, the
-# failing slot's phase and the last lines of that phase's diagnostics, every line with addresses,
-# account and resource ids, URLs, ARNs and long opaque values replaced and any line naming a
-# credential withheld. Read it with the fleet's role:
+# (dispatch.py publish_failure): validated request, source, build and phase metadata plus fixed
+# failure codes. No free-form executor or builder text leaves the management account.
+# Read it with the fleet's role:
 #   aws --region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-factory-failure
 resource "aws_ssm_parameter" "fcvm_ami_failure" {
   provider    = aws.fcvm_fleet_east1
@@ -574,7 +573,7 @@ resource "aws_iam_role_policy" "fcvm_ami_dispatch" {
     { Effect = "Allow", Action = "sts:TagSession", Resource = aws_iam_role.fcvm_ami_worker_fleet.arn },
     { Sid = "RedriveOnlyTheFixedPublisher", Effect = "Allow", Action = "lambda:InvokeFunction", Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish" },
     { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.fcvm_ami_dispatch.arn}:*" },
-    # A failed request's cause (publish_failure): the executor's log and the failing phase's archived diagnostics.
+    # Classify failure codes from the executor's log and the failing phase's archived diagnostics.
     { Sid = "FailedBuildExecutorLog", Effect = "Allow", Action = "logs:GetLogEvents", Resource = "${aws_cloudwatch_log_group.fcvm_ami_codebuild.arn}:log-stream:*" },
     { Sid = "FailedPhaseDiagnostics", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*/diagnostics/*" }
     , { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks",

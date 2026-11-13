@@ -1,6 +1,6 @@
 """Fixed factory request queue and four-slot broker. No caller-defined EC2 parameters."""
 import base64
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import copy
 import datetime
 import hashlib
@@ -32,85 +32,35 @@ INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
 
 
-# Why the latest request failed, for the fleet account's agents, which cannot read this
-# account's factory state or logs (ejc3/aws#823). The dispatcher writes it to FAILURE_PARAMETER
-# in the release's region when it records a failure: the build's terminal status, the failing
-# step from the executor's log (its last error and its phaseDiagnostics receipt), and the
-# recipe's own status lines from that phase's archived diagnostics. Only lines the fcvm recipe
-# writes itself are kept (RECIPE_LINE, and the error of a phone streamer's /health); any other
-# line is dropped, never edited. Every kept line is reduced by failure_line(), and the value
-# fits one standard parameter.
+# Cross-account failure status. Log text can include output from any builder subprocess.
+# Classify known symptoms without copying any log text or regex capture to the Fleet account.
 FAILURE_VERSION = 1
 FAILURE_LOG_EVENTS = 200
 FAILURE_TAIL_BYTES = 32 * 1024
-FAILURE_TAIL_LINES = 30
-FAILURE_LINE_CHARS = 200
-FAILURE_VALUE_BYTES = 4000
 PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
-# A line naming anything that could carry a credential is withheld whole, not edited.
-WITHHELD = re.compile(r"(?i)secret|token|passw|pwd|credential|auth|bearer|cookie|signature|x-amz-|private key|session|"
-                      r"access.?key|api.?key|\bkey\s*[=:]")
-# The recipe's status and failure lines (fleet/ami/host/build.sh, warm*.sh, scripts/phone/*.sh,
-# fleet/windows/build-image.sh, make and fcvm's own errors).
-RECIPE_LINE = re.compile(r"(== \w+ (start|done) |PHASE \w+ FAILED |(warm-phone|warm-root|warm|phone\.sh|app\.sh|aosp\.sh|"
-                         r"browser\.sh|emulator\.sh|build-image|fcvm-fleet-[a-z]+|cached-download|run\.sh): |make: \*\*\* |"
-                         r"Error: |error: |\S+ +ERROR )")
-REDACTIONS = (
-    (re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+"), "<url>"),
-    (re.compile(r"arn:aws[A-Za-z-]*:\S+"), "<arn>"),
-    (re.compile(r"\b(i|ami|vol|snap|eni|subnet|sg|vpc|lt|r|igw|rtb|nat)-[0-9a-f]{8,17}\b"), r"<\1-id>"),
-    (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"), "<email>"),
-    (re.compile(r"\bip-\d{1,3}(?:-\d{1,3}){3}\b"), "<host>"),
-    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b"), "<ipv4>"),
-    (re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:/\d{1,3})?(?![\w:])"
-                r"|(?<![\w:])::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:/\d{1,3})?(?![\w:])"
-                r"|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}(?:/\d{1,3})?(?![\w:])"), "<ipv6>"),
-    (re.compile(r"(?<!\d)\d{12}(?!\d)"), "<account>"),
-    (re.compile(r"[A-Za-z0-9+/_=-]{40,}"), "<long-value>"),
+FAILURE_REASONS = {
+    "CodeBuild definitively rejected the request before starting": "start_rejected",
+    "CodeBuild execution lease does not match its journal": "invalid_execution_lease",
+    "publication lease expired": "publication_lease_expired",
+    "factory stopped or reached its fixed deadline": "build_failed_or_expired",
+}
+BUILD_STATUSES = ("FAILED", "FAULT", "STOPPED", "TIMED_OUT", "SUCCEEDED", "IN_PROGRESS", "QUEUED")
+EXECUTOR_ERRORS = (
+    (re.compile(r"^RuntimeError: candidate viewer path failed:"), "viewer_path_failed"),
+    (re.compile(r"^(?:__main__\.)?BuilderCommandFailed:"), "builder_command_failed"),
+    (re.compile(r"^(?:[A-Za-z_][\w.]*\.)?TimeoutError:"), "executor_timeout"),
 )
-CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+DIAGNOSTIC_CODES = (
+    (re.compile(r"no space left on device|disk quota exceeded", re.I), "disk_full"),
+    (re.compile(r"adb(?:: failed to| could not) install|INSTALL_FAILED_", re.I), "adb_install_failed"),
+    (re.compile(r"failed to fetch|temporary failure resolving", re.I), "download_failed"),
+    (re.compile(r"permission denied|access denied", re.I), "permission_denied"),
+    (re.compile(r"timed out|deadline exceeded", re.I), "timeout"),
+)
 
 
-def failure_line(text):
-    """One log line as the fleet may read it: control characters gone, every address, account,
-    resource id, URL, ARN and long opaque value replaced by its kind, at most FAILURE_LINE_CHARS
-    characters, or None for a line that names a credential."""
-    line = CONTROL.sub("", text).strip()
-    if WITHHELD.search(line):
-        return None
-    for pattern, kind in REDACTIONS:
-        line = pattern.sub(kind, line)
-    return line[:FAILURE_LINE_CHARS]
-
-
-def recipe_line(raw):
-    """The line if the recipe wrote it, the error of a phone streamer's /health, else None."""
-    line = CONTROL.sub("", raw).strip()
-    if line.startswith("{") and '"error"' in line:
-        try:
-            error = json.loads(line).get("error")
-        except (ValueError, AttributeError):
-            return None
-        return "health error: " + error if isinstance(error, str) and error else None
-    return line if RECIPE_LINE.match(line) else None
-
-
-def failure_lines(text, limit):
-    """The last `limit` recipe lines of `text` through failure_line(); a run of withheld lines is
-    one marker."""
-    out = []
-    for raw in text.splitlines():
-        kept = recipe_line(raw)
-        if kept is None:
-            continue
-        line = failure_line(kept)
-        if line is None:
-            if out and out[-1] == "<line withheld>":
-                continue
-            line = "<line withheld>"
-        out.append(line)
-        del out[:-limit]
-    return out
+def diagnostic_codes(text):
+    return [code for pattern, code in DIAGNOSTIC_CODES if pattern.search(text)]
 
 
 class Refused(Exception):
@@ -242,7 +192,9 @@ class Factory:
             if fleet:
                 creds = self.client("sts").assume_role(RoleArn=self.env["FLEET_ROLE"], RoleSessionName="image-factory-broker")["Credentials"]
                 kw.update(aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
-            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}), **kw)
+            # These reads are diagnostic only and run in the single-concurrency dispatcher.
+            timeouts = {"connect_timeout": 2, "read_timeout": 3} if service in ("logs", "s3") else {}
+            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}, **timeouts), **kw)
         return self.clients[key]
 
     def release_ssm(self):
@@ -613,8 +565,7 @@ class Factory:
         return complete
 
     def executor_failure(self, build):
-        """The executor's last error line and its phaseDiagnostics receipt from the build's log:
-        (error, {"kind", "phase", "version_id"} or None)."""
+        """A fixed executor error code and a validated archive locator; the locator stays internal."""
         logs = build.get("logs") or {}
         group, stream = logs.get("groupName"), logs.get("streamName")
         if not isinstance(group, str) or not isinstance(stream, str):
@@ -629,51 +580,63 @@ class Factory:
                     value = json.loads(message)["phaseDiagnostics"]
                 except (ValueError, KeyError, TypeError):
                     continue
-                if isinstance(value, dict) and value.get("phase") in PHASES.get(value.get("kind"), ()):
+                kind = value.get("kind") if isinstance(value, dict) else None
+                if isinstance(kind, str) and value.get("phase") in PHASES.get(kind, ()):
                     version = value.get("version_id")
-                    receipt = {"kind": value["kind"], "phase": value["phase"],
-                               "version_id": version if isinstance(version, str) and 0 < len(version) <= 1024 else None}
-            elif re.match(r"[A-Za-z_][\w.]*(Error|Exception|Failed|Refused):", message):
-                error = message
+                    if not isinstance(version, str) or not 0 < len(version) <= 1024 or version == "null":
+                        version = None
+                    receipt = {"kind": kind, "phase": value["phase"], "version_id": version}
+            else:
+                for pattern, code in EXECUTOR_ERRORS:
+                    if pattern.match(message):
+                        error = code
+                        break
         return error, receipt
 
-    def diagnostics_tail(self, journal, receipt):
-        """The last lines of the archived diagnostics of the receipt's phase, from its builder's prefix."""
+    def phase_diagnostic_codes(self, journal, receipt):
+        """Classify a bounded read of one archived phase from its builder's prefix."""
         instance_id = journal["slots"].get(receipt["kind"] + "-build", {}).get("instance_id")
         if not receipt.get("version_id") or not isinstance(instance_id, str) or not re.fullmatch(r"i-[0-9a-f]{17}", instance_id):
-            return []
+            return None
         key = ("builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/"
                + instance_id + "/diagnostics/" + receipt["kind"] + "-" + receipt["phase"] + ".log")
-        body = self.client("s3", False, self.env["PIPELINE_REGION"]).get_object(Bucket=self.env["PIPELINE_BUCKET"], Key=key,
-            VersionId=receipt["version_id"], Range="bytes=-" + str(FAILURE_TAIL_BYTES))["Body"].read(FAILURE_TAIL_BYTES)
-        return failure_lines(body.decode("utf-8", "replace"), FAILURE_TAIL_LINES)
+        response = self.client("s3", False, self.env["PIPELINE_REGION"]).get_object(Bucket=self.env["PIPELINE_BUCKET"],
+            Key=key, VersionId=receipt["version_id"], Range="bytes=-" + str(FAILURE_TAIL_BYTES))
+        with closing(response["Body"]) as body:
+            return diagnostic_codes(body.read(FAILURE_TAIL_BYTES).decode("utf-8", "replace"))
 
     def publish_failure(self, record, journal=None, build=None):
-        """Writes the sanitized cause of a failed request to FAILURE_PARAMETER. Best effort: the
-        queue never waits on it, and a part that cannot be read is left out and named."""
+        """Write fixed failure codes and validated build metadata; never forward free-form text."""
         name = self.env.get("FAILURE_PARAMETER")
-        if not name:
+        request_id, source = record.get("request_id"), record.get("source_sha")
+        if (not name or record.get("status") != "failed" or not isinstance(request_id, str)
+                or not INPUT.fullmatch(request_id)):
             return
-        value = {"version": FAILURE_VERSION, "request_id": record["request_id"], "source_sha": record.get("source_sha"),
-                 "status": record.get("status"), "message": record.get("message"),
-                 "failed_at": int(self.now()), "build_status": (build or {}).get("buildStatus"),
-                 "error": None, "phase": None, "tail": [], "unavailable": []}
+        message = record.get("message")
+        reason = FAILURE_REASONS.get(message, "unknown_failure") if isinstance(message, str) else "unknown_failure"
+        status = (build or {}).get("buildStatus")
+        value = {"version": FAILURE_VERSION, "request_id": request_id,
+                 "source_sha": source if isinstance(source, str) and SHA.fullmatch(source) else None,
+                 "status": "failed", "reason": reason, "failed_at": int(self.now()),
+                 "build_status": status if status in BUILD_STATUSES else None,
+                 "executor_error": None, "phase": None, "diagnostic_codes": [], "unavailable": []}
         receipt = None
         if build is not None:
             try:
-                error, receipt = self.executor_failure(build)
-                value["error"] = failure_line(error) if error else None
+                value["executor_error"], receipt = self.executor_failure(build)
                 if receipt:
                     value["phase"] = {"kind": receipt["kind"], "phase": receipt["phase"]}
-            except Exception as error:
-                value["unavailable"].append("executor log (" + type(error).__name__ + ")")
-        if receipt and journal is not None:
+            except Exception:
+                value["unavailable"].append("executor_log")
+        if receipt:
             try:
-                value["tail"] = self.diagnostics_tail(journal, receipt)
-            except Exception as error:
-                value["unavailable"].append("phase diagnostics (" + type(error).__name__ + ")")
-        while len(json.dumps(value, separators=(",", ":")).encode()) > FAILURE_VALUE_BYTES and value["tail"]:
-            value["tail"].pop(0)
+                codes = self.phase_diagnostic_codes(journal, receipt) if journal is not None else None
+            except Exception:
+                codes = None
+            if codes is None:
+                value["unavailable"].append("phase_diagnostics")
+            else:
+                value["diagnostic_codes"] = codes
         try:
             self.release_ssm().put_parameter(Name=name, Type="String", Overwrite=True,
                 Value=json.dumps(value, separators=(",", ":")))
