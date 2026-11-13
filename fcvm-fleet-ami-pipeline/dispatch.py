@@ -35,9 +35,11 @@ PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority
 # Why the latest request failed, for the fleet account's agents, which cannot read this
 # account's factory state or logs (ejc3/aws#823). The dispatcher writes it to FAILURE_PARAMETER
 # in the release's region when it records a failure: the build's terminal status, the failing
-# step from the executor's log (its last error and its phaseDiagnostics receipt), and the last
-# lines of that phase's archived diagnostics. Every line is reduced by failure_line(), and the
-# value fits one standard parameter.
+# step from the executor's log (its last error and its phaseDiagnostics receipt), and the
+# recipe's own status lines from that phase's archived diagnostics. Only lines the fcvm recipe
+# writes itself are kept (RECIPE_LINE, and the error of a phone streamer's /health); any other
+# line is dropped, never edited. Every kept line is reduced by failure_line(), and the value
+# fits one standard parameter.
 FAILURE_VERSION = 1
 FAILURE_LOG_EVENTS = 200
 FAILURE_TAIL_BYTES = 32 * 1024
@@ -46,8 +48,13 @@ FAILURE_LINE_CHARS = 200
 FAILURE_VALUE_BYTES = 4000
 PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
 # A line naming anything that could carry a credential is withheld whole, not edited.
-WITHHELD = re.compile(r"(?i)secret|token|passw|credential|authoriz|bearer|cookie|signature|x-amz-|private key|session|"
+WITHHELD = re.compile(r"(?i)secret|token|passw|pwd|credential|auth|bearer|cookie|signature|x-amz-|private key|session|"
                       r"access.?key|api.?key|\bkey\s*[=:]")
+# The recipe's status and failure lines (fleet/ami/host/build.sh, warm*.sh, scripts/phone/*.sh,
+# fleet/windows/build-image.sh, make and fcvm's own errors).
+RECIPE_LINE = re.compile(r"(== \w+ (start|done) |PHASE \w+ FAILED |(warm-phone|warm-root|warm|phone\.sh|app\.sh|aosp\.sh|"
+                         r"browser\.sh|emulator\.sh|build-image|fcvm-fleet-[a-z]+|cached-download|run\.sh): |make: \*\*\* |"
+                         r"Error: |error: |\S+ +ERROR )")
 REDACTIONS = (
     (re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+"), "<url>"),
     (re.compile(r"arn:aws[A-Za-z-]*:\S+"), "<arn>"),
@@ -56,8 +63,9 @@ REDACTIONS = (
     (re.compile(r"\bip-\d{1,3}(?:-\d{1,3}){3}\b"), "<host>"),
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b"), "<ipv4>"),
     (re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:/\d{1,3})?(?![\w:])"
+                r"|(?<![\w:])::(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:/\d{1,3})?(?![\w:])"
                 r"|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}(?:/\d{1,3})?(?![\w:])"), "<ipv6>"),
-    (re.compile(r"\b\d{12}\b"), "<account>"),
+    (re.compile(r"(?<!\d)\d{12}(?!\d)"), "<account>"),
     (re.compile(r"[A-Za-z0-9+/_=-]{40,}"), "<long-value>"),
 )
 CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
@@ -75,20 +83,34 @@ def failure_line(text):
     return line[:FAILURE_LINE_CHARS]
 
 
+def recipe_line(raw):
+    """The line if the recipe wrote it, the error of a phone streamer's /health, else None."""
+    line = CONTROL.sub("", raw).strip()
+    if line.startswith("{") and '"error"' in line:
+        try:
+            error = json.loads(line).get("error")
+        except (ValueError, AttributeError):
+            return None
+        return "health error: " + error if isinstance(error, str) and error else None
+    return line if RECIPE_LINE.match(line) else None
+
+
 def failure_lines(text, limit):
-    """The last `limit` non-empty lines of `text` through failure_line(); a run of withheld lines is
+    """The last `limit` recipe lines of `text` through failure_line(); a run of withheld lines is
     one marker."""
     out = []
-    for raw in text.splitlines()[-4 * limit:]:
-        if not raw.strip():
+    for raw in text.splitlines():
+        kept = recipe_line(raw)
+        if kept is None:
             continue
-        line = failure_line(raw)
+        line = failure_line(kept)
         if line is None:
             if out and out[-1] == "<line withheld>":
                 continue
             line = "<line withheld>"
         out.append(line)
-    return out[-limit:]
+        del out[:-limit]
+    return out
 
 
 class Refused(Exception):
@@ -209,7 +231,7 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
-        self.failure = None
+        self.failures = []
 
     def client(self, service, fleet=False, region=None):
         # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
@@ -659,13 +681,14 @@ class Factory:
             print(json.dumps({"failure_parameter_error": type(error).__name__}))
 
     def reconcile(self):
-        self.failure = None
+        self.failures = []
         try:
             publication = self.reconcile_control()
         finally:
-            if self.failure is not None:
-                self.publish_failure(*self.failure)
-                self.failure = None
+            # In the order they were recorded, so the parameter ends on the newest.
+            failures, self.failures = self.failures, []
+            for failure in failures:
+                self.publish_failure(*failure)
         if publication is not None:
             # The publisher takes this same mutex. Invoke only after releasing it.
             response = self.client("lambda").invoke(FunctionName=self.env["PUBLISH_FUNCTION"], InvocationType="Event",
@@ -728,7 +751,7 @@ class Factory:
                     if record["status"] == "failed" and first:
                         # Once per request (this branch repeats until its builders are gone),
                         # published by reconcile() after the backend lock is released.
-                        self.failure = (copy.deepcopy(record), copy.deepcopy(journal), build)
+                        self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
@@ -786,7 +809,8 @@ class Factory:
                 record = self.request_record(start_record["request_id"])
                 record.update(status="failed", no_build=True, message="CodeBuild definitively rejected the request before starting")
                 self.save("/requests/" + record["request_id"], record)
-                self.publish_failure(record)
+                # Published by reconcile() once the queue no longer holds this intent.
+                self.failures.append((copy.deepcopy(record),))
                 with self.control_lock() as acquired:
                     if acquired:
                         control = self.load("/control", {})

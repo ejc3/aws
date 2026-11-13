@@ -1424,14 +1424,13 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(len(s3), 1)
         self.assertEqual((s3[0]["Bucket"], s3[0]["VersionId"]), ("fixture-factory", "fixture-version"))
         self.assertEqual(s3[0]["Key"], "builders/arn:aws:ec2:us-east-1:123456789012:instance/" + instance_id + "/diagnostics/host-build.log")
+        # Only the recipe's own lines are kept: make's directory line, the fetch with its signed URL,
+        # the bearer line and the host line are other programs' and are dropped.
         self.assertEqual(value["tail"], [
             "== build start 2026-11-12T21:58:40Z",
-            "make: Leaving directory '/home/ubuntu/fcvm/fleet/phone'",
-            "<line withheld>",
-            "host <host> <arn> prefix <ipv6>",
             "warm-phone: cold boot ok=0 streaming_ms=61234 gpu=0000:18:00.0",
-            '{"error":"the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: '
-            'adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]"}',
+            "health error: the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: "
+            "adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]",
             "PHASE build FAILED (exit 1)"])
         encoded = json.dumps(value)
         for private in ("123456789012", instance_id, "10.21.41.120", "2600:1f14", "fixture.invalid", "AKIDFIXTURE",
@@ -1473,7 +1472,50 @@ class FactoryTests(unittest.TestCase):
                         "X-Amz-Date: 20261112", "-----BEGIN PRIVATE KEY-----", "key=value"):
             self.assertIsNone(line(private), private)
         self.assertEqual(len(line("x " * 250)), mod.FAILURE_LINE_CHARS)
-        self.assertEqual(mod.failure_lines("a\n\ntoken 1\nsecret 2\nb\n", 10), ["a", "<line withheld>", "b"])
+        # Lines a reviewer showed passing the first version of this filter.
+        for private in ('"auth": "Zml4dHVyZTpmaXh0dXJl"', "MYSQL_PWD=fixture-value"):
+            self.assertIsNone(line(private), private)
+        self.assertEqual(line("profile exampleprofile_123456789012_us-east-1"), "profile exampleprofile_<account>_us-east-1")
+        self.assertEqual(line("connect failed to ::ffff:c000:20a and ::1"), "connect failed to <ipv6> and <ipv6>")
+        # The tail is the recipe's lines only; another program's line is dropped, never edited.
+        text = "\n".join(["warm-phone: a", "MYSQL_PWD=fixture-value", "phone.sh: token 1", "phone.sh: secret 2",
+                          "random output 192.0.2.1", "app.sh: b", '{"error":"c"}', '{"ready":true}',
+                          "2026-11-12T23:14:05Z ERROR fcvm: Error: d", "make: *** [Makefile:1: x] Error 2", ""])
+        self.assertEqual(mod.failure_lines(text, 10), ["warm-phone: a", "<line withheld>", "app.sh: b", "health error: c",
+                                                       "2026-11-12T23:14:05Z ERROR fcvm: Error: d", "make: *** [Makefile:1: x] Error 2"])
+        self.assertEqual(mod.failure_lines(text, 2), ["2026-11-12T23:14:05Z ERROR fcvm: Error: d", "make: *** [Makefile:1: x] Error 2"])
+
+    def test_failures_are_published_newest_last_after_the_queue_settles(self):
+        # A failed build is retired and the pending request's start is refused in one reconcile:
+        # the parameter ends on the refused request, and it is written once the queue holds
+        # neither intent.
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure")
+        self.factory.journal(BUILD)
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        newer = "5" * 64
+        self.store.values["/factory/requests/" + newer] = {"request_id": newer, "status": "queued", "source_sha": SOURCE_SHA,
+            "input_sha256": newer, "priority": "normal", "build_id": None, "not_before": 0}
+        self.store.values["/factory/control"]["pending"] = newer
+        def refuse(**kwargs):
+            raise ClientError({"Error": {"Code": "AccountLimitExceededException"}}, "StartBuild")
+        self.cb.start_build = refuse
+        order = []
+        test = self
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                control = test.store.values["/factory/control"]
+                test.assertIsNone(control.get("active"), "published while the queue still held an intent")
+                order.append(json.loads(Value)["request_id"])
+                return super().put_parameter(Name, Value, **kwargs)
+        fleet = FleetSSM()
+        clients = {("ssm", False): self.store, ("ssm", True): fleet, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("dynamodb", False): self.ddb, ("lambda", False): self.publisher}
+        self.factory.client = lambda name, fleet=False, region=None: clients[(name, fleet)]
+        self.factory.reconcile()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual(self.factory.request_record(newer)["status"], "failed")
+        self.assertEqual(order, [INPUT_SHA, newer])
+        self.assertEqual(fleet.values["/fcvm-fleet/ami-factory-failure"]["request_id"], newer)
 
     def test_failure_parameter_is_the_fleet_accounts_and_only_the_dispatcher_writes_it(self):
         source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
