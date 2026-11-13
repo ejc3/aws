@@ -18,9 +18,9 @@ variable "firecracker_instance_type" {
 }
 
 variable "firecracker_volume_size" {
-  description = "Root volume size in GB; includes /home/ubuntu"
+  description = "Root volume size in GiB; includes /home/ubuntu"
   type        = number
-  default     = 800
+  default     = 1000
 }
 
 variable "firecracker_key_name" {
