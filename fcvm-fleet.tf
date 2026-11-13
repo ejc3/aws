@@ -458,7 +458,12 @@ module "fcvm_fleet_east1" {
   # /etc/fcvm-fleet/windows.env, which the AMI's build writes. Older images' agents have no --windows, so the argument
   # follows the boot image, as potato mode does. Staging only, behind Cloudflare Access: a public launch needs the
   # owner's go-ahead (the evaluation's terms).
-  windows_host_amis         = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids
+  windows_host_amis = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids
+  # Minecraft mode (?mode=minecraft, ejc3/fcvm docs/fleet/minecraft.md): a host booted from the publisher's copy of the
+  # 853eb034 host, the first with fcvm's --minecraft and the tile image (ejc3/fcvm#1757 to #1762), runs four Pumpkin
+  # servers (--minecraft 4), CPU-only fcvm VMs restored from a gold snapshot the agent makes of the tile image, each at
+  # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image.
+  minecraft_host_amis       = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name

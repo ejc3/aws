@@ -121,6 +121,17 @@ variable "windows_host_amis" {
   }
 }
 
+variable "minecraft_host_amis" {
+  description = "Exact reviewed host AMIs whose fcvm has Minecraft mode and the tile image; their hosts run four Minecraft servers."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for ami in var.minecraft_host_amis : can(regex("^ami-[0-9a-f]{17}$", ami))])
+    error_message = "Each minecraft_host_amis entry must be an exact EC2 AMI ID."
+  }
+}
+
 variable "slot_tls_ports" {
   description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
@@ -244,6 +255,12 @@ locals {
       # An agent from an older image has no --windows and would refuse it.
       case "$boot_ami" in
         ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows 4" ;;
+      esac
+      %{endif~}
+      %{if length(var.minecraft_host_amis) > 0~}
+      # An agent from an older image has no --minecraft and would refuse it.
+      case "$boot_ami" in
+        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft 4" ;;
       esac
       %{endif~}
     fi
