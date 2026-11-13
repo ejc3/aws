@@ -677,6 +677,16 @@ host's entry in `versions`, and any other live receipt is refused. It is release
 same apply, invoke, apply, invoke sequence; the second apply lists the copy in
 `windows_host_amis` and `minecraft_host_amis` beside generation nine's.
 
+The fixed action `{"action":"activate-reviewed-ipv4-host-release"}` advances
+only the exact generation-ten receipt (`RESTORE_HOST_COPY` and
+`RESTORE_HOST_VERSION` in `publish.py`) to the signed cad0ddad host (generation
+eleven). Its Minecraft servers publish their view sockets on the host's IPv4
+address (ejc3/fcvm#1833), its Windows bridges run on an IPv6-enabled network
+(ejc3/fcvm#1837), and the bridges' unauthenticated `/still` route is gone
+(ejc3/fcvm#1839). It is released by the same apply, invoke, apply, invoke
+sequence; the second apply lists the copy in `windows_host_amis` and
+`minecraft_host_amis` beside the earlier ones.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
