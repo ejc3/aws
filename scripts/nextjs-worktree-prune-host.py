@@ -108,7 +108,7 @@ def query_worker(account, *args):
                 if len(data) > MAX_OUTPUT:
                     raise ValueError("account worker output exceeded its bound")
             if child.wait(timeout=max(0, end - time.monotonic())):
-                raise ValueError("account worker failed")
+                raise AccountWorkerFailed("account worker failed")
         except (OSError, ValueError, subprocess.TimeoutExpired):
             if child.poll() is None:
                 child.terminate()
@@ -185,13 +185,31 @@ def host_busy_accounts(accounts):
     return busy
 
 
+class AccountWorkerFailed(ValueError):
+    """The account worker could not complete its own check."""
+
+
+class IncompleteAccounts(Exception):
+    """Some accounts were preserved because their lists could not be verified."""
+
+
 def clean(accounts, query, pressure, apply, busy_accounts):
     busy = busy_accounts(accounts)
     for account in sorted(busy):
         print(f"nextjs-worktree-prune: preserving {account}; host process in home")
-    # Read every running account before removing anything. A failed listing
-    # can't silently make newer worktrees appear first in the global order.
-    candidates = sorted(c for a in accounts if a not in busy for c in candidates_from(a, query(a, "--list")))
+    # Collect a complete list per account before removing anything. A failed
+    # account stays untouched; order the successfully ranked accounts together.
+    candidates = []
+    incomplete = 0
+    for account in accounts:
+        if account in busy:
+            continue
+        try:
+            candidates.extend(candidates_from(account, query(account, "--list")))
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
+            print(f"nextjs-worktree-prune: preserving {account}; listing failed ({type(error).__name__})")
+            incomplete += 1
+    candidates.sort()
     removed = 0
     for candidate in candidates:
         if not apply:
@@ -208,7 +226,9 @@ def clean(accounts, query, pressure, apply, busy_accounts):
             raise ValueError(f"invalid removal result from {candidate.account}")
         print(f"nextjs-worktree-prune: {candidate.account} {result['status']} age_ns={candidate.age_ns}")
         removed += result["status"] == "removed"
-    print(f"nextjs-worktree-prune: {len(candidates)} eligible, {removed} removed")
+    print(f"nextjs-worktree-prune: {len(candidates)} eligible, {removed} removed, {incomplete} accounts not ranked")
+    if incomplete:
+        raise IncompleteAccounts
     return removed
 
 
@@ -224,6 +244,8 @@ def main():
             print("nextjs-worktree-prune: disk has enough space; skipped")
             return
         clean(managed_accounts(), query_worker, pressured, args.apply, host_busy_accounts)
+    except IncompleteAccounts:
+        parser.exit(1, "nextjs-worktree-prune: cleanup incomplete; see account results above\n")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:
         # Never echo command output, repository paths or container-controlled text.
         parser.exit(1, f"nextjs-worktree-prune: stopped ({type(e).__name__})\n")

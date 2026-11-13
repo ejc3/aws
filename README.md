@@ -1790,7 +1790,9 @@ immediately. DNS needs nothing because each zone has a single wildcard record.
 disk for the host's `ubuntu` account and every running Next.js account container.
 It checks for merged linked Git worktrees only when at least 90% of blocks or
 inodes are unavailable, or fewer than 20 GiB are available. It removes the oldest
-eligible worktrees across all accounts first and stops when space recovers.
+eligible worktrees across the accounts it could fully rank, then stops when
+space recovers. If an account cannot be ranked, the job leaves it untouched,
+logs its name and reports the run as incomplete.
 The job checks for running processes in each account's filesystem and runs Git
 as the worktree owner, rechecking eligibility before removal. It keeps main
 checkouts, branches, interactive or locked worktrees, worktrees in use, and

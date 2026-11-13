@@ -334,6 +334,25 @@ def clean(home, path, head, directory):
     marker = directory / "claude-interactive"
     if marker.exists() and time.time() - marker.stat().st_mtime < MARKER_AGE:
         return False
+    # A top-level entry absent from HEAD is already a reason to preserve the
+    # checkout, including a staged addition. Read only the root tree so large
+    # ignored dependency and build caches do not require a recursive scan.
+    entries = git(home, path, "ls-tree", "-z", "HEAD")
+    if entries is None:
+        return False
+    tracked_roots = {b".git"}
+    for entry in entries.split(b"\0"):
+        if entry:
+            _, separator, name = entry.partition(b"\t")
+            if not separator or not name:
+                return False
+            tracked_roots.add(name)
+    try:
+        with os.scandir(os.fsencode(path)) as checkout:
+            if any(entry.name not in tracked_roots for entry in checkout):
+                return False
+    except OSError:
+        return False
     if git(home, path, "status", "--porcelain=v1", "-z", "--untracked-files=normal",
            "--ignored=matching", "--ignore-submodules=none") != b"":
         return False
@@ -395,7 +414,15 @@ def prune(home, uid, token=None, *, inspect_all=False):
         head = record["HEAD"]
         if repo not in valid_repos:
             valid_repos[repo] = local_repo_ok(home, repo)
-        if not valid_repos[repo] or not clean(home, path, head, info[0]):
+        if not valid_repos[repo]:
+            continue
+        try:
+            is_clean = clean(home, path, head, info[0])
+        except Incomplete:
+            # A bounded Git read did not prove this checkout clean. Keep this
+            # tree, but continue checking independently verified candidates.
+            continue
+        if not is_clean:
             continue
         if repo not in remotes:
             url = git(home, repo, "remote", "get-url", "origin")
