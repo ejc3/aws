@@ -402,7 +402,9 @@ def prune(home, uid, token=None, *, inspect_all=False):
         return skipped
     paths = protected_paths(home, uid, inspect_all)
     eligible = []
-    remotes = {}
+    origins = {}
+    defaults = {}
+    merge_proofs = set()
     valid_repos = {}
     for age, repo, path, record, info in sorted(candidates, key=lambda item: (item[0], item[2])):
         if time.monotonic() >= end:
@@ -424,14 +426,23 @@ def prune(home, uid, token=None, *, inspect_all=False):
             continue
         if not is_clean:
             continue
-        if repo not in remotes:
+        if repo not in origins:
             url = git(home, repo, "remote", "get-url", "origin")
             match = GITHUB.fullmatch(os.fsdecode(url).strip()) if url else None
-            origin = match[1] if match else None
-            remotes[repo] = (remote_default(home, repo, origin) if origin else None, origin)
-        default, origin = remotes[repo]
-        if not default or record.get("branch") == default[0] or not merged(home, repo, head, *default, origin):
+            origins[repo] = match[1].lower() if match else None
+        origin = origins[repo]
+        if not origin:
             continue
+        if origin not in defaults:
+            defaults[origin] = remote_default(home, repo, origin)
+        default = defaults[origin]
+        if not default or record.get("branch") == default[0]:
+            continue
+        proof = (origin, head, *default)
+        if proof not in merge_proofs:
+            if not merged(home, repo, head, *default, origin):
+                continue
+            merge_proofs.add(proof)
         if not token:
             eligible.append({"token": info[2], "age_ns": age})
             if len(eligible) > LIST_LIMIT:
