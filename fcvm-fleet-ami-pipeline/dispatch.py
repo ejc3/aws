@@ -1,6 +1,7 @@
 """Fixed factory request queue and four-slot broker. No caller-defined EC2 parameters."""
 import base64
 from contextlib import contextmanager
+import copy
 import datetime
 import hashlib
 import hmac
@@ -29,6 +30,65 @@ GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
+
+
+# Why the latest request failed, for the fleet account's agents, which cannot read this
+# account's factory state or logs (ejc3/aws#823). The dispatcher writes it to FAILURE_PARAMETER
+# in the release's region when it records a failure: the build's terminal status, the failing
+# step from the executor's log (its last error and its phaseDiagnostics receipt), and the last
+# lines of that phase's archived diagnostics. Every line is reduced by failure_line(), and the
+# value fits one standard parameter.
+FAILURE_VERSION = 1
+FAILURE_LOG_EVENTS = 200
+FAILURE_TAIL_BYTES = 32 * 1024
+FAILURE_TAIL_LINES = 30
+FAILURE_LINE_CHARS = 200
+FAILURE_VALUE_BYTES = 4000
+PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
+# A line naming anything that could carry a credential is withheld whole, not edited.
+WITHHELD = re.compile(r"(?i)secret|token|passw|credential|authoriz|bearer|cookie|signature|x-amz-|private key|session|"
+                      r"access.?key|api.?key|\bkey\s*[=:]")
+REDACTIONS = (
+    (re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S+"), "<url>"),
+    (re.compile(r"arn:aws[A-Za-z-]*:\S+"), "<arn>"),
+    (re.compile(r"\b(i|ami|vol|snap|eni|subnet|sg|vpc|lt|r|igw|rtb|nat)-[0-9a-f]{8,17}\b"), r"<\1-id>"),
+    (re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"), "<email>"),
+    (re.compile(r"\bip-\d{1,3}(?:-\d{1,3}){3}\b"), "<host>"),
+    (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?\b"), "<ipv4>"),
+    (re.compile(r"(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){1,7}:(?:[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4})*)?(?:/\d{1,3})?(?![\w:])"
+                r"|(?<![\w:])(?:[0-9A-Fa-f]{1,4}:){5,7}[0-9A-Fa-f]{1,4}(?:/\d{1,3})?(?![\w:])"), "<ipv6>"),
+    (re.compile(r"\b\d{12}\b"), "<account>"),
+    (re.compile(r"[A-Za-z0-9+/_=-]{40,}"), "<long-value>"),
+)
+CONTROL = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def failure_line(text):
+    """One log line as the fleet may read it: control characters gone, every address, account,
+    resource id, URL, ARN and long opaque value replaced by its kind, at most FAILURE_LINE_CHARS
+    characters, or None for a line that names a credential."""
+    line = CONTROL.sub("", text).strip()
+    if WITHHELD.search(line):
+        return None
+    for pattern, kind in REDACTIONS:
+        line = pattern.sub(kind, line)
+    return line[:FAILURE_LINE_CHARS]
+
+
+def failure_lines(text, limit):
+    """The last `limit` non-empty lines of `text` through failure_line(); a run of withheld lines is
+    one marker."""
+    out = []
+    for raw in text.splitlines()[-4 * limit:]:
+        if not raw.strip():
+            continue
+        line = failure_line(raw)
+        if line is None:
+            if out and out[-1] == "<line withheld>":
+                continue
+            line = "<line withheld>"
+        out.append(line)
+    return out[-limit:]
 
 
 class Refused(Exception):
@@ -149,6 +209,7 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
+        self.failure = None
 
     def client(self, service, fleet=False, region=None):
         # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
@@ -529,8 +590,82 @@ class Factory:
         self.save(suffix, journal)
         return complete
 
+    def executor_failure(self, build):
+        """The executor's last error line and its phaseDiagnostics receipt from the build's log:
+        (error, {"kind", "phase", "version_id"} or None)."""
+        logs = build.get("logs") or {}
+        group, stream = logs.get("groupName"), logs.get("streamName")
+        if not isinstance(group, str) or not isinstance(stream, str):
+            return None, None
+        events = self.client("logs").get_log_events(logGroupName=group, logStreamName=stream,
+            startFromHead=False, limit=FAILURE_LOG_EVENTS)["events"]
+        error, receipt = None, None
+        for event in events:
+            message = str(event.get("message", "")).strip()
+            if message.startswith('{"phaseDiagnostics"'):
+                try:
+                    value = json.loads(message)["phaseDiagnostics"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if isinstance(value, dict) and value.get("phase") in PHASES.get(value.get("kind"), ()):
+                    version = value.get("version_id")
+                    receipt = {"kind": value["kind"], "phase": value["phase"],
+                               "version_id": version if isinstance(version, str) and 0 < len(version) <= 1024 else None}
+            elif re.match(r"[A-Za-z_][\w.]*(Error|Exception|Failed|Refused):", message):
+                error = message
+        return error, receipt
+
+    def diagnostics_tail(self, journal, receipt):
+        """The last lines of the archived diagnostics of the receipt's phase, from its builder's prefix."""
+        instance_id = journal["slots"].get(receipt["kind"] + "-build", {}).get("instance_id")
+        if not receipt.get("version_id") or not isinstance(instance_id, str) or not re.fullmatch(r"i-[0-9a-f]{17}", instance_id):
+            return []
+        key = ("builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/"
+               + instance_id + "/diagnostics/" + receipt["kind"] + "-" + receipt["phase"] + ".log")
+        body = self.client("s3", False, self.env["PIPELINE_REGION"]).get_object(Bucket=self.env["PIPELINE_BUCKET"], Key=key,
+            VersionId=receipt["version_id"], Range="bytes=-" + str(FAILURE_TAIL_BYTES))["Body"].read(FAILURE_TAIL_BYTES)
+        return failure_lines(body.decode("utf-8", "replace"), FAILURE_TAIL_LINES)
+
+    def publish_failure(self, record, journal=None, build=None):
+        """Writes the sanitized cause of a failed request to FAILURE_PARAMETER. Best effort: the
+        queue never waits on it, and a part that cannot be read is left out and named."""
+        name = self.env.get("FAILURE_PARAMETER")
+        if not name:
+            return
+        value = {"version": FAILURE_VERSION, "request_id": record["request_id"], "source_sha": record.get("source_sha"),
+                 "status": record.get("status"), "message": record.get("message"),
+                 "failed_at": int(self.now()), "build_status": (build or {}).get("buildStatus"),
+                 "error": None, "phase": None, "tail": [], "unavailable": []}
+        receipt = None
+        if build is not None:
+            try:
+                error, receipt = self.executor_failure(build)
+                value["error"] = failure_line(error) if error else None
+                if receipt:
+                    value["phase"] = {"kind": receipt["kind"], "phase": receipt["phase"]}
+            except Exception as error:
+                value["unavailable"].append("executor log (" + type(error).__name__ + ")")
+        if receipt and journal is not None:
+            try:
+                value["tail"] = self.diagnostics_tail(journal, receipt)
+            except Exception as error:
+                value["unavailable"].append("phase diagnostics (" + type(error).__name__ + ")")
+        while len(json.dumps(value, separators=(",", ":")).encode()) > FAILURE_VALUE_BYTES and value["tail"]:
+            value["tail"].pop(0)
+        try:
+            self.release_ssm().put_parameter(Name=name, Type="String", Overwrite=True,
+                Value=json.dumps(value, separators=(",", ":")))
+        except Exception as error:
+            print(json.dumps({"failure_parameter_error": type(error).__name__}))
+
     def reconcile(self):
-        publication = self.reconcile_control()
+        self.failure = None
+        try:
+            publication = self.reconcile_control()
+        finally:
+            if self.failure is not None:
+                self.publish_failure(*self.failure)
+                self.failure = None
         if publication is not None:
             # The publisher takes this same mutex. Invoke only after releasing it.
             response = self.client("lambda").invoke(FunctionName=self.env["PUBLISH_FUNCTION"], InvocationType="Event",
@@ -587,8 +722,13 @@ class Factory:
                                "CodeBuild execution lease does not match its journal" if invalid_lease else
                                "publication lease expired" if publication_expired else
                                "factory stopped or reached its fixed deadline")
+                    first = record["status"] not in ("failed", "superseded")
                     record.update(status="superseded" if preempt else "failed", message=message)
                     self.save("/requests/" + record["request_id"], record)
+                    if record["status"] == "failed" and first:
+                        # Once per request (this branch repeats until its builders are gone),
+                        # published by reconcile() after the backend lock is released.
+                        self.failure = (copy.deepcopy(record), copy.deepcopy(journal), build)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
@@ -646,6 +786,7 @@ class Factory:
                 record = self.request_record(start_record["request_id"])
                 record.update(status="failed", no_build=True, message="CodeBuild definitively rejected the request before starting")
                 self.save("/requests/" + record["request_id"], record)
+                self.publish_failure(record)
                 with self.control_lock() as acquired:
                     if acquired:
                         control = self.load("/control", {})

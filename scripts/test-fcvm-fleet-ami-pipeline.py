@@ -1352,5 +1352,148 @@ class FactoryTests(unittest.TestCase):
                 self.assertEqual(len(self.cb.starts), 1)
 
 
+    # The fleet account's agents read why a request failed from FAILURE_PARAMETER (ejc3/aws#823):
+    # the executor's last error, the failing phase and its diagnostics' last lines, sanitized.
+    def failure_fixture(self, *, logs_fail=False, diagnostics_fail=False):
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure", PIPELINE_REGION="us-east-2")
+        instance_id = self.launch()
+        self.cb.builds[BUILD].update(buildStatus="FAILED", logs={"groupName": "/aws/codebuild/factory", "streamName": "stream-1"})
+        tail = "\n".join([
+            "== build start 2026-11-12T21:58:40Z",
+            "make: Leaving directory '/home/ubuntu/fcvm/fleet/phone'",
+            "fetching https://fixture.invalid/object?X-Amz-Signature=abc&X-Amz-Credential=AKIDFIXTURE from 10.21.41.120",
+            "Authorization: Bearer fixture-bearer-value",
+            "host ip-10-21-41-120 arn:aws:ec2:us-west-2:123456789012:instance/" + instance_id + " prefix 2600:1f14:abc:de00::/56",
+            "warm-phone: cold boot ok=0 streaming_ms=61234 gpu=0000:18:00.0",
+            '{"error":"the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: '
+            'adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]"}',
+            "PHASE build FAILED (exit 1)",
+        ]) + "\n"
+        events = [{"message": "[Container] 2026/11/12 23:14:30 Running command python fleet/ami/pipeline.py"},
+                  {"message": json.dumps({"phaseDiagnostics": {"kind": "host", "phase": "build", "sha256": "e" * 64,
+                                                               "size": 1234, "version_id": "fixture-version"}})},
+                  {"message": "Traceback (most recent call last):"},
+                  {"message": "__main__.BuilderCommandFailed: the isolated builder command failed"}]
+        reads = []
+        lock = self.ddb
+        test = self
+
+        class Logs:
+            def get_log_events(self, **kwargs):
+                reads.append(("logs", kwargs))
+                if logs_fail:
+                    raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetLogEvents")
+                return {"events": events}
+
+        class S3:
+            def get_object(self, **kwargs):
+                reads.append(("s3", kwargs))
+                if diagnostics_fail:
+                    raise ClientError({"Error": {"Code": "NoSuchVersion"}}, "GetObject")
+                return {"Body": io.BytesIO(tail.encode())}
+
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                test.assertFalse(lock.held, "the failure is published outside the backend lock")
+                return super().put_parameter(Name, Value, **kwargs)
+
+        fleet_ssm = FleetSSM()
+        fleet_ssm.values = self.fleet_ssm.values
+        clients = {("ssm", False): self.store, ("ssm", True): fleet_ssm, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb,
+                   ("lambda", False): self.publisher, ("logs", False): Logs()}
+        def client(name, fleet=False, region=None):
+            if name == "s3":
+                self.assertEqual((fleet, region), (False, "us-east-2"), "diagnostics are read from the factory's bucket")
+                return S3()
+            return clients[(name, fleet)]
+        self.factory.client = client
+        self.factory.reconcile()
+        return instance_id, reads, fleet_ssm
+
+    def test_a_failed_request_publishes_its_sanitized_cause_to_the_fleet(self):
+        instance_id, reads, fleet_ssm = self.failure_fixture()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual((value["version"], value["request_id"], value["source_sha"], value["status"], value["build_status"]),
+                         (1, INPUT_SHA, SOURCE_SHA, "failed", "FAILED"))
+        self.assertEqual(value["error"], "__main__.BuilderCommandFailed: the isolated builder command failed")
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual(value["unavailable"], [])
+        s3 = [kwargs for kind, kwargs in reads if kind == "s3"]
+        self.assertEqual(len(s3), 1)
+        self.assertEqual((s3[0]["Bucket"], s3[0]["VersionId"]), ("fixture-factory", "fixture-version"))
+        self.assertEqual(s3[0]["Key"], "builders/arn:aws:ec2:us-east-1:123456789012:instance/" + instance_id + "/diagnostics/host-build.log")
+        self.assertEqual(value["tail"], [
+            "== build start 2026-11-12T21:58:40Z",
+            "make: Leaving directory '/home/ubuntu/fcvm/fleet/phone'",
+            "<line withheld>",
+            "host <host> <arn> prefix <ipv6>",
+            "warm-phone: cold boot ok=0 streaming_ms=61234 gpu=0000:18:00.0",
+            '{"error":"the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: '
+            'adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]"}',
+            "PHASE build FAILED (exit 1)"])
+        encoded = json.dumps(value)
+        for private in ("123456789012", instance_id, "10.21.41.120", "2600:1f14", "fixture.invalid", "AKIDFIXTURE",
+                        "fixture-bearer-value", "fixture-version", "/aws/codebuild", "stream-1"):
+            self.assertNotIn(private, encoded)
+        self.assertLessEqual(len(json.dumps(value, separators=(",", ":")).encode()), 4000)
+        # Published once: a later reconcile of the failed request leaves the parameter alone.
+        writes = len(fleet_ssm.writes)
+        self.factory.reconcile()
+        self.assertEqual(len(fleet_ssm.writes), writes)
+
+    def test_an_unreadable_log_or_diagnostics_still_publishes_and_says_so(self):
+        _, _, fleet_ssm = self.failure_fixture(logs_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual((value["error"], value["phase"], value["tail"]), (None, None, []))
+        self.assertEqual(value["unavailable"], ["executor log (ClientError)"])
+        self.setUp()
+        _, _, fleet_ssm = self.failure_fixture(diagnostics_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual((value["tail"], value["unavailable"]), ([], ["phase diagnostics (ClientError)"]))
+
+    def test_failure_lines_keep_the_cause_and_drop_private_values(self):
+        line = mod.failure_line
+        self.assertEqual(line("phone.sh: the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: "
+                              "Failure [INSTALL_FAILED_FIXTURE]"),
+                         "phone.sh: the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: "
+                         "Failure [INSTALL_FAILED_FIXTURE]")
+        self.assertEqual(line("2026-11-12T23:14:05Z 16:27:09 took 3m 2s on 0000:18:00.0"),
+                         "2026-11-12T23:14:05Z 16:27:09 took 3m 2s on 0000:18:00.0")
+        self.assertEqual(line("ami-0123456789abcdef0 vol-0123456789abcdef0 snap-0123456789abcdef0 i-0123456789abcdef0"),
+                         "<ami-id> <vol-id> <snap-id> <i-id>")
+        self.assertEqual(line("account 123456789012 at 192.0.2.10 and 2001:db8::1 and fe80::1/64 mail a@b.example"),
+                         "account <account> at <ipv4> and <ipv6> and <ipv6> mail <email>")
+        self.assertEqual(line("digest " + "f" * 64), "digest <long-value>")
+        self.assertEqual(line("\x1b[31mred\x1b[0m\x07"), "red")
+        for private in ("export STORE_S3_PREFIX=x SECRET=1", "aws_session_token=abc", "token: abc", "password abc",
+                        "X-Amz-Date: 20261112", "-----BEGIN PRIVATE KEY-----", "key=value"):
+            self.assertIsNone(line(private), private)
+        self.assertEqual(len(line("x " * 250)), mod.FAILURE_LINE_CHARS)
+        self.assertEqual(mod.failure_lines("a\n\ntoken 1\nsecret 2\nb\n", 10), ["a", "<line withheld>", "b"])
+
+    def test_failure_parameter_is_the_fleet_accounts_and_only_the_dispatcher_writes_it(self):
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        parameter = re.search(r'^resource "aws_ssm_parameter" "fcvm_ami_failure" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn("provider    = aws.fcvm_fleet_east1", parameter)
+        self.assertIn('name        = "/fcvm-fleet/ami-factory-failure"', parameter)
+        self.assertNotIn("ami-pipeline", re.search(r'name\s*=\s*"([^"]+)"', parameter).group(1),
+                         "the fleet's role cannot read the factory's /fcvm-fleet/ami-pipeline/ state")
+        self.assertIn("ignore_changes = [value]", parameter)
+        broker = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('{ Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", '
+                      'Resource = aws_ssm_parameter.fcvm_ami_failure.arn }', broker)
+        dispatch = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('Action = "logs:GetLogEvents", Resource = "${aws_cloudwatch_log_group.fcvm_ami_codebuild.arn}:log-stream:*"', dispatch)
+        self.assertIn('Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*/diagnostics/*"', dispatch)
+        function = re.search(r'^resource "aws_lambda_function" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(function, r"FAILURE_PARAMETER\s*=\s*aws_ssm_parameter\.fcvm_ami_failure\.name")
+        self.assertRegex(function, r"PIPELINE_REGION\s*=\s*local\.fcvm_fleet_home_region")
+        self.assertRegex(function, r'RELEASE_REGION\s*=\s*local\.fcvm_ami_region')
+        self.assertRegex(source, r'fcvm_ami_region\s*=\s*"us-east-1"')
+
 if __name__ == "__main__":
     unittest.main(buffer=True)
