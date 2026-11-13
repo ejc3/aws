@@ -668,13 +668,32 @@ the release, or after a rollback) starts an agent that has no `--windows` withou
 it. Hosts booted from the copy run four Windows sandboxes each on the staging
 wall (`?mode=windows`, behind Cloudflare Access).
 
+The fixed action `{"action":"activate-reviewed-restore-host-release"}` advances
+only the exact generation-nine receipt to the signed 0e910245 host (generation
+ten), whose Minecraft servers keep their bots connected across a restore
+(ejc3/fcvm#1824). Its predecessor is generation nine's receipt: `WINDOWS_HOST_COPY`
+and `WINDOWS_HOST_VERSION` in `publish.py` are that receipt's `host_amis` and the
+host's entry in `versions`, and any other live receipt is refused. It is released by the
+same apply, invoke, apply, invoke sequence; the second apply lists the copy in
+`windows_host_amis` and `minecraft_host_amis` beside generation nine's.
+
+The fixed action `{"action":"activate-reviewed-ipv4-host-release"}` advances
+only the exact generation-ten receipt (`RESTORE_HOST_COPY` and
+`RESTORE_HOST_VERSION` in `publish.py`) to the signed cad0ddad host (generation
+eleven). Its Minecraft servers publish their view sockets on the host's IPv4
+address (ejc3/fcvm#1833), its Windows bridges run on an IPv6-enabled network
+(ejc3/fcvm#1837), and the bridges' unauthenticated `/still` route is gone
+(ejc3/fcvm#1839). It is released by the same apply, invoke, apply, invoke
+sequence; the second apply lists the copy in `windows_host_amis` and
+`minecraft_host_amis` beside the earlier ones.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
-| `fcvm-metal-arm` | `us-west-1`, persistent Spot `r8gd.metal-24xl` | 800 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
+| `fcvm-metal-arm` | `us-west-1a`, persistent Spot `m8gd.metal-24xl` | 1,000 GiB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 96-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 600 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 700 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
@@ -1532,9 +1551,9 @@ and Claude remain four independent logins.
 
 The two metal boxes are the main `fcvm` workstations:
 
-- ARM64 uses `r8gd.metal-24xl`; x86 uses `c5d.metal`.
+- ARM64 uses `m8gd.metal-24xl`; x86 uses `c5d.metal`.
 - Both are persistent Spot instances with `stop` interruption behavior and static EIPs.
-- Their EBS roots survive a normal stop/start: 800 GB on ARM and 300 GB on x86.
+- Their EBS roots survive a normal stop/start: 1,000 GiB on ARM and 300 GiB on x86.
 - Instance-store NVMe is for VM images, build output, caches, and temporary Btrfs data.
   It is erased by a stop, Spot interruption, or host loss.
 - ARM nested virtualization requires the custom fcvm kernel and patch set documented in
@@ -1790,7 +1809,9 @@ immediately. DNS needs nothing because each zone has a single wildcard record.
 disk for the host's `ubuntu` account and every running Next.js account container.
 It checks for merged linked Git worktrees only when at least 90% of blocks or
 inodes are unavailable, or fewer than 20 GiB are available. It removes the oldest
-eligible worktrees across all accounts first and stops when space recovers.
+eligible worktrees across the accounts it could fully rank, then stops when
+space recovers. If an account cannot be ranked, the job leaves it untouched,
+logs its name and reports the run as incomplete.
 The job checks for running processes in each account's filesystem and runs Git
 as the worktree owner, rechecking eligibility before removal. It keeps main
 checkouts, branches, interactive or locked worktrees, worktrees in use, and
@@ -2558,6 +2579,23 @@ its setup script is re-run. Once a box has the script, an account can also seed 
 running `user-agents-seed`.
 
 ## Backups, safety, and cost controls
+
+A one-shot offline comparison of two restored, detached encrypted gp3 volumes is available
+in the staging recovery account. The default `offline_ebs_compare = null` creates nothing.
+Tag the two verified restore outputs with the same `Incident` and with
+`EvidencePhase=before` and `EvidencePhase=after`. Supply their exact IDs, size in GiB,
+and a UTC window of at most 24 hours using a private Terraform variable file. An optional
+lowercase SHA-256 of a hostname enables exact-match counting without putting the hostname in
+the configuration. Confirm the staged plan creates only the isolated lab and its attachments.
+
+The temporary inspector has no Internet route, public address, login key or IAM profile.
+It drops its network interface before mounting the volumes read-only with journal replay
+disabled. Read the `EVIDENCE_RESULT` line from the inspector's latest EC2 console output.
+It contains separate host and guest counts for selected persistence locations, bounded
+plain-text log tails, and samples from persistent journals. An empty result is not a
+comprehensive malware or log scan. Return the input to `null` and
+apply cleanup from main. The lab owns the attachments but does not own or delete the evidence
+volumes. Keep the variable file, plan and results private.
 
 - AWS Backup covers the ARM and x86 roots, the Next.js root, the original jumpbox home
   volume, and the `jumpbox-2` root with daily, weekly, and monthly retention.

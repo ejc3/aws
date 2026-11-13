@@ -54,14 +54,32 @@ class HostCleanup(unittest.TestCase):
             self.assertEqual(host.clean(["ubuntu"], query, lambda: True, False, lambda _: set()), 0)
         self.assertIn("eligible ubuntu", out.getvalue())
 
-    def test_bad_account_listing_aborts_before_any_deletion(self):
-        def query(account, *argv):
-            self.assertEqual(argv, ("--list",))
-            token = "a" * 64 if account == "ubuntu" else "--apply"
-            return {"candidates": [{"token": token, "age_ns": 100}]}
+    def test_bad_account_is_preserved_without_blocking_healthy_accounts(self):
+        calls = []
 
-        with self.assertRaisesRegex(ValueError, "invalid worktree identity"):
-            host.clean(["ubuntu", "ejc3"], query, lambda: True, True, lambda _: set())
+        def query(account, *argv):
+            calls.append((account, *argv))
+            if account == "ejc3":
+                return {"candidates": [{"token": "--apply", "age_ns": 1}]}
+            if account == "connor":
+                raise TimeoutError("untrusted details")
+            if argv == ("--list",):
+                age = 50 if account == "ubuntu" else 10
+                return {"candidates": [{"token": account[0] * 64 if account == "colton" else "a" * 64,
+                                         "age_ns": age}]}
+            return {"status": "removed"}
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), self.assertRaises(host.IncompleteAccounts):
+            host.clean(["ubuntu", "ejc3", "connor", "colton"], query, lambda: True, True, lambda _: set())
+        self.assertEqual(calls, [
+            ("ubuntu", "--list"), ("ejc3", "--list"), ("connor", "--list"), ("colton", "--list"),
+            ("colton", "--remove", "c" * 64), ("ubuntu", "--remove", "a" * 64),
+        ])
+        self.assertIn("preserving ejc3; listing failed (ValueError)", out.getvalue())
+        self.assertIn("preserving connor; listing failed (TimeoutError)", out.getvalue())
+        self.assertIn("2 eligible, 2 removed, 2 accounts not ranked", out.getvalue())
+        self.assertNotIn("untrusted details", out.getvalue())
 
     def test_host_process_preserves_a_container_home_before_list_and_remove(self):
         with tempfile.TemporaryDirectory() as temp:
