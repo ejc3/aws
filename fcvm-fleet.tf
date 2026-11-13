@@ -90,24 +90,29 @@ locals {
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
   # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
   # are in the home region, not the host's.
-  # The IPv4 path to a GPU host's slots: its one public IPv4 address, slot i's renderer TLS forwarded on port base + i.
-  # The agent's --tls-publish-base and the fleet security group's port range both come from these two numbers.
+  # The IPv4 path to a GPU host's tiles: its one public IPv4 address, place i's TLS forwarded on port base + i. The agent
+  # numbers its places GPUs first (the wall's and the phones'), then Windows sandboxes, then Minecraft servers (ejc3/fcvm
+  # src/fleet/agent/mod.rs), so the range covers all three. The agent's --tls-publish-base, its --windows and --minecraft
+  # counts and the fleet security group's port range all come from these numbers.
   fcvm_fleet_slot_tls_port_base = 20200
   fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
+  fcvm_fleet_host_windows       = 4
+  fcvm_fleet_host_minecraft     = 4
+  fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows + local.fcvm_fleet_host_minecraft
 
   # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
   # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
   # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
   # stack); an image without them refuses the argument and does not start, so the switch moves with the images.
   fcvm_fleet_aggregated = false
-  # A host aggregator's IPv4 path: the port after the slots', on the host's public IPv4 address (one address per host, a
-  # port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
+  # A host aggregator's IPv4 path: the port after every place's, on the host's public IPv4 address (one address per host,
+  # a port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
   # on fcvm_fleet_aggregate_port, which the security group does not admit.
-  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots
+  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places
   fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1
   }
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
@@ -407,6 +412,8 @@ module "fcvm_fleet_east2" {
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -425,6 +432,8 @@ module "fcvm_fleet_west2" {
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -465,6 +474,8 @@ module "fcvm_fleet_east1" {
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image.
   minecraft_host_amis       = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
