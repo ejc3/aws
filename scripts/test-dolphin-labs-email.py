@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""dolphin-labs.dev email: the privacy alias and the ej@ and steve@ work addresses forward only to people/addresses keys."""
+"""dolphin-labs.dev email: the privacy alias and the ej@, feedback@ and steve@ work addresses forward only to people/addresses keys."""
 import re
 import unittest
 from pathlib import Path
@@ -12,10 +12,13 @@ class DolphinLabsEmail(unittest.TestCase):
     def test_no_address_literal_in_the_file(self):
         self.assertNotRegex(TF, r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}")
 
-    def test_work_aliases_are_ej_and_steve_from_people_keys(self):
+    def test_work_aliases_are_ej_feedback_and_steve_from_people_keys(self):
         block = re.search(r"dolphin_work_aliases = \{(.*?)\n  \}", TF, re.S).group(1)
-        self.assertIn("ej    = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward", block)
-        self.assertIn("steve = local.dolphin_enabled && contains(local.dolphin_verified_destinations, lower(local.dolphin_steve_email)) ? local.dolphin_steve_email", block)
+        self.assertIn("ej = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward", block)
+        # feedback@ is what Dolphin's own emails are sent from; replies to it reach the owner.
+        self.assertIn("feedback = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward", block)
+        self.assertIn("steve    = local.dolphin_enabled && contains(local.dolphin_verified_destinations, lower(local.dolphin_steve_email)) ? local.dolphin_steve_email", block)
+        self.assertEqual(sorted(re.findall(r"^\s+(\w+)\s+=", block, re.M)), ["ej", "feedback", "steve"])
         self.assertIn('value = "${each.key}@${local.dolphin_labs_domain}"', TF)
         self.assertIn("actions  = [{ type = \"forward\", value = [each.value] }]", TF)
 
