@@ -133,7 +133,8 @@ class ReleaseContracts(unittest.TestCase):
         entries = re.findall(r'"(host/x86_64/[0-9a-f]{8})"\s*=\s*\{\s*image\s*=\s*"(ami-[0-9a-f]{17})",\s*'
                              r'kind\s*=\s*"host",\s*name\s*=\s*"(fcvm-fleet-host-x86_64-[0-9a-f]{8}-[0-9]{12})"\s*\}',
                              catalog.group(1))
-        self.assertEqual([key for key, _, _ in entries], ["host/x86_64/fb2f5c36", "host/x86_64/853eb034"])
+        self.assertEqual([key for key, _, _ in entries],
+                         ["host/x86_64/fb2f5c36", "host/x86_64/853eb034", "host/x86_64/0e910245"])
         for key, _, name in entries:
             self.assertEqual(name[23:31], key[-8:])
         for name, key in (("fcvm_ami_build_region_kind", "FleetImageKind"),

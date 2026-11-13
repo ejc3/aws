@@ -111,9 +111,16 @@ locals {
   # Windows mode's image and bridge (ejc3/fcvm#1742, ejc3/fcvm#1743, ejc3/fcvm#1778; the image is a Windows Server
   # 2025 evaluation install, rebuilt before its evaluation runs out), Cloud Hypervisor restores with memory mapped
   # from the snapshot (ejc3/fcvm#1728), and the other changes on fcvm main from fb2f5c36 to 853eb034.
+  #
+  # 0e910245: built from ejc3/fcvm main 0e910245, revised from the 853eb034 image: everything in 853eb034's, plus
+  # Minecraft restores that keep the bots connected (ejc3/fcvm#1824: restore to first chunk 2.0 s to 0.49 s), the
+  # level particles decode fix (ejc3/fcvm#1822), the servers' scheduled reset (ejc3/fcvm#1776), the recipe's wait for
+  # the boot's store restore and its base-store cleanup (ejc3/fcvm#1826, ejc3/fcvm#1827), cached-download.sh's quiet
+  # stdout (ejc3/fcvm#1829), and the other changes on fcvm main from 853eb034 to 0e910245.
   fcvm_ami_build_region_reviewed = {
     "host/x86_64/fb2f5c36" = { image = "ami-0d176763f9f33416e", kind = "host", name = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303" }
     "host/x86_64/853eb034" = { image = "ami-0925206c2b9eac0fe", kind = "host", name = "fcvm-fleet-host-x86_64-853eb034-202611091050" }
+    "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
   }
 }
 
