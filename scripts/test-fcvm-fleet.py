@@ -25,17 +25,33 @@ def block(header, text=TF):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_public_minecraft_joins_close_with_one_variable(self):
+        # The kill switch: one local, passed to every region, and the only thing the 25565 rule depends on.
+        self.assertIn("fcvm_fleet_minecraft_public_join = true", TF)
+        self.assertEqual(len(re.findall(r"minecraft_public_join\s*=\s*local\.fcvm_fleet_minecraft_public_join\n", TF)), 3)
+        var = block('variable "minecraft_public_join"', MOD)
+        self.assertIn("type        = bool", var)
+        self.assertNotIn("default", var)
+        self.assertEqual(MOD.count("[25565]"), 1)
+        self.assertEqual(MOD.count("var.minecraft_public_join"), 1)
+
+
     def test_guarded_fleet_admits_only_https_slot_tls_and_minecraft(self):
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 3)
-        # Minecraft mode's servers (ejc3/fcvm docs/fleet/minecraft.md): Java Edition's port, IPv6 only, since each
-        # server has its own IPv6 address and none is forwarded over the host's IPv4 address.
-        self.assertIn("from_port        = 25565", rules[2])
-        self.assertIn("to_port          = 25565", rules[2])
-        self.assertIn('protocol         = "tcp"', rules[2])
-        self.assertIn('ipv6_cidr_blocks = ["::/0"]', rules[2])
-        self.assertNotIn("cidr_blocks      =", rules[2].replace("ipv6_cidr_blocks", ""))
+        self.assertEqual(len(rules), 2)
+        # Minecraft mode's servers (ejc3/fcvm docs/fleet/minecraft.md, "Public joins"): Java Edition's port, IPv6
+        # only, since each server has its own IPv6 address and none is forwarded over the host's IPv4 address; one
+        # dynamic rule, present only while minecraft_public_join is true.
+        dynamic = re.findall(r'  dynamic "ingress" \{\n(.*?)\n  \}', sg, re.S)
+        self.assertEqual(len(dynamic), 1, dynamic)
+        mc = dynamic[0]
+        self.assertIn("for_each = var.minecraft_public_join ? [25565] : []", mc)
+        self.assertIn("from_port        = ingress.value", mc)
+        self.assertIn("to_port          = ingress.value", mc)
+        self.assertIn('protocol         = "tcp"', mc)
+        self.assertIn('ipv6_cidr_blocks = ["::/0"]', mc)
+        self.assertNotIn("cidr_blocks      =", mc.replace("ipv6_cidr_blocks", ""))
         self.assertIn("from_port        = 443", sg)
         self.assertIn("to_port          = 443", sg)
         self.assertIn('protocol         = "tcp"', sg)
@@ -744,7 +760,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn('"--public-ipv4-from-imds"', TF)
         sg = block('resource "aws_security_group" "fleet"', MOD)
         rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
-        self.assertEqual(len(rules), 3, rules)
+        self.assertEqual(len(rules), 2, rules)
         slots = [rule for rule in rules if "var.slot_tls_ports" in rule]
         self.assertEqual(len(slots), 1)
         self.assertIn('description = "GPU slot renderer TLS over IPv4"', slots[0])
