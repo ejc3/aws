@@ -165,6 +165,53 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertEqual(self.remove(candidate["token"]), {"status": "skipped"})
         self.assertEqual((path / "src/new.local").read_text(), "created after listing")
 
+    def test_untracked_dependency_root_skips_recursive_status(self):
+        dirty = self.worktree("dirty-dependencies")
+        cache = dirty / "node_modules"
+        cache.mkdir()
+        (cache / "cached-package.local").write_text("local dependency")
+        clean = self.worktree("clean")
+
+        checks = []
+        git = WORKER.git
+
+        def record(home, path, *args, **kwargs):
+            if args[0] == "status":
+                checks.append(path)
+            return git(home, path, *args, **kwargs)
+
+        with mock.patch.object(WORKER, "git", side_effect=record):
+            [candidate] = self.list()
+        self.assertIn(clean, checks)
+        self.assertNotIn(dirty, checks)
+        self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertTrue(cache.exists())
+
+    def test_one_unreadable_worktree_preserves_it_without_blocking_another(self):
+        unreadable = self.worktree("unreadable")
+        eligible = self.worktree("eligible")
+        self.set_age(unreadable, 1)
+        self.set_age(eligible, 2)
+        real_clean = WORKER.clean
+
+        def verify(home, path, head, admin):
+            if path == unreadable:
+                raise WORKER.Incomplete("command timed out")
+            return real_clean(home, path, head, admin)
+
+        with mock.patch.object(WORKER, "clean", side_effect=verify):
+            [candidate] = self.list()
+            self.assertEqual(candidate["age_ns"], 2)
+            self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertTrue(unreadable.exists())
+
+    def test_nested_untracked_files_are_still_rejected(self):
+        dirty = self.worktree("dirty-nested")
+        extra = dirty / "src" / "local.local"
+        extra.write_text("not tracked")
+        self.assertEqual(self.list(), [])
+        self.assertTrue(extra.exists())
+
     def test_squash_requires_exact_pr_head_and_reachable_merge(self):
         path = self.worktree("squash")
         head = self.commit(path)
