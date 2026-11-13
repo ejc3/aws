@@ -33,7 +33,7 @@ variable "nextjs_ct_volume_size" {
   # the same homes plus one container root per person (a few GB each), with room to grow.
   description = "Root volume GB for the containerized nextjs box: the homes and every container root."
   type        = number
-  default     = 600
+  default     = 700
 }
 
 resource "aws_instance" "nextjs_ct" {
