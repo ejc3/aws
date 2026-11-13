@@ -247,6 +247,30 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertEqual(self.list(), [])
         self.assertEqual(self.network, [])
 
+    def test_one_listing_reuses_proof_across_clones_and_remove_checks_again(self):
+        first = self.worktree("first")
+        clone = self.home / "other-clone"
+        self.git(self.home, "clone", "-q", str(self.remote), str(clone))
+        second = self.home / "second"
+        self.git(clone, "worktree", "add", "-q", "-b", "second", str(second))
+        self.set_age(first, 1)
+        self.set_age(second, 2)
+
+        merged = WORKER.merged
+        with mock.patch.object(WORKER, "merged", side_effect=merged) as proof:
+            old, new = self.list()
+            self.assertEqual(proof.call_count, 1)
+        self.assertEqual([old["age_ns"], new["age_ns"]], [1, 2])
+        self.assertEqual(self.network, ["repos/example/app", "repos/example/app/git/ref/heads/main"])
+
+        # An earlier candidate list is not proof at removal time.
+        self.network.clear()
+        with mock.patch.object(WORKER, "merged", return_value=False) as proof:
+            self.assertEqual(self.remove(old["token"]), {"status": "skipped"})
+            proof.assert_called_once()
+        self.assertEqual(self.network, ["repos/example/app", "repos/example/app/git/ref/heads/main"])
+        self.assertTrue(first.exists())
+
     def test_stale_clone_requires_exact_remote_ancestry_without_fetching(self):
         path = self.worktree("candidate")
         head = self.git(path, "rev-parse", "HEAD").decode().strip()
