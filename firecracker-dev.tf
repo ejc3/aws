@@ -14,7 +14,7 @@ variable "enable_firecracker_instance" {
 variable "firecracker_instance_type" {
   description = "Instance type for Firecracker dev"
   type        = string
-  default     = "c7gd.metal" # Same-AZ Spot donor adopted with the original 800 GiB root.
+  default     = "m8gd.metal-24xl" # Same-AZ Spot donor adopted with the original 800 GiB root.
 }
 
 variable "firecracker_volume_size" {
@@ -122,6 +122,13 @@ resource "aws_security_group" "firecracker_dev" {
   }
 }
 
+locals {
+  firecracker_retired_primary_eni_ids = {
+    first  = "eni-0c56d49bcd6502d3f"
+    second = "eni-0fae2a9b8eb55d043"
+  }
+}
+
 # Network interface with IPv6 /64 prefix for routed mode VMs
 resource "aws_network_interface" "firecracker_dev" {
   count             = var.enable_firecracker_instance ? 1 : 0
@@ -153,7 +160,7 @@ resource "aws_network_interface" "firecracker_dev" {
 # address from creating a look-alike if its state binding is missing.
 import {
   to = aws_network_interface.firecracker_dev_retired
-  id = "eni-0c56d49bcd6502d3f"
+  id = local.firecracker_retired_primary_eni_ids.first
 }
 
 resource "aws_network_interface" "firecracker_dev_retired" {
@@ -172,8 +179,32 @@ resource "aws_network_interface" "firecracker_dev_retired" {
     }
 
     postcondition {
-      condition     = self.id == "eni-0c56d49bcd6502d3f"
+      condition     = self.id == local.firecracker_retired_primary_eni_ids.first
       error_message = "The retired FCVM ARM interface must be the original retained ENI."
+    }
+  }
+}
+
+# Keep the primary interface from the previous donor independently of the
+# first retained interface. This address can only adopt the existing interface.
+import {
+  to = aws_network_interface.firecracker_dev_retired_second
+  id = local.firecracker_retired_primary_eni_ids.second
+}
+
+resource "aws_network_interface" "firecracker_dev_retired_second" {
+  subnet_id         = local.subnet_ids_by_az["us-west-1a"]
+  security_groups   = [aws_security_group.firecracker_dev[0].id]
+  ipv6_prefix_count = 1
+  private_ips_count = 1
+  tags              = { Name = "fcvm-metal-arm-retired-eni-second" }
+
+  lifecycle {
+    prevent_destroy = true
+
+    postcondition {
+      condition     = self.id == local.firecracker_retired_primary_eni_ids.second
+      error_message = "The second retired FCVM ARM interface must be the previous canonical ENI."
     }
   }
 }
@@ -305,6 +336,10 @@ resource "aws_instance" "firecracker_dev" {
     # The donor now carries the only live copy of the recovered root. Any later
     # replacement must deliberately remove this guard after proving a backup.
     prevent_destroy = true
+    precondition {
+      condition     = !contains(values(local.firecracker_retired_primary_eni_ids), aws_network_interface.firecracker_dev[0].id)
+      error_message = "Move the verified donor ENI to the canonical state address before planning the adopted instance."
+    }
     # Prevent recreation for imported instance
     ignore_changes = [
       ami,
