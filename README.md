@@ -2570,8 +2570,9 @@ the configuration. Confirm the staged plan creates only the isolated lab and its
 The temporary inspector has no Internet route, public address, login key or IAM profile.
 It drops its network interface before mounting the volumes read-only with journal replay
 disabled. Read the `EVIDENCE_RESULT` line from the inspector's latest EC2 console output.
-It contains counts for selected persistence locations and bounded plain-text log tails;
-an empty result is not a comprehensive malware or log scan. Return the input to `null` and
+It contains separate host and guest counts for selected persistence locations, bounded
+plain-text log tails, and samples from persistent journals. An empty result is not a
+comprehensive malware or log scan. Return the input to `null` and
 apply cleanup from main. The lab owns the attachments but does not own or delete the evidence
 volumes. Keep the variable file, plan and results private.
 

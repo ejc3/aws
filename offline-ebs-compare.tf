@@ -40,10 +40,10 @@ locals {
     after  = var.offline_ebs_compare.post_volume
   } : {}
   offline_ebs_compare_userdata = local.offline_ebs_compare_enabled ? templatefile("${path.module}/scripts/offline-ebs-compare-boot.sh.tftpl", {
-    analysis     = file("${path.module}/scripts/offline-ebs-compare.py")
-    pre_volume   = var.offline_ebs_compare.pre_volume
-    post_volume  = var.offline_ebs_compare.post_volume
-    volume_bytes = var.offline_ebs_compare.volume_size_gib * 1073741824
+    analysis_gzip_base64 = base64gzip(file("${path.module}/scripts/offline-ebs-compare.py"))
+    pre_volume           = var.offline_ebs_compare.pre_volume
+    post_volume          = var.offline_ebs_compare.post_volume
+    volume_bytes         = var.offline_ebs_compare.volume_size_gib * 1073741824
     config_base64 = base64encode(jsonencode({
       window_start_utc = var.offline_ebs_compare.window_start
       window_end_utc   = var.offline_ebs_compare.window_end

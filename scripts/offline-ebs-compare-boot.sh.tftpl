@@ -3,7 +3,9 @@ set -Eeuo pipefail
 umask 077
 export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 LAB=/run/evidence-lab
-mkdir -p "$LAB/pre" "$LAB/post"
+JOURNAL_SCRATCH=/run/evidence-journal
+install -d -m 0700 "$LAB" "$LAB/pre" "$LAB/post"
+install -d -m 0711 "$JOURNAL_SCRATCH"
 serial() {
   local console
   for console in /dev/ttyS0 /dev/ttyAMA0 /dev/console; do
@@ -31,9 +33,7 @@ stage=lock_network
 for nic in /sys/class/net/*; do
   [[ "$nic" == /sys/class/net/lo ]] || ip link set dev "$${nic##*/}" down
 done
-cat > "$LAB/analysis.py" <<'PYTHON'
-${analysis}
-PYTHON
+printf '%s' '${analysis_gzip_base64}' | base64 -d | gzip -d > "$LAB/analysis.py"
 printf '%s' '${config_base64}' | base64 -d > "$LAB/config.json"
 disk_for() {
   local vol="$1" dev found=''
@@ -73,11 +73,16 @@ stage=discover_volumes
 PRE=$(disk_for '${pre_volume}')
 POST=$(disk_for '${post_volume}')
 [[ "$PRE" != "$POST" ]]
+stage=verify_network
+for nic in /sys/class/net/*; do
+  [[ "$nic" == /sys/class/net/lo ]] && continue
+  [[ -r "$nic/flags" ]] && (( ($(cat "$nic/flags") & 1) == 0 ))
+done
 stage=read_only_mount
 mount_evidence "$PRE" "$LAB/pre"
 mount_evidence "$POST" "$LAB/post"
 stage=compare
-timeout 900 /usr/bin/python3 -I "$LAB/analysis.py" "$LAB/pre" "$LAB/post" "$LAB/config.json" > "$LAB/result.json"
-[[ $(wc -c < "$LAB/result.json") -lt 3000 ]]
+timeout 900 /usr/bin/python3 -I "$LAB/analysis.py" "$LAB/pre" "$LAB/post" "$LAB/config.json" "$JOURNAL_SCRATCH" > "$LAB/result.json"
+[[ $(wc -c < "$LAB/result.json") -lt 6000 ]]
 serial "EVIDENCE_RESULT $(cat "$LAB/result.json")"
 stage=done
