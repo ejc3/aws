@@ -1945,7 +1945,8 @@ the data from before the move.
 ### dolphin-labs podcasts R2 (dolphin-labs-podcasts.tf)
 
 The R2 bucket `dolphin-labs-podcasts` is in this Cloudflare account, the account that runs `dolphin-labs-prod` and
-`dolphin-labs-stage`. It holds the team podcasts' transcripts and ad alignments, and objects in it expire after 180 days.
+`dolphin-labs-stage`. It holds the team podcasts' descriptions, transcripts and ad alignments. Objects expire after 240
+days so they outlive episode records, which can last up to 217 days.
 The bucket is private, with no r2.dev address and no custom domain. The production Worker serves from it through the binding
 `PODCASTS`. The podcast function in the Dolphin account writes it through R2's S3 API, with an account token that reaches
 this bucket's objects and nothing else. Its S3 pair is derived from the token: the key id is the token's id, and the
