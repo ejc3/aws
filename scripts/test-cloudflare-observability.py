@@ -40,6 +40,17 @@ class TokenTests(unittest.TestCase):
         for name in [*ACCOUNT.values(), *ZONE.values()]:
             self.assertTrue(name.endswith("Read"), name)
 
+    def test_email_routing_rules_read_by_name_on_every_zone(self):
+        # Looked up by name at plan time (the token cannot list groups); read only, rules only, never the account's
+        # list of destination addresses.
+        names = re.findall(r'^\s*name\s*=\s*"([^"]+)"', TF, re.M)
+        self.assertIn("Email%20Routing%20Rules%20Read", names)
+        self.assertIn('scope      = "com.cloudflare.api.account.zone"', TF)
+        self.assertIn("one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id", TF)
+        self.assertNotIn("Email%20Routing%20Addresses", TF)
+        for name in re.findall(r'data "cloudflare_account_api_token_permission_groups_list" "[^"]+" \{.*?name\s*=\s*"([^"]+)"', TF, re.S):
+            self.assertTrue(name.endswith("Read"), name)
+
     def test_nothing_that_names_people(self):
         for gid in (ACCESS_AUDIT_LOGS_READ, ACCESS_SCIM_LOGS_READ):
             self.assertNotIn(gid, TF)
