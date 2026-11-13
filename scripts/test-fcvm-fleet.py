@@ -105,7 +105,15 @@ class HostTests(unittest.TestCase):
                                     configured[1]), ["95217caa", "a4a0bd3e", "92a26793", "343b2287"])
         # and every copy the publisher has made of a reviewed build-region host
         self.assertEqual(configured[2], "flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids])")
-        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split('%{endif~}', 1)[0]
+        windows = "ami-0dddddddddddddddd"   # the publisher's copy of the 853eb034 host, a build-region copy too
+        self.assertRegex(east, r'windows_host_amis\s*=\s*data\.aws_ami_ids\.fcvm_ami_build_region_copies'
+                               r'\["host/x86_64/853eb034"\]\.ids\n')
+        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
+        # the nested Windows case, rendered as Terraform does when the list is not empty
+        windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"
+        self.assertEqual(guard.count(windows_if), 1)
+        guard = guard.replace(windows_if, "").replace("      %{endif~}\n", "")
+        self.assertNotIn("%{", guard)
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
             curl.write_text(
@@ -121,7 +129,8 @@ class HostTests(unittest.TestCase):
             )
             curl.chmod(0o700)
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
-                                                   "|".join(sorted([oldest, older, rollback, previous, candidate])))
+                                                   "|".join(sorted([oldest, older, rollback, previous, candidate, windows])))
+            boot = boot.replace('${join("|", sort(tolist(var.windows_host_amis)))}', windows)
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
                 (oldest, "--phones 2 --potato-players 96"),
@@ -129,6 +138,7 @@ class HostTests(unittest.TestCase):
                 (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
                 (candidate, "--phones 2 --potato-players 96"),
+                (windows, "--phones 2 --potato-players 96 --windows 4"),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
                 ("no-token", "--phones 2"),
                 ("no-ami", "--phones 2"),

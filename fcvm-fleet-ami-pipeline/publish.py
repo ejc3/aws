@@ -321,6 +321,30 @@ class Publisher:
             },
         }, host_only=True)
 
+    # The publisher's us-east-1 copy of the fb2f5c36 host, which the generation-eight receipt names.
+    HELD_STAMP_HOST_COPY = "ami-02217558b180d38fb"
+
+    def reviewed_windows_host_release(self):
+        held = self.reviewed_held_stamp_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-eight receipt selected version 27 on the host, after Terraform prepared
+        # version 26, kept every tile's version, and names the publisher's us-east-1 copy of the
+        # fb2f5c36 host (the reviewed identity is the us-west-2 original).
+        return self.reviewed_pair({
+            "source_sha": "853eb034a4611e4e4d3b7e79caaf03cf5b2ed643",
+            "images": {"host": "ami-0925206c2b9eac0fe", "tile": held["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 8, "source_sha": held["source_sha"],
+                "build_id": "reviewed-held-stamp-host-release:" + digest(encoded(held)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**held["expected"]["versions"], host_key: 27},
+                "previous": {k: v for k, v in held["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.HELD_STAMP_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": held["images"]["tile"]}},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -532,9 +556,16 @@ class Publisher:
     def run_held_stamp_host_release(self, event):
         need(event == {"action": "activate-reviewed-held-stamp-host-release"},
              "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_held_stamp_host_release(), "reviewed-held-stamp-host-release")
+
+    def run_windows_host_release(self, event):
+        need(event == {"action": "activate-reviewed-windows-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_windows_host_release(), "reviewed-windows-host-release")
+
+    def run_build_region_host_release(self, config, identity):
         host_user_data = self.env["HOST_FIX_BOOT_SHA"]
         need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
-        config = self.reviewed_held_stamp_host_release()
         # Built in us-west-2 (#807's build region): the release names the publisher's copy.
         copied = self.reviewed_release_copy(config["images"]["host"], "host")
         need(copied is not None, "release-region copies are still pending: host")
@@ -542,7 +573,7 @@ class Publisher:
         host = next(t for t in self.templates if t["kind"] == "host")
         boot = base64.b64decode(self.current(host["id"])["LaunchTemplateData"].get("UserData", "")).decode("utf-8", "replace")
         need(copied in boot, "Terraform's host bootstrap does not name the release-region copy yet")
-        return self.run_reviewed(config, "reviewed-held-stamp-host-release", host_user_data=host_user_data,
+        return self.run_reviewed(config, identity, host_user_data=host_user_data,
                                  host_only=True, release_images={**config["images"], "host": copied})
 
     def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False,
@@ -1379,6 +1410,8 @@ class Publisher:
             return self.run_retake_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-held-stamp-host-release":
             return self.run_held_stamp_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-windows-host-release":
+            return self.run_windows_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

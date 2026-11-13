@@ -657,6 +657,17 @@ Terraform's host bootstrap has to name the copy before the release:
    rollback. `/fcvm-fleet/ami-release-copies` names the copy in us-east-1 and
    the original in us-west-2; nothing is copied back.
 
+The fixed action `{"action":"activate-reviewed-windows-host-release"}` advances
+only the exact generation-eight receipt to the signed 853eb034 host, which adds
+Windows mode's image and bridge. It was built by hand in us-west-2 too, so it is
+released by the same apply, invoke, apply, invoke sequence as generation eight,
+and becomes generation nine. The second apply also lists the copy in
+`windows_host_amis`: the host bootstrap adds `--windows 4` when the boot image is
+that copy, as it adds potato mode, so a host booted from an older image (before
+the release, or after a rollback) starts an agent that has no `--windows` without
+it. Hosts booted from the copy run four Windows sandboxes each on the staging
+wall (`?mode=windows`, behind Cloudflare Access).
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |

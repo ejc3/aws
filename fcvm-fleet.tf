@@ -452,6 +452,13 @@ module "fcvm_fleet_east1" {
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
     local.fcvm_ami_bootstrap["host/x86_64/343b2287"].image,
   ], flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids]))
+  # Windows mode (?mode=windows, ejc3/fcvm docs/fleet/windows-sandboxes.md): a host booted from the publisher's copy of
+  # the 853eb034 host runs four disposable Windows Server 2025 evaluation desktops (--windows 4), CPU-only Cloud
+  # Hypervisor VMs restored from a snapshot the agent takes of the AMI's image; the image and the bridge come from
+  # /etc/fcvm-fleet/windows.env, which the AMI's build writes. Older images' agents have no --windows, so the argument
+  # follows the boot image, as potato mode does. Staging only, behind Cloudflare Access: a public launch needs the
+  # owner's go-ahead (the evaluation's terms).
+  windows_host_amis         = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name

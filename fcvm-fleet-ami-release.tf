@@ -106,8 +106,14 @@ locals {
   # boundary (ejc3/fcvm#1705), working-set replay in first-touch order (ejc3/fcvm#1538, ejc3/fcvm#1704,
   # ejc3/fcvm#1664), routed restore with one ip -batch (ejc3/fcvm#1702) and the recipe's metal reboot and prep fixes
   # (ejc3/fcvm#1716, ejc3/fcvm#1736). The IP-options guard is installed by prep and its publication proof passed.
+  #
+  # 853eb034: built from ejc3/fcvm main 853eb034, revised from the fb2f5c36 image: everything in fb2f5c36's, plus
+  # Windows mode's image and bridge (ejc3/fcvm#1742, ejc3/fcvm#1743, ejc3/fcvm#1778; the image is a Windows Server
+  # 2025 evaluation install, rebuilt before its evaluation runs out), Cloud Hypervisor restores with memory mapped
+  # from the snapshot (ejc3/fcvm#1728), and the other changes on fcvm main from fb2f5c36 to 853eb034.
   fcvm_ami_build_region_reviewed = {
     "host/x86_64/fb2f5c36" = { image = "ami-0d176763f9f33416e", kind = "host", name = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303" }
+    "host/x86_64/853eb034" = { image = "ami-0925206c2b9eac0fe", kind = "host", name = "fcvm-fleet-host-x86_64-853eb034-202611091050" }
   }
 }
 
