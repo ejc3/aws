@@ -149,6 +149,21 @@ resource "aws_ssm_parameter" "fcvm_ami_control" {
   lifecycle { ignore_changes = [value] }
 }
 
+# Why the latest factory request failed, readable in the fleet account, whose agents fix the image
+# code but cannot read the factory's state above (ejc3/aws#823). The dispatcher writes it
+# (dispatch.py publish_failure): validated request, source, build and phase metadata plus fixed
+# failure codes. No free-form executor or builder text leaves the management account.
+# Read it with the fleet's role:
+#   aws --region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-factory-failure
+resource "aws_ssm_parameter" "fcvm_ami_failure" {
+  provider    = aws.fcvm_fleet_east1
+  name        = "/fcvm-fleet/ami-factory-failure"
+  description = "Sanitized cause of the latest failed image factory request; the factory dispatcher owns the value"
+  type        = "String"
+  value       = jsonencode({ version = 1, request_id = "" })
+  lifecycle { ignore_changes = [value] }
+}
+
 data "aws_ami" "fcvm_ami_canonical" {
   provider    = aws.fcvm_fleet_west2
   most_recent = true
@@ -354,7 +369,9 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       CANONICAL_AMI     = data.aws_ami.fcvm_ami_canonical.id
       GUARD_SHA256      = local.fcvm_ami_guard_sha
       PIPELINE_BUCKET   = aws_s3_bucket.fcvm_ami_pipeline.id
+      PIPELINE_REGION   = local.fcvm_fleet_home_region
       RELEASE_PARAMETER = "/fcvm-fleet/ami-release"
+      FAILURE_PARAMETER = aws_ssm_parameter.fcvm_ami_failure.name
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
       TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
@@ -540,6 +557,7 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     # The fixed broker pins InstanceId from an immutable slot; workers never get this unscoped read.
     { Sid = "OwnCommandStatusBroker", Effect = "Allow", Action = "ssm:GetCommandInvocation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_build_region } } },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    { Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", Resource = aws_ssm_parameter.fcvm_ami_failure.arn },
     { Effect = "Deny", Action = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "s3:GetObject*", "sts:AssumeRole*", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*"], Resource = "*" }
   ] })
 }
@@ -554,7 +572,10 @@ resource "aws_iam_role_policy" "fcvm_ami_dispatch" {
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = [aws_iam_role.fcvm_ami_broker_fleet.arn, aws_iam_role.fcvm_ami_worker_fleet.arn] },
     { Effect = "Allow", Action = "sts:TagSession", Resource = aws_iam_role.fcvm_ami_worker_fleet.arn },
     { Sid = "RedriveOnlyTheFixedPublisher", Effect = "Allow", Action = "lambda:InvokeFunction", Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish" },
-    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.fcvm_ami_dispatch.arn}:*" }
+    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.fcvm_ami_dispatch.arn}:*" },
+    # Classify failure codes from the executor's log and the failing phase's archived diagnostics.
+    { Sid = "FailedBuildExecutorLog", Effect = "Allow", Action = "logs:GetLogEvents", Resource = "${aws_cloudwatch_log_group.fcvm_ami_codebuild.arn}:log-stream:*" },
+    { Sid = "FailedPhaseDiagnostics", Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*/diagnostics/*" }
     , { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks",
     Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } } }
   ] })

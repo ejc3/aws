@@ -1352,5 +1352,213 @@ class FactoryTests(unittest.TestCase):
                 self.assertEqual(len(self.cb.starts), 1)
 
 
+    # The fleet account's agents read why a request failed from FAILURE_PARAMETER (ejc3/aws#823):
+    # fixed failure codes and validated phase metadata, without raw log text.
+    def failure_fixture(self, *, logs_fail=False, diagnostics_fail=False, version_id="fixture-version"):
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure", PIPELINE_REGION="us-east-2")
+        instance_id = self.launch()
+        self.cb.builds[BUILD].update(buildStatus="FAILED", logs={"groupName": "/aws/codebuild/factory", "streamName": "stream-1"})
+        tail = "\n".join([
+            "== build start 2026-11-12T21:58:40Z",
+            "make: Leaving directory '/home/ubuntu/fcvm/fleet/phone'",
+            "fetching https://fixture.invalid/object?X-Amz-Signature=abc&X-Amz-Credential=AKIDFIXTURE from 10.21.41.120",
+            "Authorization: Bearer fixture-bearer-value",
+            "Error: rdp rejected Q3Z4mW9P2h8N",
+            '{"error":"M7vSp8R4K2dQ"}',
+            "Error: no space left on device D3vmQ8w2R5pN",
+            "host ip-10-21-41-120 arn:aws:ec2:us-west-2:123456789012:instance/" + instance_id + " prefix 2600:1f14:abc:de00::/56",
+            "warm-phone: cold boot ok=0 streaming_ms=61234 gpu=0000:18:00.0",
+            '{"error":"the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: '
+            'adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]"}',
+            "PHASE build FAILED (exit 1)",
+        ]) + "\n"
+        events = [{"message": "[Container] 2026/11/12 23:14:30 Running command python fleet/ami/pipeline.py"},
+                  {"message": json.dumps({"phaseDiagnostics": {"kind": "host", "phase": "build", "sha256": "e" * 64,
+                                                               "size": 1234, "version_id": version_id}})},
+                  {"message": "Traceback (most recent call last):"},
+                  {"message": "__main__.BuilderCommandFailed: the isolated builder command failed S8nV9kQ2R4zM"}]
+        reads = []
+        lock = self.ddb
+        test = self
+
+        class Logs:
+            def get_log_events(self, **kwargs):
+                reads.append(("logs", kwargs))
+                if logs_fail:
+                    raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetLogEvents")
+                return {"events": events}
+
+        class S3:
+            def get_object(self, **kwargs):
+                reads.append(("s3", kwargs))
+                if diagnostics_fail:
+                    raise ClientError({"Error": {"Code": "NoSuchVersion"}}, "GetObject")
+                return {"Body": io.BytesIO(tail.encode())}
+
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                test.assertFalse(lock.held, "the failure is published outside the backend lock")
+                return super().put_parameter(Name, Value, **kwargs)
+
+        fleet_ssm = FleetSSM()
+        fleet_ssm.values = self.fleet_ssm.values
+        clients = {("ssm", False): self.store, ("ssm", True): fleet_ssm, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb,
+                   ("lambda", False): self.publisher, ("logs", False): Logs()}
+        def client(name, fleet=False, region=None):
+            if name == "s3":
+                self.assertEqual((fleet, region), (False, "us-east-2"), "diagnostics are read from the factory's bucket")
+                return S3()
+            return clients[(name, fleet)]
+        self.factory.client = client
+        self.factory.reconcile()
+        return instance_id, reads, fleet_ssm
+
+    def test_failure_parameter_never_copies_short_log_values(self):
+        _, _, fleet_ssm = self.failure_fixture()
+        encoded = json.dumps(fleet_ssm.values["/fcvm-fleet/ami-factory-failure"])
+        for opaque in ("Q3Z4mW9P2h8N", "M7vSp8R4K2dQ", "D3vmQ8w2R5pN", "S8nV9kQ2R4zM"):
+            with self.subTest(opaque=opaque):
+                self.assertNotIn(opaque, encoded)
+
+    def test_a_failed_request_publishes_its_sanitized_cause_to_the_fleet(self):
+        instance_id, reads, fleet_ssm = self.failure_fixture()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual((value["version"], value["request_id"], value["source_sha"], value["status"], value["build_status"]),
+                         (1, INPUT_SHA, SOURCE_SHA, "failed", "FAILED"))
+        self.assertEqual(value["reason"], "build_failed_or_expired")
+        self.assertEqual(value["executor_error"], "builder_command_failed")
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual(value["unavailable"], [])
+        s3 = [kwargs for kind, kwargs in reads if kind == "s3"]
+        self.assertEqual(len(s3), 1)
+        self.assertEqual((s3[0]["Bucket"], s3[0]["VersionId"]), ("fixture-factory", "fixture-version"))
+        self.assertEqual(s3[0]["Key"], "builders/arn:aws:ec2:us-east-1:123456789012:instance/" + instance_id + "/diagnostics/host-build.log")
+        self.assertEqual(value["diagnostic_codes"], ["disk_full", "adb_install_failed"])
+        encoded = json.dumps(value)
+        for private in ("123456789012", instance_id, "10.21.41.120", "2600:1f14", "fixture.invalid", "AKIDFIXTURE",
+                        "fixture-bearer-value", "fixture-version", "/aws/codebuild", "stream-1"):
+            self.assertNotIn(private, encoded)
+        self.assertLessEqual(len(json.dumps(value, separators=(",", ":")).encode()), 4000)
+        # Published once: a later reconcile of the failed request leaves the parameter alone.
+        writes = len(fleet_ssm.writes)
+        self.factory.reconcile()
+        self.assertEqual(len(fleet_ssm.writes), writes)
+
+    def test_an_unreadable_log_or_diagnostics_still_publishes_and_says_so(self):
+        _, _, fleet_ssm = self.failure_fixture(logs_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual((value["executor_error"], value["phase"], value["diagnostic_codes"]), (None, None, []))
+        self.assertEqual(value["unavailable"], ["executor_log"])
+        self.setUp()
+        _, _, fleet_ssm = self.failure_fixture(diagnostics_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual((value["diagnostic_codes"], value["unavailable"]), ([], ["phase_diagnostics"]))
+        self.setUp()
+        _, reads, fleet_ssm = self.failure_fixture(version_id="null")
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual(value["unavailable"], ["phase_diagnostics"])
+        self.assertFalse(any(kind == "s3" for kind, _ in reads), "never read an unversioned archive")
+
+    def test_failure_parameter_keeps_only_recognized_metadata(self):
+        _, _, fleet_ssm = self.failure_fixture()
+        self.factory.publish_failure(
+            {"request_id": INPUT_SHA, "status": "failed", "source_sha": "another private value",
+             "message": "some private error detail"},
+            build={"buildStatus": "unexpected private status"})
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual((value["reason"], value["source_sha"], value["build_status"]), ("unknown_failure", None, None))
+        self.assertNotIn("private", json.dumps(value))
+
+    def test_viewer_path_failure_keeps_only_its_code(self):
+        class Logs:
+            def get_log_events(self, **kwargs):
+                return {"events": [{"message": "RuntimeError: candidate viewer path failed: example private detail"}]}
+        self.factory.client = lambda *args: Logs()
+        self.assertEqual(self.factory.executor_failure({"logs": {"groupName": "group", "streamName": "stream"}}),
+                         ("viewer_path_failed", None))
+
+    def test_publisher_rollback_reports_once_during_repeated_cleanup(self):
+        for lease_expired in (False, True):
+            with self.subTest(lease_expired=lease_expired):
+                self.setUp()
+                path = "/fcvm-fleet/ami-factory-failure"
+                self.factory.env["FAILURE_PARAMETER"] = path
+                ended = self.succeed()
+                if lease_expired:
+                    self.time = ended + mod.PUBLICATION_SECONDS + 1
+                record = self.store.values["/factory/requests/" + INPUT_SHA]
+                record.update(status="failed", message="publication rolled back; automatic replay refused")
+                # EC2 termination has not settled on the first two reconciliation ticks.
+                self.factory.gone = lambda *args: False
+                self.factory.reconcile()
+                self.factory.reconcile()
+                self.factory.gone = lambda *args: True
+                self.factory.reconcile()
+                self.assertEqual(self.fleet_ssm.writes.count(path), 1)
+                status = self.fleet_ssm.values[path]
+                self.assertEqual((status["reason"], status["build_status"]), ("publication_rolled_back", "SUCCEEDED"))
+                self.assertEqual(self.factory.request_record(INPUT_SHA)["message"],
+                                 "publication rolled back; automatic replay refused")
+                self.assertIsNone(self.store.values["/factory/control"]["active"])
+                self.assertEqual(self.publisher.calls, [], "a rolled-back request cannot be replayed")
+
+    def test_failures_are_published_newest_last_after_the_queue_settles(self):
+        # A failed build is retired and the pending request's start is refused in one reconcile:
+        # the parameter ends on the refused request, and it is written once the queue holds
+        # neither intent.
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure")
+        self.factory.journal(BUILD)
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        newer = "5" * 64
+        self.store.values["/factory/requests/" + newer] = {"request_id": newer, "status": "queued", "source_sha": SOURCE_SHA,
+            "input_sha256": newer, "priority": "normal", "build_id": None, "not_before": 0}
+        self.store.values["/factory/control"]["pending"] = newer
+        def refuse(**kwargs):
+            raise ClientError({"Error": {"Code": "AccountLimitExceededException"}}, "StartBuild")
+        self.cb.start_build = refuse
+        order = []
+        test = self
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                control = test.store.values["/factory/control"]
+                test.assertIsNone(control.get("active"), "published while the queue still held an intent")
+                order.append(json.loads(Value)["request_id"])
+                return super().put_parameter(Name, Value, **kwargs)
+        fleet = FleetSSM()
+        clients = {("ssm", False): self.store, ("ssm", True): fleet, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("dynamodb", False): self.ddb, ("lambda", False): self.publisher}
+        self.factory.client = lambda name, fleet=False, region=None: clients[(name, fleet)]
+        self.factory.reconcile()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual(self.factory.request_record(newer)["status"], "failed")
+        self.assertEqual(order, [INPUT_SHA, newer])
+        self.assertEqual(fleet.values["/fcvm-fleet/ami-factory-failure"]["request_id"], newer)
+        self.assertEqual(fleet.values["/fcvm-fleet/ami-factory-failure"]["reason"], "start_rejected")
+
+    def test_failure_parameter_is_the_fleet_accounts_and_only_the_dispatcher_writes_it(self):
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        parameter = re.search(r'^resource "aws_ssm_parameter" "fcvm_ami_failure" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn("provider    = aws.fcvm_fleet_east1", parameter)
+        self.assertIn('name        = "/fcvm-fleet/ami-factory-failure"', parameter)
+        self.assertNotIn("ami-pipeline", re.search(r'name\s*=\s*"([^"]+)"', parameter).group(1),
+                         "the fleet's role cannot read the factory's /fcvm-fleet/ami-pipeline/ state")
+        self.assertIn("ignore_changes = [value]", parameter)
+        broker = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('{ Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", '
+                      'Resource = aws_ssm_parameter.fcvm_ami_failure.arn }', broker)
+        dispatch = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('Action = "logs:GetLogEvents", Resource = "${aws_cloudwatch_log_group.fcvm_ami_codebuild.arn}:log-stream:*"', dispatch)
+        self.assertIn('Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*/diagnostics/*"', dispatch)
+        function = re.search(r'^resource "aws_lambda_function" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(function, r"FAILURE_PARAMETER\s*=\s*aws_ssm_parameter\.fcvm_ami_failure\.name")
+        self.assertRegex(function, r"PIPELINE_REGION\s*=\s*local\.fcvm_fleet_home_region")
+        self.assertRegex(function, r'RELEASE_REGION\s*=\s*local\.fcvm_ami_region')
+        self.assertRegex(source, r'fcvm_ami_region\s*=\s*"us-east-1"')
+
 if __name__ == "__main__":
     unittest.main(buffer=True)
