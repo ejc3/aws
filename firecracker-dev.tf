@@ -378,6 +378,11 @@ variable "fcvm_host_kernel_commit" {
   description = "ejc3/fcvm commit whose [kernel_profiles.nested.arm64.host_kernel] the dev box installs"
   type        = string
   default     = "624220f8707472cf01e0c02ceb46101e60e4f600"
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{40}$", var.fcvm_host_kernel_commit))
+    error_message = "The FCVM host kernel commit must be a full lowercase Git SHA."
+  }
 }
 
 resource "aws_ssm_association" "firecracker_dev_host_kernel" {
