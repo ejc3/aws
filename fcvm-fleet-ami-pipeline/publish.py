@@ -839,6 +839,9 @@ class Publisher:
                  and all(validation.get(field) is True for field in ("guard", "frames", "sanitized", "tls_rotation"))
                  and all(validation.get(key) == value for key, value in tls.items())
                  and (kind != "host" or validation.get("phone_clone") is True)
+                 # Every mode's tiles answered a viewer over IPv4 and IPv6 on the host's cold boot
+                 # (ejc3/fcvm fleet/tools/viewer-acceptance.sh, docs/fleet/ARCHITECTURE.md).
+                 and (kind != "host" or validation.get("viewer_path") is True)
                  and len(boots) == len(set(boots)) == 3
                  and all(re.fullmatch(r"[0-9a-f-]{36}", value) for value in boots), "candidate lacks the full boot/security proof")
         need(manifest["images"]["host"]["image_id"] != manifest["images"]["tile"]["image_id"]

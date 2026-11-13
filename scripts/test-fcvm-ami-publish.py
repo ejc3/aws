@@ -362,7 +362,8 @@ class PublisherTests(unittest.TestCase):
         for kind in ("host", "tile"):
             self.manifest["images"][kind] = {"image_id": new[kind], "renderer_sha256": "d" * 64,
                 "renderer_image_id": "sha256:" + "e" * 64, "validation": {"guard": True, "frames": True,
-                    "sanitized": True, "tls_rotation": True, "phone_clone": kind == "host", **self.manifest["tls"],
+                    "sanitized": True, "tls_rotation": True, "phone_clone": kind == "host",
+                    "viewer_path": kind == "host", **self.manifest["tls"],
                     "boot_ids": [f"00000000-0000-0000-0000-{i:012d}" for i in range(3)]}}
             tags = {"Purpose": "fcvm-fleet", "FleetImageKind": kind, "GuardHelperSHA256": self.env["GUARD_SHA256"],
                 "SourceCommit": self.source, "InputSHA256": self.input, "PipelineBuildId": self.build, "PipelineSanitized": "true"}
@@ -1791,6 +1792,23 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual([(call.args[0], call.kwargs["region_name"]) for call in sdk.client.call_args_list],
                          [("s3", "us-east-2"), ("ssm", "us-west-1"), ("codebuild", "us-west-1"),
                           ("ec2", "us-east-1"), ("s3", "us-east-2")])
+
+    def test_a_host_without_the_viewer_path_proof_is_not_published(self):
+        # A host image whose tiles did not answer a viewer over both families (ejc3/fcvm
+        # viewer-acceptance.sh) never reaches the launch templates, and neither does one built
+        # before the factory ran that proof.
+        for value in (False, None):
+            with self.subTest(viewer_path=value):
+                self.setUp()
+                validation = self.manifest["images"]["host"]["validation"]
+                if value is None:
+                    del validation["viewer_path"]
+                else:
+                    validation["viewer_path"] = value
+                self.update_manifest()
+                with self.assertRaises(MODULE.Refused):
+                    self.publisher().run(self.event)
+                self.assertEqual(self.ec2.created, [])
 
     def test_staging_proof_cannot_substitute_the_control_region(self):
         self.manifest["store"]["region"] = "us-west-1"
