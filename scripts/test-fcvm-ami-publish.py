@@ -1596,6 +1596,96 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values, before)
         self.assertEqual(self.ec2.selected, [])
 
+    IPV4_SOURCE = "cad0ddad653808dcce3acc78264c7c84263fac6a"
+    IPV4_IMAGE = "ami-05c06ef8ae037b10a"
+    IPV4_NAME = "fcvm-fleet-host-x86_64-cad0ddad-202611131412"
+
+    def release_through_second_apply(self, publisher_for, event, previous, source):
+        """Run a build-region host release to its receipt: the copy, Terraform's second apply naming
+        it in the bootstrap, and the promotion. Returns the copy and the template version before."""
+        host = self.ids[0]
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher_for(previous).run(event)
+        copied = self.ec2.copies[-1][1]
+        self.ec2.available()
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap names the host: " + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        publisher = publisher_for(previous)
+        publisher.github_source_json.return_value["sha"] = source
+        return publisher, copied, version
+
+    def reviewed_ipv4_host_fixture(self):
+        """Generation ten live (the 0e910245 host, released by its own action after generation nine),
+        and the cad0ddad host built by hand in us-west-2 and tagged validated there by Terraform."""
+        publisher, event, nine, _, _ = self.reviewed_restore_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, nine, self.RESTORE_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 10})
+        ten = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # Generation eleven's predecessor constants, as they are filled from the generation-ten receipt.
+        for name, value in (("RESTORE_HOST_COPY", ten["host_amis"]["us-east-1"]["x86_64"]),
+                            ("RESTORE_HOST_VERSION", ten["versions"]["us-east-1/" + self.ids[0]])):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.IPV4_SOURCE[:8]}"\s*=\s*{{ image = "{self.IPV4_IMAGE}", kind = "host", '
+                                  rf'name = "{self.IPV4_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.RESTORE_IMAGE])
+        image.update(ImageId=self.IPV4_IMAGE, Name=self.IPV4_NAME, State="available",
+                     Description="fcvm fleet: " + self.IPV4_NAME, SourceImageId=self.RESTORE_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[self.IPV4_IMAGE] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-ipv4-host-release"}, ten
+
+    def test_reviewed_ipv4_host_releases_generation_eleven_after_generation_ten(self):
+        event, ten = self.reviewed_ipv4_host_fixture()
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher, copied, version = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(self.ec2.copies[-1][0], self.IPV4_IMAGE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (11, self.IPV4_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-ipv4-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_ipv4_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], ten["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in ten.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**ten["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"], self.IPV4_IMAGE)
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 11})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_ipv4_host_names_the_generation_ten_receipt(self):
+        # Filled from the live generation-ten receipt: an image id and a template version.
+        self.assertRegex(MODULE.Publisher.RESTORE_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertIs(type(MODULE.Publisher.RESTORE_HOST_VERSION), int)
+        self.assertGreater(MODULE.Publisher.RESTORE_HOST_VERSION, 0)
+
+    def test_reviewed_ipv4_host_refuses_a_predecessor_other_than_the_one_it_names(self):
+        event, ten = self.reviewed_ipv4_host_fixture()
+        patcher = mock.patch.object(MODULE.Publisher, "RESTORE_HOST_VERSION", ten["versions"]["us-east-1/" + self.ids[0]] + 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

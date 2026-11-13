@@ -108,14 +108,16 @@ class HostTests(unittest.TestCase):
         windows = "ami-0dddddddddddddddd"   # the publisher's copy of the 853eb034 host, a build-region copy too
         self.assertRegex(east, r'windows_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/0e910245"\]\.ids\)\n')
+                               r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
+                               r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
         # Minecraft mode needs the same image: its agent is the first with --minecraft, so the flag is never in
         # every host's arguments, only in the boot-image case below.
         self.assertNotIn('"--minecraft', TF)
         self.assertEqual(MOD.count("--minecraft 4"), 1)
         self.assertRegex(east, r'minecraft_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/0e910245"\]\.ids\)\n')
+                               r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
+                               r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
         # the nested Windows case, rendered as Terraform does when the list is not empty
         windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"

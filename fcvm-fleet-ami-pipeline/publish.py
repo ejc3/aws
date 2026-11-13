@@ -370,6 +370,33 @@ class Publisher:
             },
         }, host_only=True)
 
+    # The generation-ten receipt (/fcvm-fleet/ami-release, version 11, 2026-11-13): the publisher's
+    # us-east-1 copy of the 0e910245 host it names, and the host template version it selects.
+    RESTORE_HOST_COPY = "ami-0f80d4d1c02857480"
+    RESTORE_HOST_VERSION = 32
+
+    def reviewed_ipv4_host_release(self):
+        restore = self.reviewed_restore_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # Generation eleven: the cad0ddad host. Its Minecraft servers publish their view sockets on
+        # the host's IPv4 address (ejc3/fcvm#1833), its Windows bridges are on an IPv6-enabled
+        # network (ejc3/fcvm#1837), and the bridges' unauthenticated /still route is gone
+        # (ejc3/fcvm#1839). Its predecessor is the generation-ten receipt.
+        return self.reviewed_pair({
+            "source_sha": "cad0ddad653808dcce3acc78264c7c84263fac6a",
+            "images": {"host": "ami-05c06ef8ae037b10a", "tile": restore["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 10, "source_sha": restore["source_sha"],
+                "build_id": "reviewed-restore-host-release:" + digest(encoded(restore)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**restore["expected"]["versions"], host_key: self.RESTORE_HOST_VERSION},
+                "previous": {k: v for k, v in restore["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.RESTORE_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": restore["images"]["tile"]}},
+            },
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -587,6 +614,11 @@ class Publisher:
         need(event == {"action": "activate-reviewed-restore-host-release"},
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_restore_host_release(), "reviewed-restore-host-release")
+
+    def run_ipv4_host_release(self, event):
+        need(event == {"action": "activate-reviewed-ipv4-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
 
     def run_windows_host_release(self, event):
         need(event == {"action": "activate-reviewed-windows-host-release"},
@@ -1444,6 +1476,8 @@ class Publisher:
             return self.run_windows_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-restore-host-release":
             return self.run_restore_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-ipv4-host-release":
+            return self.run_ipv4_host_release(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
