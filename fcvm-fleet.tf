@@ -51,13 +51,13 @@ variable "fcvm_fleet_tile_amis" {
   default = { "us-east-1" = { x86_64 = "ami-094ca9c62a284a389" } }
 }
 
-# First apply the rollback-safe host bootstrap with the extra ports closed. Once
-# the live default and every regional attachment have been checked, a separate
-# Terraform change enables Windows and Minecraft viewers over IPv4.
+# The reviewed us-east-1 host bootstrap starts Windows only on an image without
+# the bridge's /still route (ejc3/fcvm#1839). The other regions keep their old ingress;
+# in us-west-2 the shared security group also serves independently launched lab hosts.
 variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
-  description = "Open IPv4 viewer TLS for Windows and Minecraft after the rollback-safe bootstrap is live."
+  description = "Open the reviewed us-east-1 IPv4 viewer TLS ports for Windows and Minecraft."
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {
@@ -125,9 +125,13 @@ locals {
   fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
+    to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+  }
+  fcvm_fleet_east1_slot_tls_ports = {
+    from = local.fcvm_fleet_slot_tls_ports.from
     to = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? (
       local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1
-    ) : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+    ) : local.fcvm_fleet_slot_tls_ports.to
   }
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
@@ -486,7 +490,7 @@ module "fcvm_fleet_east1" {
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image. The
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
   minecraft_host_amis       = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
-  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name

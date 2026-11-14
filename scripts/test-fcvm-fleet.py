@@ -708,12 +708,14 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : "
                       "r.offset + r.count if m != \"aggregate\"]...)", TF)
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        # Before the bootstrap is deployed, the rule retains its exact previous range and description.
+        # Only us-east-1 may add the extra ports; closing its gate reuses the ordinary GPU slot range.
         gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
-        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= false$")
-        ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
+        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= true$")
+        base_ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
+        self.assertRegex(base_ports, r"to\s*= local.fcvm_fleet_slot_tls_port_base \+ local.fcvm_fleet_host_gpu_slots - 1")
+        ports = re.search(r"  fcvm_fleet_east1_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
         self.assertIn(f"to = var.{gate} ? (", ports)
-        self.assertIn(") : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", ports)
+        self.assertIn(") : local.fcvm_fleet_slot_tls_ports.to", ports)
         # With the gate open: every place's port, and with aggregated streaming the host aggregator's declared port after them.
         self.assertIn("local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
                       "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1", ports)
@@ -741,7 +743,12 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
         self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
         self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
-        self.assertEqual(len(re.findall(r"slot_tls_ports\s*=\s*local\.fcvm_fleet_slot_tls_ports\b", TF)), 3)
+        # Only the region whose host bootstrap was verified may open the extra ports.
+        for region, port_range in (("east1", "fcvm_fleet_east1_slot_tls_ports"),
+                                   ("east2", "fcvm_fleet_slot_tls_ports"),
+                                   ("west2", "fcvm_fleet_slot_tls_ports")):
+            self.assertRegex(block(f'module "fcvm_fleet_{region}"'),
+                             rf"(?m)^  slot_tls_ports\s*= local\.{port_range}$")
 
     def test_the_coordinator_serves_the_launch_names_subzone(self):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
