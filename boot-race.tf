@@ -61,6 +61,7 @@ resource "aws_security_group" "boot_race" {
   description = "boot-race workloads: TCP 8080 and SSH from the parallel boxes only"
   vpc_id      = aws_vpc.ohio_pbox.id
 
+  # Keep existing Ohio pbox access until the legacy campaign drains.
   ingress {
     description     = "The workload, from the parallel boxes"
     from_port       = 8080
@@ -75,6 +76,17 @@ resource "aws_security_group" "boot_race" {
     to_port         = 22
     protocol        = "tcp"
     security_groups = [aws_security_group.ohio_pbox.id]
+  }
+
+  dynamic "ingress" {
+    for_each = local.benchmark_worker_enabled ? toset([22, 8080]) : toset([])
+    content {
+      description     = "AMI builder SSH or workload HTTP from the benchmark worker"
+      from_port       = ingress.value
+      to_port         = ingress.value
+      protocol        = "tcp"
+      security_groups = [aws_security_group.benchmark_worker[0].id]
+    }
   }
 
   # Fargate tasks reach ECR through the endpoints below; the container instance reaches the ECS endpoint over the
@@ -860,12 +872,26 @@ resource "aws_iam_role" "boot_race_driver" {
   max_session_duration = 3600
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = aws_iam_role.dev_server.arn }
-      Action    = "sts:AssumeRole"
-      Condition = { ArnEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
-    }]
+    Statement = [
+      {
+        Sid       = "PrimaryArm"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.dev_server.arn }
+        Action    = "sts:AssumeRole"
+        Condition = { ArnEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
+      },
+      {
+        Sid       = "OnlyBenchmarkWorkerEni"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.benchmark_worker[0].arn }
+        Action    = "sts:AssumeRole"
+        Condition = {
+          ArnLike      = { "ec2:SourceInstanceARN" = "${local.benchmark_worker_ec2}:instance/*" }
+          StringEquals = { "aws:Ec2InstanceSourceVpc" = local.benchmark_worker_vpc_id }
+          IpAddress    = { "aws:Ec2InstanceSourcePrivateIPv4" = "${local.benchmark_worker_private_ipv4}/32" }
+        }
+      },
+    ]
   })
   tags = local.boot_race_tag
 }

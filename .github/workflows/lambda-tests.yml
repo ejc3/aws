@@ -264,6 +264,9 @@ jobs:
       - name: boot-race grants match the calls the functions make (offline)
         run: python3 -S -B scripts/test-boot-race-iam.py
 
+      - name: Dedicated benchmark worker launch and expiration boundaries
+        run: python3 -S -B scripts/test-benchmark-worker.py
+
       - name: play.cc-games.app edge protections (offline)
         run: python3 -S -B scripts/test-games-mp-edge.py
 

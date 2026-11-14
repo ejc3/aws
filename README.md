@@ -904,11 +904,23 @@ with `scripts/test-opencode-setup.py` in CI.
 
 ### fcvm boot benchmark (boot-race)
 
-Boot-race is available without a per-run jumpbox apply. Run `creds.sh` on the
-primary FCVM ARM instance. Only instance-role credentials issued to that instance
-can assume `arn:aws:iam::<account>:role/boot-race-driver`; other hosts using
-`dev-server-role` and the Ohio pbox's `dev-ebs-only` role cannot. The script
-delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
+Boot-race runs on a dedicated Ohio Spot worker. On the primary FCVM ARM host,
+use `scripts/benchmark-worker.sh up` from this checkout and save its returned
+instance ID. Use `scripts/benchmark-worker.sh status` during startup, then
+`scripts/benchmark-worker.sh ssh 'cloud-init status --wait'`. This only admits
+a temporary SSH key for the primary ARM operator. The worker has no shared
+dev-hop key, and uses IAM credentials from its own instance profile for the
+benchmark. There is no credential copy or per-run jumpbox apply.
+
+Only one worker fits its fixed network interface. Bootstrap checks `/dev/kvm`
+and prepares disposable instance storage under `/mnt/nvme`. The worker bids up
+to $1.50/hour for Spot. If capacity is unavailable at that price, `up` fails
+without starting an on-demand instance. Use `scripts/benchmark-worker.sh ssh
+'command'` to prepare and run from the worker. Copy results out before
+`scripts/benchmark-worker.sh down <instance-id>`; the worker's disk and temporary
+login key are not retained. A scheduler checks every five minutes and terminates
+workers older than six hours. Its reserved IPv4 costs $0.005/hour (about
+$3.65/month) even when the worker is down.
 
 - The driver can launch only `c8g.medium` instances through the two boot-race
   templates, tagging instances, volumes and interfaces `Project=boot-race`. ECS
@@ -924,8 +936,9 @@ delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
   budget blocks the legacy launcher because it can start tasks.
 - Verify the `Project` billing tag is Active and the budget action is monitoring
   before the first campaign. Tag activation can take up to 24 hours. Budget data
-  can lag by hours and excludes untagged costs, including the separate Ohio
-  pbox, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
+  can lag by hours and excludes costs without the exact tag, including the
+  dedicated Ohio worker. The $25 action is a backstop; the worker has its own
+  Spot price and lifetime limits. AWS Budgets removes the
   deny at the start of the next month; an administrator can reverse it sooner.
 
 The Fargate lane stays off: its ECR interface endpoints bill hourly and change
@@ -936,7 +949,7 @@ do not run the default nine-lane command. Restoring Fargate requires a separate
 reviewed change with a reliable endpoint teardown.
 
 After a campaign, copy the data out, run the benchmark's `cleanup` and
-`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper does
+`leftovers`, then terminate the benchmark worker. The reaper does
 not remove the pushed ECR image, so complete the harness cleanup. The uploaded
 Lambda workload stays in the two inactive IAM-only functions and is replaced
 on the next run. To remove the driver and disable the reaper, clean up any
@@ -956,6 +969,14 @@ IPv6. A stop/start keeps those addresses; Terraform updates the grant on
 replacement. Keep the token in the benchmark process environment and out of
 arguments, logs, artifacts and disk. Browser usage is billable. Rotate with
 `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
+
+The dedicated Ohio benchmark worker can run the same hosted Quick Actions
+directly alongside its local trials. It loads a separate Browser Run credential
+from Secrets Manager; Cloudflare restricts that credential to the worker's
+reserved public IPv4 and IPv6 addresses. Ordinary and member pboxes cannot
+retrieve it. The worker makes the Cloudflare request itself, so the measured
+latency includes the worker's network path. Delete the worker when done;
+launching it and running browser trials can incur charges.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
