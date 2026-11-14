@@ -891,39 +891,42 @@ login. Later visits and expired API connections use the automatic flow. Browser 
 `scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
 with `scripts/test-opencode-setup.py` in CI.
 
-### One-off fcvm boot benchmark
+### fcvm boot benchmark (boot-race)
 
-The driver and cleanup schedule are disabled by default. For an approved run,
-prepare one Ohio Spot pbox as the benchmark worker before enabling anything.
-Separately designate one primary-region EC2 dev host with `dev-server-role`
-to run `creds.sh` and deliver short sessions over SSH to the Ohio worker; the
-pbox's own `dev-ebs-only` credentials cannot assume the role. Commit
-`boot_race_enabled = true` with `boot_race_campaign`: the exact source dev
-instance ARN and fixed UTC start and end timestamps at most three hours apart.
-Use a unique, nonoverlapping window each time; never extend or reuse its start.
-Review the plan and apply from fresh main. AssumeRole checks the EC2 identity
-that issued the source credentials, not the network origin; AWS denies requests
-signed with the resulting STS sessions after expiry.
+The driver role, the reaper schedule and a spend cap are on by default, so a
+campaign needs nothing from the jumpbox. The fcvm dev host (`dev-server-role`)
+may assume `boot-race-driver` at any time; it runs `creds.sh` and delivers
+one-hour sessions over SSH to the Ohio Spot pbox that drives the benchmark (the
+pbox's own `dev-ebs-only` credentials cannot assume the role). The role is
+`arn:aws:iam::<account>:role/boot-race-driver`, the name `creds.sh` builds.
 
-The limited campaign keeps the Fargate lane disabled. It creates no paid ECR
-interface endpoints and does not change ECR DNS for other Ohio pboxes. With the
+What bounds the standing role without a person:
+
+- Scope: launches only through the two boot-race launch templates, only
+  `c8g.medium`, only resources tagged `Project=boot-race`; ECS tasks only
+  through `boot-race-launcher`.
+- `boot-race-reaper`, every 15 minutes: terminates boot-race instances after
+  3 hours, stops tasks after 1 hour, removes images and snapshots after a day.
+- `boot-race-monthly`, a $25 monthly budget on `Project=boot-race` spend: at
+  80% it notifies `cost-alerts`; at 100% its action attaches
+  `boot-race-spend-cap` to the driver role, which denies everything except
+  stop, terminate, deregister, delete and reads, so `cleanup` and `leftovers`
+  still run. Budget data lags the bill by hours. The cap stays attached until an
+  administrator reverses the action in AWS Budgets.
+
+The Fargate lane stays off: its ECR interface endpoints bill hourly and change
+ECR DNS for every Ohio pbox. With the
 [benchmark driver](https://github.com/ejc3/fcvm/pull/1539), pass
 `--lanes fcvm-file,fcvm-uffd,ec2-launch,ec2-start,ec2-hibernate,ecs-ec2,lambda-cold,lambda-warm`;
-do not run the default nine-lane command. Restoring the private Fargate lane
-requires a separate reviewed change with a reliable endpoint teardown.
+do not run the default nine-lane command. Restoring Fargate requires a separate
+reviewed change with a reliable endpoint teardown.
 
-Copy the data out and stop early enough to run the benchmark's `cleanup` and
-`leftovers` before the window expires. Terminate the exact campaign pbox and
-verify there are no remaining campaign instances, tasks, AMIs, snapshots or
-workload images, stop `creds.sh`, and remove the worker's cached credentials.
-The reaper can recover left-behind compute after credentials expire, but does not
-remove ECR images or reset the two IAM-only benchmark functions' uploaded code.
-The regular cleanup deletes ECR images; the uploaded Lambda workload stays in
-those dedicated, inactive functions and is replaced on the next run. If cleanup
-cannot finish inside the window, an administrator clears the remaining ECR
-images and any workload the reaper missed; verify both before retiring. Then
-commit `boot_race_enabled = false` and clear `boot_race_campaign`, apply,
-and confirm the role is gone and the schedule disabled.
+After a campaign, copy the data out, run the benchmark's `cleanup` and
+`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper
+removes compute left behind; the regular cleanup deletes ECR images. The
+uploaded Lambda workload stays in the two inactive IAM-only functions and is
+replaced on the next run. To turn the whole thing off, set
+`boot_race_enabled = false` and apply.
 
 ### Cloudflare Browser Run benchmark credential
 

@@ -18,14 +18,17 @@
 # the function URLs take IAM auth only. Every instance and task is started by the driver and terminated or stopped by
 # it when its samples are taken, and boot-race-reaper expires whatever a failed or interrupted campaign leaves (instances
 # after 3 hours, tasks after 1 hour, images and snapshots after a day). The Fargate lane is held off until there is
-# a reviewed teardown for its billed ECR interface endpoints.
+# a reviewed teardown for its billed ECR interface endpoints, which bill by the hour whether or not a campaign runs.
 #
 # The driver uses boot-race-driver, which the dev role assumes. Its grants are scoped to these resources by ARN or by
 # the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
 # parallel-box-control (parallel-box-launch.tf). ECS tasks are run and stopped only by boot-race-launcher, a
 # Terraform-owned function whose code fixes the cluster, the task definitions and the Fargate network (the
 # dedicated boot-race subnet, the boot-race group, no public IP); Fargate pulls the image through ECR endpoints in the VPC.
-# The driver role and reaper are disabled by default; see README.md for activation and retirement.
+# The driver role and the reaper are on by default, so the dev box can run a campaign without a per-run apply
+# (owner, 2026-11-14: "Kill the window. We shouldn't need back and forth with jumphost"). Spend is bounded without a
+# person: the reaper's age limits, and a $25 monthly budget on Project=boot-race whose action attaches a deny to the
+# driver role when actual spend passes it (the budget section below).
 
 locals {
   boot_race_region  = "us-east-2"
@@ -769,50 +772,16 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
 # Private DNS on the interface endpoints applies to the whole VPC, so while they exist new ECR connections from any
 # subnet resolve to them; their group admits HTTPS from the VPC's own range so those keep working.
 #
-# The bounded campaign covers all existing lanes except Fargate. Keep the Fargate
-# definition available for separate review; neither opening the benchmark window
-# nor a stale window may create hourly ECR endpoints or change VPC-wide ECR DNS.
+# Fargate stays off: its interface endpoints bill hourly and change ECR DNS for every subnet in the VPC, so turning it on
+# is a separate reviewed change with a reliable endpoint teardown. Enabling the driver never opens it.
 variable "boot_race_enabled" {
-  description = "Enable the scoped boot-race driver and reaper, for an explicitly approved campaign window."
+  description = "The boot-race driver role, its dev-box grant, the reaper schedule and the spend cap. On by default."
   type        = bool
-  default     = false
-
-  validation {
-    condition     = !var.boot_race_enabled || var.boot_race_campaign != null
-    error_message = "An enabled boot race requires one designated EC2 operator and an explicit UTC window."
-  }
-}
-
-variable "boot_race_campaign" {
-  description = "Exact ARN of the source EC2 instance using dev-server-role and the approved UTC campaign window."
-  type = object({
-    source_instance_arn = string
-    starts_at           = string
-    expires_at          = string
-  })
-  default = null
-
-  validation {
-    condition = var.boot_race_campaign == null ? true : try(
-      can(regex("^arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/i-[0-9a-f]{17}$", var.boot_race_campaign.source_instance_arn)) &&
-      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", var.boot_race_campaign.starts_at)) &&
-      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", var.boot_race_campaign.expires_at)) &&
-      timecmp(var.boot_race_campaign.starts_at, var.boot_race_campaign.expires_at) < 0 &&
-      timecmp(var.boot_race_campaign.expires_at, timeadd(var.boot_race_campaign.starts_at, "3h")) <= 0,
-      false
-    )
-    error_message = "Use an exact EC2 instance ARN in the primary account and Region and a positive UTC window of at most three hours."
-  }
+  default     = true
 }
 
 locals {
   boot_race_fargate_enabled = false
-  # Used in both the source identity policy and the driver's trust policy.
-  boot_race_assume_conditions = var.boot_race_campaign == null ? null : {
-    StringEquals          = { "ec2:SourceInstanceARN" = var.boot_race_campaign.source_instance_arn }
-    DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.starts_at }
-    DateLessThan          = { "aws:CurrentTime" = var.boot_race_campaign.expires_at }
-  }
 }
 
 resource "aws_subnet" "boot_race" {
@@ -884,6 +853,8 @@ resource "aws_vpc_endpoint" "boot_race_s3" {
 }
 
 # ============================================================ the driver's role
+# The trust policy names dev-server-role by its ARN, which within one account is enough to assume the role: no grant is
+# added to dev-server-role, whose inline policies are at IAM's 10,240-character limit (scripts/test-pbox-ohio.py).
 resource "aws_iam_role" "boot_race_driver" {
   count                = var.boot_race_enabled ? 1 : 0
   name                 = "boot-race-driver"
@@ -894,7 +865,6 @@ resource "aws_iam_role" "boot_race_driver" {
       Effect    = "Allow"
       Principal = { AWS = aws_iam_role.dev_server.arn }
       Action    = "sts:AssumeRole"
-      Condition = local.boot_race_assume_conditions
     }]
   })
   tags = local.boot_race_tag
@@ -1167,51 +1137,143 @@ data "aws_iam_policy_document" "boot_race_driver" {
 }
 
 resource "aws_iam_role_policy" "boot_race_driver" {
-  count = var.boot_race_enabled ? 1 : 0
-  name  = "boot-race-driver"
-  role  = aws_iam_role.boot_race_driver[0].id
-  # Reject late calls even from an already-issued STS session. A different
-  # campaign also cannot reactivate a session issued before its opening.
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(jsondecode(data.aws_iam_policy_document.boot_race_driver.json).Statement, [
-      {
-        Sid       = "DenyAfterCampaignExpiry"
-        Effect    = "Deny"
-        Action    = "*"
-        Resource  = "*"
-        Condition = { DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.expires_at } }
-      },
-      {
-        Sid       = "DenySessionsFromBeforeCampaign"
-        Effect    = "Deny"
-        Action    = "*"
-        Resource  = "*"
-        Condition = { DateLessThan = { "aws:TokenIssueTime" = var.boot_race_campaign.starts_at } }
-      },
-    ])
-  })
+  count  = var.boot_race_enabled ? 1 : 0
+  name   = "boot-race-driver"
+  role   = aws_iam_role.boot_race_driver[0].id
+  policy = data.aws_iam_policy_document.boot_race_driver.json
 }
 
-# The dev role may assume the driver role and nothing more.
-resource "aws_iam_role_policy" "dev_server_boot_race" {
-  count = var.boot_race_enabled ? 1 : 0
-  name  = "boot-race-assume-driver"
-  role  = aws_iam_role.dev_server.id
+# ============================================================ the spend cap
+# The driver is standing, so the cap needs no person to trigger it: a monthly $25 budget on everything tagged
+# Project=boot-race, whose action attaches boot-race-spend-cap to the driver role as soon as actual spend passes it.
+# That policy denies every driver call except the ones that stop spending or read state (stop, terminate, deregister,
+# delete, describe), so the campaign's `cleanup` and `leftovers` still run after the cap. Budgets data lags hours
+# behind the bill; the reaper's age limits (3 h instances, 1 h tasks, 1 day images) bound what accrues meanwhile.
+# The deny stays attached until an administrator reverses the action in AWS Budgets; the $25 is about 25 times the
+# AWS-side cost of one campaign (#854: under $1).
+#
+# The filter needs Project as an active cost allocation tag. This account is the organization's management account,
+# so it can activate it; Cost Explorer counts tagged spend from activation on, not before.
+resource "aws_ce_cost_allocation_tag" "project" {
+  tag_key = "Project"
+  status  = "Active"
+}
+
+resource "aws_budgets_budget" "boot_race" {
+  name         = "boot-race-monthly"
+  budget_type  = "COST"
+  limit_amount = "25"
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  cost_filter {
+    name   = "TagKeyValue"
+    values = ["user:Project$boot-race"]
+  }
+
+  notification {
+    comparison_operator       = "GREATER_THAN"
+    threshold                 = 80
+    threshold_type            = "PERCENTAGE"
+    notification_type         = "ACTUAL"
+    subscriber_sns_topic_arns = [aws_sns_topic.cost_alerts.arn]
+  }
+
+  depends_on = [aws_ce_cost_allocation_tag.project]
+}
+
+resource "aws_iam_policy" "boot_race_spend_cap" {
+  name        = "boot-race-spend-cap"
+  description = "Attached to boot-race-driver by the boot-race-monthly budget action: deny everything but cleanup and reads"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid       = "AssumeBootRaceDriver"
+      Sid    = "DenyAllButCleanupAndReads"
+      Effect = "Deny"
+      NotAction = [
+        "ec2:StopInstances",
+        "ec2:TerminateInstances",
+        "ec2:DeregisterImage",
+        "ec2:DeleteSnapshot",
+        "ec2:Describe*",
+        "ecs:Describe*",
+        "ecs:List*",
+        "ecr:GetAuthorizationToken",
+        "ecr:DescribeImages",
+        "ecr:BatchDeleteImage",
+        "lambda:GetFunction",
+        "lambda:GetFunctionConfiguration",
+        "lambda:GetFunctionUrlConfig",
+        "logs:FilterLogEvents",
+        "logs:GetLogEvents",
+        "logs:DescribeLogStreams",
+      ]
+      Resource = "*"
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+resource "aws_iam_role" "boot_race_budget_action" {
+  name = "boot-race-budget-action"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
       Effect    = "Allow"
+      Principal = { Service = "budgets.amazonaws.com" }
       Action    = "sts:AssumeRole"
-      Resource  = aws_iam_role.boot_race_driver[0].arn
-      Condition = local.boot_race_assume_conditions
+      Condition = { StringEquals = { "aws:SourceAccount" = local.boot_race_account } }
+    }]
+  })
+  tags = local.boot_race_tag
+}
+
+# Attach and detach the cap policy on the driver role, and nothing else.
+resource "aws_iam_role_policy" "boot_race_budget_action" {
+  name = "attach-boot-race-spend-cap"
+  role = aws_iam_role.boot_race_budget_action.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "CapTheDriver"
+      Effect    = "Allow"
+      Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
+      Resource  = "arn:aws:iam::${local.boot_race_account}:role/boot-race-driver"
+      Condition = { ArnEquals = { "iam:PolicyARN" = aws_iam_policy.boot_race_spend_cap.arn } }
     }]
   })
 }
 
+resource "aws_budgets_budget_action" "boot_race" {
+  count              = var.boot_race_enabled ? 1 : 0
+  budget_name        = aws_budgets_budget.boot_race.name
+  action_type        = "APPLY_IAM_POLICY"
+  approval_model     = "AUTOMATIC"
+  notification_type  = "ACTUAL"
+  execution_role_arn = aws_iam_role.boot_race_budget_action.arn
+
+  action_threshold {
+    action_threshold_type  = "PERCENTAGE"
+    action_threshold_value = 100
+  }
+
+  definition {
+    iam_action_definition {
+      policy_arn = aws_iam_policy.boot_race_spend_cap.arn
+      roles      = [aws_iam_role.boot_race_driver[0].name]
+    }
+  }
+
+  subscriber {
+    address           = aws_sns_topic.cost_alerts.arn
+    subscription_type = "SNS"
+  }
+
+  depends_on = [aws_iam_role_policy.boot_race_budget_action]
+}
+
 output "boot_race" {
-  description = "What the boot-race driver needs when enabled: its role, the function URLs, the image repository"
+  description = "What the boot-race driver needs: its role, the function URLs, the image repository"
   value = var.boot_race_enabled ? {
     driver_role_arn = aws_iam_role.boot_race_driver[0].arn
     function_urls   = { for k, u in aws_lambda_function_url.boot_race : k => u.function_url }

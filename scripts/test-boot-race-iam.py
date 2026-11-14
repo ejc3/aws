@@ -115,51 +115,107 @@ class SharedRoute(unittest.TestCase):
         self.assertNotIn("route {", route_table[:route_table.index("\n}\n")], "the campaign subnet needs no internet route")
 
 
-class Retirement(unittest.TestCase):
-    def test_ordinary_apply_leaves_the_driver_and_paid_network_dormant(self):
-        def block(header):
-            content = TF[TF.index(header):]
-            return re.sub(r"\s+", " ", content[:content.index("\n}\n")])
+def block(header):
+    content = TF[TF.index(header):]
+    return re.sub(r"\s+", " ", content[:content.index("\n}\n")])
 
-        self.assertIn("default = false", block('variable "boot_race_enabled"'))
+
+class StandingDriver(unittest.TestCase):
+    """Owner, 2026-11-14: "Kill the window. We shouldn't need back and forth with jumphost"."""
+
+    def test_driver_reaper_and_cap_are_on_by_default(self):
+        self.assertIn("default = true", block('variable "boot_race_enabled"'))
         for header in ('resource "aws_iam_role" "boot_race_driver"',
                        'resource "aws_iam_role_policy" "boot_race_driver"',
-                       'resource "aws_iam_role_policy" "dev_server_boot_race"'):
+                       'resource "aws_budgets_budget_action" "boot_race"'):
             self.assertIn("count = var.boot_race_enabled ? 1 : 0", block(header), header)
         self.assertIn('state = var.boot_race_enabled ? "ENABLED" : "DISABLED"',
                       block('resource "aws_scheduler_schedule" "boot_race_reaper"'))
 
-    def test_opening_driver_never_opens_fargate_network(self):
+    def test_no_campaign_window_or_source_instance_remains(self):
+        for gone in ("boot_race_campaign", "boot_race_assume_conditions", "aws:CurrentTime", "aws:TokenIssueTime",
+                     "ec2:SourceInstanceARN", "DenyAfterCampaignExpiry", "DenySessionsFromBeforeCampaign"):
+            self.assertNotIn(gone, TF)
+
+    def test_dev_server_role_is_trusted_unconditionally_with_no_inline_grant(self):
+        trust = block('resource "aws_iam_role" "boot_race_driver"')
+        self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", trust)
+        self.assertNotIn("Condition", trust)
+        # The trust policy alone admits the role within the account; dev-server-role's inline policies are full.
+        self.assertNotRegex(TF, r"role\s*=\s*aws_iam_role\.dev_server\.")
+        self.assertIn("policy = data.aws_iam_policy_document.boot_race_driver.json",
+                      block('resource "aws_iam_role_policy" "boot_race_driver"'))
+
+    def test_the_driver_keeps_its_tag_template_and_type_scopes(self):
+        driver = block('data "aws_iam_policy_document" "boot_race_driver"')
+        run = driver[driver.index('sid = "RunTaggedBootRaceOnly"'):driver.index('sid = "DenyOtherInstanceTypes"')]
+        self.assertIn('variable = "aws:RequestTag/Project" values = ["boot-race"]', run)
+        self.assertIn("values = [aws_launch_template.boot_race_ec2.arn, aws_launch_template.boot_race_ecs_host.arn]", run)
+        deny = driver[driver.index('sid = "DenyOtherInstanceTypes"'):driver.index('sid = "RunInstancesReferencedResources"')]
+        self.assertIn('effect = "Deny"', deny)
+        self.assertIn('test = "StringNotEquals" variable = "ec2:InstanceType" values = ["c8g.medium"]', deny)
+        manage = driver[driver.index('sid = "ManageTaggedBootRaceInstances"'):driver.index('sid = "ImageFromTaggedInstance"')]
+        self.assertIn('variable = "ec2:ResourceTag/Project" values = ["boot-race"]', manage)
+
+    def test_reaper_age_limits_are_unchanged(self):
+        reaper = block('resource "aws_lambda_function" "boot_race_reaper"')
+        for limit in ('INSTANCE_LIMIT_S = "10800"', 'TASK_LIMIT_S = "3600"', 'IMAGE_LIMIT_S = "86400"'):
+            self.assertIn(limit, reaper)
+
+    def test_fargate_network_stays_off(self):
         self.assertIn("boot_race_fargate_enabled = false", TF)
         for header in ('resource "aws_subnet" "boot_race"', 'resource "aws_route_table" "boot_race"',
                        'resource "aws_route_table_association" "boot_race"', 'resource "aws_security_group" "boot_race_endpoints"',
                        'resource "aws_vpc_endpoint" "boot_race_s3"'):
-            chunk = TF[TF.index(header):]
-            self.assertIn("count = local.boot_race_fargate_enabled ? 1 : 0",
-                          re.sub(r"\s+", " ", chunk[:chunk.index("\n}\n")]), header)
-        ecr = TF[TF.index('resource "aws_vpc_endpoint" "boot_race_ecr"'):]
+            self.assertIn("count = local.boot_race_fargate_enabled ? 1 : 0", block(header), header)
         self.assertIn('local.boot_race_fargate_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])',
-                      ecr[:ecr.index("\n}\n")])
+                      block('resource "aws_vpc_endpoint" "boot_race_ecr"'))
 
-    def test_exact_operator_and_window_bound_both_assume_role_policies(self):
-        self.assertIn("!var.boot_race_enabled || var.boot_race_campaign != null", TF)
-        self.assertIn('instance/i-[0-9a-f]{17}$', TF)
-        self.assertIn('timeadd(var.boot_race_campaign.starts_at, "3h")', TF)
-        self.assertIn('"ec2:SourceInstanceARN" = var.boot_race_campaign.source_instance_arn', TF)
-        self.assertIn('DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.starts_at }', TF)
-        self.assertRegex(TF, r'DateLessThan\s*= \{ "aws:CurrentTime" = var.boot_race_campaign.expires_at \}')
-        self.assertEqual(TF.count("Condition = local.boot_race_assume_conditions"), 2)
 
-    def test_already_issued_sts_sessions_expire_and_cannot_carry_forward(self):
-        for sid, op, field, value in (
-            ("DenyAfterCampaignExpiry", "DateGreaterThanEquals", "aws:CurrentTime", "expires_at"),
-            ("DenySessionsFromBeforeCampaign", "DateLessThan", "aws:TokenIssueTime", "starts_at"),
-        ):
-            chunk = TF.split(f'Sid       = "{sid}"', 1)[1]
-            self.assertTrue(chunk.startswith(
-                f'\n        Effect    = "Deny"\n        Action    = "*"\n        Resource  = "*"\n'
-                f'        Condition = {{ {op} = {{ "{field}" = var.boot_race_campaign.{value} }} }}'
-            ), sid)
+class SpendCap(unittest.TestCase):
+    def test_a_25_dollar_monthly_budget_on_the_project_tag(self):
+        budget = block('resource "aws_budgets_budget" "boot_race"')
+        self.assertIn('limit_amount = "25"', budget)
+        self.assertIn('time_unit = "MONTHLY"', budget)
+        self.assertIn('name = "TagKeyValue" values = ["user:Project$boot-race"]', budget)
+        self.assertIn("depends_on = [aws_ce_cost_allocation_tag.project]", budget)
+        tag = block('resource "aws_ce_cost_allocation_tag" "project"')
+        self.assertIn('tag_key = "Project"', tag)
+        self.assertIn('status = "Active"', tag)
+
+    def test_breaching_the_budget_caps_the_driver_without_a_person(self):
+        action = block('resource "aws_budgets_budget_action" "boot_race"')
+        self.assertIn("budget_name = aws_budgets_budget.boot_race.name", action)
+        self.assertIn('action_type = "APPLY_IAM_POLICY"', action)
+        self.assertIn('approval_model = "AUTOMATIC"', action)
+        self.assertIn('notification_type = "ACTUAL"', action)
+        self.assertIn('action_threshold_type = "PERCENTAGE" action_threshold_value = 100', action)
+        self.assertIn("policy_arn = aws_iam_policy.boot_race_spend_cap.arn", action)
+        self.assertIn("roles = [aws_iam_role.boot_race_driver[0].name]", action)
+
+    def test_the_cap_denies_everything_but_cleanup_and_reads(self):
+        cap = block('resource "aws_iam_policy" "boot_race_spend_cap"')
+        self.assertIn('Effect = "Deny"', cap)
+        self.assertIn('Resource = "*"', cap)
+        allowed = set(re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', cap[cap.index("NotAction"):cap.index("Resource")]))
+        for cleanup in ("ec2:StopInstances", "ec2:TerminateInstances", "ec2:DeregisterImage", "ec2:DeleteSnapshot",
+                        "ecr:BatchDeleteImage"):
+            self.assertIn(cleanup, allowed)
+        for spend in ("ec2:RunInstances", "ec2:StartInstances", "ec2:CreateImage", "lambda:InvokeFunction",
+                      "lambda:InvokeFunctionUrl", "lambda:UpdateFunctionCode", "ecr:PutImage"):
+            self.assertNotIn(spend, allowed)
+        for verb in allowed:
+            self.assertRegex(verb.split(":")[1], r"^(Stop|Terminate|Deregister|Delete|BatchDelete|Describe|List|Get|Filter)",
+                             verb)
+
+    def test_the_budget_role_may_only_attach_the_cap_to_the_driver(self):
+        trust = block('resource "aws_iam_role" "boot_race_budget_action"')
+        self.assertIn('Principal = { Service = "budgets.amazonaws.com" }', trust)
+        self.assertIn('"aws:SourceAccount" = local.boot_race_account', trust)
+        grant = block('resource "aws_iam_role_policy" "boot_race_budget_action"')
+        self.assertIn('Action = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)
+        self.assertIn('Resource = "arn:aws:iam::${local.boot_race_account}:role/boot-race-driver"', grant)
+        self.assertIn('ArnEquals = { "iam:PolicyARN" = aws_iam_policy.boot_race_spend_cap.arn }', grant)
 
 
 if __name__ == "__main__":
