@@ -678,19 +678,35 @@ class TileSubnetTests(unittest.TestCase):
         self.assertIn('"arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}"', refs)
 
 
+class PublishedPortsTests(unittest.TestCase):
+    """The copy of ejc3/fcvm's port declaration is the one on its main: a mode or a count fcvm changes there reaches the
+    security group only through this file, so a stale copy fails here rather than dropping viewers."""
+
+    def test_the_copy_is_fcvm_mains(self):
+        import urllib.request
+        url = "https://raw.githubusercontent.com/ejc3/fcvm/main/fleet/published-ports.json"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            upstream = response.read()
+        self.assertEqual((ROOT / "fcvm-fleet-published-ports.json").read_bytes(), upstream,
+                         "fcvm-fleet-published-ports.json differs from ejc3/fcvm main's fleet/published-ports.json: copy it")
+
+
 class SlotV4Tests(unittest.TestCase):
     """IPv4 viewers reach a GPU host's slots on its one public address, a port per slot."""
 
     def test_slot_publish_contract_and_ipv4_ingress_agree(self):
-        base = int(re.search(r"fcvm_fleet_slot_tls_port_base = (\d+)", TF).group(1))
-        slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
-        windows = int(re.search(r"fcvm_fleet_host_windows\s+= (\d+)", TF).group(1))
-        minecraft = int(re.search(r"fcvm_fleet_host_minecraft\s+= (\d+)", TF).group(1))
-        self.assertEqual((base, slots, windows, minecraft), (20200, 8, 4, 4))
-        # The agent numbers its TLS ports GPUs, then Windows sandboxes, then Minecraft servers: the range
-        # covers every place, so an IPv4 viewer reaches a sandbox (20208 to 20211) and a server (20212 to 20215).
-        self.assertIn("fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows"
-                      " + local.fcvm_fleet_host_minecraft", TF)
+        # Every number comes from ejc3/fcvm's declaration (fcvm-fleet-published-ports.json, a copy of fleet/published-ports.json).
+        decl = json.loads((ROOT / "fcvm-fleet-published-ports.json").read_text())
+        ranges = {r["mode"]: r for r in decl["gpu_host_ipv4"]["ranges"]}
+        base = decl["gpu_host_ipv4"]["base"]
+        self.assertIn('fcvm_fleet_published_ports    = jsondecode(file("${path.module}/fcvm-fleet-published-ports.json"))', TF)
+        self.assertIn("fcvm_fleet_slot_tls_port_base = local.fcvm_fleet_published_ports.gpu_host_ipv4.base", TF)
+        for local, mode in (("fcvm_fleet_host_gpu_slots", "slot"), ("fcvm_fleet_host_windows", "windows"),
+                            ("fcvm_fleet_host_minecraft", "minecraft")):
+            self.assertRegex(TF, rf"{local}\s+= local\.fcvm_fleet_tls_port_ranges\.{mode}\.count\b")
+        self.assertNotRegex(TF, r"fcvm_fleet_slot_tls_port_base\s+=\s+\d", "the base is a literal again")
+        self.assertIn("fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : "
+                      "r.offset + r.count if m != \"aggregate\"]...)", TF)
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
         # Before the bootstrap is deployed, the rule retains its exact previous range and description.
         gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
@@ -698,9 +714,16 @@ class SlotV4Tests(unittest.TestCase):
         ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
         self.assertIn(f"to = var.{gate} ? (", ports)
         self.assertIn(") : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", ports)
+        # With the gate open: every place's port, and with aggregated streaming the host aggregator's declared port after them.
         self.assertIn("local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
-                      "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1", ports)
-        self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places", TF)
+                      "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1", ports)
+        self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + "
+                      "local.fcvm_fleet_tls_port_ranges.aggregate.offset", TF)
+        # What that evaluates to today: the range admits every place, and the aggregator's port is the one after.
+        end = max(r["offset"] + r["count"] for m, r in ranges.items() if m != "aggregate")
+        self.assertEqual((base, base + end - 1, base + ranges["aggregate"]["offset"]), (20200, 20215, 20216))
+        self.assertEqual({m: (base + r["offset"], r["count"]) for m, r in ranges.items()},
+                         {"slot": (20200, 8), "windows": (20208, 4), "minecraft": (20212, 4), "aggregate": (20216, 1)})
         # The counts the agent is started with are the ones the range was sized for, in every region.
         self.assertIn('agent_args="$agent_args --windows ${var.windows_count}"', MOD)
         self.assertIn('agent_args="$agent_args --minecraft ${var.minecraft_count}"', MOD)
@@ -815,8 +838,8 @@ class AggregatedTests(unittest.TestCase):
 
     def test_the_host_aggregator_port_follows_the_slots(self):
         # After every place's port: the GPU slots', the Windows sandboxes' and the Minecraft servers'.
-        self.assertIn(
-            "fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places", TF)
+        self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + "
+                      "local.fcvm_fleet_tls_port_ranges.aggregate.offset", TF)
         priv = int(re.search(r"fcvm_fleet_aggregate_port\s+= (\d+)", TF).group(1))
         # The private listener is outside the admitted range.
         self.assertFalse(20200 <= priv <= 20216, priv)

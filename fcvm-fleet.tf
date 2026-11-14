@@ -99,30 +99,34 @@ locals {
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
   # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
   # are in the home region, not the host's.
-  # The IPv4 path to a GPU host's tiles: its one public IPv4 address, place i's TLS forwarded on port base + i. The agent
-  # numbers its places GPUs first (the wall's and the phones'), then Windows sandboxes, then Minecraft servers (ejc3/fcvm
-  # src/fleet/agent/mod.rs), so the range covers all three. The agent's --tls-publish-base, its --windows and --minecraft
-  # counts and the fleet security group's port range all come from these numbers.
-  fcvm_fleet_slot_tls_port_base = 20200
-  fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
-  fcvm_fleet_host_windows       = 4
-  fcvm_fleet_host_minecraft     = 4
-  fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows + local.fcvm_fleet_host_minecraft
+  # The IPv4 path to a GPU host's tiles: its one public IPv4 address, each place's TLS forwarded on its own port. Every port
+  # a viewer connects to is declared once, in ejc3/fcvm fleet/published-ports.json, copied here byte for byte as
+  # fcvm-fleet-published-ports.json (scripts/test-fcvm-fleet.py fails when the copy differs from ejc3/fcvm main). The agent
+  # allocates each mode's ports inside that mode's range and refuses a place outside it, so the agent's --tls-publish-base,
+  # its --windows and --minecraft counts and the fleet security group's port range all come from the same file.
+  fcvm_fleet_published_ports    = jsondecode(file("${path.module}/fcvm-fleet-published-ports.json"))
+  fcvm_fleet_tls_port_ranges    = { for r in local.fcvm_fleet_published_ports.gpu_host_ipv4.ranges : r.mode => r }
+  fcvm_fleet_slot_tls_port_base = local.fcvm_fleet_published_ports.gpu_host_ipv4.base
+  fcvm_fleet_host_gpu_slots     = local.fcvm_fleet_tls_port_ranges.slot.count # a g4dn.metal's T4s
+  fcvm_fleet_host_windows       = local.fcvm_fleet_tls_port_ranges.windows.count
+  fcvm_fleet_host_minecraft     = local.fcvm_fleet_tls_port_ranges.minecraft.count
+  # One past the last place's port: GPU slots, Windows sandboxes and Minecraft servers.
+  fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : r.offset + r.count if m != "aggregate"]...)
 
   # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
   # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
   # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
   # stack); an image without them refuses the argument and does not start, so the switch moves with the images.
   fcvm_fleet_aggregated = false
-  # A host aggregator's IPv4 path: the port after every place's, on the host's public IPv4 address (one address per host,
-  # a port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
-  # on fcvm_fleet_aggregate_port, which the security group does not admit.
-  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places
+  # A host aggregator's IPv4 path: its declared port, after every place's, on the host's public IPv4 address (one address
+  # per host, a port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout,
+  # stats) is on fcvm_fleet_aggregate_port, which the security group does not admit.
+  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_tls_port_ranges.aggregate.offset
   fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
     to = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? (
-      local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1
+      local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1
     ) : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
   fcvm_fleet_host_agent_args = join(" ", concat([
