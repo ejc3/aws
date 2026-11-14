@@ -2,6 +2,7 @@
 """Credential-free publisher transactions against strict in-memory AWS fakes."""
 import base64
 import copy
+import inspect
 import re
 import datetime
 import hashlib
@@ -1833,6 +1834,129 @@ class PublisherTests(unittest.TestCase):
             publisher.run(ena)
         self.assertEqual(self.fleet_ssm.values, before)
         self.assertEqual(self.ec2.selected, [])
+
+    def generation_eleven_live(self):
+        """Generation eleven live (the cad0ddad host, released after generation ten): a receipt whose
+        previous names generation ten's pair."""
+        event, ten = self.reviewed_ipv4_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return ten, copy.deepcopy(self.fleet_ssm.values["/release"])
+
+    def test_the_gate_rolls_a_failed_generation_back_to_its_previous(self):
+        ten, eleven = self.generation_eleven_live()
+        host, *tiles = self.ids
+        before = copy.deepcopy(self.ec2.templates)
+        self.assertEqual(self.publisher().gate({"action": "status"}),
+                         {"generation": 11, "source_sha": self.IPV4_SOURCE, "verified": False, "rollback": False,
+                          "current": True})
+        self.assertEqual(self.publisher().gate({"action": "rollback", "generation": 11}),
+                         {"status": "rolled_back", "generation": 12})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (12, ten["source_sha"]))
+        self.assertTrue(after["build_id"].startswith("rollback-to-previous:"))
+        self.assertEqual((after["host_amis"], after["tile_amis"]), (ten["host_amis"], ten["tile_amis"]))
+        self.assertEqual(after["previous"], {k: v for k, v in eleven.items() if k != "previous"})
+        table = self.ec2.templates[host]
+        self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"]["ImageId"],
+                         ten["host_amis"]["us-east-1"]["x86_64"])
+        # Only the image changed: the bootstrap and everything else is the live default's.
+        self.assertEqual(MODULE.without_image(table["versions"][table["default"]]["LaunchTemplateData"]),
+                         MODULE.without_image(before[host]["versions"][before[host]["default"]]["LaunchTemplateData"]))
+        # The rollback is recorded as verified, so the next smoke cannot roll it back.
+        self.assertEqual(self.publisher().gate({"action": "status"})["verified"], True)
+        # A replay of the same request is the same receipt.
+        created = list(self.ec2.created)
+        self.assertEqual(self.publisher().gate({"action": "rollback", "generation": 11}),
+                         {"status": "rolled_back", "generation": 12})
+        self.assertEqual(self.ec2.created, created)
+        with self.assertRaisesRegex(MODULE.Refused, "the live release is a rollback"):
+            self.publisher().run({"action": "rollback-to-previous"})
+        self.assertIsNone(self.ddb.item)
+
+    def test_the_gate_refuses_a_rollback_with_no_previous_release(self):
+        _, eleven = self.generation_eleven_live()
+        orphan = dict(eleven, previous=None)
+        self.fleet_ssm.values["/release"] = copy.deepcopy(orphan)
+        with self.assertRaisesRegex(MODULE.Refused, "no previous release to roll back to"):
+            self.publisher().gate({"action": "rollback", "generation": 11})
+        self.assertEqual(self.fleet_ssm.values["/release"], orphan)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_refuses_a_rollback_whose_previous_image_is_gone(self):
+        ten, _ = self.generation_eleven_live()
+        del self.ec2.images[ten["host_amis"]["us-east-1"]["x86_64"]]
+        before = copy.deepcopy(self.fleet_ssm.values)
+        # EC2 answers DescribeImages for a deregistered id with an error (the fake raises KeyError);
+        # either way the gate stops before it records a transaction or touches a template.
+        with self.assertRaises(Exception):
+            self.publisher().gate({"action": "rollback", "generation": 11})
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_does_not_roll_back_a_verified_generation(self):
+        _, eleven = self.generation_eleven_live()
+        self.fleet_host(eleven["host_amis"]["us-east-1"]["x86_64"])
+        self.assertEqual(self.publisher().gate({"action": "verify", "generation": 11}), {"status": "verified", "generation": 11})
+        with self.assertRaisesRegex(MODULE.Refused, "the gate verified this generation"):
+            self.publisher().gate({"action": "rollback", "generation": 11})
+        with self.assertRaisesRegex(MODULE.Refused, "the live release is not that generation"):
+            self.publisher().gate({"action": "rollback", "generation": 10})
+        self.assertEqual(self.fleet_ssm.values["/release"], eleven)
+
+    def fleet_host(self, image, number=200, state="running"):
+        name = "i-" + format(number, "017x")
+        self.ec2.instances[name] = {"InstanceId": name, "ImageId": image, "InstanceType": "g4dn.metal",
+            "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-host"}], "State": {"Name": state}}
+        return name
+
+    def test_the_gate_verifies_only_a_smoke_on_hosts_booted_from_the_release(self):
+        ten, eleven = self.generation_eleven_live()
+        new, old = eleven["host_amis"]["us-east-1"]["x86_64"], ten["host_amis"]["us-east-1"]["x86_64"]
+        # Nothing running: a smoke wakes the fleet from the templates, which name the release.
+        self.assertTrue(self.publisher().gate({"action": "status"})["current"])
+        # ...but nothing ran on it, so there is nothing to verify yet.
+        with self.assertRaisesRegex(MODULE.Refused, "did not run on hosts booted from this release"):
+            self.publisher().gate({"action": "verify", "generation": 11})
+        # A routine publication leaves a running host on the image it booted: not current, no verify.
+        self.fleet_host(old, number=201)
+        self.fleet_host(new, number=202)
+        self.assertFalse(self.publisher().gate({"action": "status"})["current"])
+        with self.assertRaisesRegex(MODULE.Refused, "did not run on hosts booted from this release"):
+            self.publisher().gate({"action": "verify", "generation": 11})
+        # Once that host is gone, the smoke on the release's host verifies it.
+        self.ec2.instances["i-" + format(201, "017x")]["State"]["Name"] = "terminated"
+        self.assertTrue(self.publisher().gate({"action": "status"})["current"])
+        self.assertEqual(self.publisher().gate({"action": "verify", "generation": 11}), {"status": "verified", "generation": 11})
+
+    def test_the_gate_handler_takes_only_its_three_requests(self):
+        for event in ({"action": "rollback"}, {"action": "rollback", "generation": "11"},
+                      {"action": "activate-reviewed-seed"}, {"action": "status", "generation": 1}, []):
+            with mock.patch.object(MODULE.Publisher, "__init__", lambda this, *a, **k: None):
+                self.assertEqual(MODULE.gate_handler(event, None)["status"], "refused", event)
+
+    def test_the_release_gate_is_its_own_function_that_staging_ci_and_dev_servers_may_invoke(self):
+        root = SOURCE.parents[1]
+        pipeline = (root / "fcvm-fleet-ami-pipeline.tf").read_text()
+        gate = re.search(r'resource "aws_lambda_function" "fcvm_ami_release_gate" \{\n(.*?)\n\}', pipeline, re.S).group(1)
+        self.assertIn('handler                        = "publish.gate_handler"', gate)
+        self.assertIn("role                           = aws_iam_role.fcvm_ami_publish.arn", gate)
+        self.assertIn("variables = aws_lambda_function.fcvm_ami_publish.environment[0].variables", gate)
+        self.assertIn("reserved_concurrent_executions = 1", gate)
+        dev = re.search(r'resource "aws_iam_role_policy" "dev_server_fcvm_ami_release_gate" \{\n(.*?)\n\}', pipeline, re.S).group(1)
+        self.assertIn("role = aws_iam_role.dev_server.id", dev)
+        self.assertEqual(re.findall(r'Resource = ([^ }]+)', dev), ["aws_lambda_function.fcvm_ami_release_gate.arn"])
+        ci = (root / "fcvm-fleet-ci.tf").read_text()
+        stage = re.search(r'resource "aws_iam_role_policy" "fcvm_stage_ci" \{\n(.*?)\n\}', ci, re.S).group(1)
+        self.assertEqual(re.findall(r'Action = "lambda:InvokeFunction", Resource = ([^ }]+)', stage),
+                         ["aws_lambda_function.fcvm_coordinator_release.arn", "aws_lambda_function.fcvm_ami_release_gate.arn"])
+        self.assertIn("RELEASE_GATE        = aws_lambda_function.fcvm_ami_release_gate.function_name", ci)
+        # The gate's handler reaches only Publisher.gate, never Publisher.run.
+        handler = inspect.getsource(MODULE.gate_handler)
+        self.assertIn("Publisher().gate(event)", handler)
+        self.assertNotIn(".run(", handler)
 
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))

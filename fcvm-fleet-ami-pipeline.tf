@@ -696,11 +696,11 @@ resource "aws_iam_role_policy" "fcvm_ami_publish" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami.arn },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = local.fcvm_ami_state_arn },
-    { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*"] },
+    { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/gate"] },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.fcvm_ami_publish_fleet.arn },
     { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks", Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } } },
-    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = "${aws_cloudwatch_log_group.fcvm_ami_publish.arn}:*" },
+    { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["${aws_cloudwatch_log_group.fcvm_ami_publish.arn}:*", "${aws_cloudwatch_log_group.fcvm_ami_release_gate.arn}:*"] },
     { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_dispatch.arn }
   ] })
 }
@@ -785,6 +785,42 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       BUILD_REGION = local.fcvm_ami_build_region
     }
   }
+}
+
+# The release gate: the publisher's code behind a handler that takes only status, verify and
+# rollback of one generation (publish.py gate_handler). ejc3/fcvm's staging viewer smoke
+# (.github/workflows/fleet-release-gate.yml) asks it for the live generation, smokes it once,
+# and records it verified or rolls it back to the live receipt's own previous release, so a
+# release that fails the smoke on either address family withdraws itself with no Terraform
+# step. The dev servers may invoke it too, for a rollback by hand.
+resource "aws_cloudwatch_log_group" "fcvm_ami_release_gate" {
+  name              = "/aws/lambda/fcvm-fleet-ami-release-gate"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "fcvm_ami_release_gate" {
+  function_name                  = "fcvm-fleet-ami-release-gate"
+  role                           = aws_iam_role.fcvm_ami_publish.arn
+  runtime                        = "python3.12"
+  handler                        = "publish.gate_handler"
+  timeout                        = 900
+  memory_size                    = 512
+  reserved_concurrent_executions = 1
+  filename                       = data.archive_file.fcvm_ami_publish.output_path
+  source_code_hash               = data.archive_file.fcvm_ami_publish.output_base64sha256
+  environment {
+    # The publisher's own environment: the gate runs the same code against the same state.
+    variables = aws_lambda_function.fcvm_ami_publish.environment[0].variables
+  }
+}
+
+# A dev server may ask the gate for the live generation or roll a failed one back by hand.
+resource "aws_iam_role_policy" "dev_server_fcvm_ami_release_gate" {
+  name = "fcvm-fleet-ami-release-gate"
+  role = aws_iam_role.dev_server.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [
+    { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_release_gate.arn }
+  ] })
 }
 
 resource "aws_cloudwatch_event_rule" "fcvm_ami_success" {

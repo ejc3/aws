@@ -93,6 +93,8 @@ resource "aws_iam_role_policy" "fcvm_stage_ci" {
         Resource = aws_ecr_repository.fcvm_fleet_coordinator.arn
       },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_coordinator_release.arn },
+      # The image release gate (fcvm-fleet-ami-pipeline.tf): status, verify or rollback of the live generation.
+      { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_release_gate.arn },
       {
         Sid    = "NeverAdministerOrReadCredentials"
         Effect = "Deny"
@@ -262,6 +264,7 @@ resource "github_actions_environment_variable" "fcvm_stage" {
   provider = github.agents_md
   for_each = {
     COORDINATOR_RELEASE = aws_lambda_function.fcvm_coordinator_release.function_name
+    RELEASE_GATE        = aws_lambda_function.fcvm_ami_release_gate.function_name
     STAGING_API_URL     = "https://${local.fcvm_dev_api_stage_hostname}"
     STAGING_ORIGIN      = "https://${local.fcvm_dev_site_stage_host}"
   }

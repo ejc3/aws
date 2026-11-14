@@ -707,6 +707,108 @@ class Publisher:
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ena_host_release(), "reviewed-ena-host-release")
 
+    ROLLBACK_PREFIX = "rollback-to-previous:"
+
+    def rollback_to_previous(self):
+        """The live release's own `previous` pair as a reviewed transition from the live receipt.
+
+        Refused when the live release names no previous release, when the previous pair has no
+        image, or when the live release is itself a rollback (rolling it back would bring back the
+        release that was just withdrawn). Images that are gone or no longer validated are refused
+        by reviewed_fence, which reads each one before anything changes."""
+        active = self.load(self.env["RELEASE_PARAMETER"], True)
+        need(not str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX),
+             "the live release is a rollback; it is not rolled back again")
+        previous = active.get("previous")
+        need(isinstance(previous, dict) and previous.get("version") == 1 and type(previous.get("generation")) is int
+             and SHA.fullmatch(str(previous.get("source_sha", ""))),
+             "the live release has no previous release to roll back to")
+        region = self.env["COMPUTE_REGION"]
+        images, live = {}, {}
+        for kind in ("host", "tile"):
+            images[kind] = (previous.get(kind + "_amis") or {}).get(region, {}).get("x86_64")
+            live[kind] = active[kind + "_amis"][region]["x86_64"]
+        need(all(IMAGE.fullmatch(str(image)) for image in images.values()),
+             "the previous release names no image pair")
+        need(images["host"] != live["host"], "the previous release's host image is the live one")
+        host_only = images["tile"] == live["tile"]
+        config = self.reviewed_pair({"source_sha": previous["source_sha"], "images": images, "expected": active},
+                                    host_only=host_only)
+        return config, host_only
+
+    def run_rollback_to_previous(self):
+        config, host_only = self.rollback_to_previous()
+        return self.run_reviewed(config, self.ROLLBACK_PREFIX.rstrip(":"), host_only=host_only)
+
+    def gate_record(self):
+        try:
+            return self.load(self.env["STATE_PREFIX"] + "/gate")
+        except Exception as error:
+            if getattr(error, "response", {}).get("Error", {}).get("Code") == "ParameterNotFound":
+                return {}
+            raise
+
+    def fleet_images(self, release):
+        """Count the fleet's live hosts and tiles by whether they run the release's image: a smoke
+        can verify a release only on machines booted from it (a routine publication leaves running
+        machines on the image they booted)."""
+        region = self.env["COMPUTE_REGION"]
+        want = {"fcvm-fleet-" + kind: release[kind + "_amis"][region]["x86_64"] for kind in ("host", "tile")}
+        counts = {"release_hosts": 0, "other": 0}
+        arguments = {"Filters": [{"Name": "tag:Purpose", "Values": sorted(want)},
+                                 {"Name": "instance-state-name", "Values": ["pending", "running"]}]}
+        for _ in range(20):
+            page = self.client("ec2", True).describe_instances(**arguments)
+            for reservation in page["Reservations"]:
+                for item in reservation["Instances"]:
+                    purpose = {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get("Purpose")
+                    if item.get("ImageId") != want.get(purpose):
+                        counts["other"] += 1
+                    elif purpose == "fcvm-fleet-host":
+                        counts["release_hosts"] += 1
+            if not page.get("NextToken"):
+                return counts
+            arguments["NextToken"] = page["NextToken"]
+        raise Refused("Fleet inventory exceeds its fixed bound")
+
+    def gate(self, event):
+        """The release gate the staging viewer smoke drives (ejc3/fcvm fleet/ami/release_gate.py).
+
+        status: the live generation, whether the gate has verified it, and whether every live host and
+        tile runs its images. verify N: the smoke passed on generation N, on hosts booted from it. rollback N: the smoke failed on generation N; the live release goes back
+        to its `previous` unless the gate already verified N. A rollback's own receipt is recorded
+        as verified, so the next smoke cannot roll it back to the release it withdrew."""
+        need(isinstance(event, dict) and event.get("action") in {"status", "verify", "rollback"}
+             and set(event) == ({"action"} if event.get("action") == "status" else {"action", "generation"})
+             and (event.get("action") == "status" or type(event.get("generation")) is int),
+             "the release gate takes status, verify or rollback of one generation")
+        active = self.load(self.env["RELEASE_PARAMETER"], True)
+        gate = self.gate_record()
+        rolled_back = str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX)
+        if event["action"] == "status":
+            # current: no live host or tile runs another image, so a smoke now exercises this release
+            # (with nothing running, the smoke wakes the fleet from the templates, which name it).
+            return {"generation": active.get("generation"), "source_sha": active.get("source_sha"),
+                    "verified": gate.get("verified_generation") == active.get("generation"), "rollback": rolled_back,
+                    "current": self.fleet_images(active)["other"] == 0}
+        n = event["generation"]
+        if event["action"] == "verify":
+            need(active.get("generation") == n, "the live release is not that generation")
+            images = self.fleet_images(active)
+            need(images["other"] == 0 and images["release_hosts"] > 0,
+                 "the smoke did not run on hosts booted from this release")
+            self.save(self.env["STATE_PREFIX"] + "/gate", {"verified_generation": n, "build_id": active.get("build_id")})
+            return {"status": "verified", "generation": n}
+        if rolled_back and (active.get("previous") or {}).get("generation") == n:
+            return {"status": "rolled_back", "generation": active["generation"]}
+        need(active.get("generation") == n, "the live release is not that generation")
+        need(gate.get("verified_generation") != n, "the gate verified this generation; it is not rolled back")
+        result = self.run_rollback_to_previous()
+        need(result.get("status") == "promoted", "the rollback did not complete")
+        after = self.load(self.env["RELEASE_PARAMETER"], True)
+        self.save(self.env["STATE_PREFIX"] + "/gate", {"verified_generation": after["generation"], "build_id": after["build_id"]})
+        return {"status": "rolled_back", "generation": result["generation"]}
+
     def run_generation_eleven_rollback(self, event):
         need(event == {"action": "activate-reviewed-generation-eleven-rollback"},
              "reviewed rollback accepts no caller configuration")
@@ -1577,6 +1679,8 @@ class Publisher:
             return self.run_ipv4_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-generation-eleven-rollback":
             return self.run_generation_eleven_rollback(event)
+        if event == {"action": "rollback-to-previous"}:
+            return self.run_rollback_to_previous()
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ena-host-release":
             return self.run_ena_host_release(event)
         # A factory build that was already running when the factory was paused
@@ -1615,6 +1719,17 @@ class Publisher:
             released = {"images": {kind: {"image_id": image} for kind, image in targets.items()}}
             result = self.promote(released, source, input_sha, resources)
             return self.finish(result, source, input_sha)
+
+
+def gate_handler(event, context):
+    """The release gate's own function: it takes only the gate's three requests (Publisher.gate)."""
+    try:
+        return Publisher().gate(event)
+    except Refused as refusal:
+        # Refusals are fixed sentences in this file; a caller needs the reason to act on it.
+        return {"status": "refused", "reason": str(refusal)}
+    except Exception:
+        raise RuntimeError("release gate failed; inspect the bounded publication journal") from None
 
 
 def lambda_handler(event, context):
