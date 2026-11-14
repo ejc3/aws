@@ -104,9 +104,9 @@ class Terraform(unittest.TestCase):
         self.assertIn('SUBNET         = local.boot_race_fargate_enabled ? aws_subnet.boot_race[0].id : ""', fn)
         self.assertIn("SECURITY_GROUP = aws_security_group.boot_race.id", fn)
 
-    def test_the_driver_may_only_invoke_the_launcher(self):
+    def test_only_the_fixed_launcher_can_start_ecs_tasks(self):
         driver = block(TF, 'data "aws_iam_policy_document" "boot_race_driver"')
-        for action in ("ecs:RunTask", "ecs:StopTask", "ecs-tasks.amazonaws.com"):
+        for action in ("ecs:RunTask", "ecs-tasks.amazonaws.com"):
             self.assertNotIn(action, driver)
         invoke = re.search(r'sid\s*=\s*"InvokeTheLauncher".*?\n  \}', driver, re.S).group()
         self.assertIn("aws_lambda_function.boot_race_launcher.arn", invoke)

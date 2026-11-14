@@ -891,39 +891,45 @@ login. Later visits and expired API connections use the automatic flow. Browser 
 `scripts/test-opencode-access-flow.cjs` (requires nginx and Playwright Chromium/WebKit); the offline worker checks run
 with `scripts/test-opencode-setup.py` in CI.
 
-### One-off fcvm boot benchmark
+### fcvm boot benchmark (boot-race)
 
-The driver and cleanup schedule are disabled by default. For an approved run,
-prepare one Ohio Spot pbox as the benchmark worker before enabling anything.
-Separately designate one primary-region EC2 dev host with `dev-server-role`
-to run `creds.sh` and deliver short sessions over SSH to the Ohio worker; the
-pbox's own `dev-ebs-only` credentials cannot assume the role. Commit
-`boot_race_enabled = true` with `boot_race_campaign`: the exact source dev
-instance ARN and fixed UTC start and end timestamps at most three hours apart.
-Use a unique, nonoverlapping window each time; never extend or reuse its start.
-Review the plan and apply from fresh main. AssumeRole checks the EC2 identity
-that issued the source credentials, not the network origin; AWS denies requests
-signed with the resulting STS sessions after expiry.
+Boot-race is available without a per-run jumpbox apply. Run `creds.sh` on the
+primary FCVM ARM instance. Only instance-role credentials issued to that instance
+can assume `arn:aws:iam::<account>:role/boot-race-driver`; other hosts using
+`dev-server-role` and the Ohio pbox's `dev-ebs-only` role cannot. The script
+delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
 
-The limited campaign keeps the Fargate lane disabled. It creates no paid ECR
-interface endpoints and does not change ECR DNS for other Ohio pboxes. With the
-[benchmark driver](https://github.com/ejc3/fcvm/pull/1539), pass
+- The driver can launch only `c8g.medium` instances through the two boot-race
+  templates, tagging instances, volumes and interfaces `Project=boot-race`. ECS
+  runs go through the fixed `boot-race-launcher`. Run one campaign at a time:
+  cleanup also removes the shared tagged EC2 resources and pushed ECR image.
+- The reaper checks every 15 minutes. It terminates instances after 3 hours,
+  stops tasks after 1 hour, and removes images and snapshots after a day. These
+  age limits don't cap the number of concurrent launches.
+- The `boot-race-monthly` budget alerts at $20 and blocks new driver work at $25
+  of reported `Project=boot-race` costs. The denial leaves cleanup and reads
+  available, including direct task stops in the boot-race cluster. Run `cleanup`
+  and `leftovers` from a benchmark checkout that supports direct ECS stops: the
+  budget blocks the legacy launcher because it can start tasks.
+- Verify the `Project` billing tag is Active and the budget action is monitoring
+  before the first campaign. Tag activation can take up to 24 hours. Budget data
+  can lag by hours and excludes untagged costs, including the separate Ohio
+  pbox, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
+  deny at the start of the next month; an administrator can reverse it sooner.
+
+The Fargate lane stays off: its ECR interface endpoints bill hourly and change
+ECR DNS for every Ohio pbox. With the
+[benchmark driver](https://github.com/ejc3/fcvm/tree/main/bench/boot-race), pass
 `--lanes fcvm-file,fcvm-uffd,ec2-launch,ec2-start,ec2-hibernate,ecs-ec2,lambda-cold,lambda-warm`;
-do not run the default nine-lane command. Restoring the private Fargate lane
-requires a separate reviewed change with a reliable endpoint teardown.
+do not run the default nine-lane command. Restoring Fargate requires a separate
+reviewed change with a reliable endpoint teardown.
 
-Copy the data out and stop early enough to run the benchmark's `cleanup` and
-`leftovers` before the window expires. Terminate the exact campaign pbox and
-verify there are no remaining campaign instances, tasks, AMIs, snapshots or
-workload images, stop `creds.sh`, and remove the worker's cached credentials.
-The reaper can recover left-behind compute after credentials expire, but does not
-remove ECR images or reset the two IAM-only benchmark functions' uploaded code.
-The regular cleanup deletes ECR images; the uploaded Lambda workload stays in
-those dedicated, inactive functions and is replaced on the next run. If cleanup
-cannot finish inside the window, an administrator clears the remaining ECR
-images and any workload the reaper missed; verify both before retiring. Then
-commit `boot_race_enabled = false` and clear `boot_race_campaign`, apply,
-and confirm the role is gone and the schedule disabled.
+After a campaign, copy the data out, run the benchmark's `cleanup` and
+`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper does
+not remove the pushed ECR image, so complete the harness cleanup. The uploaded
+Lambda workload stays in the two inactive IAM-only functions and is replaced
+on the next run. To remove the driver and disable the reaper, clean up any
+leftovers first, then set `boot_race_enabled = false` and apply.
 
 ### Cloudflare Browser Run token
 
