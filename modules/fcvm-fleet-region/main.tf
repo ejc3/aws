@@ -133,8 +133,18 @@ variable "minecraft_host_amis" {
 }
 
 variable "slot_tls_ports" {
-  description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
+  description = "The GPU host ports each place's TLS port is forwarded on (GPU slots, then Windows sandboxes, then Minecraft servers), for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
+}
+
+variable "windows_count" {
+  description = "Windows sandboxes on a host booted from one of windows_host_amis (--windows); their TLS ports follow the GPU slots'."
+  type        = number
+}
+
+variable "minecraft_count" {
+  description = "Minecraft servers on a host booted from one of minecraft_host_amis (--minecraft); their TLS ports follow the sandboxes'."
+  type        = number
 }
 
 variable "host_profile_name" {
@@ -254,13 +264,13 @@ locals {
       %{if length(var.windows_host_amis) > 0~}
       # An agent from an older image has no --windows and would refuse it.
       case "$boot_ami" in
-        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows 4" ;;
+        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows ${var.windows_count}" ;;
       esac
       %{endif~}
       %{if length(var.minecraft_host_amis) > 0~}
       # An agent from an older image has no --minecraft and would refuse it.
       case "$boot_ami" in
-        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft 4" ;;
+        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft ${var.minecraft_count}" ;;
       esac
       %{endif~}
     fi
