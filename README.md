@@ -931,11 +931,14 @@ and confirm the role is gone and the schedule disabled.
 Cloudflare token with Browser Run Write on this account and no other
 permission (`browser-run.tf`), as JSON `{ account_id, api_token }`. The fcvm
 render benchmark uses it for Browser Run's Chromium and its hosted Kitesurf
-engine (`?browser=kitesurf`). Readers are dev-server-role and administration;
-the fcvm dev box passes it to the pbox it drives. It is not pinned to an
-address, because the dev box egresses through an HTTPS proxy and pboxes change
-addresses. It needs nothing from the jumpbox per run. Rotate with
-`terraform apply -replace=cloudflare_account_token.browser_run`.
+engine (`?browser=kitesurf`). Run the hosted Quick Actions benchmark on the
+primary fcvm-arm instance. It fetches the credential there without a jumpbox
+step. The secret accepts EC2 credentials issued to that instance or
+administrators; the Cloudflare token accepts only its Elastic IPv4 and host
+IPv6. A stop/start keeps those addresses; Terraform updates the grant on
+replacement. Keep the token in the benchmark process environment and out of
+arguments, logs, artifacts and disk. Browser usage is billable. Rotate with
+`terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
 
 ### Temporary EC2 Mac builds: `macpbox`
 

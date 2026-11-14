@@ -2,7 +2,7 @@
 """Offline contracts for the standing Browser Run token (browser-run.tf).
 
 Owner, 2026-11-14: "What is this window thing? Kill the window. We shouldn't need back and forth with jumphost".
-The token is minted on every apply, holds Browser Run Write and nothing else, and is readable by dev-server-role.
+The standing token holds Browser Run Write only; only administration and credentials issued to fcvm-arm can read it.
 
 Run from the repo root:  python3 -S -B scripts/test-browser-run.py
 """
@@ -25,19 +25,27 @@ class BrowserRunTests(unittest.TestCase):
     def test_the_token_is_standing_with_no_window(self):
         for gone in ("browser_run_window", "browser_run_leases", "plantimestamp", "not_before", "expires_on"):
             self.assertNotIn(gone, TF)
-        self.assertNotRegex(TF, r"(?m)^\s*(for_each|count)\s*=")
+        self.assertNotIn("for_each", TF)
+
+    def test_token_and_payload_only_exist_when_the_primary_arm_host_is_enabled(self):
         for kind, name in (
             ('data "cloudflare_account_api_token_permission_groups_list"', "browser_rendering_write"),
             ('resource "cloudflare_account_token"', "browser_run"),
             ('resource "aws_secretsmanager_secret_version"', "cloudflare_browser_run"),
         ):
-            block(kind, name)
+            self.assertRegex(block(kind, name), r"count\s*= var\.enable_firecracker_instance \? 1 : 0")
 
-    def test_the_token_is_not_pinned_to_an_address(self):
+    def test_token_is_pinned_to_the_exact_primary_arm_host_addresses(self):
         token = block('resource "cloudflare_account_token"', "browser_run")
-        self.assertNotRegex(token, r"(?m)^  condition\s*=")
-        self.assertNotIn("request_ip", TF)
-        self.assertNotIn("aws_eip.jumpbox", TF)
+        self.assertIn("request_ip = { in = concat(local.browser_run_arm_ipv4, local.browser_run_arm_ipv6) }", token)
+        self.assertIn('for eip in aws_eip.firecracker_dev_next : "${eip.public_ip}/32"', TF)
+        self.assertIn('for ip in eni.ipv6_addresses : "${ip}/128"', TF)
+        self.assertIn('for eni in data.aws_network_interface.browser_run_arm :', TF)
+        eni = block('data "aws_network_interface"', "browser_run_arm")
+        self.assertIn("id    = aws_network_interface.firecracker_dev[count.index].id", eni)
+        self.assertIn("depends_on = [terraform_data.firecracker_dev_host_ipv6]", eni)
+        self.assertIn('length(local.browser_run_arm_ipv4) == 1 && length(local.browser_run_arm_ipv6) == 1', token)
+        self.assertNotRegex(TF, r"aws_eip\.(jumpbox|x86_dev)|ipv6_prefixes|local\.dev_fleet_subnets")
 
     def test_the_token_holds_browser_run_write_on_this_account_only(self):
         lookup = block('data "cloudflare_account_api_token_permission_groups_list"', "browser_rendering_write")
@@ -55,24 +63,53 @@ class BrowserRunTests(unittest.TestCase):
         self.assertNotIn("cloudflare_account_token.workers_deploy", TF)
         self.assertNotIn("kitesurf", (ROOT / "workers-deploy.tf").read_text().lower())
 
-    def test_dev_server_role_and_administration_read_it_and_no_one_else(self):
-        self.assertIn("browser_run_readers = [aws_iam_role.dev_server.arn]", TF)
+    def test_the_dev_grant_requires_credentials_issued_to_the_managed_primary_arm(self):
+        self.assertIn("browser_run_dev_role = aws_iam_role.dev_server.arn", TF)
+        self.assertIn("browser_run_arm_arns = aws_instance.firecracker_dev[*].arn", TF)
         policy = block('resource "aws_secretsmanager_secret_policy"', "cloudflare_browser_run")
         self.assertIn("block_public_policy = true", policy)
-        allow = policy[policy.index('Sid       = "MetalBoxesRead"'):policy.index('Sid       = "OnlyAdministrationAndMetalBoxes"')]
+        allow_sid = 'Sid       = "ReadFromPrimaryArmCredentials"'
+        deny_sid = 'Sid       = "DenyDevRoleWithoutPrimaryArmCredentials"'
+        self.assertIn(allow_sid, policy)
+        self.assertIn(deny_sid, policy)
+        allow = policy[policy.index(allow_sid):policy.index(deny_sid)]
         self.assertIn('Effect    = "Allow"', allow)
-        self.assertIn("Principal = { AWS = local.browser_run_readers }", allow)
+        self.assertIn("Principal = { AWS = local.browser_run_dev_role }", allow)
         self.assertIn('Action    = "secretsmanager:GetSecretValue"', allow)
-        deny = policy[policy.index('Sid       = "OnlyAdministrationAndMetalBoxes"'):]
+        self.assertIn('Condition = { ArnEquals = { "ec2:SourceInstanceARN" = instance_arn } }', allow)
+        self.assertEqual(policy.count('for instance_arn in local.browser_run_arm_arns'), 2)
+        self.assertNotRegex(TF, r"aws_iam_role\.(nextjs_dev|dev_ebs_only)")
+
+    def test_wrong_or_missing_instance_provenance_cannot_be_allowed_by_an_identity_policy(self):
+        policy = block('resource "aws_secretsmanager_secret_policy"', "cloudflare_browser_run")
+        sid = 'Sid       = "DenyDevRoleWithoutPrimaryArmCredentials"'
+        self.assertIn(sid, policy)
+        deny = policy[policy.index(sid):]
         self.assertIn('Effect    = "Deny"', deny)
         self.assertIn('Principal = "*"', deny)
-        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]', deny)
-        self.assertIn('"aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.browser_run_readers)', deny)
-        self.assertNotRegex(TF, r"aws_iam_role\.(nextjs_dev|dev_ebs_only)")
+        self.assertIn('Action    = local.browser_run_read_actions', deny)
+        self.assertIn('ArnEquals            = { "aws:PrincipalArn" = local.browser_run_dev_role }', deny)
+        self.assertIn('ArnNotEqualsIfExists = { "ec2:SourceInstanceARN" = instance_arn }', deny)
+        self.assertIn('"secretsmanager:GetSecretValue",\n    "secretsmanager:BatchGetSecretValue",', TF)
+
+    def test_administration_stays_exempt_and_a_missing_arm_fails_closed(self):
+        policy = block('resource "aws_secretsmanager_secret_policy"', "cloudflare_browser_run")
+        deny_sid = 'Sid       = "DenyOtherPrincipals"'
+        allow_sid = 'Sid       = "ReadFromPrimaryArmCredentials"'
+        self.assertIn(deny_sid, policy)
+        self.assertIn(allow_sid, policy)
+        deny = policy[policy.index(deny_sid):policy.index(allow_sid)]
+        self.assertIn('Effect    = "Deny"', deny)
+        self.assertIn('Principal = "*"', deny)
+        self.assertIn('Action    = local.browser_run_read_actions', deny)
+        self.assertIn('ArnNotLike = {', deny)
+        self.assertIn('"aws:PrincipalArn" = concat(', deny)
+        self.assertIn('local.games_mp_admin_principals,', deny)
+        self.assertIn('length(local.browser_run_arm_arns) == 1 ? [local.browser_run_dev_role] : []', deny)
 
     def test_the_payload_is_written_after_the_policy(self):
         payload = block('resource "aws_secretsmanager_secret_version"', "cloudflare_browser_run")
-        self.assertIn("api_token  = cloudflare_account_token.browser_run.value", payload)
+        self.assertIn("api_token  = cloudflare_account_token.browser_run[0].value", payload)
         self.assertIn("account_id = var.cloudflare_account_id", payload)
         self.assertIn("depends_on = [aws_secretsmanager_secret_policy.cloudflare_browser_run]", payload)
 
