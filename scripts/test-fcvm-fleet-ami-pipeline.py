@@ -374,9 +374,17 @@ class FactoryTests(unittest.TestCase):
         def response(path):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": source_sha}}
-            if path == "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha:
+            base = "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha
+            if path in (base, base + "?per_page=1&page=2"):
                 if isinstance(comparison, Exception):
                     raise comparison
+                # GitHub puts every changed file's patch on the first page of a comparison: over a
+                # long history that page passes public_github's 2 MiB bound (2.24 MB for the
+                # extended-timeout source...20fc62c4 on 2026-11-14), and only page two is small.
+                if isinstance(comparison, dict) and comparison.get("oversized"):
+                    if path == base:
+                        raise mod.Refused("trusted CI metadata exceeds its fixed bound")
+                    return {k: v for k, v in comparison.items() if k != "oversized"}
                 return comparison
             return {"workflow_runs": [self.ci_run(head_sha=source_sha)]}
         with patch.object(mod, "public_github", side_effect=response):
@@ -927,6 +935,9 @@ class FactoryTests(unittest.TestCase):
             ("2" * 40, {**proof, "status": "behind"}, 240),
             ("3" * 40, {**proof, "merge_base_commit": {"sha": "9" * 40}}, 240),
             ("4" * 40, OSError("GitHub unavailable"), 240),
+            # A long history whose first comparison page is over the response bound (generation
+            # fifteen's request expired at 240 minutes on 2026-11-14 for this reason).
+            ("5" * 40, {**proof, "oversized": True}, 360),
         ):
             with self.subTest(source=source):
                 self.setUp()
