@@ -276,6 +276,29 @@ locals {
     fi
     unset token boot_ami
     %{endif~}
+    %{~if var.ami_release_parameter_arn != ""~}
+    # The factory publisher can change ImageId while retaining this bootstrap.
+    # An unlisted image can run a mode only if it has both that mode's image in
+    # root's Podman store and the flag in its installed agent. Windows remains
+    # allowlisted above: the presence of its assets does not prove /still is safe.
+    have_mode_artifact() {
+      case " $agent_args " in *" $1 "*|*" $1="*) return 1 ;; esac
+      /usr/bin/timeout -k 1 10 /usr/bin/podman image exists "$2" 2>/dev/null
+    }
+    potato_present=false
+    minecraft_present=false
+    if have_mode_artifact --potato-players localhost/fcvm-potato:fleet; then potato_present=true; fi
+    if have_mode_artifact --minecraft localhost/fcvm-minecraft:fleet; then minecraft_present=true; fi
+    if { "$potato_present" || "$minecraft_present"; } &&
+      mode_help=$(/usr/bin/timeout -k 1 10 /usr/local/bin/fcvm fleet agent --help 2>/dev/null); then
+      if "$potato_present" && grep -Eq -- '^[[:space:]]+--potato-players([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --potato-players 96"
+      fi
+      if "$minecraft_present" && grep -Eq -- '^[[:space:]]+--minecraft([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --minecraft ${var.minecraft_count}"
+      fi
+    fi
+    %{endif~}
     printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
     systemctl enable fcvm-fleet-agent.service
     systemctl start --no-block fcvm-fleet-agent.service

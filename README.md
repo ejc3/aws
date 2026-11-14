@@ -522,6 +522,12 @@ Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
 
+On factory-managed host templates, a newly published AMI can start Potato players
+or Minecraft servers when it contains both the matching rootful Podman image and
+an installed Fleet agent that accepts the matching option. Windows sandboxes still
+require an explicitly reviewed boot AMI ID: older Windows bridges can carry the
+same assets while exposing an unauthenticated `/still` endpoint.
+
 The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
 builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
 pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatcher redrives

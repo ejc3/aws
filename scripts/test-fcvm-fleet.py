@@ -112,12 +112,12 @@ class HostTests(unittest.TestCase):
         # Legacy copies still carry Minecraft and potato, but the widened public ports
         # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)
-        self.assertEqual(MOD.count("--minecraft ${var.minecraft_count}"), 1)
         self.assertRegex(east, r'minecraft_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
-        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
+        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    unset token boot_ami\n", 1)[0]
+        self.assertEqual(guard.count("--minecraft ${var.minecraft_count}"), 1)
         # the nested Windows case, rendered as Terraform does when the list is not empty
         windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"
         minecraft_if = "      %{if length(var.minecraft_host_amis) > 0~}\n"
@@ -165,6 +165,55 @@ class HostTests(unittest.TestCase):
                     )
                     self.assertEqual(result.stdout, expected)
                     self.assertNotIn("fixture-token", result.stderr)
+
+    def test_factory_host_needs_both_local_image_and_agent_support_for_each_extra_mode(self):
+        # Feed the actual fallback shell fake read-only probes, using a non-default
+        # Minecraft count to verify it still comes from the port allocation's input.
+        fallback = MOD.split('    unset token boot_ami\n    %{endif~}\n', 1)[1].split("    printf 'FLEET_AGENT_ARGS", 1)[0]
+        fallback = fallback.replace('    %{~if var.ami_release_parameter_arn != ""~}\n', '').replace('    %{endif~}\n', '')
+        with tempfile.TemporaryDirectory() as temp:
+            fixtures = Path(temp)
+            windows_env = fixtures / 'windows.env'
+            windows_env.write_text('WINDOWS_AGENT_ARGS=--windows-image /legacy-image\n')
+            fcvm = fixtures / 'fcvm'
+            fcvm.write_text('''#!/bin/bash
+set -eu
+test "$*" = 'fleet agent --help'
+test "$HELP" != fails || exit 1
+for option in $HELP; do printf '      %s <VALUE>  description\\n' "$option"; done
+''')
+            podman = fixtures / 'podman'
+            podman.write_text('''#!/bin/bash
+set -eu
+test "$1 $2" = 'image exists'
+case " $IMAGES " in *" $3 "*) exit 0;; esac
+exit 1
+''')
+            for probe in (fcvm, podman):
+                probe.chmod(0o700)
+            shell = (textwrap.dedent(fallback).replace('/usr/local/bin/fcvm', str(fcvm))
+                     .replace('/usr/bin/podman', str(podman))
+                     .replace('/etc/fcvm-fleet/windows.env', str(windows_env))
+                     .replace('${var.minecraft_count}', '3'))
+            potato_image = 'localhost/fcvm-potato:fleet'
+            minecraft_image = 'localhost/fcvm-minecraft:fleet'
+            both_images = f'{potato_image} {minecraft_image}'
+            both_flags = '--potato-players --minecraft --windows'
+            for name, before, images, help_text, suffix in (
+                ('factory host with both', '', both_images, both_flags, ' --potato-players 96 --minecraft 3'),
+                ('only Minecraft image', '', minecraft_image, both_flags, ' --minecraft 3'),
+                ('only potato flag', '', both_images, '--potato-players --minecraft-image --windows', ' --potato-players 96'),
+                ('neither image; legacy Windows config present', '', '', both_flags, ''),
+                ('old agent with both images', '', both_images, '--potato-image --minecraft-image --windows', ''),
+                ('help probe failure', '', both_images, 'fails', ''),
+                ('reviewed image keeps existing arguments once', ' --windows 4 --potato-players 96 --minecraft=3', both_images, both_flags, ''),
+            ):
+                with self.subTest(name=name):
+                    result = subprocess.run(
+                        ['/bin/bash', '-eu', '-c', f"agent_args='--phones 2{before}'\n" + shell + '\nprintf "%s" "$agent_args"'],
+                        env=dict(os.environ, IMAGES=images, HELP=help_text), capture_output=True, text=True, check=True, timeout=5,
+                    )
+                    self.assertEqual(result.stdout, f'--phones 2{before}{suffix}')
 
     def test_hosts_ask_for_a_prefix_only_and_imdsv2_hop_1(self):
         lt = block('resource "aws_launch_template" "host"', MOD)
