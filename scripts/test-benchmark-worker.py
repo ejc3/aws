@@ -79,6 +79,15 @@ class Worker(unittest.TestCase):
         self.assertEqual(self.invoke(action="reap")["state"], "shutting-down")
         self.ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-example"])
 
+    def test_periodic_reap_of_an_empty_worker_never_launches_one(self):
+        self.assertEqual(self.invoke(action="reap"), {"state": "absent"})
+        self.ec2.run_instances.assert_not_called()
+        self.ec2.terminate_instances.assert_not_called()
+        event = block('resource "aws_cloudwatch_event_target" "benchmark_worker_reaper"')
+        self.assertIn('jsonencode({ action = "reap" })', event)
+        permission = block('resource "aws_lambda_permission" "benchmark_worker_reaper"')
+        self.assertIn('source_arn    = aws_cloudwatch_event_rule.benchmark_worker_reaper[0].arn', permission)
+
     def test_unexpected_attachment_is_never_touched(self):
         for invalid in ({"project": "ordinary"}, {"index": 1}):
             self.attached(**invalid)
