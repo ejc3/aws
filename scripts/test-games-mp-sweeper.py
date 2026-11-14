@@ -333,20 +333,30 @@ class TerraformWiringTests(unittest.TestCase):
                            "the AWS ceiling must sit above what the lobby itself allows")
 
     def test_only_the_launch_function_may_run_or_stop_engines_besides_the_sweeper(self):
-        # The lobby's roles may only invoke games-mp-launch (scripts/test-games-mp-launch.py).
-        # The boot-race launcher may run and stop tasks too, and the boot-race reaper stop them, but only on
-        # the boot-race cluster, so neither can reach a games engine. The boot-race driver holds neither action.
+        # The lobby can only invoke games-mp-launch. Benchmark policies cannot reach multiplayer tasks.
+        grants = {
+            "ecs:RunTask": {("games-multiplayer.tf", "games_mp_launch"), ("boot-race.tf", "boot_race_launcher")},
+            "ecs:StopTask": {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper"),
+                             ("boot-race.tf", "boot_race_launcher"), ("boot-race.tf", "boot_race_reaper"),
+                             ("boot-race.tf", "boot_race_driver")},
+        }
         for path in ROOT.glob("*.tf"):
             text = path.read_text()
-            for action in ("ecs:RunTask", "ecs:StopTask"):
+            for action, allowed in grants.items():
                 for m in re.finditer(r'"%s"' % action, text):
-                    owner = re.findall(r'^(?:resource "aws_iam_role_policy"|data "aws_iam_policy_document") "(\w+)"',
-                                       text[:m.start()], re.M)
+                    owner = re.findall(
+                        r'^(?:resource "aws_iam_(?:role_)?policy"|data "aws_iam_policy_document") "(\w+)"',
+                        text[:m.start()], re.M)
                     key = (path.name, owner[-1] if owner else None)
-                    self.assertIn(key,
-                                  {("games-multiplayer.tf", "games_mp_launch"), ("games-multiplayer.tf", "games_mp_sweeper"),
-                                   ("boot-race.tf", "boot_race_launcher"), ("boot-race.tf", "boot_race_reaper")},
-                                  "%s granted outside the launch function and the sweeper" % action)
+                    if key == ("boot-race.tf", "boot_race_spend_cap"):
+                        # This managed policy can deny a stop or exempt it from a deny; it must never grant it.
+                        start = text.rfind("\n      {\n", 0, m.start())
+                        end = text.find("\n      },", m.end())
+                        self.assertGreaterEqual(start, 0)
+                        self.assertGreater(end, m.end())
+                        self.assertRegex(text[start:end], r'Effect\s*=\s*"Deny"')
+                        continue
+                    self.assertIn(key, allowed, "%s granted outside its reviewed roles" % action)
                     if key[0] == "boot-race.tf":
                         start = text.rfind("statement {", 0, m.start())
                         end = text.find("\n  }\n", m.start())
@@ -354,6 +364,12 @@ class TerraformWiringTests(unittest.TestCase):
                         self.assertNotIn("games", statement)
                         self.assertNotIn('"*"', statement)
                         self.assertRegex(statement, r"boot-race|boot_race")
+                        if key[1] == "boot_race_driver":
+                            self.assertRegex(statement, r'resources\s*=\s*\[local\.boot_race_task_arn\]')
+                            self.assertRegex(statement, r'test\s*=\s*"ArnEquals"')
+                            self.assertRegex(statement, r'variable\s*=\s*"ecs:cluster"')
+                            self.assertRegex(statement, r'values\s*=\s*\[aws_ecs_cluster\.boot_race\.arn\]')
+                            self.assertRegex(text, r'boot_race_task_arn\s*= "\$\{local\.boot_race_ecs_arn\}:task/boot-race/\*"')
 
     def test_router_is_denied_and_carries_the_denied_tag(self):
         block = self.launch_statement("NeverStopTheRouter")
