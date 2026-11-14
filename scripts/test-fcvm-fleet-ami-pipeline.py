@@ -1560,5 +1560,28 @@ class FactoryTests(unittest.TestCase):
         self.assertRegex(function, r'RELEASE_REGION\s*=\s*local\.fcvm_ami_region')
         self.assertRegex(source, r'fcvm_ami_region\s*=\s*"us-east-1"')
 
+    def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
+        # 2026-11-14: generation twelve broke staging; the factory is paused until the boot fix
+        # and the launch-path gate are in. The pause reaches the dispatcher as ENABLED=false,
+        # which starts nothing, while the launch templates still follow the release pointer.
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
+        self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
+        # what ENABLED=false does with a queued normal request whose window has opened
+        self.store.values.pop("/factory/control", None)
+        self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
+        self.queue_prepared = True
+        queued = self.request("normal")
+        self.assertEqual(queued["status"], "queued")
+        self.factory.env["ENABLED"] = "false"
+        self.time += 7 * 3600
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts, [])
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "queued")
+        self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
+        self.assertEqual(self.cb.starts, [])
+
 if __name__ == "__main__":
     unittest.main(buffer=True)

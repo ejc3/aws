@@ -2,6 +2,7 @@
 """Credential-free publisher transactions against strict in-memory AWS fakes."""
 import base64
 import copy
+import re
 import datetime
 import hashlib
 import http.client
@@ -2533,6 +2534,24 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaises(MODULE.Refused):
                 MODULE.Publisher(self.env, {}, config=path)
 
+
+    def test_a_paused_factory_build_is_not_promoted_but_reviewed_actions_are(self):
+        # A build already running when the factory was paused (fcvm_ami_factory_paused) still
+        # finishes and asks to publish; it must not promote. A reviewed action still can.
+        source = (Path(MODULE.__file__).parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        publisher_tf = re.search(r'^resource "aws_lambda_function" "fcvm_ami_publish" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(publisher_tf, r"FACTORY_PAUSED\s*=\s*tostring\(var\.fcvm_ami_factory_paused\)")
+        self.env["FACTORY_PAUSED"] = "true"
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        with self.assertRaises(MODULE.Refused) as caught:
+            self.publisher().run(self.event)
+        self.assertIn("paused", str(caught.exception))
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual((self.ec2.created, self.ec2.tagged, self.assets.copies), ([], [], []))
+        self.assertEqual(self.seed_success(self.publisher(), self.legacy_seed()), {"status": "promoted", "generation": 1})
+        self.setUp()
+        self.env["FACTORY_PAUSED"] = "false"
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
 
 if __name__ == "__main__":
     unittest.main(buffer=True)
