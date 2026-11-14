@@ -94,16 +94,14 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Resource = "*"
       },
       {
-        # The base is Canonical's Ubuntu image, picked by scripts/build-ami.sh with
-        # `describe-images --owners 099720109477`. Canonical's images carry the owner
-        # alias "amazon", and for an image with an alias that alias is the value
-        # IAM gives ec2:Owner, so the account id alone matched nothing and every
-        # build stopped at RunInstances with UnauthorizedOperation.
+        # Canonical's Ubuntu AMIs report the "amazon" owner alias, which
+        # ec2:Owner also gives to other verified publishers. Match the source
+        # AMI's account instead, as scripts/build-ami.sh does when selecting it.
         Sid       = "LaunchUbuntuImage"
         Effect    = "Allow"
         Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:us-west-1::image/*"
-        Condition = { StringEquals = { "ec2:Owner" = ["099720109477", "amazon"] } }
+        Condition = { StringEquals = { "aws:ResourceAccount" = "099720109477" } }
       },
       {
         Sid    = "UseIsolatedRunnerNetwork"

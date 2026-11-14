@@ -87,18 +87,16 @@ class CISecurityTests(unittest.TestCase):
         self.assertIn('"ec2:VolumeSize"', policy)
         self.assertIn('"aws:TagKeys"', policy)
 
-    def test_builder_can_launch_the_canonical_base_image(self):
-        # Canonical's Ubuntu images report the owner alias "amazon", and IAM evaluates
-        # ec2:Owner to that alias. A condition naming only the account id denied every
-        # launch of the base image.
+    def test_builder_can_launch_only_canonical_owned_images(self):
+        # Canonical and other verified providers can all have the owner alias "amazon".
+        # For these image ARNs, aws:ResourceAccount uses the actual 12-digit owner.
         policy = resource('github-ami-builder.tf', 'aws_iam_role_policy', 'github_actions_ami_builder')
         statement = re.search(r'Sid\s*=\s*"LaunchUbuntuImage".*?\n      \}', policy, re.S)
         self.assertIsNotNone(statement)
-        owner = re.search(r'"ec2:Owner"\s*=\s*(\[[^\]]*\]|"[^"]*")', statement.group())
-        self.assertIsNotNone(owner, 'LaunchUbuntuImage must keep an ec2:Owner condition')
-        values = re.findall(r'"([^"]*)"', owner.group(1))
-        self.assertIn('amazon', values)
-        self.assertEqual(set(values), {'099720109477', 'amazon'})
+        self.assertRegex(statement.group(), r'Action\s*=\s*"ec2:RunInstances"')
+        self.assertRegex(statement.group(), r'Resource\s*=\s*"arn:aws:ec2:us-west-1::image/\*"')
+        self.assertRegex(statement.group(),
+                         r'Condition\s*=\s*\{ StringEquals = \{ "aws:ResourceAccount" = "099720109477" \} \}')
 
     def test_codeartifact_cannot_restore_retired_ci_write_access(self):
         self.assertNotIn('GitHubActionsPublish', source('codeartifact.tf'))
