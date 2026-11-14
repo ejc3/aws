@@ -13,12 +13,11 @@
 #            (Workers Logs and the telemetry query API), Workers Tail Read (live `wrangler tail`), Workers Scripts Read
 #            (versions and deployments, to line logs up with a release), Logs Read (Logpush jobs), Allow Request
 #            Tracer Read
-#   zones:   Analytics Read, Logs Read, Zone Observability Read, Health Checks Read, Email Routing Rules Read (which
-#            alias forwards where, so an agent tracing a reply or a bounce can see the route instead of guessing;
-#            owner, 2026-11-13: a provider's reply to an unrouted address was being refused unseen)
+#   zones:   Analytics Read, Logs Read, Zone Observability Read, Health Checks Read
+#   dolphin-labs.dev only: Email Routing Rules Read (which alias forwards where, to trace a refused reply or a bounce)
 # Deliberately left out: Access audit and SCIM logs (they carry people's email addresses), Security Center insights,
-# Email Routing Addresses (the account's list of every verified destination), and anything that can write. A routing
-# rule does name its forward destination, so this token reads the owner's (he allowed it, 2026-11-13) and steve@'s.
+# Email Routing Addresses (the account's list of every verified destination), and anything that can write. A routing rule
+# names its forward destination; limit that permission to the Dolphin zone where the owner asked to trace replies.
 # Not IP-pinned: the dev boxes egress over IPv6 and IPv4 from several addresses.
 #
 #   export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 \
@@ -89,12 +88,14 @@ resource "cloudflare_account_token" "observability_read" {
       resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })
     },
     {
-      effect = "allow"
-      permission_groups = concat(
-        [for id in values(local.cloudflare_observability_zone_groups) : { id = id }],
-        [{ id = one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id }],
-      )
-      resources = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = { "com.cloudflare.api.account.zone.*" = "*" } })
+      effect            = "allow"
+      permission_groups = [for id in values(local.cloudflare_observability_zone_groups) : { id = id }]
+      resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = { "com.cloudflare.api.account.zone.*" = "*" } })
+    },
+    {
+      effect            = "allow"
+      permission_groups = [{ id = one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id }]
+      resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })
     },
   ]
 }

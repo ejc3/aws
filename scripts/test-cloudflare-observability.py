@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """The read-only Cloudflare logs and metrics token (cloudflare-observability.tf): only Read permission groups, account-wide
-and on every zone, nothing that names people (Access audit logs), readable by administration and the two dev-box roles."""
+and on every zone, plus Dolphin-only mail rules. No Access audit logs; readable by administration and the two dev-box roles."""
 import re
 import unittest
 from pathlib import Path
@@ -40,18 +40,28 @@ class TokenTests(unittest.TestCase):
         for name in [*ACCOUNT.values(), *ZONE.values()]:
             self.assertTrue(name.endswith("Read"), name)
 
-    def test_email_routing_rules_read_by_name_on_every_zone(self):
+    def test_email_routing_rules_read_only_on_dolphin_zone(self):
         # Looked up by name at plan time (the token cannot list groups); read only, rules only, never the account's
         # list of destination addresses.
         names = re.findall(r'^\s*name\s*=\s*"([^"]+)"', TF, re.M)
         self.assertIn("Email%20Routing%20Rules%20Read", names)
         self.assertIn('scope      = "com.cloudflare.api.account.zone"', TF)
-        self.assertIn("one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id", TF)
+        group = "one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id"
+        token = TF.split('resource "cloudflare_account_token" "observability_read" {', 1)[1].split("\n}", 1)[0]
+        policies = re.findall(r"(?ms)^    \{\n(.*?)^    \},", token)
+        mail = [policy for policy in policies if group in policy]
+        self.assertEqual(len(mail), 1, "one separate mail policy")
+        all_zones = [policy for policy in policies if '"com.cloudflare.api.account.zone.*"' in policy]
+        self.assertEqual(len(all_zones), 1)
+        self.assertNotIn(group, all_zones[0], "mail rule destinations must not be visible in other zones")
+        self.assertRegex(mail[0], r'(?m)^\s*effect\s*=\s*"allow"\s*$')
+        self.assertIn(f"permission_groups = [{{ id = {group} }}]", mail[0])
+        self.assertIn('resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })', mail[0])
         self.assertNotIn("Email%20Routing%20Addresses", TF)
         for name in re.findall(r'data "cloudflare_account_api_token_permission_groups_list" "[^"]+" \{.*?name\s*=\s*"([^"]+)"', TF, re.S):
             self.assertTrue(name.endswith("Read"), name)
 
-    def test_nothing_that_names_people(self):
+    def test_no_access_audit_or_scim_permissions(self):
         for gid in (ACCESS_AUDIT_LOGS_READ, ACCESS_SCIM_LOGS_READ):
             self.assertNotIn(gid, TF)
 
