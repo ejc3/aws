@@ -132,6 +132,28 @@ variable "minecraft_host_amis" {
   }
 }
 
+# Only Virginia opts in. The configured /128 is for the external proof.
+variable "minecraft_java_access" {
+  description = "Exact reviewed IPv6 Java host AMI and permitted IPv6 source; null leaves the region closed."
+  type = object({
+    host_ami    = string
+    source_cidr = string
+    gpu_slots   = number
+  })
+  default = null
+
+  validation {
+    condition = var.minecraft_java_access == null ? true : (
+      can(regex("^ami-[a-f0-9]{17}$", var.minecraft_java_access.host_ami)) &&
+      (var.minecraft_java_access.source_cidr == "::/0" ||
+        (strcontains(var.minecraft_java_access.source_cidr, ":") &&
+          endswith(var.minecraft_java_access.source_cidr, "/128") &&
+      can(cidrhost(var.minecraft_java_access.source_cidr, 0))))
+    )
+    error_message = "Minecraft Java needs one exact AMI ID and only IPv6 /128 proof sources or ::/0."
+  }
+}
+
 variable "slot_tls_ports" {
   description = "The GPU host ports each place's TLS port is forwarded on (GPU slots, then Windows sandboxes, then Minecraft servers), for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
@@ -248,6 +270,18 @@ locals {
     echo "fcvm-fleet host booted $(date -u +%FT%TZ)" > /var/log/fcvm-fleet-boot.log
     %{if var.host_agent_args != ""~}
     install -d -m 0755 /etc/fcvm-fleet
+    %{if var.minecraft_java_access != null~}
+    install -d -m 0755 /usr/local/libexec /etc/systemd/system/fcvm-fleet-agent.service.d
+    install -m 0755 /dev/null /usr/local/libexec/fcvm-minecraft-java-guard
+    cat > /usr/local/libexec/fcvm-minecraft-java-guard <<'MINECRAFT_GUARD'
+    ${file("${path.module}/minecraft-java-guard.sh")}
+    MINECRAFT_GUARD
+    cat > /etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf <<'MINECRAFT_UNIT'
+    [Service]
+    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard ${var.minecraft_java_access.host_ami} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    MINECRAFT_UNIT
+    systemctl daemon-reload
+    %{endif~}
     agent_args='${var.host_agent_args}'
     %{if length(var.potato_host_amis) > 0~}
     # The publisher changes ImageId without changing user data. Check the
@@ -395,6 +429,26 @@ resource "aws_security_group" "fleet" {
   tags = { Name = "fcvm-fleet" }
 }
 
+# Host-only, never the shared HTTPS security group. The main Fleet group
+# already supplies egress; there is no need for this extra group to grant it.
+resource "aws_security_group" "minecraft_java" {
+  count       = var.minecraft_java_access == null ? 0 : 1
+  name        = "fcvm-fleet-minecraft-java"
+  description = "Fleet host IPv6 Minecraft Java joins"
+  vpc_id      = aws_vpc.this.id
+  tags        = { Name = "fcvm-fleet-minecraft-java" }
+}
+
+resource "aws_vpc_security_group_ingress_rule" "minecraft_java" {
+  count             = var.minecraft_java_access == null ? 0 : 1
+  security_group_id = aws_security_group.minecraft_java[0].id
+  description       = "IPv6 Minecraft Java joins"
+  cidr_ipv6         = var.minecraft_java_access.source_cidr
+  from_port         = 25565
+  to_port           = 25565
+  ip_protocol       = "tcp"
+}
+
 resource "aws_flow_log" "this" {
   vpc_id                   = aws_vpc.this.id
   traffic_type             = "ALL"
@@ -441,8 +495,13 @@ resource "aws_launch_template" "host" {
   }
 
   network_interfaces {
-    device_index                = 0
-    security_groups             = [aws_security_group.fleet.id]
+    device_index = 0
+    # New Terraform defaults attach the extra group only to the reviewed
+    # image. Image-only publisher copies retain the bootstrap gate as well.
+    security_groups = concat([aws_security_group.fleet.id],
+      each.key == "x86_64" && var.gpu_amis[each.key] == try(var.minecraft_java_access.host_ami, "")
+      ? aws_security_group.minecraft_java[*].id : []
+    )
     associate_public_ip_address = true
     ipv6_prefix_count           = 1
     delete_on_termination       = true
@@ -696,6 +755,16 @@ output "host_template_names" {
 output "host_user_data_sha256" {
   description = "SHA-256 of the exact base64-encoded launch template user data."
   value       = sha256(local.user_data)
+}
+
+output "host_minecraft_java_security_group_arns" {
+  description = "Java ingress group ARN for the dedicated x86_64 host-template policy."
+  value       = local.hosts_on && contains(local.host_archs, "x86_64") ? aws_security_group.minecraft_java[*].arn : []
+}
+
+output "host_minecraft_java_template_arn" {
+  description = "Exact x86_64 host launch template used by the dedicated Java ingress policy."
+  value       = var.minecraft_java_access != null ? try(aws_launch_template.host["x86_64"].arn, null) : null
 }
 
 output "host_subnet_ids" {
