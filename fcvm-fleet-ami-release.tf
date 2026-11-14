@@ -89,6 +89,86 @@ locals {
     "host/x86_64/a4a0bd3e" = { image = "ami-04c3294f21cb88942", kind = "host" }
     "host/x86_64/92a26793" = { image = "ami-09ac99f69700ec306", kind = "host" }
     "tile/x86_64/92a26793" = { image = "ami-094ca9c62a284a389", kind = "tile" }
+    "host/x86_64/343b2287" = { image = "ami-05923927f810a2ce9", kind = "host" }
+  }
+}
+
+locals {
+  # Reviewed images built by hand in the build region (us-west-2 since #807). Terraform tags
+  # the original validated there; the publisher's reviewed action copies it to us-east-1 with
+  # its tags (as it copies a factory candidate) and releases the copy, and its record names
+  # the original as the build region's image. Additive, like the catalog above.
+  #
+  # fb2f5c36: built from ejc3/fcvm main fb2f5c36, revised from the f4c57dc3 image (itself built from the 343b2287 one,
+  # never released): everything in 343b2287's, plus fcvm's host kernel instead of Ubuntu's (ejc3/fcvm#1700, 6.18.60),
+  # a browser's first show after a phone retake in about 0.2 s instead of 2.6 to 3.2 s (ejc3/fcvm#1724), a held
+  # phone's stamp read as the whole screen (ejc3/fcvm#1729, ejc3/fcvm#1730), the container frozen across a snapshot
+  # boundary (ejc3/fcvm#1705), working-set replay in first-touch order (ejc3/fcvm#1538, ejc3/fcvm#1704,
+  # ejc3/fcvm#1664), routed restore with one ip -batch (ejc3/fcvm#1702) and the recipe's metal reboot and prep fixes
+  # (ejc3/fcvm#1716, ejc3/fcvm#1736). The IP-options guard is installed by prep and its publication proof passed.
+  #
+  # 853eb034: built from ejc3/fcvm main 853eb034, revised from the fb2f5c36 image: everything in fb2f5c36's, plus
+  # Windows mode's image and bridge (ejc3/fcvm#1742, ejc3/fcvm#1743, ejc3/fcvm#1778; the image is a Windows Server
+  # 2025 evaluation install, rebuilt before its evaluation runs out), Cloud Hypervisor restores with memory mapped
+  # from the snapshot (ejc3/fcvm#1728), and the other changes on fcvm main from fb2f5c36 to 853eb034.
+  #
+  # 0e910245: built from ejc3/fcvm main 0e910245, revised from the 853eb034 image: everything in 853eb034's, plus
+  # Minecraft restores that keep the bots connected (ejc3/fcvm#1824: restore to first chunk 2.0 s to 0.49 s), the
+  # level particles decode fix (ejc3/fcvm#1822), the servers' scheduled reset (ejc3/fcvm#1776), the recipe's wait for
+  # the boot's store restore and its base-store cleanup (ejc3/fcvm#1826, ejc3/fcvm#1827), cached-download.sh's quiet
+  # stdout (ejc3/fcvm#1829), and the other changes on fcvm main from 853eb034 to 0e910245.
+  #
+  # cad0ddad: built from ejc3/fcvm main cad0ddad, revised from the 0e910245 image: everything in 0e910245's, plus
+  # Minecraft view sockets on the host's IPv4 address (ejc3/fcvm#1833), the Windows bridges on an IPv6-enabled podman
+  # network (ejc3/fcvm#1837), the bridges' unauthenticated /still route removed (ejc3/fcvm#1839), and the other changes
+  # on fcvm main from 0e910245 to cad0ddad.
+  fcvm_ami_build_region_reviewed = {
+    "host/x86_64/fb2f5c36" = { image = "ami-0d176763f9f33416e", kind = "host", name = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303" }
+    "host/x86_64/853eb034" = { image = "ami-0925206c2b9eac0fe", kind = "host", name = "fcvm-fleet-host-x86_64-853eb034-202611091050" }
+    "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
+    "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
+  }
+}
+
+resource "aws_ec2_tag" "fcvm_ami_build_region_kind" {
+  provider    = aws.fcvm_fleet_west2
+  for_each    = local.fcvm_ami_build_region_reviewed
+  resource_id = each.value.image
+  key         = "FleetImageKind"
+  value       = each.value.kind
+}
+
+resource "aws_ec2_tag" "fcvm_ami_build_region_validated" {
+  provider    = aws.fcvm_fleet_west2
+  for_each    = local.fcvm_ami_build_region_reviewed
+  resource_id = each.value.image
+  key         = "FleetImageValidated"
+  value       = "true"
+}
+
+# The publisher's us-east-1 copy of each of those images, once it has made one (none before).
+# Potato mode is chosen by the boot image's id, so the host bootstrap names each copy; the
+# reviewed action refuses until it does. Bound to the original by the copy's description and
+# names (the publisher's regional_copy: the original's name, then -copy-2 and -copy-3).
+data "aws_ami_ids" "fcvm_ami_build_region_copies" {
+  provider = aws.fcvm_fleet_east1
+  for_each = local.fcvm_ami_build_region_reviewed
+  owners   = ["self"]
+  filter {
+    name   = "name"
+    values = [each.value.name, "${each.value.name}-copy-2", "${each.value.name}-copy-3"]
+  }
+  filter {
+    name   = "description"
+    values = ["copy of ${each.value.image} from us-west-2"]
+  }
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+  filter {
+    name   = "tag:FleetImageValidated"
+    values = ["true"]
   }
 }
 

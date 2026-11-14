@@ -1,6 +1,7 @@
 """Fixed factory request queue and four-slot broker. No caller-defined EC2 parameters."""
 import base64
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+import copy
 import datetime
 import hashlib
 import hmac
@@ -20,12 +21,50 @@ from botocore.exceptions import ClientError
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
 VOLUMES = {"host": 64, "tile": 32}
-DEADLINE_SECONDS = 240 * 60
+LEGACY_TIMEOUT_MINUTES = 240
+EXTENDED_TIMEOUT_MINUTES = 360
+# First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
+EXTENDED_TIMEOUT_SOURCE = "063042ae40a1a6df3f1b4fc7d72fc3625a427058"
+# This exact source was queued before the pause and boots without fleet user data (aws#850).
+RETIRED_SOURCE_SHA = "3e36a3a36e13fdb03168b77ff6257a707e6654d1"
+RETIRED_SOURCE_REASON = "source retired: fleet host fails to load boot user data"
 PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
+
+
+# Cross-account failure status. Log text can include output from any builder subprocess.
+# Classify known symptoms without copying any log text or regex capture to the Fleet account.
+FAILURE_VERSION = 1
+FAILURE_LOG_EVENTS = 200
+FAILURE_TAIL_BYTES = 32 * 1024
+PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
+FAILURE_REASONS = {
+    "CodeBuild definitively rejected the request before starting": "start_rejected",
+    "CodeBuild execution lease does not match its journal": "invalid_execution_lease",
+    "publication lease expired": "publication_lease_expired",
+    "publication rolled back; automatic replay refused": "publication_rolled_back",
+    "factory stopped or reached its fixed deadline": "build_failed_or_expired",
+}
+BUILD_STATUSES = ("FAILED", "FAULT", "STOPPED", "TIMED_OUT", "SUCCEEDED", "IN_PROGRESS", "QUEUED")
+EXECUTOR_ERRORS = (
+    (re.compile(r"^RuntimeError: candidate viewer path failed:"), "viewer_path_failed"),
+    (re.compile(r"^(?:__main__\.)?BuilderCommandFailed:"), "builder_command_failed"),
+    (re.compile(r"^(?:[A-Za-z_][\w.]*\.)?TimeoutError:"), "executor_timeout"),
+)
+DIAGNOSTIC_CODES = (
+    (re.compile(r"no space left on device|disk quota exceeded", re.I), "disk_full"),
+    (re.compile(r"adb(?:: failed to| could not) install|INSTALL_FAILED_", re.I), "adb_install_failed"),
+    (re.compile(r"failed to fetch|temporary failure resolving", re.I), "download_failed"),
+    (re.compile(r"permission denied|access denied", re.I), "permission_denied"),
+    (re.compile(r"timed out|deadline exceeded", re.I), "timeout"),
+)
+
+
+def diagnostic_codes(text):
+    return [code for pattern, code in DIAGNOSTIC_CODES if pattern.search(text)]
 
 
 class Refused(Exception):
@@ -56,6 +95,29 @@ def public_github(path):
     return json.loads(raw)
 
 
+def execution_timeout_minutes(source):
+    if source == EXTENDED_TIMEOUT_SOURCE:
+        return EXTENDED_TIMEOUT_MINUTES
+    try:
+        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source)
+    except (OSError, ValueError, Refused):
+        # Missing ancestry proof is not permission to extend the legacy bound.
+        return LEGACY_TIMEOUT_MINUTES
+    if isinstance(comparison, dict):
+        base = comparison.get("merge_base_commit")
+        if (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+                and isinstance(base, dict) and base.get("sha") == EXTENDED_TIMEOUT_SOURCE):
+            return EXTENDED_TIMEOUT_MINUTES
+    return LEGACY_TIMEOUT_MINUTES
+
+
+def execution_deadline(build):
+    minutes = build.get("timeoutInMinutes")
+    if type(minutes) is int and minutes in (LEGACY_TIMEOUT_MINUTES, EXTENDED_TIMEOUT_MINUTES):
+        return int(build["startTime"].timestamp()) + minutes * 60
+    return None
+
+
 def documentation_path(path):
     if not isinstance(path, str) or not path.endswith(".md"):
         return False
@@ -64,12 +126,24 @@ def documentation_path(path):
             and (len(pieces) == 1 or pieces[0] == "docs"))
 
 
+def source_descends_from(base, head, limit=None):
+    # GitHub only includes file patches on page one; this check needs ancestry alone.
+    comparison = public_github("compare/" + base + "..." + head + "?per_page=1&page=2")
+    distance = comparison.get("ahead_by")
+    return (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+            and type(distance) is int and distance > 0 and (limit is None or distance <= limit)
+            and comparison.get("merge_base_commit", {}).get("sha") == base)
+
+
 def trusted_ci(source):
     # Pin the actual CI workflow, not its display name (the docs summary is also named CI).
     data = public_github("actions/workflows/ci.yml/runs?branch=main&status=success&per_page=20")
     runs = data.get("workflow_runs")
     if not isinstance(runs, list):
         raise Refused("trusted main CI is unavailable")
+    # A requested ancestor's exact run can follow a newer successful run. Scan the
+    # bounded page for an exact match before trying the existing docs-only fallback.
+    fallback = None
     for run in runs[:20]:
         head = run.get("head_sha", "")
         if not (run.get("conclusion") == "success" and run.get("status") == "completed"
@@ -80,23 +154,23 @@ def trusted_ci(source):
             continue
         if head == source:
             return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        comparison = public_github("compare/" + head + "..." + source)
-        files = comparison.get("files")
-        if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
-                and comparison.get("merge_base_commit", {}).get("sha") == head
-                and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
-                and isinstance(files, list) and len(files) < 300):
-            raise Refused("trusted CI comparison is incomplete or outside its bound")
-        safe = True
-        for item in files:
-            previous = item.get("previous_filename")
-            if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
-                safe = False
-                break
-        if safe:
-            return {"ci_head_sha": head, "ci_run_id": run["id"]}
-        raise Refused("non-documentation changes require successful CI for this exact revision")
-    raise Refused("no successful trusted main CI covers these image inputs")
+        if fallback is None:
+            fallback = head, run["id"]
+    if fallback is None:
+        raise Refused("no successful trusted main CI covers these image inputs")
+    head, run_id = fallback
+    comparison = public_github("compare/" + head + "..." + source)
+    files = comparison.get("files")
+    if not (comparison.get("status") == "ahead" and comparison.get("behind_by") == 0
+            and comparison.get("merge_base_commit", {}).get("sha") == head
+            and type(comparison.get("total_commits")) is int and 0 < comparison["total_commits"] <= 250
+            and isinstance(files, list) and len(files) < 300):
+        raise Refused("trusted CI comparison is incomplete or outside its bound")
+    for item in files:
+        previous = item.get("previous_filename")
+        if not documentation_path(item.get("filename")) or previous is not None and not documentation_path(previous):
+            raise Refused("non-documentation changes require successful CI for this exact revision")
+    return {"ci_head_sha": head, "ci_run_id": run_id}
 
 
 def strict(event, allowed, required):
@@ -111,6 +185,7 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
+        self.failures = []
 
     def client(self, service, fleet=False, region=None):
         # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
@@ -121,7 +196,9 @@ class Factory:
             if fleet:
                 creds = self.client("sts").assume_role(RoleArn=self.env["FLEET_ROLE"], RoleSessionName="image-factory-broker")["Credentials"]
                 kw.update(aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
-            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}), **kw)
+            # These reads are diagnostic only and run in the single-concurrency dispatcher.
+            timeouts = {"connect_timeout": 2, "read_timeout": 3} if service in ("logs", "s3") else {}
+            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}, **timeouts), **kw)
         return self.clients[key]
 
     def release_ssm(self):
@@ -155,7 +232,8 @@ class Factory:
         record = self.load("/requests/" + journal["request_id"], {})
         build = self.actual_build(journal["build_id"], active=False)
         return (control.get("active") == journal["build_id"] and record.get("status") not in (None, "superseded", "failed")
-                and build["buildStatus"] == "IN_PROGRESS" and build.get("resolvedSourceVersion") == journal["source_sha"])
+                and build["buildStatus"] == "IN_PROGRESS" and build.get("resolvedSourceVersion") == journal["source_sha"]
+                and execution_deadline(build) == journal["deadline_unix"])
 
     def actual_build(self, build_id, active=True):
         if not isinstance(build_id, str) or not build_id.startswith(self.project + ":") or not re.fullmatch(r"[0-9a-f-]{36}", build_id.split(":", 1)[1]):
@@ -181,7 +259,8 @@ class Factory:
         if journal is None:
             started = int(build["startTime"].timestamp())
             journal = {"build_id": build_id, "source_sha": source, "input_sha256": input_sha, "request_id": input_sha,
-                       "started": started, "deadline_unix": started + DEADLINE_SECONDS, "slots": {}, "candidates": {}}
+                       # An unsupported receipt has no compute lease, but still gets cleanup.
+                       "started": started, "deadline_unix": execution_deadline(build) or started, "slots": {}, "candidates": {}}
             self.save(suffix, journal)
         if journal["source_sha"] != source or journal["input_sha256"] != input_sha:
             raise Refused("immutable build provenance changed")
@@ -383,6 +462,26 @@ class Factory:
         return {"status": result["Status"], "response_code": result.get("ResponseCode"),
                 "standard_output": result.get("StandardOutputContent", ""), "standard_error": result.get("StandardErrorContent", "")}
 
+    def admitted_sources(self, control):
+        last = control.get("last_source")
+        if last is not None:
+            sources = [last]
+        else:
+            # Before last_source existed, these records could already hold a newer
+            # revision. Do not let the first ancestor request displace that work.
+            sources = []
+            pending = control.get("pending")
+            if pending is not None:
+                sources.append(self.request_record(pending).get("source_sha"))
+            active = control.get("active")
+            if isinstance(active, dict):
+                sources.append(self.request_record(active.get("intent")).get("source_sha"))
+            elif active is not None:
+                sources.append(self.actual_build(active, active=False).get("resolvedSourceVersion"))
+        if any(not isinstance(source, str) or not SHA.fullmatch(source) for source in sources):
+            raise Refused("a previously admitted factory source could not be verified")
+        return sorted(set(sources))
+
     def request(self, event):
         action = event.get("action")
         if action == "status":
@@ -394,6 +493,8 @@ class Factory:
             raise Refused("invalid image request")
         if self.env.get("ENABLED") != "true":
             return {"request_id": event["input_sha256"], "status": "disabled", "message": "factory automation is disabled"}
+        if event["source_sha"] == RETIRED_SOURCE_SHA:
+            raise Refused(RETIRED_SOURCE_REASON)
         request_id = event["input_sha256"]
         existing = self.load("/requests/" + request_id)
         if existing:
@@ -404,18 +505,27 @@ class Factory:
                 existing = self.request_record(request_id)
             return public_record(existing)
         current = public_github("git/ref/heads/main")["object"]["sha"]
-        if current != event["source_sha"]:
-            raise Refused("only the current main revision can enter the factory")
-        ci = trusted_ci(current)
-        now = int(self.now())
-        record = {"request_id": request_id, "status": "queued", "source_sha": current, "input_sha256": request_id,
-                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
+        source = event["source_sha"]
         control = self.load("/control", {})
+        if current != source:
+            # A busy main rarely holds still for its CI (the next merge cancels the head's run, a
+            # download fails it), so a recent ancestor of main with its own successful CI enters
+            # too, but never one older than a revision already admitted: that would roll back.
+            if not source_descends_from(source, current, limit=250):
+                raise Refused("only main or a recent ancestor of it can enter the factory")
+            for floor in self.admitted_sources(control):
+                if floor != source and not source_descends_from(floor, source):
+                    raise Refused("requested main revision does not descend from a source already admitted by the factory")
+        ci = trusted_ci(source)
+        now = int(self.now())
+        record = {"request_id": request_id, "status": "queued", "source_sha": source, "input_sha256": request_id,
+                  "priority": event["priority"], "build_id": None, "created": now, "not_before": now + (21600 if event["priority"] == "normal" else 0), "deadline_unix": None, **ci}
         previous = self.request_record(control["pending"]) if control.get("pending") else None
         if (previous is not None and previous["priority"] == record["priority"] == "normal"
                 and previous["status"] == "queued" and not previous.get("start_attempted")):
             # Keep the first request's window while replacing its source with the newest main.
             record["not_before"] = min(record["not_before"], previous["not_before"])
+        record["build_timeout_minutes"] = execution_timeout_minutes(record["source_sha"])
         self.save("/requests/" + request_id, record)
         if previous is not None:
             if previous["priority"] == "critical" and record["priority"] == "normal":
@@ -425,6 +535,7 @@ class Factory:
             previous.update(status="superseded", message="a newer input superseded this queued request")
             self.save("/requests/" + previous["request_id"], previous)
         control["pending"] = request_id
+        control["last_source"] = source
         self.save("/control", control)
         self.reconcile()
         return public_record(self.request_record(request_id))
@@ -459,8 +570,103 @@ class Factory:
         self.save(suffix, journal)
         return complete
 
+    def executor_failure(self, build):
+        """A fixed executor error code and a validated archive locator; the locator stays internal."""
+        logs = build.get("logs") or {}
+        group, stream = logs.get("groupName"), logs.get("streamName")
+        if not isinstance(group, str) or not isinstance(stream, str):
+            return None, None
+        events = self.client("logs").get_log_events(logGroupName=group, logStreamName=stream,
+            startFromHead=False, limit=FAILURE_LOG_EVENTS)["events"]
+        error, receipt = None, None
+        for event in events:
+            message = str(event.get("message", "")).strip()
+            if message.startswith('{"phaseDiagnostics"'):
+                try:
+                    value = json.loads(message)["phaseDiagnostics"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                kind = value.get("kind") if isinstance(value, dict) else None
+                if isinstance(kind, str) and value.get("phase") in PHASES.get(kind, ()):
+                    version = value.get("version_id")
+                    if not isinstance(version, str) or not 0 < len(version) <= 1024 or version == "null":
+                        version = None
+                    receipt = {"kind": kind, "phase": value["phase"], "version_id": version}
+            else:
+                for pattern, code in EXECUTOR_ERRORS:
+                    if pattern.match(message):
+                        error = code
+                        break
+        return error, receipt
+
+    def phase_diagnostic_codes(self, journal, receipt):
+        """Classify a bounded read of one archived phase from its builder's prefix."""
+        instance_id = journal["slots"].get(receipt["kind"] + "-build", {}).get("instance_id")
+        if not receipt.get("version_id") or not isinstance(instance_id, str) or not re.fullmatch(r"i-[0-9a-f]{17}", instance_id):
+            return None
+        key = ("builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/"
+               + instance_id + "/diagnostics/" + receipt["kind"] + "-" + receipt["phase"] + ".log")
+        response = self.client("s3", False, self.env["PIPELINE_REGION"]).get_object(Bucket=self.env["PIPELINE_BUCKET"],
+            Key=key, VersionId=receipt["version_id"], Range="bytes=-" + str(FAILURE_TAIL_BYTES))
+        with closing(response["Body"]) as body:
+            return diagnostic_codes(body.read(FAILURE_TAIL_BYTES).decode("utf-8", "replace"))
+
+    def publish_failure(self, record, journal=None, build=None):
+        """Write fixed failure codes and validated build metadata; never forward free-form text."""
+        name = self.env.get("FAILURE_PARAMETER")
+        request_id, source = record.get("request_id"), record.get("source_sha")
+        if (not name or record.get("status") != "failed" or not isinstance(request_id, str)
+                or not INPUT.fullmatch(request_id)):
+            return
+        message = record.get("message")
+        reason = FAILURE_REASONS.get(message, "unknown_failure") if isinstance(message, str) else "unknown_failure"
+        status = (build or {}).get("buildStatus")
+        value = {"version": FAILURE_VERSION, "request_id": request_id,
+                 "source_sha": source if isinstance(source, str) and SHA.fullmatch(source) else None,
+                 "status": "failed", "reason": reason, "failed_at": int(self.now()),
+                 "build_status": status if status in BUILD_STATUSES else None,
+                 "executor_error": None, "phase": None, "diagnostic_codes": [], "unavailable": []}
+        receipt = None
+        if build is not None:
+            try:
+                value["executor_error"], receipt = self.executor_failure(build)
+                if receipt:
+                    value["phase"] = {"kind": receipt["kind"], "phase": receipt["phase"]}
+            except Exception:
+                value["unavailable"].append("executor_log")
+        if receipt:
+            try:
+                codes = self.phase_diagnostic_codes(journal, receipt) if journal is not None else None
+            except Exception:
+                codes = None
+            if codes is None:
+                value["unavailable"].append("phase_diagnostics")
+            else:
+                value["diagnostic_codes"] = codes
+        try:
+            self.release_ssm().put_parameter(Name=name, Type="String", Overwrite=True,
+                Value=json.dumps(value, separators=(",", ":")))
+        except Exception as error:
+            print(json.dumps({"failure_parameter_error": type(error).__name__}))
+
+    def queue_failure(self, record, journal=None, build=None):
+        # A publisher rollback can leave a request failed before the dispatcher sees it.
+        # Track the best-effort report separately from the request's terminal state.
+        if not self.env.get("FAILURE_PARAMETER") or record.get("failure_report_queued") is True:
+            return
+        record["failure_report_queued"] = True
+        self.save("/requests/" + record["request_id"], record)
+        self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
+
     def reconcile(self):
-        publication = self.reconcile_control()
+        self.failures = []
+        try:
+            publication = self.reconcile_control()
+        finally:
+            # In the order they were recorded, so the parameter ends on the newest.
+            failures, self.failures = self.failures, []
+            for failure in failures:
+                self.publish_failure(*failure)
         if publication is not None:
             # The publisher takes this same mutex. Invoke only after releasing it.
             response = self.client("lambda").invoke(FunctionName=self.env["PUBLISH_FUNCTION"], InvocationType="Event",
@@ -489,6 +695,7 @@ class Factory:
                     if control.get("pending") == start_record["request_id"]:
                         control["pending"] = None
                         pending = None
+                    self.queue_failure(start_record)
                     self.save("/control", control)
                     start_record = None
             elif active:
@@ -496,11 +703,12 @@ class Factory:
                 build = self.actual_build(active, active=False)
                 record = self.request_record(journal["request_id"])
                 preempt = pending and pending["priority"] == "critical" and pending["request_id"] != record["request_id"]
-                succeeded = build["buildStatus"] == "SUCCEEDED"
+                invalid_lease = execution_deadline(build) != journal["deadline_unix"]
+                succeeded = build["buildStatus"] == "SUCCEEDED" and not invalid_lease
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
-                if succeeded:
+                if succeeded and record["status"] != "failed":
                     if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
                         raise Refused("successful build has no final execution receipt")
                     publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
@@ -508,17 +716,33 @@ class Factory:
                     if self.now() >= publication_deadline:
                         release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
-                if preempt or expired or failed or publication_expired:
+                if record["status"] == "failed":
+                    # Preserve the publisher's rollback reason even after its lease expires.
+                    self.queue_failure(record, journal, build)
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
                     self.cleanup(journal)
-                    record.update(status="superseded" if preempt else "failed", message="preempted by critical work" if preempt else "publication lease expired" if publication_expired else "factory stopped or reached its fixed deadline")
-                    self.save("/requests/" + record["request_id"], record)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
                     self.save("/control", control)
-                elif record["status"] in ("promoted", "failed", "superseded"):
+                elif preempt or expired or failed or publication_expired or invalid_lease:
+                    if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
+                        self.client("codebuild").stop_build(id=active)
+                    self.cleanup(journal)
+                    message = ("preempted by critical work" if preempt else
+                               "CodeBuild execution lease does not match its journal" if invalid_lease else
+                               "publication lease expired" if publication_expired else
+                               "factory stopped or reached its fixed deadline")
+                    record.update(status="superseded" if preempt else "failed", message=message)
+                    self.save("/requests/" + record["request_id"], record)
+                    if record["status"] == "failed":
+                        self.queue_failure(record, journal, build)
+                    if not self.gone(suffix, journal):
+                        return
+                    control["active"] = None
+                    self.save("/control", control)
+                elif record["status"] in ("promoted", "superseded"):
                     self.cleanup(journal)
                     if not self.gone(suffix, journal):
                         return
@@ -543,6 +767,17 @@ class Factory:
             if start_record is None:
                 if not pending or self.env.get("ENABLED") != "true":
                     return
+                if pending.get("source_sha") == RETIRED_SOURCE_SHA:
+                    if pending.get("start_attempted") or pending.get("build_id"):
+                        raise Refused("retired request has an uncertain start")
+                    if pending["status"] not in ("queued", "superseded"):
+                        raise Refused("retired pending request has an unexpected status")
+                    # Save terminal status first so a lost control write can be retried safely.
+                    pending.update(status="superseded", message=RETIRED_SOURCE_REASON)
+                    self.save("/requests/" + pending["request_id"], pending)
+                    control["pending"] = None
+                    self.save("/control", control)
+                    return
                 today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
                 if pending["priority"] == "normal" and (self.now() < pending["not_before"] or control.get("last_normal_day") == today):
                     return
@@ -557,8 +792,10 @@ class Factory:
         # No backend lock is held through StartBuild or its reconciliation.
         if is_new:
             try:
+                minutes = (EXTENDED_TIMEOUT_MINUTES if start_record.get("build_timeout_minutes") == EXTENDED_TIMEOUT_MINUTES
+                           else LEGACY_TIMEOUT_MINUTES)
                 build = self.client("codebuild").start_build(projectName=self.project, sourceVersion=start_record["source_sha"],
-                    idempotencyToken=start_record["request_id"], environmentVariablesOverride=[
+                    idempotencyToken=start_record["request_id"], timeoutInMinutesOverride=minutes, environmentVariablesOverride=[
                         {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
                         {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
                         {"name": "FLEET_AMI_CAPABILITY", "value": secrets.token_urlsafe(32), "type": "PLAINTEXT"}])["build"]
@@ -573,6 +810,9 @@ class Factory:
                     if acquired:
                         control = self.load("/control", {})
                         if control.get("active") == {"intent": record["request_id"]}:
+                            # Queue the failure while the durable no_build intent can still
+                            # recover it, then clear the intent before publishing outside the lock.
+                            self.queue_failure(record)
                             control["active"] = None
                             if control.get("pending") == record["request_id"]:
                                 control["pending"] = None
@@ -593,7 +833,8 @@ class Factory:
             if control.get("active") != {"intent": start_record["request_id"]}:
                 raise Refused("build start no longer owns the control intent")
             record = self.request_record(start_record["request_id"])
-            record.update(status="superseded" if record["status"] == "superseded" else "building", build_id=build["id"], deadline_unix=int(build["startTime"].timestamp()) + DEADLINE_SECONDS)
+            record.update(status="superseded" if record["status"] == "superseded" else "building",
+                          build_id=build["id"], deadline_unix=execution_deadline(build))
             control["active"] = build["id"]
             if control.get("pending") == start_record["request_id"]:
                 control["pending"] = None
@@ -613,9 +854,15 @@ class Factory:
             if not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
                 continue
             journal = self.load("/builds/" + build_hash)
-            age = self.now() - instance["LaunchTime"].timestamp()
-            expired = age >= DEADLINE_SECONDS or journal is not None and self.now() >= journal["deadline_unix"]
-            terminal = journal is not None and self.actual_build(journal["build_id"], active=False)["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
+            if journal is not None:
+                build = self.actual_build(journal["build_id"], active=False)
+                deadline = execution_deadline(build)
+                expired = deadline is None or self.now() >= min(deadline, journal["deadline_unix"])
+                terminal = build["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
+            else:
+                # A real launch has a durable journal before RunInstances; a lost journal cannot extend compute.
+                expired = self.now() - instance["LaunchTime"].timestamp() >= LEGACY_TIMEOUT_MINUTES * 60
+                terminal = False
             if expired or terminal:
                 self.client("ec2", True).terminate_instances(InstanceIds=[instance["InstanceId"]])
         self.reconcile()

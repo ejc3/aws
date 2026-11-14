@@ -165,6 +165,53 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertEqual(self.remove(candidate["token"]), {"status": "skipped"})
         self.assertEqual((path / "src/new.local").read_text(), "created after listing")
 
+    def test_untracked_dependency_root_skips_recursive_status(self):
+        dirty = self.worktree("dirty-dependencies")
+        cache = dirty / "node_modules"
+        cache.mkdir()
+        (cache / "cached-package.local").write_text("local dependency")
+        clean = self.worktree("clean")
+
+        checks = []
+        git = WORKER.git
+
+        def record(home, path, *args, **kwargs):
+            if args[0] == "status":
+                checks.append(path)
+            return git(home, path, *args, **kwargs)
+
+        with mock.patch.object(WORKER, "git", side_effect=record):
+            [candidate] = self.list()
+        self.assertIn(clean, checks)
+        self.assertNotIn(dirty, checks)
+        self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertTrue(cache.exists())
+
+    def test_one_unreadable_worktree_preserves_it_without_blocking_another(self):
+        unreadable = self.worktree("unreadable")
+        eligible = self.worktree("eligible")
+        self.set_age(unreadable, 1)
+        self.set_age(eligible, 2)
+        real_clean = WORKER.clean
+
+        def verify(home, path, head, admin):
+            if path == unreadable:
+                raise WORKER.Incomplete("command timed out")
+            return real_clean(home, path, head, admin)
+
+        with mock.patch.object(WORKER, "clean", side_effect=verify):
+            [candidate] = self.list()
+            self.assertEqual(candidate["age_ns"], 2)
+            self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertTrue(unreadable.exists())
+
+    def test_nested_untracked_files_are_still_rejected(self):
+        dirty = self.worktree("dirty-nested")
+        extra = dirty / "src" / "local.local"
+        extra.write_text("not tracked")
+        self.assertEqual(self.list(), [])
+        self.assertTrue(extra.exists())
+
     def test_squash_requires_exact_pr_head_and_reachable_merge(self):
         path = self.worktree("squash")
         head = self.commit(path)
@@ -199,6 +246,30 @@ class WorktreePruneTests(unittest.TestCase):
         self.origin_url = b"ssh://some-other-host/private/repo\n"
         self.assertEqual(self.list(), [])
         self.assertEqual(self.network, [])
+
+    def test_one_listing_reuses_proof_across_clones_and_remove_checks_again(self):
+        first = self.worktree("first")
+        clone = self.home / "other-clone"
+        self.git(self.home, "clone", "-q", str(self.remote), str(clone))
+        second = self.home / "second"
+        self.git(clone, "worktree", "add", "-q", "-b", "second", str(second))
+        self.set_age(first, 1)
+        self.set_age(second, 2)
+
+        merged = WORKER.merged
+        with mock.patch.object(WORKER, "merged", side_effect=merged) as proof:
+            old, new = self.list()
+            self.assertEqual(proof.call_count, 1)
+        self.assertEqual([old["age_ns"], new["age_ns"]], [1, 2])
+        self.assertEqual(self.network, ["repos/example/app", "repos/example/app/git/ref/heads/main"])
+
+        # An earlier candidate list is not proof at removal time.
+        self.network.clear()
+        with mock.patch.object(WORKER, "merged", return_value=False) as proof:
+            self.assertEqual(self.remove(old["token"]), {"status": "skipped"})
+            proof.assert_called_once()
+        self.assertEqual(self.network, ["repos/example/app", "repos/example/app/git/ref/heads/main"])
+        self.assertTrue(first.exists())
 
     def test_stale_clone_requires_exact_remote_ancestry_without_fetching(self):
         path = self.worktree("candidate")

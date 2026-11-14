@@ -110,9 +110,41 @@ variable "potato_host_amis" {
   }
 }
 
+variable "windows_host_amis" {
+  description = "Exact reviewed host AMIs that include Windows mode's image and bridge; their hosts run four Windows sandboxes."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for ami in var.windows_host_amis : can(regex("^ami-[0-9a-f]{17}$", ami))])
+    error_message = "Each windows_host_amis entry must be an exact EC2 AMI ID."
+  }
+}
+
+variable "minecraft_host_amis" {
+  description = "Exact reviewed host AMIs whose fcvm has Minecraft mode and the tile image; their hosts run four Minecraft servers."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for ami in var.minecraft_host_amis : can(regex("^ami-[0-9a-f]{17}$", ami))])
+    error_message = "Each minecraft_host_amis entry must be an exact EC2 AMI ID."
+  }
+}
+
 variable "slot_tls_ports" {
-  description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
+  description = "The GPU host ports each place's TLS port is forwarded on (GPU slots, then Windows sandboxes, then Minecraft servers), for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
+}
+
+variable "windows_count" {
+  description = "Windows sandboxes on a host booted from one of windows_host_amis (--windows); their TLS ports follow the GPU slots'."
+  type        = number
+}
+
+variable "minecraft_count" {
+  description = "Minecraft servers on a host booted from one of minecraft_host_amis (--minecraft); their TLS ports follow the sandboxes'."
+  type        = number
 }
 
 variable "host_profile_name" {
@@ -229,8 +261,43 @@ locals {
       case "$boot_ami" in
         ${join("|", sort(tolist(var.potato_host_amis)))}) agent_args="$agent_args --potato-players 96" ;;
       esac
+      %{if length(var.windows_host_amis) > 0~}
+      # An agent from an older image has no --windows and would refuse it.
+      case "$boot_ami" in
+        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows ${var.windows_count}" ;;
+      esac
+      %{endif~}
+      %{if length(var.minecraft_host_amis) > 0~}
+      # An agent from an older image has no --minecraft and would refuse it.
+      case "$boot_ami" in
+        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft ${var.minecraft_count}" ;;
+      esac
+      %{endif~}
     fi
     unset token boot_ami
+    %{endif~}
+    %{~if var.ami_release_parameter_arn != ""~}
+    # The factory publisher can change ImageId while retaining this bootstrap.
+    # An unlisted image can run a mode only if it has both that mode's image in
+    # root's Podman store and the flag in its installed agent. Windows remains
+    # allowlisted above: the presence of its assets does not prove /still is safe.
+    have_mode_artifact() {
+      case " $agent_args " in *" $1 "*|*" $1="*) return 1 ;; esac
+      /usr/bin/timeout -k 1 10 /usr/bin/podman image exists "$2" 2>/dev/null
+    }
+    potato_present=false
+    minecraft_present=false
+    if have_mode_artifact --potato-players localhost/fcvm-potato:fleet; then potato_present=true; fi
+    if have_mode_artifact --minecraft localhost/fcvm-minecraft:fleet; then minecraft_present=true; fi
+    if { "$potato_present" || "$minecraft_present"; } &&
+      mode_help=$(/usr/bin/timeout -k 1 10 /usr/local/bin/fcvm fleet agent --help 2>/dev/null); then
+      if "$potato_present" && grep -Eq -- '^[[:space:]]+--potato-players([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --potato-players 96"
+      fi
+      if "$minecraft_present" && grep -Eq -- '^[[:space:]]+--minecraft([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --minecraft ${var.minecraft_count}"
+      fi
+    fi
     %{endif~}
     printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
     systemctl enable fcvm-fleet-agent.service

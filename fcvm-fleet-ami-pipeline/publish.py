@@ -38,7 +38,7 @@ NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-"
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
-DEADLINE_SECONDS = 240 * 60
+EXECUTION_TIMEOUT_MINUTES = (240, 360)
 
 
 class Refused(Exception):
@@ -48,6 +48,13 @@ class Refused(Exception):
 def need(value, message):
     if not value:
         raise Refused(message)
+
+
+def execution_lease_seconds(build):
+    minutes = build.get("timeoutInMinutes")
+    need(type(minutes) is int and minutes in EXECUTION_TIMEOUT_MINUTES,
+         "CodeBuild execution lease is missing or unsupported")
+    return minutes * 60
 
 
 def encoded(value):
@@ -273,6 +280,174 @@ class Publisher:
             },
         })
 
+    def reviewed_retake_host_release(self):
+        stride = self.reviewed_stride_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-six receipt selected the next version on each tile
+        # and version 23 on the host, after Terraform prepared version 22.
+        versions = {key: number + 1 for key, number in stride["expected"]["versions"].items()}
+        versions[host_key] = 23
+        return self.reviewed_pair({
+            "source_sha": "343b2287636d07b1726ab7a2d431c9a1ec854a67",
+            "images": {"host": "ami-05923927f810a2ce9", "tile": stride["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 6, "source_sha": stride["source_sha"],
+                "build_id": "reviewed-stride-release:" + digest(encoded(stride)),
+                "guard_sha256": self.env["GUARD_SHA256"], "versions": versions,
+                "previous": {k: v for k, v in stride["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in stride["images"].items()},
+            },
+        }, host_only=True)
+
+    def reviewed_held_stamp_host_release(self):
+        retake = self.reviewed_retake_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-seven receipt selected version 25 on the host, after
+        # Terraform prepared version 24, and kept every tile's version.
+        return self.reviewed_pair({
+            "source_sha": "fb2f5c361175bb8a0b5baac141e359906543e101",
+            "images": {"host": "ami-0d176763f9f33416e", "tile": retake["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 7, "source_sha": retake["source_sha"],
+                "build_id": "reviewed-retake-host-release:" + digest(encoded(retake)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**retake["expected"]["versions"], host_key: 25},
+                "previous": {k: v for k, v in retake["expected"].items() if k != "previous"},
+                **{kind + "_amis": {self.env["COMPUTE_REGION"]: {"x86_64": image}}
+                   for kind, image in retake["images"].items()},
+            },
+        }, host_only=True)
+
+    # The publisher's us-east-1 copy of the fb2f5c36 host, which the generation-eight receipt names.
+    HELD_STAMP_HOST_COPY = "ami-02217558b180d38fb"
+
+    def reviewed_windows_host_release(self):
+        held = self.reviewed_held_stamp_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # The generation-eight receipt selected version 27 on the host, after Terraform prepared
+        # version 26, kept every tile's version, and names the publisher's us-east-1 copy of the
+        # fb2f5c36 host (the reviewed identity is the us-west-2 original).
+        return self.reviewed_pair({
+            "source_sha": "853eb034a4611e4e4d3b7e79caaf03cf5b2ed643",
+            "images": {"host": "ami-0925206c2b9eac0fe", "tile": held["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 8, "source_sha": held["source_sha"],
+                "build_id": "reviewed-held-stamp-host-release:" + digest(encoded(held)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**held["expected"]["versions"], host_key: 27},
+                "previous": {k: v for k, v in held["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.HELD_STAMP_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": held["images"]["tile"]}},
+            },
+        }, host_only=True)
+
+    # The generation-nine receipt (/fcvm-fleet/ami-release, version 10, 2026-11-13): the publisher's
+    # us-east-1 copy of the 853eb034 host it names, and the host template version it selects.
+    WINDOWS_HOST_COPY = "ami-0aae929f9b7dfd764"
+    WINDOWS_HOST_VERSION = 30
+
+    def reviewed_restore_host_release(self):
+        windows = self.reviewed_windows_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # Generation ten: the 0e910245 host, whose Minecraft servers keep their bots connected
+        # across a restore (ejc3/fcvm#1824). Its predecessor is the generation-nine receipt.
+        return self.reviewed_pair({
+            "source_sha": "0e910245f92d3ff093ec1fad1fdbe69fef948f3c",
+            "images": {"host": "ami-0c1f87eea5c86c172", "tile": windows["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 9, "source_sha": windows["source_sha"],
+                "build_id": "reviewed-windows-host-release:" + digest(encoded(windows)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**windows["expected"]["versions"], host_key: self.WINDOWS_HOST_VERSION},
+                "previous": {k: v for k, v in windows["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.WINDOWS_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": windows["images"]["tile"]}},
+            },
+        }, host_only=True)
+
+    # The generation-ten receipt (/fcvm-fleet/ami-release, version 11, 2026-11-13): the publisher's
+    # us-east-1 copy of the 0e910245 host it names, and the host template version it selects.
+    RESTORE_HOST_COPY = "ami-0f80d4d1c02857480"
+    RESTORE_HOST_VERSION = 32
+
+    def reviewed_ipv4_host_release(self):
+        restore = self.reviewed_restore_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        host_key = host["region"] + "/" + host["id"]
+        # Generation eleven: the cad0ddad host. Its Minecraft servers publish their view sockets on
+        # the host's IPv4 address (ejc3/fcvm#1833), its Windows bridges are on an IPv6-enabled
+        # network (ejc3/fcvm#1837), and the bridges' unauthenticated /still route is gone
+        # (ejc3/fcvm#1839). Its predecessor is the generation-ten receipt.
+        return self.reviewed_pair({
+            "source_sha": "cad0ddad653808dcce3acc78264c7c84263fac6a",
+            "images": {"host": "ami-05c06ef8ae037b10a", "tile": restore["images"]["tile"]},
+            "expected": {
+                "version": 1, "generation": 10, "source_sha": restore["source_sha"],
+                "build_id": "reviewed-restore-host-release:" + digest(encoded(restore)),
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {**restore["expected"]["versions"], host_key: self.RESTORE_HOST_VERSION},
+                "previous": {k: v for k, v in restore["expected"].items() if k != "previous"},
+                "host_amis": {self.env["COMPUTE_REGION"]: {"x86_64": self.RESTORE_HOST_COPY}},
+                "tile_amis": {self.env["COMPUTE_REGION"]: {"x86_64": restore["images"]["tile"]}},
+            },
+        }, host_only=True)
+
+    # The generation-eleven receipt (/fcvm-fleet/ami-release version 12, 2026-11-13): the publisher's
+    # us-east-1 copy of the cad0ddad host it names, and the host template version it selects.
+    IPV4_HOST_COPY = "ami-0ab1b335605d4902c"
+    IPV4_HOST_VERSION = 34
+    # The generation-twelve receipt (version 13, 2026-11-14), which the image factory published from
+    # ejc3/fcvm 5cb0257d: its build, its images in us-east-1, and that it selected the next version of
+    # every template (host 35, tiles 15, 18 and 18).
+    FACTORY_TWELVE_BUILD = "fcvm-fleet-image-factory:4481950e-b4f6-4121-a8d5-4f6323d0c990"
+    FACTORY_TWELVE_SOURCE = "5cb0257d07e95129ad91ab45d0f804bd669b5b58"
+    FACTORY_TWELVE_HOST = "ami-0af4efcc4f8abe951"
+    FACTORY_TWELVE_TILE = "ami-05219ce75766aea15"
+
+    def ipv4_host_receipt(self):
+        """The generation-eleven receipt, as reviewed_ipv4_host_release's publication wrote it."""
+        ipv4 = self.reviewed_ipv4_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        region = self.env["COMPUTE_REGION"]
+        return {
+            "version": 1, "generation": 11, "source_sha": ipv4["source_sha"],
+            "build_id": "reviewed-ipv4-host-release:" + digest(encoded(ipv4)),
+            "guard_sha256": self.env["GUARD_SHA256"],
+            "versions": {**ipv4["expected"]["versions"], host["region"] + "/" + host["id"]: self.IPV4_HOST_VERSION},
+            "previous": {k: v for k, v in ipv4["expected"].items() if k != "previous"},
+            "host_amis": {region: {"x86_64": self.IPV4_HOST_COPY}},
+            "tile_amis": {region: {"x86_64": ipv4["images"]["tile"]}},
+        }
+
+    def reviewed_generation_eleven_rollback(self):
+        eleven = self.ipv4_host_receipt()
+        region = self.env["COMPUTE_REGION"]
+        # Generation twelve's host image boots fcvm's host kernel with no initramfs, so the network
+        # driver loads after cloud-init's first stage has looked for a network interface. cloud-init
+        # then never reaches the instance metadata service, runs no user data, and the host's fleet
+        # agent has no arguments and does not start: no GPU slot, phone, Windows sandbox or Minecraft
+        # server on staging. This puts back generation eleven's host and tile images, on which the
+        # staging viewer smoke passed on every tile, as the next generation. Its predecessor is the
+        # exact generation-twelve receipt.
+        return self.reviewed_pair({
+            "source_sha": eleven["source_sha"],
+            "images": {"host": self.IPV4_HOST_COPY, "tile": eleven["tile_amis"][region]["x86_64"]},
+            "expected": {
+                "version": 1, "generation": 12, "source_sha": self.FACTORY_TWELVE_SOURCE,
+                "build_id": self.FACTORY_TWELVE_BUILD,
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {key: number + 1 for key, number in eleven["versions"].items()},
+                "previous": {k: v for k, v in eleven.items() if k != "previous"},
+                "host_amis": {region: {"x86_64": self.FACTORY_TWELVE_HOST}},
+                "tile_amis": {region: {"x86_64": self.FACTORY_TWELVE_TILE}},
+            },
+        })
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -446,9 +621,88 @@ class Publisher:
         need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
         return self.run_reviewed(self.reviewed_stride_release(), "reviewed-stride-release", host_user_data=host_user_data)
 
-    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False):
+    def run_retake_host_release(self, event):
+        need(event == {"action": "activate-reviewed-retake-host-release"},
+             "reviewed host release accepts no caller configuration")
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        return self.run_reviewed(self.reviewed_retake_host_release(), "reviewed-retake-host-release",
+                                 host_user_data=host_user_data, host_only=True)
+
+    def reviewed_release_copy(self, original, kind):
+        """The release-region copy of a reviewed image built by hand in BUILD_REGION.
+
+        The copy is made the way release_copies makes a factory candidate's (same name, a
+        CopyImage that carries the original's tags, found again by name on a replay), so the
+        release names a us-east-1 copy, replicate records the original as the build region's
+        image, and retention sees both. Returns None while the copy is pending."""
+        compute = self.env["COMPUTE_REGION"]
+        need(self.build_region != compute, "a reviewed build-region image needs a distinct build region")
+        rows = self.client("ec2", True, self.build_region).describe_images(ImageIds=[original])["Images"]
+        need(len(rows) == 1, "reviewed image is missing")
+        image = rows[0]
+        tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+        validated = {"Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                     "GuardHelperSHA256": self.env["GUARD_SHA256"]}
+        need(image.get("ImageId") == original and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+             and image.get("Public") is False and image.get("State") == "available"
+             and image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs"
+             and NAME[kind].fullmatch(image.get("Name", ""))
+             # build-ami.sh's CreateImage, not a copy (both report a SourceImageId: a CreateImage
+             # image's is the image its builder booted)
+             and image.get("Description") == "fcvm fleet: " + image.get("Name", "")
+             and all(tags.get(key) == value for key, value in validated.items()),
+             "reviewed image is outside its private validated scope")
+        return self.regional_copy(self.client("ec2", True), compute, original, self.build_region,
+                                  image["Name"], validated, factory=True)
+
+    def run_held_stamp_host_release(self, event):
+        need(event == {"action": "activate-reviewed-held-stamp-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_held_stamp_host_release(), "reviewed-held-stamp-host-release")
+
+    def run_restore_host_release(self, event):
+        need(event == {"action": "activate-reviewed-restore-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_restore_host_release(), "reviewed-restore-host-release")
+
+    def run_ipv4_host_release(self, event):
+        need(event == {"action": "activate-reviewed-ipv4-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
+
+    def run_generation_eleven_rollback(self, event):
+        need(event == {"action": "activate-reviewed-generation-eleven-rollback"},
+             "reviewed rollback accepts no caller configuration")
+        # Both images are already in the release region, and Terraform's host bootstrap already
+        # names the host's (it is in every boot-image list), so the templates change only their image.
+        return self.run_reviewed(self.reviewed_generation_eleven_rollback(), "reviewed-generation-eleven-rollback")
+
+    def run_windows_host_release(self, event):
+        need(event == {"action": "activate-reviewed-windows-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_windows_host_release(), "reviewed-windows-host-release")
+
+    def run_build_region_host_release(self, config, identity):
+        host_user_data = self.env["HOST_FIX_BOOT_SHA"]
+        need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
+        # Built in us-west-2 (#807's build region): the release names the publisher's copy.
+        copied = self.reviewed_release_copy(config["images"]["host"], "host")
+        need(copied is not None, "release-region copies are still pending: host")
+        # Potato mode is chosen by the boot image's id, so the reviewed bootstrap must name the copy.
+        host = next(t for t in self.templates if t["kind"] == "host")
+        boot = base64.b64decode(self.current(host["id"])["LaunchTemplateData"].get("UserData", "")).decode("utf-8", "replace")
+        need(copied in boot, "Terraform's host bootstrap does not name the release-region copy yet")
+        return self.run_reviewed(config, identity, host_user_data=host_user_data,
+                                 host_only=True, release_images={**config["images"], "host": copied})
+
+    def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False,
+                     release_images=None):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
+        if release_images is not None:
+            # The reviewed identity stays the build-region image; the release names its copy.
+            config = self.reviewed_pair({**config, "images": release_images}, host_only=host_only)
         generation = config["expected"]["generation"] + 1
 
         def fence():
@@ -521,7 +775,7 @@ class Publisher:
         source, input_sha = variables.get("SOURCE_SHA", ""), variables.get("INPUT_SHA256", "")
         need(SHA.fullmatch(source) and DIGEST.fullmatch(input_sha)
              and build.get("resolvedSourceVersion") == source, "factory source provenance changed")
-        need(0 < (build["endTime"] - build["startTime"]).total_seconds() <= DEADLINE_SECONDS,
+        need(0 < (build["endTime"] - build["startTime"]).total_seconds() <= execution_lease_seconds(build),
              "build exceeded its fixed execution lease")
         return build, source, input_sha
 
@@ -534,7 +788,7 @@ class Publisher:
              and journal.get("input_sha256") == input_sha and journal.get("request_id") == input_sha
              and set(journal.get("slots", {})) == SLOTS
              and set(journal.get("candidates", {})) == {"host", "tile"}
-             and journal["deadline_unix"] == int(build["startTime"].timestamp()) + DEADLINE_SECONDS
+             and journal["deadline_unix"] == int(build["startTime"].timestamp()) + execution_lease_seconds(build)
              and build["endTime"].timestamp() <= journal["deadline_unix"], "broker proof does not match this completed build")
         ids = [journal["slots"][slot].get("instance_id", "") for slot in sorted(SLOTS)]
         need(len(set(ids)) == 4 and all(re.fullmatch(r"i-[0-9a-f]{17}", item) for item in ids),
@@ -1272,6 +1526,22 @@ class Publisher:
             return self.run_potato_host_fix(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-stride-release":
             return self.run_stride_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-retake-host-release":
+            return self.run_retake_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-held-stamp-host-release":
+            return self.run_held_stamp_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-windows-host-release":
+            return self.run_windows_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-restore-host-release":
+            return self.run_restore_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-ipv4-host-release":
+            return self.run_ipv4_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-generation-eleven-rollback":
+            return self.run_generation_eleven_rollback(event)
+        # A factory build that was already running when the factory was paused
+        # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
+        # actions above are how a release is changed while paused.
+        need(self.env.get("FACTORY_PAUSED") != "true", "factory promotion is paused (fcvm_ami_factory_paused)")
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

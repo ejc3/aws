@@ -142,7 +142,8 @@ class DolphinSecurityTests(unittest.TestCase):
         topic = block((ROOT / "dolphin-security.tf").read_text(),
                       'resource "aws_sns_topic_policy" "dolphin_alerts"')
         statements = dict(re.findall(r'\{\n\s*Sid\s*=\s*"([^"]+)"(.*?)\n      \}', topic, re.S))
-        self.assertEqual(set(statements), {"__default_statement_ID", "ConfigRecorderAlarm", "BatchJobFailures"})
+        self.assertEqual(set(statements), {"__default_statement_ID", "ConfigRecorderAlarm", "BatchJobFailures",
+                                           "DolphinBudgets"})
         sources = {
             "ConfigRecorderAlarm": "aws_cloudwatch_event_rule.dolphin_config_recorder.arn",
             "BatchJobFailures": '"arn:aws:events:us-west-1:${data.aws_caller_identity.dolphin.account_id}:rule/dolphin-labs-podcast-whisper-failed"',
@@ -159,12 +160,22 @@ class DolphinSecurityTests(unittest.TestCase):
                 self.assertNotIn("*", statement)
                 self.assertNotRegex(statement, r'\b(?:ArnLike|StringLike)\b')
 
+    def test_only_the_two_dolphin_budgets_can_publish(self):
+        topic = block((ROOT / "dolphin-security.tf").read_text(),
+                      'resource "aws_sns_topic_policy" "dolphin_alerts"')
+        statement = dict(re.findall(r'\{\n\s*Sid\s*=\s*"([^"]+)"(.*?)\n      \}', topic, re.S))["DolphinBudgets"]
+        self.assertIn('Principal = { Service = "budgets.amazonaws.com" }', statement)
+        self.assertRegex(statement, r'Action\s*=\s*"sns:Publish"')
+        self.assertRegex(statement, r'StringEquals\s*=\s*\{ "aws:SourceAccount" = data\.aws_caller_identity\.dolphin\.account_id \}')
+        self.assertRegex(statement, r'ArnEquals\s*=\s*\{ "aws:SourceArn" = local\.dolphin_budget_arns \}')
+        self.assertNotIn("*", statement)
+
     def test_monitoring_grants_the_dolphin_account_nothing_here(self):
         text = (ROOT / "dolphin-security.tf").read_text()
         # The resource policies are in the Dolphin account, for its own services: the Config bucket's, and dolphin-alerts'
-        # (its same-account default plus the exact Config recorder and Batch failure rules); the one role is this
+        # (its same-account default, the exact Config recorder and Batch failure rules, and its own budgets); the one role is this
         # account's own, trusted only by this account's EventBridge rule.
-        self.assertEqual(text.count("Principal = "), 7)
+        self.assertEqual(text.count("Principal = "), 8)
         self.assertEqual(text.count('resource "aws_iam_role" '), 1)
         role = block(text, 'resource "aws_iam_role" "dolphin_security_inspector"')
         self.assertNotIn("provider", role)
@@ -177,7 +188,7 @@ class DolphinSecurityTests(unittest.TestCase):
         self.assertEqual(text.count('resource "aws_sns_topic_policy"'), 1)
         topic = block(text, 'resource "aws_sns_topic_policy" "dolphin_alerts"')
         self.assertIn("provider = aws.dolphin\n", topic)
-        self.assertEqual(topic.count("Principal = "), 3)
+        self.assertEqual(topic.count("Principal = "), 4)
         self.assertIn('"AWS:SourceOwner" = data.aws_caller_identity.dolphin.account_id', topic)
         self.assertIn('"aws:SourceArn" = aws_cloudwatch_event_rule.dolphin_config_recorder.arn', topic)
         self.assertNotIn("current", topic)

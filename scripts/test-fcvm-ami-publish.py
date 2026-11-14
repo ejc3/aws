@@ -2,6 +2,7 @@
 """Credential-free publisher transactions against strict in-memory AWS fakes."""
 import base64
 import copy
+import re
 import datetime
 import hashlib
 import http.client
@@ -325,6 +326,7 @@ class PublisherTests(unittest.TestCase):
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
         build = {"id": self.build, "projectName": "factory", "buildStatus": "SUCCEEDED", "buildComplete": True,
             "resolvedSourceVersion": self.source, "startTime": start, "endTime": start + datetime.timedelta(hours=2),
+            "timeoutInMinutes": 360,
             "environment": {"environmentVariables": [{"name": "SOURCE_SHA", "value": self.source}, {"name": "INPUT_SHA256", "value": self.input}]}}
         self.main_ssm, self.fleet_ssm, self.ddb, self.ec2 = SSM(), SSM(), DDB(), EC2()
         self.west = EC2("us-west-2", self.ec2.peers)
@@ -341,7 +343,7 @@ class PublisherTests(unittest.TestCase):
         self.fleet_ssm.values["/release"] = release
         self.env["SEED_RELEASE_JSON"] = json.dumps({"source_sha": self.source, "images": new, "expected": copy.deepcopy(release)})
         journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
-                   "deadline_unix": int(start.timestamp()) + 14400, "slots": {}, "candidates": new}
+                   "deadline_unix": int(start.timestamp()) + 21600, "slots": {}, "candidates": new}
         for i, slot in enumerate(sorted(MODULE.SLOTS), 10):
             instance = "i-" + format(i, "017x")
             journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
@@ -969,6 +971,808 @@ class PublisherTests(unittest.TestCase):
         self.assertCountEqual([item[0] for item in self.ec2.deleted], self.ids)
         self.assertIsNone(self.ddb.item)
 
+    def reviewed_retake_host_fixture(self):
+        stride, event, _, images, _ = self.reviewed_stride_fixture()
+        self.assertEqual(stride.run(event), {"status": "promoted", "generation": 6})
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        before_copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        host, image_id = self.ids[0], "ami-05923927f810a2ce9"
+        source = "343b2287636d07b1726ab7a2d431c9a1ec854a67"
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/343b2287"\s*=\s*{{ image = "{image_id}", kind = "host" }}')
+        self.ec2.images[image_id] = {
+            **copy.deepcopy(self.ec2.images[images["host"]]), "ImageId": image_id,
+            "Name": "fcvm-fleet-host-x86_64-343b2287-202611071247",
+        }
+        table = self.ec2.templates[host]
+        self.assertEqual(table["default"], 23)
+        prepared = copy.deepcopy(table["versions"][23])
+        user_data = base64.b64encode(b"reviewed bootstrap includes both gen6 and gen7 hosts").decode()
+        prepared.update(VersionNumber=24, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][24] = prepared
+        table["default"] = 24
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.west.copies.clear()
+        publisher = self.publisher()
+        publisher.github_source_json = mock.Mock(return_value={
+            "sha": source, "commit": {"verification": {"verified": True, "reason": "valid"}},
+        })
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": before["source_sha"]},
+            "merge_base_commit": {"sha": before["source_sha"]},
+        })
+        return publisher, {"action": "activate-reviewed-retake-host-release"}, before, before_copies, source, image_id
+
+    def test_reviewed_retake_host_commits_once_and_reuses_the_generation_six_west_tile(self):
+        publisher, event, before, before_copies, source, image_id = self.reviewed_retake_host_fixture()
+        old_templates = copy.deepcopy(self.ec2.templates)
+        host, *tiles = self.ids
+        self.west.copy_state = "pending"
+        with self.assertRaisesRegex(MODULE.Refused, "regional AMI copies are still pending: us-west-2/host"):
+            publisher.run(event)
+        after = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(after["generation"], 7)
+        self.assertEqual(after["source_sha"], source)
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": image_id}})
+        self.assertEqual(after["tile_amis"], before["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**before["versions"], "us-east-1/" + host: 25})
+        self.assertEqual(self.ec2.templates[host]["versions"][25]["LaunchTemplateData"],
+                         {**old_templates[host]["versions"][24]["LaunchTemplateData"], "ImageId": image_id})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(publisher.compare_sources.call_args_list, [mock.call(before["source_sha"], source)] * 2)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+        self.assertEqual([image for image, _ in self.west.copies], [image_id])
+        self.assertIsNone(self.ddb.item)
+
+        with self.assertRaisesRegex(MODULE.Refused, "regional AMI copies are still pending: us-west-2/host"):
+            self.publisher().run(event)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+        self.west.available()
+        self.assertEqual(self.publisher().run({"action": "replicate-active-release"}), {"status": "replicated", "generation": 7})
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 7})
+        copies = self.fleet_ssm.values["/release-copies"]
+        self.assertEqual(copies["generation"], 7)
+        self.assertEqual(copies["build_id"], after["build_id"])
+        self.assertEqual(copies["images"]["us-west-2"], {
+            "host": self.west.copies[0][1], "tile": before_copies["images"]["us-west-2"]["tile"],
+        })
+        self.assertEqual(copies["previous_images"], before_copies["images"])
+        self.assertEqual(self.fleet_ssm.values["/release"], after)
+        self.assertEqual(self.ec2.created, [(host, 24, 25)])
+        self.assertEqual(self.ec2.selected, [(host, 25)])
+        self.assertEqual(len(self.west.copies), 1)
+        self.assertEqual((self.ec2.deleted, self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_retake_host_requires_exact_predecessor_and_candidate(self):
+        reasons = {
+            "caller-image": "accepts no caller configuration",
+            "predecessor": "requires its unchanged predecessor",
+            "rollback": "requires its unchanged predecessor",
+            "unsigned": "reviewed host source signature is invalid",
+            "candidate-tag": "reviewed image is outside its private validated scope",
+            "host-default": "Terraform has not prepared the exact reviewed host bootstrap",
+            "tile-default": "retained tile template default differs",
+        }
+        for variant, reason in reasons.items():
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, _, _, image_id = self.reviewed_retake_host_fixture()
+                if variant == "caller-image":
+                    event["host_image"] = image_id
+                elif variant == "predecessor":
+                    self.fleet_ssm.values["/release"]["versions"]["us-east-1/" + self.ids[1]] += 1
+                elif variant == "rollback":
+                    self.fleet_ssm.values["/release"]["previous"]["build_id"] = "changed"
+                elif variant == "unsigned":
+                    publisher.github_source_json.return_value["commit"]["verification"]["verified"] = False
+                elif variant == "candidate-tag":
+                    tags = self.ec2.images[image_id]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "host-default":
+                    self.ec2.templates[self.ids[0]]["default"] = 23
+                elif variant == "tile-default":
+                    self.ec2.templates[self.ids[1]]["default"] -= 1
+                before = copy.deepcopy(self.fleet_ssm.values)
+                journal = copy.deepcopy(self.main_ssm.values)
+                with self.assertRaisesRegex(MODULE.Refused, reason):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values, before)
+                self.assertEqual(self.main_ssm.values, journal)
+                self.assertEqual((self.ec2.created, self.ec2.selected, self.west.copies), ([], [], []))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_retake_host_failed_pointer_restores_only_the_generation_six_host(self):
+        publisher, event, before, before_copies, _, _ = self.reviewed_retake_host_fixture()
+        old = copy.deepcopy(self.ec2.templates)
+        host, *tiles = self.ids
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=RuntimeError("no write")):
+            with self.assertRaisesRegex(MODULE.Refused, "pointer update was not confirmed"):
+                publisher.run(event)
+        table = self.ec2.templates[host]
+        self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                         old[host]["versions"][24]["LaunchTemplateData"])
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old[tile])
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+        self.assertEqual(self.west.copies, [])
+        self.assertEqual([name for name, _ in self.ec2.deleted], [host])
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertIsNone(self.ddb.item)
+
+    HELD_STAMP_SOURCE = "fb2f5c361175bb8a0b5baac141e359906543e101"
+    HELD_STAMP_IMAGE = "ami-0d176763f9f33416e"
+    HELD_STAMP_NAME = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303"
+
+    def held_stamp_publisher(self, before):
+        publisher = self.publisher()
+        publisher.github_source_json = mock.Mock(return_value={
+            "sha": self.HELD_STAMP_SOURCE, "commit": {"verification": {"verified": True, "reason": "valid"}},
+        })
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": before["source_sha"]},
+            "merge_base_commit": {"sha": before["source_sha"]},
+        })
+        return publisher
+
+    def prepare_held_stamp_bootstrap(self, copied):
+        # Terraform's second apply: the potato list names the copy, which changes the host bootstrap.
+        table = self.ec2.templates[self.ids[0]]
+        self.assertEqual(table["default"], 25)
+        prepared = copy.deepcopy(table["versions"][25])
+        user_data = base64.b64encode(b"reviewed bootstrap names the gen6, gen7 and gen8 hosts: " + copied.encode()).decode()
+        prepared.update(VersionNumber=26, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][26] = prepared
+        table["default"] = 26
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+
+    def reviewed_held_stamp_host_fixture(self, prepared=True):
+        """Generation seven live, and the fb2f5c36 host built by hand in us-west-2 (#807's build
+        region) and tagged validated there by Terraform. Prepared: the publisher has copied it to
+        us-east-1 and Terraform's bootstrap names the copy."""
+        retake, event, _, _, _, _ = self.reviewed_retake_host_fixture()
+        self.assertEqual(retake.run(event), {"status": "promoted", "generation": 7})
+        self.env["BUILD_REGION"] = "us-west-2"   # production's, since #807
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        before_copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        original = self.HELD_STAMP_IMAGE
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/fb2f5c36"\s*=\s*{{ image = "{original}", kind = "host", '
+                                  rf'name = "{self.HELD_STAMP_NAME}" }}')
+        image = copy.deepcopy(self.ec2.images[before["host_amis"]["us-east-1"]["x86_64"]])
+        # what build-ami.sh's CreateImage reports: its builder's base image as the ancestry
+        image.update(ImageId=original, Name=self.HELD_STAMP_NAME, State="available",
+                     Description="fcvm fleet: " + self.HELD_STAMP_NAME,
+                     SourceImageId="ami-0ddddddddddddddd0", SourceImageRegion="us-west-2")
+        self.west.images[original] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.ec2.copies.clear()
+        self.west.copies.clear()
+        event = {"action": "activate-reviewed-held-stamp-host-release"}
+        if prepared:
+            with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+                self.held_stamp_publisher(before).run(event)
+            self.ec2.available()
+            self.prepare_held_stamp_bootstrap(self.ec2.copies[0][1])
+        return self.held_stamp_publisher(before), event, before, before_copies, original
+
+    def test_reviewed_held_stamp_host_releases_the_publishers_copy_of_the_west_build(self):
+        publisher, event, before, before_copies, original = self.reviewed_held_stamp_host_fixture(prepared=False)
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(source_image, copied)] = self.ec2.copies
+        self.assertEqual(source_image, original)
+        made = self.ec2.images[copied]
+        self.assertEqual((made["Name"], made["SourceImageId"], made["SourceImageRegion"], made["Description"]),
+                         (self.HELD_STAMP_NAME, original, "us-west-2", "copy of " + original + " from us-west-2"))
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            self.held_stamp_publisher(before).run(event)
+        self.assertEqual(len(self.ec2.copies), 1)
+        self.ec2.available()
+        with self.assertRaisesRegex(MODULE.Refused, "host bootstrap does not name the release-region copy yet"):
+            self.held_stamp_publisher(before).run(event)
+        self.assertEqual(self.ec2.templates, old_templates)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+
+        self.prepare_held_stamp_bootstrap(copied)
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher = self.held_stamp_publisher(before)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 8})
+        after = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(after["generation"], 8)
+        self.assertEqual(after["source_sha"], self.HELD_STAMP_SOURCE)
+        self.assertEqual(after["build_id"], "reviewed-held-stamp-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_held_stamp_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], before["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**before["versions"], "us-east-1/" + host: 27})
+        self.assertEqual(self.ec2.templates[host]["versions"][27]["LaunchTemplateData"],
+                         {**old_templates[host]["versions"][26]["LaunchTemplateData"], "ImageId": copied})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        record = self.fleet_ssm.values["/release-copies"]
+        self.assertEqual((record["generation"], record["build_id"], record["source_sha"]),
+                         (8, after["build_id"], self.HELD_STAMP_SOURCE))
+        self.assertEqual(record["images"], {
+            "us-east-1": {"host": copied, "tile": before["tile_amis"]["us-east-1"]["x86_64"]},
+            # the build region's entry is the hand-built original, not a copy of the copy
+            "us-west-2": {"host": original, "tile": before_copies["images"]["us-west-2"]["tile"]},
+        })
+        self.assertEqual(record["previous_images"], before_copies["images"])
+        self.assertEqual(self.west.copies, [])
+        self.assertEqual(self.ec2.created, [(host, 26, 27)])
+        self.assertEqual(self.ec2.selected, [(host, 27)])
+
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 8})
+        self.assertEqual(self.fleet_ssm.values["/release"], after)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], record)
+        self.assertEqual((len(self.ec2.copies), self.west.copies, self.ec2.created), (1, [], [(host, 26, 27)]))
+        self.assertEqual((self.ec2.deleted, self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_held_stamp_host_requires_exact_predecessor_and_candidate(self):
+        reasons = {
+            "caller-image": "accepts no caller configuration",
+            "predecessor": "requires its unchanged predecessor",
+            "rollback": "requires its unchanged predecessor",
+            "unsigned": "reviewed host source signature is invalid",
+            "west-unvalidated": "reviewed image is outside its private validated scope",
+            "west-a-copy": "reviewed image is outside its private validated scope",
+            "candidate-tag": "a regional copy is outside its private image lineage",
+            "bootstrap-without-copy": "host bootstrap does not name the release-region copy yet",
+            "host-default": "Terraform has not prepared the exact reviewed host bootstrap",
+            "tile-default": "retained tile template default differs",
+        }
+        for variant, reason in reasons.items():
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, _, original = self.reviewed_held_stamp_host_fixture()
+                copied = self.ec2.copies[0][1]
+                if variant == "caller-image":
+                    event["host_image"] = original
+                elif variant == "predecessor":
+                    self.fleet_ssm.values["/release"]["versions"]["us-east-1/" + self.ids[1]] += 1
+                elif variant == "rollback":
+                    self.fleet_ssm.values["/release"]["previous"]["build_id"] = "changed"
+                elif variant == "unsigned":
+                    publisher.github_source_json.return_value["commit"]["verification"]["verified"] = False
+                elif variant == "west-unvalidated":
+                    tags = self.west.images[original]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "west-a-copy":
+                    self.west.images[original].update(Description="copy of ami-0bbbbbbbbbbbbbbb0 from us-east-1",
+                                                      SourceImageId="ami-0bbbbbbbbbbbbbbb0", SourceImageRegion="us-east-1")
+                elif variant == "candidate-tag":
+                    tags = self.ec2.images[copied]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "bootstrap-without-copy":
+                    data = self.ec2.templates[self.ids[0]]["versions"][26]["LaunchTemplateData"]
+                    data["UserData"] = base64.b64encode(b"reviewed bootstrap names only the gen6 and gen7 hosts").decode()
+                    self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(data["UserData"])
+                elif variant == "host-default":
+                    self.ec2.templates[self.ids[0]]["default"] = 25
+                    self.ec2.templates[self.ids[0]]["versions"][25]["LaunchTemplateData"]["UserData"] = \
+                        self.ec2.templates[self.ids[0]]["versions"][26]["LaunchTemplateData"]["UserData"]
+                elif variant == "tile-default":
+                    self.ec2.templates[self.ids[1]]["default"] -= 1
+                before = copy.deepcopy(self.fleet_ssm.values)
+                journal = copy.deepcopy(self.main_ssm.values)
+                with self.assertRaisesRegex(MODULE.Refused, reason):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values, before)
+                self.assertEqual(self.main_ssm.values, journal)
+                self.assertEqual((self.ec2.created, self.ec2.selected, self.west.copies, len(self.ec2.copies)), ([], [], [], 1))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_held_stamp_host_failed_pointer_restores_only_the_generation_seven_host(self):
+        publisher, event, before, before_copies, _ = self.reviewed_held_stamp_host_fixture()
+        old = copy.deepcopy(self.ec2.templates)
+        host, *tiles = self.ids
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=RuntimeError("no write")):
+            with self.assertRaisesRegex(MODULE.Refused, "pointer update was not confirmed"):
+                publisher.run(event)
+        table = self.ec2.templates[host]
+        self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                         old[host]["versions"][26]["LaunchTemplateData"])
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old[tile])
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+        self.assertEqual(self.west.copies, [])
+        self.assertEqual([name for name, _ in self.ec2.deleted], [host])
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertIsNone(self.ddb.item)
+
+    WINDOWS_SOURCE = "853eb034a4611e4e4d3b7e79caaf03cf5b2ed643"
+    WINDOWS_IMAGE = "ami-0925206c2b9eac0fe"
+    WINDOWS_NAME = "fcvm-fleet-host-x86_64-853eb034-202611091050"
+
+    def windows_publisher(self, before):
+        publisher = self.publisher()
+        publisher.github_source_json = mock.Mock(return_value={
+            "sha": self.WINDOWS_SOURCE, "commit": {"verification": {"verified": True, "reason": "valid"}},
+        })
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": before["source_sha"]},
+            "merge_base_commit": {"sha": before["source_sha"]},
+        })
+        return publisher
+
+    def prepare_windows_bootstrap(self, copied):
+        # Terraform's second apply: the potato list names the copy, which changes the host bootstrap.
+        table = self.ec2.templates[self.ids[0]]
+        self.assertEqual(table["default"], 27)
+        prepared = copy.deepcopy(table["versions"][27])
+        user_data = base64.b64encode(b"reviewed bootstrap with --windows 4 names the gen6, gen7, gen8 and gen9 hosts: " + copied.encode()).decode()
+        prepared.update(VersionNumber=28, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][28] = prepared
+        table["default"] = 28
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+
+    def reviewed_windows_host_fixture(self, prepared=True):
+        """Generation eight live, and the 853eb034 host built by hand in us-west-2 and tagged
+        validated there by Terraform. Prepared: the publisher has copied it to us-east-1 and
+        Terraform's bootstrap names the copy."""
+        held, event, _, _, _ = self.reviewed_held_stamp_host_fixture()
+        self.assertEqual(held.run(event), {"status": "promoted", "generation": 8})
+        # The generation-eight receipt names the publisher's copy, whose id this fake EC2 chose.
+        held_copy = self.fleet_ssm.values["/release"]["host_amis"]["us-east-1"]["x86_64"]
+        patcher = mock.patch.object(MODULE.Publisher, "HELD_STAMP_HOST_COPY", held_copy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        before_copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        original = self.WINDOWS_IMAGE
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/853eb034"\s*=\s*{{ image = "{original}", kind = "host", '
+                                  rf'name = "{self.WINDOWS_NAME}" }}')
+        image = copy.deepcopy(self.ec2.images[before["host_amis"]["us-east-1"]["x86_64"]])
+        # what build-ami.sh's CreateImage reports: its builder's base image as the ancestry
+        image.update(ImageId=original, Name=self.WINDOWS_NAME, State="available",
+                     Description="fcvm fleet: " + self.WINDOWS_NAME,
+                     SourceImageId="ami-0ddddddddddddddd0", SourceImageRegion="us-west-2")
+        self.west.images[original] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.ec2.copies.clear()
+        self.west.copies.clear()
+        event = {"action": "activate-reviewed-windows-host-release"}
+        if prepared:
+            with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+                self.windows_publisher(before).run(event)
+            self.ec2.available()
+            self.prepare_windows_bootstrap(self.ec2.copies[0][1])
+        return self.windows_publisher(before), event, before, before_copies, original
+
+    def test_reviewed_windows_host_releases_the_publishers_copy_of_the_west_build(self):
+        publisher, event, before, before_copies, original = self.reviewed_windows_host_fixture(prepared=False)
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(source_image, copied)] = self.ec2.copies
+        self.assertEqual(source_image, original)
+        made = self.ec2.images[copied]
+        self.assertEqual((made["Name"], made["SourceImageId"], made["SourceImageRegion"], made["Description"]),
+                         (self.WINDOWS_NAME, original, "us-west-2", "copy of " + original + " from us-west-2"))
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            self.windows_publisher(before).run(event)
+        self.assertEqual(len(self.ec2.copies), 1)
+        self.ec2.available()
+        with self.assertRaisesRegex(MODULE.Refused, "host bootstrap does not name the release-region copy yet"):
+            self.windows_publisher(before).run(event)
+        self.assertEqual(self.ec2.templates, old_templates)
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+
+        self.prepare_windows_bootstrap(copied)
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher = self.windows_publisher(before)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 9})
+        after = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(after["generation"], 9)
+        self.assertEqual(after["source_sha"], self.WINDOWS_SOURCE)
+        self.assertEqual(after["build_id"], "reviewed-windows-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_windows_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], before["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in before.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**before["versions"], "us-east-1/" + host: 29})
+        self.assertEqual(self.ec2.templates[host]["versions"][29]["LaunchTemplateData"],
+                         {**old_templates[host]["versions"][28]["LaunchTemplateData"], "ImageId": copied})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        record = self.fleet_ssm.values["/release-copies"]
+        self.assertEqual((record["generation"], record["build_id"], record["source_sha"]),
+                         (9, after["build_id"], self.WINDOWS_SOURCE))
+        self.assertEqual(record["images"], {
+            "us-east-1": {"host": copied, "tile": before["tile_amis"]["us-east-1"]["x86_64"]},
+            # the build region's entry is the hand-built original, not a copy of the copy
+            "us-west-2": {"host": original, "tile": before_copies["images"]["us-west-2"]["tile"]},
+        })
+        self.assertEqual(record["previous_images"], before_copies["images"])
+        self.assertEqual(self.west.copies, [])
+        self.assertEqual(self.ec2.created, [(host, 28, 29)])
+        self.assertEqual(self.ec2.selected, [(host, 29)])
+
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 9})
+        self.assertEqual(self.fleet_ssm.values["/release"], after)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], record)
+        self.assertEqual((len(self.ec2.copies), self.west.copies, self.ec2.created), (1, [], [(host, 28, 29)]))
+        self.assertEqual((self.ec2.deleted, self.ec2.tagged, self.assets.copies, self.ec2.terminated), ([], [], [], []))
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_windows_host_requires_exact_predecessor_and_candidate(self):
+        reasons = {
+            "caller-image": "accepts no caller configuration",
+            "predecessor": "requires its unchanged predecessor",
+            "rollback": "requires its unchanged predecessor",
+            "unsigned": "reviewed host source signature is invalid",
+            "west-unvalidated": "reviewed image is outside its private validated scope",
+            "west-a-copy": "reviewed image is outside its private validated scope",
+            "candidate-tag": "a regional copy is outside its private image lineage",
+            "bootstrap-without-copy": "host bootstrap does not name the release-region copy yet",
+            "host-default": "Terraform has not prepared the exact reviewed host bootstrap",
+            "tile-default": "retained tile template default differs",
+        }
+        for variant, reason in reasons.items():
+            with self.subTest(variant=variant):
+                self.setUp()
+                publisher, event, _, _, original = self.reviewed_windows_host_fixture()
+                copied = self.ec2.copies[0][1]
+                if variant == "caller-image":
+                    event["host_image"] = original
+                elif variant == "predecessor":
+                    self.fleet_ssm.values["/release"]["versions"]["us-east-1/" + self.ids[1]] += 1
+                elif variant == "rollback":
+                    self.fleet_ssm.values["/release"]["previous"]["build_id"] = "changed"
+                elif variant == "unsigned":
+                    publisher.github_source_json.return_value["commit"]["verification"]["verified"] = False
+                elif variant == "west-unvalidated":
+                    tags = self.west.images[original]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "west-a-copy":
+                    self.west.images[original].update(Description="copy of ami-0bbbbbbbbbbbbbbb0 from us-east-1",
+                                                      SourceImageId="ami-0bbbbbbbbbbbbbbb0", SourceImageRegion="us-east-1")
+                elif variant == "candidate-tag":
+                    tags = self.ec2.images[copied]["Tags"]
+                    next(tag for tag in tags if tag["Key"] == "FleetImageValidated")["Value"] = "false"
+                elif variant == "bootstrap-without-copy":
+                    data = self.ec2.templates[self.ids[0]]["versions"][28]["LaunchTemplateData"]
+                    data["UserData"] = base64.b64encode(b"reviewed bootstrap names only the gen6, gen7 and gen8 hosts").decode()
+                    self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(data["UserData"])
+                elif variant == "host-default":
+                    self.ec2.templates[self.ids[0]]["default"] = 27
+                    self.ec2.templates[self.ids[0]]["versions"][27]["LaunchTemplateData"]["UserData"] = \
+                        self.ec2.templates[self.ids[0]]["versions"][28]["LaunchTemplateData"]["UserData"]
+                elif variant == "tile-default":
+                    self.ec2.templates[self.ids[1]]["default"] -= 1
+                before = copy.deepcopy(self.fleet_ssm.values)
+                journal = copy.deepcopy(self.main_ssm.values)
+                with self.assertRaisesRegex(MODULE.Refused, reason):
+                    publisher.run(event)
+                self.assertEqual(self.fleet_ssm.values, before)
+                self.assertEqual(self.main_ssm.values, journal)
+                self.assertEqual((self.ec2.created, self.ec2.selected, self.west.copies, len(self.ec2.copies)), ([], [], [], 1))
+                self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_windows_host_failed_pointer_restores_only_the_generation_eight_host(self):
+        publisher, event, before, before_copies, _ = self.reviewed_windows_host_fixture()
+        old = copy.deepcopy(self.ec2.templates)
+        host, *tiles = self.ids
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=RuntimeError("no write")):
+            with self.assertRaisesRegex(MODULE.Refused, "pointer update was not confirmed"):
+                publisher.run(event)
+        table = self.ec2.templates[host]
+        self.assertEqual(table["versions"][table["default"]]["LaunchTemplateData"],
+                         old[host]["versions"][28]["LaunchTemplateData"])
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old[tile])
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual(self.fleet_ssm.values["/release-copies"], before_copies)
+        self.assertEqual(self.west.copies, [])
+        self.assertEqual([name for name, _ in self.ec2.deleted], [host])
+        self.assertEqual(self.publisher().run(event), {"status": "failed", "reason": "rolled_back"})
+        self.assertIsNone(self.ddb.item)
+
+    RESTORE_SOURCE = "0e910245f92d3ff093ec1fad1fdbe69fef948f3c"
+    RESTORE_IMAGE = "ami-0c1f87eea5c86c172"
+    RESTORE_NAME = "fcvm-fleet-host-x86_64-0e910245-202611121727"
+
+    def reviewed_restore_host_fixture(self):
+        """Generation nine live (the 853eb034 host, released by its own action), and the 0e910245
+        host built by hand in us-west-2 and tagged validated there by Terraform."""
+        publisher, event, _, _, _ = self.reviewed_windows_host_fixture()
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 9})
+        nine = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # Generation ten's predecessor constants, as they are filled from the generation-nine receipt.
+        for name, value in (("WINDOWS_HOST_COPY", nine["host_amis"]["us-east-1"]["x86_64"]),
+                            ("WINDOWS_HOST_VERSION", nine["versions"]["us-east-1/" + self.ids[0]])):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        before_copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        original = self.RESTORE_IMAGE
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.RESTORE_SOURCE[:8]}"\s*=\s*{{ image = "{original}", kind = "host", '
+                                  rf'name = "{self.RESTORE_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.WINDOWS_IMAGE])
+        image.update(ImageId=original, Name=self.RESTORE_NAME, State="available",
+                     Description="fcvm fleet: " + self.RESTORE_NAME, SourceImageId=self.WINDOWS_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[original] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.ec2.copies.clear()
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        return publisher, {"action": "activate-reviewed-restore-host-release"}, nine, before_copies, original
+
+    def test_reviewed_restore_host_releases_generation_ten_after_generation_nine(self):
+        publisher, event, nine, nine_copies, original = self.reviewed_restore_host_fixture()
+        host, *tiles = self.ids
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(source_image, copied)] = self.ec2.copies
+        self.assertEqual(source_image, original)
+        self.ec2.available()
+        with self.assertRaisesRegex(MODULE.Refused, "host bootstrap does not name the release-region copy yet"):
+            publisher.run(event)
+        # Terraform's second apply: the bootstrap names the generation-ten copy too.
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap with --windows 4 and --minecraft 4 names the gen9 and gen10 hosts: "
+                                     + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        old_templates = copy.deepcopy(self.ec2.templates)
+        # A publisher reads its environment when it starts: the next invocation sees the new digest.
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 10})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (10, self.RESTORE_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-restore-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_restore_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], nine["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in nine.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**nine["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"], original)
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 10})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_restore_host_names_the_generation_nine_receipt(self):
+        # Filled from the live generation-nine receipt: an image id and a template version.
+        self.assertRegex(MODULE.Publisher.WINDOWS_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertIs(type(MODULE.Publisher.WINDOWS_HOST_VERSION), int)
+        self.assertGreater(MODULE.Publisher.WINDOWS_HOST_VERSION, 0)
+
+    def test_reviewed_restore_host_refuses_a_predecessor_other_than_the_one_it_names(self):
+        # The constants name a generation-nine receipt that is not the live one (here the host
+        # version differs): the action refuses at the predecessor check and changes nothing.
+        publisher, event, nine, _, _ = self.reviewed_restore_host_fixture()
+        host = self.ids[0]
+        patcher = mock.patch.object(MODULE.Publisher, "WINDOWS_HOST_VERSION", nine["versions"]["us-east-1/" + host] + 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher.run(event)
+        [(_, copied)] = self.ec2.copies
+        self.ec2.available()
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap names the gen10 host: " + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        publisher = self.windows_publisher(nine)
+        publisher.github_source_json.return_value["sha"] = self.RESTORE_SOURCE
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    IPV4_SOURCE = "cad0ddad653808dcce3acc78264c7c84263fac6a"
+    IPV4_IMAGE = "ami-05c06ef8ae037b10a"
+    IPV4_NAME = "fcvm-fleet-host-x86_64-cad0ddad-202611131412"
+
+    def release_through_second_apply(self, publisher_for, event, previous, source):
+        """Run a build-region host release to its receipt: the copy, Terraform's second apply naming
+        it in the bootstrap, and the promotion. Returns the copy and the template version before."""
+        host = self.ids[0]
+        with self.assertRaisesRegex(MODULE.Refused, "release-region copies are still pending: host"):
+            publisher_for(previous).run(event)
+        copied = self.ec2.copies[-1][1]
+        self.ec2.available()
+        table = self.ec2.templates[host]
+        version = table["default"]
+        prepared = copy.deepcopy(table["versions"][version])
+        user_data = base64.b64encode(b"reviewed bootstrap names the host: " + copied.encode()).decode()
+        prepared.update(VersionNumber=version + 1, VersionDescription="terraform")
+        prepared["LaunchTemplateData"]["UserData"] = user_data
+        table["versions"][version + 1] = prepared
+        table["default"] = version + 1
+        self.env["HOST_FIX_BOOT_SHA"] = MODULE.digest(user_data)
+        publisher = publisher_for(previous)
+        publisher.github_source_json.return_value["sha"] = source
+        return publisher, copied, version
+
+    def reviewed_ipv4_host_fixture(self):
+        """Generation ten live (the 0e910245 host, released by its own action after generation nine),
+        and the cad0ddad host built by hand in us-west-2 and tagged validated there by Terraform."""
+        publisher, event, nine, _, _ = self.reviewed_restore_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, nine, self.RESTORE_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 10})
+        ten = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # Generation eleven's predecessor constants, as they are filled from the generation-ten receipt.
+        for name, value in (("RESTORE_HOST_COPY", ten["host_amis"]["us-east-1"]["x86_64"]),
+                            ("RESTORE_HOST_VERSION", ten["versions"]["us-east-1/" + self.ids[0]])):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.IPV4_SOURCE[:8]}"\s*=\s*{{ image = "{self.IPV4_IMAGE}", kind = "host", '
+                                  rf'name = "{self.IPV4_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.RESTORE_IMAGE])
+        image.update(ImageId=self.IPV4_IMAGE, Name=self.IPV4_NAME, State="available",
+                     Description="fcvm fleet: " + self.IPV4_NAME, SourceImageId=self.RESTORE_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[self.IPV4_IMAGE] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-ipv4-host-release"}, ten
+
+    def test_reviewed_ipv4_host_releases_generation_eleven_after_generation_ten(self):
+        event, ten = self.reviewed_ipv4_host_fixture()
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher, copied, version = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(self.ec2.copies[-1][0], self.IPV4_IMAGE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (11, self.IPV4_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-ipv4-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_ipv4_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], ten["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in ten.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**ten["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        self.assertEqual(self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"], self.IPV4_IMAGE)
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 11})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_ipv4_host_names_the_generation_ten_receipt(self):
+        # Filled from the live generation-ten receipt: an image id and a template version.
+        self.assertRegex(MODULE.Publisher.RESTORE_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertIs(type(MODULE.Publisher.RESTORE_HOST_VERSION), int)
+        self.assertGreater(MODULE.Publisher.RESTORE_HOST_VERSION, 0)
+
+    def test_reviewed_ipv4_host_refuses_a_predecessor_other_than_the_one_it_names(self):
+        event, ten = self.reviewed_ipv4_host_fixture()
+        patcher = mock.patch.object(MODULE.Publisher, "RESTORE_HOST_VERSION", ten["versions"]["us-east-1/" + self.ids[0]] + 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    FACTORY_BUILD = "fcvm-fleet-image-factory:00000000-0000-4000-8000-000000000012"
+    FACTORY_SOURCE = "5cb0257d07e95129ad91ab45d0f804bd669b5b58"
+    FACTORY_HOST = "ami-0f00000000000012a"
+    FACTORY_TILE = "ami-0f00000000000012b"
+
+    def generation_eleven_rollback_fixture(self, *, factory_build=None):
+        """Generation eleven live (the cad0ddad host), then the image factory's generation twelve: a new
+        version of every template naming its host and tile, selected, and its receipt. The publisher's
+        constants are filled from both receipts, as they are from the live ones."""
+        event, ten = self.reviewed_ipv4_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        eleven = copy.deepcopy(self.fleet_ssm.values["/release"])
+        host = self.ids[0]
+        versions = {}
+        for template in self.ids:
+            table = self.ec2.templates[template]
+            number = table["default"] + 1
+            factory = copy.deepcopy(table["versions"][table["default"]])
+            factory.update(VersionNumber=number, VersionDescription="fleet-image-factory")
+            factory["LaunchTemplateData"]["ImageId"] = self.FACTORY_HOST if template == host else self.FACTORY_TILE
+            table["versions"][number] = factory
+            table["default"] = number
+            versions["us-east-1/" + template] = number
+        twelve = copy.deepcopy(eleven)
+        twelve.update(generation=12, source_sha=self.FACTORY_SOURCE, build_id=self.FACTORY_BUILD, versions=versions,
+                      previous={k: v for k, v in eleven.items() if k != "previous"},
+                      host_amis={"us-east-1": {"x86_64": self.FACTORY_HOST}},
+                      tile_amis={"us-east-1": {"x86_64": self.FACTORY_TILE}})
+        self.fleet_ssm.values["/release"] = copy.deepcopy(twelve)
+        for name, value in (("IPV4_HOST_COPY", eleven["host_amis"]["us-east-1"]["x86_64"]),
+                            ("IPV4_HOST_VERSION", eleven["versions"]["us-east-1/" + host]),
+                            ("FACTORY_TWELVE_BUILD", factory_build or self.FACTORY_BUILD),
+                            ("FACTORY_TWELVE_SOURCE", self.FACTORY_SOURCE),
+                            ("FACTORY_TWELVE_HOST", self.FACTORY_HOST),
+                            ("FACTORY_TWELVE_TILE", self.FACTORY_TILE)):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-generation-eleven-rollback"}, eleven, twelve
+
+    def test_reviewed_rollback_puts_generation_eleven_back_after_the_factory_generation_twelve(self):
+        event, eleven, twelve = self.generation_eleven_rollback_fixture()
+        before = copy.deepcopy(self.ec2.templates)
+        publisher = self.publisher()
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 13})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (13, self.IPV4_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-generation-eleven-rollback:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_generation_eleven_rollback())))
+        self.assertEqual(after["host_amis"], eleven["host_amis"])
+        self.assertEqual(after["tile_amis"], eleven["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in twelve.items() if k != "previous"})
+        for template in self.ids:
+            table = self.ec2.templates[template]
+            old = before[template]["versions"][before[template]["default"]]
+            new = table["versions"][table["default"]]
+            # A new version of the factory's: generation eleven's image and nothing else changed.
+            self.assertEqual(table["default"], before[template]["default"] + 1)
+            self.assertEqual(after["versions"]["us-east-1/" + template], table["default"])
+            kind = "host" if template == self.ids[0] else "tile"
+            self.assertEqual(new["LaunchTemplateData"]["ImageId"], eleven[kind + "_amis"]["us-east-1"]["x86_64"])
+            self.assertEqual(MODULE.without_image(new["LaunchTemplateData"]), MODULE.without_image(old["LaunchTemplateData"]))
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 13})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_rollback_refuses_a_predecessor_other_than_the_factory_receipt_it_names(self):
+        event, _, _ = self.generation_eleven_rollback_fixture(
+            factory_build="fcvm-fleet-image-factory:00000000-0000-4000-8000-000000000099")
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            self.publisher().run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_reviewed_rollback_names_the_live_receipts(self):
+        self.assertRegex(MODULE.Publisher.IPV4_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_HOST, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_TILE, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_SOURCE, r"^[0-9a-f]{40}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_BUILD, r"^fcvm-fleet-image-factory:[0-9a-f-]{36}$")
+        self.assertIs(type(MODULE.Publisher.IPV4_HOST_VERSION), int)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
@@ -1081,29 +1885,44 @@ class PublisherTests(unittest.TestCase):
         block = text.split('resource "aws_lambda_function" "fcvm_ami_publish" {', 1)[1].split('\n}\n', 1)[0]
         self.assertIn('BUILDER_PROFILE   = aws_iam_instance_profile.fcvm_ami_builder.arn', block)
 
-    def test_success_after_150_minutes_and_at_exactly_240_can_publish(self):
-        for seconds in (9001, 14400):
+    def test_success_after_240_minutes_and_at_exactly_360_can_publish(self):
+        for seconds in (9001, 14401, 21600):
             with self.subTest(seconds=seconds):
                 self.setUp()
                 self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=seconds)
                 try:
                     result = self.publisher().run(self.event)
                 except MODULE.Refused as error:
-                    self.fail("the approved 240-minute build was refused: " + str(error))
+                    self.fail("the approved 360-minute build was refused: " + str(error))
                 self.assertEqual(result, {"status": "promoted", "generation": 1})
                 self.assertEqual(len(self.ec2.created), 4)
 
+    def set_execution_receipt(self, timeout_minutes, elapsed_seconds, journal_seconds):
+        build = self.codebuild.value
+        if timeout_minutes is None:
+            del build["timeoutInMinutes"]
+        else:
+            build["timeoutInMinutes"] = timeout_minutes
+        build["endTime"] = build["startTime"] + datetime.timedelta(seconds=elapsed_seconds)
+        journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+        journal["deadline_unix"] = int(build["startTime"].timestamp()) + journal_seconds
+        self.manifest["deadline_unix"] = journal["deadline_unix"]
+        self.update_manifest()
+
+    def test_legacy_execution_receipt_and_proof_still_publish(self):
+        self.set_execution_receipt(240, 14400, 14400)
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual(len(self.ec2.created), 4)
+
     def test_overlong_or_mismatched_execution_lease_cannot_change_templates(self):
-        for case in ("elapsed-over-240", "old-journal", "extended-journal"):
-            with self.subTest(case=case):
+        for timeout_minutes, elapsed_seconds, journal_seconds in (
+            (240, 14401, 14400), (240, 1000, 21600), (360, 21601, 21600),
+            (360, 1000, 14400), (360, 1000, 21601),
+            (None, 1000, 21600), (300, 1000, 18000), ("360", 1000, 21600),
+        ):
+            with self.subTest(timeout=timeout_minutes, elapsed=elapsed_seconds, journal=journal_seconds):
                 self.setUp()
-                if case == "elapsed-over-240":
-                    self.codebuild.value["endTime"] = self.codebuild.value["startTime"] + datetime.timedelta(seconds=14401)
-                else:
-                    journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
-                    journal["deadline_unix"] = int(self.codebuild.value["startTime"].timestamp()) + (9000 if case == "old-journal" else 14401)
-                    self.manifest["deadline_unix"] = journal["deadline_unix"]
-                    self.update_manifest()
+                self.set_execution_receipt(timeout_minutes, elapsed_seconds, journal_seconds)
                 with self.assertRaises(MODULE.Refused):
                     self.publisher().run(self.event)
                 self.assertEqual((self.ec2.created, self.assets.copies), ([], []))
@@ -1715,6 +2534,24 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaises(MODULE.Refused):
                 MODULE.Publisher(self.env, {}, config=path)
 
+
+    def test_a_paused_factory_build_is_not_promoted_but_reviewed_actions_are(self):
+        # A build already running when the factory was paused (fcvm_ami_factory_paused) still
+        # finishes and asks to publish; it must not promote. A reviewed action still can.
+        source = (Path(MODULE.__file__).parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        publisher_tf = re.search(r'^resource "aws_lambda_function" "fcvm_ami_publish" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(publisher_tf, r"FACTORY_PAUSED\s*=\s*tostring\(var\.fcvm_ami_factory_paused\)")
+        self.env["FACTORY_PAUSED"] = "true"
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        with self.assertRaises(MODULE.Refused) as caught:
+            self.publisher().run(self.event)
+        self.assertIn("paused", str(caught.exception))
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual((self.ec2.created, self.ec2.tagged, self.assets.copies), ([], [], []))
+        self.assertEqual(self.seed_success(self.publisher(), self.legacy_seed()), {"status": "promoted", "generation": 1})
+        self.setUp()
+        self.env["FACTORY_PAUSED"] = "false"
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

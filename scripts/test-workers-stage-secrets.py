@@ -219,6 +219,34 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0, out)
         self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **extra})
 
+    LIGHTS = {"LIGHTS_AWS_ACCESS_KEY_ID": "AKIAFAKELIGHTS000001", "LIGHTS_AWS_SECRET_ACCESS_KEY": "lights-secret-0123",
+              "LIGHTS_BEDROCK_REGION": "us-west-2", "LIGHTS_BEDROCK_MODEL": "us.anthropic.claude-haiku-5-5"}
+
+    def test_lights_loads_terraforms_container_alone_into_lights_stage(self):
+        r, out = self.run_loader("lights", stage_json=None, managed_json=json.dumps(self.LIGHTS))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), self.LIGHTS)
+        calls = "\n".join(self.aws_calls()) + " "
+        self.assertIn("--secret-id workers-stage/lights/terraform ", calls)
+        self.assertNotIn("--secret-id workers-stage/lights ", calls)
+        self.assertIn("--name lights-stage", self.log.read_text())
+        self.assertFalse([c for c in self.aws_calls() if "assume-role" in c])
+        for secret in ("lights-secret-0123", "AKIAFAKELIGHTS000001"):
+            self.assertNotIn(secret, out)
+
+    def test_lights_refuses_a_missing_name_or_container_before_cloudflare(self):
+        for name in self.LIGHTS:
+            with self.subTest(name=name):
+                partial = {k: v for k, v in self.LIGHTS.items() if k != name}
+                r, out = self.run_loader("lights", managed_json=json.dumps(partial))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name, out)
+                self.assertFalse(self.log.exists(), "a missing name must not reach Wrangler")
+        r, out = self.run_loader("lights", managed_json=None)
+        self.assertEqual(r.returncode, 1, out)
+        self.assertIn("workers-stage/lights/terraform", out)
+        self.assertFalse(self.log.exists(), "wrangler must not run")
+
     def test_other_sites_never_assume_a_role(self):
         r, out = self.run_loader("imagine", stage_json=json.dumps({"A": "b"}))
         self.assertEqual(r.returncode, 0, out)

@@ -493,12 +493,14 @@ source builds; routine changes batch for six hours from the first queued request
 at most once per UTC day, with a weekly refresh. Newer routine inputs replace the
 queued source without pushing back its deadline. Critical-labelled merges and a
 main `critical` dispatch start immediately after validation and can preempt a
-routine build once its builders are terminated. Each job has a 240-minute deadline,
-at most one `g4dn.metal` host and one `g4dn.xlarge` tile active, and four total
-build/validation slots. An independent
-five-minute expiry sweep bounds abandoned compute. At the current instance rates,
-four hours plus the expiry sweep is about $35 of compute; EBS, snapshots, CodeBuild
-and transfer remain additional. Individual SSM commands remain capped at 150 minutes.
+routine build once its builders are terminated. Jobs on a compatible executor have
+a 360-minute deadline; older revisions and requests queued before the change keep
+240 minutes. At most one `g4dn.metal` host and one `g4dn.xlarge` tile are active,
+with four total build/validation slots. An independent five-minute expiry sweep
+bounds abandoned compute. The six-hour ceiling allows up to half again as much
+instance time as the four-hour ceiling, plus the same sweep delay. EBS, snapshots,
+CodeBuild and transfer are additional. Individual SSM commands remain capped at
+150 minutes.
 
 GitHub receives only a main-environment request/status role. Fixed AWS handlers
 launch the bounded slots and issue job-bound worker credentials; CI cannot read
@@ -519,6 +521,12 @@ replaces only old-image Fleet instances, so active streams may briefly reconnect
 Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
+
+On factory-managed host templates, a newly published AMI can start Potato players
+or Minecraft servers when it contains both the matching rootful Podman image and
+an installed Fleet agent that accepts the matching option. Windows sandboxes still
+require an explicitly reviewed boot AMI ID: older Windows bridges can carry the
+same assets while exposing an unauthenticated `/still` endpoint.
 
 The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
 builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
@@ -572,7 +580,7 @@ Each manual critical dispatch gets a fresh request identity, allowing a controll
 same-source retry without resetting a failed request or replaying uncertain launches.
 The five-minute reconciler retries successful-build publication outside the backend
 lock for up to 24 hours; a committed release keeps retrying old-instance cleanup.
-This publication interval never extends the 240-minute compute lease.
+This publication interval never extends the build's recorded compute lease.
 The executor saves validation before final cleanup; publication waits for the
 dispatcher to confirm every actual termination, including delayed EC2 shutdowns.
 Failed, unreferenced candidates remain private for 24 hours after the native build
@@ -625,13 +633,86 @@ four template image IDs, and retains generation five for rollback. Both older
 reviewed potato host images keep potato mode. The action does not wake or retire
 running instances.
 
+The fixed action `{"action":"activate-reviewed-retake-host-release"}` advances
+only the exact generation-six receipt to the signed 343b2287 host from #812.
+Apply the candidate tags and reviewed host bootstrap first. The publisher
+changes only the host image for future launches, keeps all three tile versions,
+and retains generation six for rollback. It reuses the existing West tile copy;
+if the new West host copy is still pending, the East release stays committed
+and `{"action":"replicate-active-release"}` completes the regional record.
+
+The fixed action `{"action":"activate-reviewed-held-stamp-host-release"}`
+advances only the exact generation-seven receipt to the signed fb2f5c36 host.
+That host was built by hand in the build region (us-west-2), so it is released
+the way a factory candidate is: the publisher copies it to us-east-1 and the
+release names the copy. Potato mode is chosen by the boot image's id, so
+Terraform's host bootstrap has to name the copy before the release:
+
+1. Apply. Terraform tags the us-west-2 original `FleetImageKind` and
+   `FleetImageValidated` (`fcvm_ami_build_region_reviewed`); the bootstrap is
+   unchanged, since no copy exists yet.
+2. Invoke the action. It starts the us-east-1 copy (`CopyImage` with the
+   original's tags) and refuses with `release-region copies are still pending:
+   host`; invoke again until it refuses with `Terraform's host bootstrap does
+   not name the release-region copy yet`.
+3. Apply again. `data.aws_ami_ids.fcvm_ami_build_region_copies` finds the copy
+   by its name and `copy of <original> from us-west-2` description, the potato
+   list names it, and Terraform prepares the host template's next version.
+4. Invoke the action. It releases the copy as generation eight, changes only
+   the host image, keeps every tile version and retains generation seven for
+   rollback. `/fcvm-fleet/ami-release-copies` names the copy in us-east-1 and
+   the original in us-west-2; nothing is copied back.
+
+The fixed action `{"action":"activate-reviewed-windows-host-release"}` advances
+only the exact generation-eight receipt to the signed 853eb034 host, which adds
+Windows mode's image and bridge. It was built by hand in us-west-2 too, so it is
+released by the same apply, invoke, apply, invoke sequence as generation eight,
+and becomes generation nine. The second apply also lists the copy in
+`windows_host_amis`: the host bootstrap adds `--windows 4` when the boot image is
+that copy, as it adds potato mode, so a host booted from an older image (before
+the release, or after a rollback) starts an agent that has no `--windows` without
+it. Hosts booted from the copy run four Windows sandboxes each on the staging
+wall (`?mode=windows`, behind Cloudflare Access).
+
+The fixed action `{"action":"activate-reviewed-restore-host-release"}` advances
+only the exact generation-nine receipt to the signed 0e910245 host (generation
+ten), whose Minecraft servers keep their bots connected across a restore
+(ejc3/fcvm#1824). Its predecessor is generation nine's receipt: `WINDOWS_HOST_COPY`
+and `WINDOWS_HOST_VERSION` in `publish.py` are that receipt's `host_amis` and the
+host's entry in `versions`, and any other live receipt is refused. It is released by the
+same apply, invoke, apply, invoke sequence; the second apply lists the copy in
+`windows_host_amis` and `minecraft_host_amis` beside generation nine's.
+
+The fixed action `{"action":"activate-reviewed-ipv4-host-release"}` advances
+only the exact generation-ten receipt (`RESTORE_HOST_COPY` and
+`RESTORE_HOST_VERSION` in `publish.py`) to the signed cad0ddad host (generation
+eleven). Its Minecraft servers publish their view sockets on the host's IPv4
+address (ejc3/fcvm#1833), its Windows bridges run on an IPv6-enabled network
+(ejc3/fcvm#1837), and the bridges' unauthenticated `/still` route is gone
+(ejc3/fcvm#1839). It is released by the same apply, invoke, apply, invoke
+sequence; the second apply lists the copy in `windows_host_amis` and
+`minecraft_host_amis` beside the earlier ones.
+
+The fixed action `{"action":"activate-reviewed-generation-eleven-rollback"}`
+puts generation eleven's host and tile images back as generation thirteen. Its
+predecessor is the exact generation-twelve receipt that the image factory
+published from fcvm 5cb0257d (`FACTORY_TWELVE_*` in `publish.py`), and any other
+live receipt is refused. That host image boots fcvm's host kernel without an
+initramfs, so the network driver loads after cloud-init's first stage has looked
+for a network interface; cloud-init never reaches the instance metadata service,
+runs no user data, and the fleet agent never gets its arguments, so the host runs
+no GPU slot, phone, Windows sandbox or Minecraft server. Both images of
+generation eleven are already in us-east-1 and every boot-image list names its
+host, so after the apply that deploys this publisher one invoke makes a new version of each
+template with only its image changed and selects it.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
-| `fcvm-metal-arm` | `us-west-1`, persistent Spot `r8gd.metal-24xl` | 800 GB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 64-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
+| `fcvm-metal-arm` | `us-west-1a`, persistent Spot `m8gd.metal-24xl` | 1,000 GiB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 96-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 600 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 700 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
@@ -782,6 +863,13 @@ during that period, or its worktree has uncommitted changes. Only `github.com/ej
 checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
 interactive launch attaches to the same work when run from that repository root.
 
+Claude Remote Control windows opened automatically are retired after seven days without a message.
+The watcher leaves open any window viewed in tmux, and keeps a window if it cannot verify the
+conversation is empty. It keeps the transcript and remembers retirement across reboots. Running
+`t-claude` yourself still works; to restore automatic startup for a checkout, remove
+`claude-remote-retired` from that checkout's Git directory. The rule applies once the wrapper has
+identified an unattended launch.
+
 ### OpenCode from a phone or tablet
 
 Open [opencode.cc-games.dev](https://opencode.cc-games.dev/) in your browser and sign in through Cloudflare Access.
@@ -805,22 +893,37 @@ with `scripts/test-opencode-setup.py` in CI.
 
 ### One-off fcvm boot benchmark
 
-`boot_race_enabled` defaults to false. An ordinary apply leaves the benchmark driver's
-role absent and the cleanup schedule disabled. It provisions no Fargate endpoints and
-leaves ECR DNS unchanged for existing Ohio pboxes.
+The driver and cleanup schedule are disabled by default. For an approved run,
+prepare one Ohio Spot pbox as the benchmark worker before enabling anything.
+Separately designate one primary-region EC2 dev host with `dev-server-role`
+to run `creds.sh` and deliver short sessions over SSH to the Ohio worker; the
+pbox's own `dev-ebs-only` credentials cannot assume the role. Commit
+`boot_race_enabled = true` with `boot_race_campaign`: the exact source dev
+instance ARN and fixed UTC start and end timestamps at most three hours apart.
+Use a unique, nonoverlapping window each time; never extend or reuse its start.
+Review the plan and apply from fresh main. AssumeRole checks the EC2 identity
+that issued the source credentials, not the network origin; AWS denies requests
+signed with the resulting STS sessions after expiry.
 
-When the [benchmark driver](https://github.com/ejc3/fcvm/pull/1539) has a reviewed revision
-ready to run, commit the activation setting and apply that revision of this repository.
-Review the plan for the driver role and the isolated Fargate subnet, route table, and
-endpoints. The two ECR interface endpoints cost about $0.02/hour together plus data
-processing. During the campaign, their private DNS also applies to other boxes in the
-Ohio VPC. Run the campaign from its pbox after the plan is applied.
+The limited campaign keeps the Fargate lane disabled. It creates no paid ECR
+interface endpoints and does not change ECR DNS for other Ohio pboxes. With the
+[benchmark driver](https://github.com/ejc3/fcvm/pull/1539), pass
+`--lanes fcvm-file,fcvm-uffd,ec2-launch,ec2-start,ec2-hibernate,ecs-ec2,lambda-cold,lambda-warm`;
+do not run the default nine-lane command. Restoring the private Fargate lane
+requires a separate reviewed change with a reliable endpoint teardown.
 
-Afterward, confirm no live or stopped instances, ECS tasks, workload AMIs, snapshots,
-or workload images remain. Keep the cleanup schedule enabled until that check passes.
-Restore `boot_race_enabled = false` in Git, apply, and confirm AWS reports that the
-campaign endpoints and driver role are gone. The dormant reaper remains available for
-admin recovery if any campaign resources still need cleanup.
+Copy the data out and stop early enough to run the benchmark's `cleanup` and
+`leftovers` before the window expires. Terminate the exact campaign pbox and
+verify there are no remaining campaign instances, tasks, AMIs, snapshots or
+workload images, stop `creds.sh`, and remove the worker's cached credentials.
+The reaper can recover left-behind compute after credentials expire, but does not
+remove ECR images or reset the two IAM-only benchmark functions' uploaded code.
+The regular cleanup deletes ECR images; the uploaded Lambda workload stays in
+those dedicated, inactive functions and is replaced on the next run. If cleanup
+cannot finish inside the window, an administrator clears the remaining ECR
+images and any workload the reaper missed; verify both before retiring. Then
+commit `boot_race_enabled = false` and clear `boot_race_campaign`, apply,
+and confirm the role is gone and the schedule disabled.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
@@ -1482,9 +1585,9 @@ and Claude remain four independent logins.
 
 The two metal boxes are the main `fcvm` workstations:
 
-- ARM64 uses `r8gd.metal-24xl`; x86 uses `c5d.metal`.
+- ARM64 uses `m8gd.metal-24xl`; x86 uses `c5d.metal`.
 - Both are persistent Spot instances with `stop` interruption behavior and static EIPs.
-- Their EBS roots survive a normal stop/start: 800 GB on ARM and 300 GB on x86.
+- Their EBS roots survive a normal stop/start: 1,000 GiB on ARM and 300 GiB on x86.
 - Instance-store NVMe is for VM images, build output, caches, and temporary Btrfs data.
   It is erased by a stop, Spot interruption, or host loss.
 - ARM nested virtualization requires the custom fcvm kernel and patch set documented in
@@ -1553,6 +1656,7 @@ pbox flavors               # the menu: vCPU, memory, local disk, what each is fo
 pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
+pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
 
@@ -1566,6 +1670,10 @@ a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` 
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and
 `kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often.
+
+Use `--local-nvme` with `pbox up N kvm-96` when a workload needs both KVM and disposable local disks.
+The flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; it refuses an occupied slot with another
+instance type and leaves that box alone. `pbox capacity N kvm-96 --local-nvme` checks those same candidates.
 
 `kvm-gpu-64` is a `g5g.metal` (Graviton2, 64 vCPU, 128 GiB, two NVIDIA T4G) for GPU passthrough into fcvm microVMs:
 `/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent
@@ -1735,7 +1843,9 @@ immediately. DNS needs nothing because each zone has a single wildcard record.
 disk for the host's `ubuntu` account and every running Next.js account container.
 It checks for merged linked Git worktrees only when at least 90% of blocks or
 inodes are unavailable, or fewer than 20 GiB are available. It removes the oldest
-eligible worktrees across all accounts first and stops when space recovers.
+eligible worktrees across the accounts it could fully rank, then stops when
+space recovers. If an account cannot be ranked, the job leaves it untouched,
+logs its name and reports the run as incomplete.
 The job checks for running processes in each account's filesystem and runs Git
 as the worktree owner, rechecking eligibility before removal. It keeps main
 checkouts, branches, interactive or locked worktrees, worktrees in use, and
@@ -2049,8 +2159,10 @@ TestFlight uploads from nextjs-dev stay unavailable until it holds a key. Once, 
    upload succeeds; on a failure, fix the cause and run the pipeline again.
 
 Only administration, nextjs-dev's role, fcvm-metal-arm's instance (dev-server-role pinned by `ec2:SourceInstanceARN`,
-so fcvm-metal-x86 cannot) and `dolphin-labs-testflight` (dolphin-labs CI's TestFlight uploads: GitHub OIDC for
-`testflight.yml` on `main` only, `dolphin-labs-testflight.tf`) can read it. Every account on nextjs-dev has
+so fcvm-metal-x86 cannot), and the two TestFlight upload roles can read it. `dolphin-labs-testflight` and
+`kid-sports-highlights-testflight` each accept GitHub OIDC only from their own repository's
+`.github/workflows/testflight.yml` on `main`. The output `kid_sports_highlights_testflight` supplies that
+repository's three Actions variables; the key value stays in Secrets Manager. Every account on nextjs-dev has
 sudo, so treat the key as readable by that whole box (accepted by the owner, 2026-10-17). Revoke it in App Store Connect
 and put a new one the same way to rotate.
 
@@ -2501,6 +2613,23 @@ its setup script is re-run. Once a box has the script, an account can also seed 
 running `user-agents-seed`.
 
 ## Backups, safety, and cost controls
+
+A one-shot offline comparison of two restored, detached encrypted gp3 volumes is available
+in the staging recovery account. The default `offline_ebs_compare = null` creates nothing.
+Tag the two verified restore outputs with the same `Incident` and with
+`EvidencePhase=before` and `EvidencePhase=after`. Supply their exact IDs, size in GiB,
+and a UTC window of at most 24 hours using a private Terraform variable file. An optional
+lowercase SHA-256 of a hostname enables exact-match counting without putting the hostname in
+the configuration. Confirm the staged plan creates only the isolated lab and its attachments.
+
+The temporary inspector has no Internet route, public address, login key or IAM profile.
+It drops its network interface before mounting the volumes read-only with journal replay
+disabled. Read the `EVIDENCE_RESULT` line from the inspector's latest EC2 console output.
+It contains separate host and guest counts for selected persistence locations, bounded
+plain-text log tails, and samples from persistent journals. An empty result is not a
+comprehensive malware or log scan. Return the input to `null` and
+apply cleanup from main. The lab owns the attachments but does not own or delete the evidence
+volumes. Keep the variable file, plan and results private.
 
 - AWS Backup covers the ARM and x86 roots, the Next.js root, the original jumpbox home
   volume, and the `jumpbox-2` root with daily, weekly, and monthly retention.

@@ -20,7 +20,14 @@ symlinks into `fcvm/kernel/patches/`, so a fix there lands on both architectures
 `*.vm.patch` is applied to the VM kernel only -- the `host_kernel` `build_inputs` glob
 deliberately excludes it, so the host takes a strict subset.
 
-**Rebuild and install the host kernel** (fcvm drives the whole thing -- it downloads the
+**The host must not be older than the L1 guest kernel** (ejc3/fcvm#659): a 6.19 or later L1
+on a 6.18 host wedges L2. fcvm pins the arm64 host at 7.3.3, built from its own
+`kernel/patches-arm64-host`, ahead of its guests. On fcvm-metal-arm the SSM association
+`fcvm-arm-host-kernel` (firecracker-dev.tf) installs the host kernel of
+`var.fcvm_host_kernel_commit` and selects it for the next boot, once per commit change. It
+does not reboot the box: the owner does, when nobody is using it.
+
+**Rebuild and install the host kernel by hand** (fcvm drives the whole thing -- it downloads the
 kernel.org tarball for the pinned version, applies the patch set, builds, installs to
 `/boot`, and runs `update-grub`):
 
@@ -1166,6 +1173,13 @@ scan plus about a second.
   reboot there is no tmux until someone connects; the watcher retries every tick and starts the sessions
   (including the post-reboot ones) the moment a server exists. A boot launcher that owns the server is a
   design decision of its own (what owns the cgroup, what a restart kills), not part of this watcher.
+- **Unused Claude Remote Control windows retire after seven days.** The watcher checks only windows
+  stamped by an unattended t-claude launch, using the exact idle Claude process, its hook-reported
+  transcript, and a prompt latch. A client viewing the pane, a message, or uncertain evidence keeps it
+  open. The marker lives in the checkout's Git directory (per-user local state for non-Git folders)
+  and is written before the window closes. An interrupted close is reconciled with the transcript.
+  Next.js accounts without repo discovery run the same watcher in retirement-only mode. Boot launchers and the watcher respect it; manual t-claude
+  and Codex do not depend on it. Untagged windows are left alone.
 - **Rollout and updates.** One script and one template unit (`agent-session-sync@.service`) installed by the
   same snippet everywhere, replaced atomically. The watcher re-executes itself when its own file changes, so
   no installer restarts it. Running jumpboxes converge through `terraform_data.admin_agent_session_sync`,
@@ -1766,10 +1780,19 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   secret denies reads to all but constellation's roles; rotating means a new value put there by hand). Order: apply; the first deploy creates the
   Worker; set `constellation_mcp_stage_deployed = true` and apply (the hostname); `scripts/workers-stage-secrets.sh
   constellation-mcp`.
+- **Lights' photo reader on staging** (`lights-vision.tf`): the IAM user `lights-vision-worker-stage`, whose only grant is
+  bedrock-haiku.tf's Haiku 5.5 statements, so the Worker `lights-stage` (ejc3/constellation `apps/lights-web`) can read a
+  photo of a house. Its key is written to `workers-stage/lights/terraform` and loaded with
+  `scripts/workers-stage-secrets.sh lights`, which reads that container alone for this site (lights has no hand-set staging
+  secrets). The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
 - **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
   script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
   of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
   covers it.
+- **Lights on staging** (`workers-stage.tf`): the Worker `lights-stage`, the buying wizard as Worker assets plus a small
+  script for `/api/*` (live Shopify prices and the photo reader), deployed by ejc3/constellation (`deploy-lights-web.yml`)
+  from the same `cloudflare-deploy` environment. It is one of the staging Workers behind the shared "Site staging
+  Workers" Access application; its URLs turn on only after that covers it. The photo reader's key is `lights-vision.tf`'s.
 - **State:** `constellation-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - **No CI credential**, as with Dolphin: GitHub holds no AWS role for this account (state and configuration reads can carry
   secret values, and any same-repository pull request could read them). Its CI validates without credentials; plans run on
@@ -1929,7 +1952,8 @@ the data from before the move.
 ### dolphin-labs podcasts R2 (dolphin-labs-podcasts.tf)
 
 The R2 bucket `dolphin-labs-podcasts` is in this Cloudflare account, the account that runs `dolphin-labs-prod` and
-`dolphin-labs-stage`. It holds the team podcasts' transcripts and ad alignments, and objects in it expire after 180 days.
+`dolphin-labs-stage`. It holds the team podcasts' descriptions, transcripts and ad alignments. Objects expire after 240
+days so they outlive episode records, which can last up to 217 days.
 The bucket is private, with no r2.dev address and no custom domain. The production Worker serves from it through the binding
 `PODCASTS`. The podcast function in the Dolphin account writes it through R2's S3 API, with an account token that reaches
 this bucket's objects and nothing else. Its S3 pair is derived from the token: the key id is the token's id, and the
@@ -1942,6 +1966,30 @@ dolphin-aws owns that container (`podcasts.tf` there) and its policy. Until the 
 apply. The bucket needs **Workers R2 Storage Write** (permission group `bf7481a1826f439697cb59a20b22293e`) on the provider
 token `cloudflare-tunnel-token`. Add it with one PUT of the token's definition, the same way Workers KV Storage Write was
 added.
+
+### Dolphin site probe token and budgets (dolphin-site-probe.tf, dolphin-budgets.tf)
+
+The site probe in the Dolphin account (dolphin-aws `monitoring.tf`) alarms on the production Worker as Cloudflare saw it:
+failed invocations by event type, console.error lines, and 5xx answers on gamesworthwatching.com. It reads them with an
+account token minted here: Individual Workers Metadata Read-Only on `dolphin-labs-prod` (Workers Logs) and Analytics Read
+on the gamesworthwatching.com zone. Terraform writes it, with the account and zone ids, into
+`dolphin-site-probe/cloudflare` in the Dolphin account through `aws.dolphin`. That container is dolphin-aws's, so
+**dolphin-aws is applied first**, then this merges; the write is unconditional, and a missing container fails the apply.
+Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_site_probe`.
+
+`dolphin-budgets.tf` keeps the Dolphin account's cost budgets (`dolphin-daily`, $100; `dolphin-monthly`, $1,500
+forecast and actual) on `dolphin-alerts`, after the topic's policy (`dolphin-security.tf`, `DolphinBudgets`) lets
+those two budgets publish, in the same apply.
+
+### dolphin-labs live logs R2 (dolphin-labs-live-logs.tf)
+
+The R2 bucket `dolphin-labs-live-logs` holds the live capture's daily logs, written by the Workers through the binding
+`LIVE_LOGS`. The engine's parity work reads them from nextjs-dev with a read-only account token: Workers R2 Storage Bucket
+Item Read on this one bucket, which lists and reads its objects and nothing else. Terraform writes its S3 pair (derived as
+for the podcasts bucket) and the endpoint into `dolphin-labs/live-logs-r2` in the Dolphin account through `aws.dolphin`.
+dolphin-aws owns that container (`live-logs.tf` there) and keeps it administration only; nextjs-dev reads it through
+`dolphin-terraform`. Until the container exists nothing is written (output `dolphin_labs_live_logs_read.secret_written`).
+Rotate with `terraform apply -replace=cloudflare_account_token.dolphin_labs_live_logs_read`.
 
 ### dolphin-films credentials
 

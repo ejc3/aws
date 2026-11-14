@@ -81,6 +81,7 @@ class CodeBuild:
     def build(self, build_id, variables=None):
         return {"id": build_id, "projectName": "factory", "buildStatus": "IN_PROGRESS",
                 "startTime": datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc), "resolvedSourceVersion": SOURCE_SHA,
+                "timeoutInMinutes": 360,
                 "environment": {"environmentVariables": variables or [
                     {"name": "SOURCE_SHA", "value": SOURCE_SHA}, {"name": "INPUT_SHA256", "value": INPUT_SHA},
                     {"name": "FLEET_AMI_CAPABILITY", "value": CAP}]}}
@@ -98,6 +99,7 @@ class CodeBuild:
         build = self.build(build_id, kwargs["environmentVariablesOverride"])
         build["resolvedSourceVersion"] = kwargs["sourceVersion"]
         build["startTime"] = datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc)
+        build["timeoutInMinutes"] = kwargs.get("timeoutInMinutesOverride", 240)
         self.builds[build_id] = build
         if self.lose_start:
             self.lose_start = False
@@ -364,7 +366,7 @@ class FactoryTests(unittest.TestCase):
         self.ec2.instances[instance_id]["State"]["Name"] = "stopped"
         return self.call("seal", slot)
 
-    def request(self, priority="normal", input_sha=INPUT_SHA, source_sha=SOURCE_SHA):
+    def request(self, priority="normal", input_sha=INPUT_SHA, source_sha=SOURCE_SHA, comparison=None):
         if not self.queue_prepared and not self.ec2.launches:
             self.store.values.pop("/factory/control", None)
             self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
@@ -372,6 +374,10 @@ class FactoryTests(unittest.TestCase):
         def response(path):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": source_sha}}
+            if path == "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha:
+                if isinstance(comparison, Exception):
+                    raise comparison
+                return comparison
             return {"workflow_runs": [self.ci_run(head_sha=source_sha)]}
         with patch.object(mod, "public_github", side_effect=response):
             return self.factory.request({"action": "request", "source_sha": source_sha, "input_sha256": input_sha, "priority": priority})
@@ -657,8 +663,8 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.publisher.calls[0], self.publisher.calls[1])
 
     def test_success_near_compute_deadline_keeps_a_separate_publication_lease(self):
-        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
-        self.time = NOW + mod.DEADLINE_SECONDS + 10
+        ended = self.succeed(21600 - 2)
+        self.time = NOW + 21600 + 10
         self.factory.reconcile()
         record = self.factory.request_record(INPUT_SHA)
         self.assertEqual(record["status"], "awaiting-publish")
@@ -674,11 +680,11 @@ class FactoryTests(unittest.TestCase):
             self.call("status", kind + "-build")
             instance_id = self.launch(kind + "-verify")
             self.ec2.instances[instance_id]["State"]["Name"] = "shutting-down"
-        ended = self.succeed(mod.DEADLINE_SECONDS - 2)
+        ended = self.succeed(21600 - 2)
         self.factory.reconcile()
         self.assertEqual(self.publisher.calls, [], "a successful executor is not termination proof")
         self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "awaiting-publish")
-        self.time = NOW + mod.DEADLINE_SECONDS + 360
+        self.time = NOW + 21600 + 360
         for instance in self.ec2.instances.values():
             instance["State"]["Name"] = "terminated"
             instance.pop("IamInstanceProfile", None)  # Actual terminal EC2 shape.
@@ -749,24 +755,26 @@ class FactoryTests(unittest.TestCase):
 
     def test_deadline_cannot_be_reset_but_cleanup_still_works(self):
         instance_id = self.launch()
-        self.time += mod.DEADLINE_SECONDS + 1
+        self.time += 21600 + 1
         for action in ("launch", "start", "reboot", "credentials"):
             with self.assertRaises(mod.Refused):
                 self.call(action, "host-build")
         self.call("cleanup")
         self.assertEqual(self.ec2.terminations, [[instance_id]])
 
-    def test_global_lease_survives_150_minutes_and_expires_at_exactly_240(self):
+    def test_global_lease_survives_240_minutes_and_expires_at_exactly_360(self):
+        # 240 minutes never reached a tile builder (ejc3/aws#823): three builds' host sides took
+        # 2 h 58 min to 3 h 14 min from launch to CreateImage.
         instance_id = self.launch()
-        self.time = NOW + 9001
+        self.time = NOW + 14401
         try:
             self.call("credentials")
         except mod.Refused:
-            self.fail("the approved 240-minute lease expired at the old 150-minute limit")
+            self.fail("the approved 360-minute lease expired at the old 240-minute limit")
         self.factory.tick()
         self.assertEqual((self.cb.stops, self.ec2.terminations), ([], []))
-        self.assertEqual(self.factory.journal(BUILD)[1]["deadline_unix"], NOW + 14400)
-        self.time = NOW + 14400
+        self.assertEqual(self.factory.journal(BUILD)[1]["deadline_unix"], NOW + 21600)
+        self.time = NOW + 21600
         issued = len(self.sts.calls)
         with self.assertRaises(mod.Refused):
             self.call("credentials")
@@ -776,7 +784,36 @@ class FactoryTests(unittest.TestCase):
         self.assertIn(instance_id, [name for batch in self.ec2.terminations for name in batch])
         self.assertEqual(len(self.ec2.launches), 1)
 
-    def test_codebuild_global_timeout_keeps_the_separate_command_ceiling(self):
+    def test_legacy_receipt_journals_and_expires_at_240_under_new_broker(self):
+        self.cb.builds[BUILD]["timeoutInMinutes"] = 240
+        instance_id = self.launch()
+        self.assertEqual(self.factory.journal(BUILD)[1]["deadline_unix"], NOW + 14400)
+        self.time = NOW + 14400
+        with self.assertRaises(mod.Refused):
+            self.call("credentials")
+        self.factory.tick()
+        self.assertEqual(self.cb.stops, [BUILD])
+        self.assertTrue(all(ids == [instance_id] for ids in self.ec2.terminations))
+        self.assertTrue(self.ec2.terminations)
+
+    def test_missing_receipt_cannot_authorize_more_work_or_block_cleanup(self):
+        instance_id = self.launch()
+        del self.cb.builds[BUILD]["timeoutInMinutes"]
+        with self.assertRaises(mod.Refused):
+            self.call("launch", "tile-build")
+        self.factory.tick()
+        self.assertEqual(self.cb.stops, [BUILD])
+        self.assertIn([instance_id], self.ec2.terminations)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+
+    def test_orphan_builder_without_journal_keeps_the_shorter_sweep_bound(self):
+        instance_id = self.launch()
+        self.store.values.pop("/factory/builds/" + mod.digest(BUILD))
+        self.time = NOW + 14400
+        self.factory.tick()
+        self.assertEqual(self.ec2.terminations, [[instance_id]])
+
+    def test_codebuild_default_keeps_the_legacy_and_separate_command_bounds(self):
         text = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         self.assertRegex(text, r"fcvm_ami_build_minutes\s*=\s*240\b")
         self.assertRegex(text, r"build_timeout\s*=\s*local\.fcvm_ami_build_minutes")
@@ -860,12 +897,37 @@ class FactoryTests(unittest.TestCase):
         self.cb.builds.clear()
         self.cb.lose_start = True
         with self.assertRaises(TimeoutError):
-            self.request("critical")
+            self.request("critical", source_sha=mod.EXTENDED_TIMEOUT_SOURCE)
         self.factory.reconcile()
         self.assertEqual(len(self.cb.starts), 1)
         record = self.factory.request_record(INPUT_SHA)
         self.assertEqual(record["status"], "building")
         self.assertEqual(record["build_id"], "factory:22222222-2222-2222-2222-222222222222")
+        self.assertEqual(record["deadline_unix"], NOW + 21600)
+
+    def test_six_hour_override_requires_a_compatible_executor_source(self):
+        supported = mod.EXTENDED_TIMEOUT_SOURCE
+        proof = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": supported}}
+        for source, compare, expected in (
+            (supported, None, 360),
+            ("1" * 40, proof, 360),
+            ("2" * 40, {**proof, "status": "behind"}, 240),
+            ("3" * 40, {**proof, "merge_base_commit": {"sha": "9" * 40}}, 240),
+            ("4" * 40, OSError("GitHub unavailable"), 240),
+        ):
+            with self.subTest(source=source):
+                self.setUp()
+                result = self.request("critical", source_sha=source, comparison=compare)
+                self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], expected)
+                self.assertEqual(result["deadline_unix"], NOW + expected * 60)
+
+    def test_request_queued_before_upgrade_keeps_legacy_project_timeout(self):
+        result = self.request(source_sha=mod.EXTENDED_TIMEOUT_SOURCE)
+        del self.store.values["/factory/requests/" + INPUT_SHA]["build_timeout_minutes"]
+        self.time = result["not_before"]
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], 240)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["deadline_unix"], self.time + 14400)
 
     def test_definitive_start_rejection_releases_only_its_intent_for_new_critical_work(self):
         for code in ("AccountLimitExceededException", "InvalidInputException", "ResourceNotFoundException", "AccessDeniedException"):
@@ -1006,7 +1068,7 @@ class FactoryTests(unittest.TestCase):
         foreign["InstanceId"] = "i-99999999999999999"
         foreign["IamInstanceProfile"]["Arn"] = "arn:aws:iam::123456789012:instance-profile/production"
         self.ec2.instances[foreign["InstanceId"]] = foreign
-        self.time += mod.DEADLINE_SECONDS + 1
+        self.time += 21600 + 1
         self.factory.tick()
         self.assertEqual(self.ec2.terminations, [[instance_id]])
 
@@ -1105,6 +1167,124 @@ class FactoryTests(unittest.TestCase):
                 self.factory.request({"action": "request", "source_sha": SOURCE_SHA, "input_sha256": INPUT_SHA, "priority": "critical"})
             self.assertEqual((self.cb.starts, self.store.writes), ([], []))
 
+    def test_a_green_revision_main_has_moved_past_is_admitted(self):
+        # A busy main rarely holds still for its CI: the head's run is cancelled by the next
+        # merge or fails on a download, and a head-only rule then builds nothing. A recent
+        # ancestor of main with its own successful CI is admitted, even when GitHub lists
+        # the newer head's successful run first. No documentation fallback is needed.
+        head = "8" * 40
+        self.store.values.clear()
+        responses = [{"object": {"sha": head}},
+            {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+            {"workflow_runs": [self.ci_run(head_sha=head, id=100), self.ci_run()]},
+            {"status": "behind", "ahead_by": 0, "behind_by": 3, "merge_base_commit": {"sha": SOURCE_SHA}}]
+        with (patch.object(mod, "public_github", side_effect=responses) as github,
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
+            result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                "input_sha256": INPUT_SHA, "priority": "critical"})
+        self.assertEqual(github.call_count, 3)
+        self.assertEqual(result["status"], "building")
+        self.assertEqual((result["source_sha"], result["ci_head_sha"], result["ci_run_id"]), (SOURCE_SHA, SOURCE_SHA, 99))
+        self.assertEqual(len(self.cb.starts), 1)
+
+    def test_a_revision_off_main_or_far_behind_it_is_refused(self):
+        head = "8" * 40
+        for comparison in ({"status": "diverged", "ahead_by": 1, "behind_by": 1, "merge_base_commit": {"sha": "7" * 40}},
+                           {"status": "behind", "ahead_by": 0, "behind_by": 2, "merge_base_commit": {"sha": head}},
+                           {"status": "ahead", "ahead_by": 251, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}):
+            with self.subTest(comparison=comparison["status"]):
+                self.setUp()
+                self.store.values.clear()
+                responses = [{"object": {"sha": head}}, comparison, {"workflow_runs": [self.ci_run()]}]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
+    def test_a_revision_must_descend_from_the_last_admitted_source(self):
+        head, newer = "8" * 40, "6" * 40
+        for comparison in ({"status": "behind", "ahead_by": 0, "behind_by": 1, "merge_base_commit": {"sha": SOURCE_SHA}},
+                           {"status": "diverged", "ahead_by": 1, "behind_by": 1, "merge_base_commit": {"sha": "7" * 40}}):
+            with self.subTest(status=comparison["status"]):
+                self.store.values.clear()
+                self.factory.save("/control", {"last_source": newer})
+                self.store.writes.clear()
+                responses = [{"object": {"sha": head}},
+                    {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+                    comparison]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaisesRegex(mod.Refused, "already admitted"):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": INPUT_SHA, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.store.writes), ([], []))
+
+    def test_legacy_control_keeps_newer_work_when_an_old_critical_request_arrives(self):
+        older, head, old_input = "9" * 40, "8" * 40, "7" * 64
+        for slot, control in (("active", {"active": BUILD}),
+                              ("intent", {"active": {"intent": INPUT_SHA}}),
+                              ("pending", {"pending": INPUT_SHA})):
+            with self.subTest(slot=slot):
+                self.setUp()
+                self.store.values["/factory/control"] = control
+                if slot == "active":
+                    self.factory.journal(BUILD)
+                if slot == "pending":
+                    self.store.values["/factory/requests/" + INPUT_SHA]["status"] = "queued"
+                self.store.writes.clear()
+                before = copy.deepcopy(self.store.values)
+
+                def response(path):
+                    if path == "git/ref/heads/main":
+                        return {"object": {"sha": head}}
+                    if path.startswith("compare/" + older + "..." + head):
+                        return {"status": "ahead", "ahead_by": 3, "behind_by": 0, "merge_base_commit": {"sha": older}}
+                    if path.startswith("compare/" + SOURCE_SHA + "..." + older):
+                        return {"status": "behind", "ahead_by": 0, "behind_by": 1, "merge_base_commit": {"sha": older}}
+                    return {"workflow_runs": [self.ci_run(head_sha=older)]}
+
+                with patch.object(mod, "public_github", side_effect=response), self.assertRaisesRegex(mod.Refused, "already admitted"):
+                    self.factory.request({"action": "request", "source_sha": older, "input_sha256": old_input, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.cb.stops, self.store.writes), ([], [], []))
+                self.assertEqual(self.store.values, before)
+
+    def test_legacy_control_with_unverifiable_work_refuses_a_non_head_request(self):
+        for control in ({"pending": "7" * 64}, {"active": {}}, {"active": BUILD}):
+            with self.subTest(control=control):
+                self.setUp()
+                self.store.values["/factory/control"] = control
+                self.cb.builds[BUILD].pop("resolvedSourceVersion")
+                responses = [{"object": {"sha": "8" * 40}},
+                    {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}}]
+                with patch.object(mod, "public_github", side_effect=responses), self.assertRaises(mod.Refused):
+                    self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                        "input_sha256": "7" * 64, "priority": "critical"})
+                self.assertEqual((self.cb.starts, self.cb.stops, self.store.writes), ([], [], []))
+
+    def test_later_green_revision_can_replace_legacy_queued_work(self):
+        later, head, later_input = "6" * 40, "8" * 40, "7" * 64
+        self.store.values["/factory/control"] = {"pending": INPUT_SHA}
+        self.store.values["/factory/requests/" + INPUT_SHA]["status"] = "queued"
+        responses = [{"object": {"sha": head}},
+            {"status": "ahead", "ahead_by": 2, "behind_by": 0, "merge_base_commit": {"sha": later}},
+            {"status": "ahead", "ahead_by": 1, "behind_by": 0, "merge_base_commit": {"sha": SOURCE_SHA}},
+            {"workflow_runs": [self.ci_run(head_sha=later)]}]
+        with (patch.object(mod, "public_github", side_effect=responses),
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
+            result = self.factory.request({"action": "request", "source_sha": later, "input_sha256": later_input, "priority": "critical"})
+        self.assertEqual((result["status"], result["source_sha"]), ("building", later))
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "superseded")
+        self.assertEqual(self.factory.load("/control")["last_source"], later)
+
+    def test_current_head_does_not_need_legacy_admission_proof(self):
+        self.store.values.clear()
+        self.store.values["/factory/control"] = {"last_source": "unverified"}
+        responses = [{"object": {"sha": SOURCE_SHA}}, {"workflow_runs": [self.ci_run()]}]
+        with (patch.object(mod, "public_github", side_effect=responses),
+              patch.object(mod, "execution_timeout_minutes", return_value=240, create=True)):
+            result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
+                "input_sha256": INPUT_SHA, "priority": "critical"})
+        self.assertEqual(result["status"], "building")
+        self.assertEqual(self.factory.load("/control")["last_source"], SOURCE_SHA)
+
     def test_green_ancestor_covers_only_complete_docs_changes(self):
         previous = "9" * 40
         run = self.ci_run(head_sha=previous)
@@ -1163,7 +1343,7 @@ class FactoryTests(unittest.TestCase):
                 comparison = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": previous},
                     "total_commits": 1, "files": [changed]}
                 responses = [{"object": {"sha": SOURCE_SHA}},
-                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison]
+                    {"workflow_runs": [self.ci_run(head_sha=previous)]}, comparison, {"status": "behind"}]
                 with patch.object(mod, "public_github", side_effect=responses):
                     result = self.factory.request({"action": "request", "source_sha": SOURCE_SHA,
                         "input_sha256": INPUT_SHA, "priority": "critical"})
@@ -1171,6 +1351,315 @@ class FactoryTests(unittest.TestCase):
                 self.assertEqual(self.factory.request_record(INPUT_SHA)["ci_head_sha"], previous)
                 self.assertEqual(len(self.cb.starts), 1)
 
+
+    # The fleet account's agents read why a request failed from FAILURE_PARAMETER (ejc3/aws#823):
+    # fixed failure codes and validated phase metadata, without raw log text.
+    def failure_fixture(self, *, logs_fail=False, diagnostics_fail=False, version_id="fixture-version"):
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure", PIPELINE_REGION="us-east-2")
+        instance_id = self.launch()
+        self.cb.builds[BUILD].update(buildStatus="FAILED", logs={"groupName": "/aws/codebuild/factory", "streamName": "stream-1"})
+        tail = "\n".join([
+            "== build start 2026-11-12T21:58:40Z",
+            "make: Leaving directory '/home/ubuntu/fcvm/fleet/phone'",
+            "fetching https://fixture.invalid/object?X-Amz-Signature=abc&X-Amz-Credential=AKIDFIXTURE from 10.21.41.120",
+            "Authorization: Bearer fixture-bearer-value",
+            "Error: rdp rejected Q3Z4mW9P2h8N",
+            '{"error":"M7vSp8R4K2dQ"}',
+            "Error: no space left on device D3vmQ8w2R5pN",
+            "host ip-10-21-41-120 arn:aws:ec2:us-west-2:123456789012:instance/" + instance_id + " prefix 2600:1f14:abc:de00::/56",
+            "warm-phone: cold boot ok=0 streaming_ms=61234 gpu=0000:18:00.0",
+            '{"error":"the app did not start: adb could not install /work/robotpark-0123456789abcdef.apk: '
+            'adb: failed to install /work/robotpark-0123456789abcdef.apk: Failure [INSTALL_FAILED_FIXTURE: reason]"}',
+            "PHASE build FAILED (exit 1)",
+        ]) + "\n"
+        events = [{"message": "[Container] 2026/11/12 23:14:30 Running command python fleet/ami/pipeline.py"},
+                  {"message": json.dumps({"phaseDiagnostics": {"kind": "host", "phase": "build", "sha256": "e" * 64,
+                                                               "size": 1234, "version_id": version_id}})},
+                  {"message": "Traceback (most recent call last):"},
+                  {"message": "__main__.BuilderCommandFailed: the isolated builder command failed S8nV9kQ2R4zM"}]
+        reads = []
+        lock = self.ddb
+        test = self
+
+        class Logs:
+            def get_log_events(self, **kwargs):
+                reads.append(("logs", kwargs))
+                if logs_fail:
+                    raise ClientError({"Error": {"Code": "AccessDeniedException"}}, "GetLogEvents")
+                return {"events": events}
+
+        class S3:
+            def get_object(self, **kwargs):
+                reads.append(("s3", kwargs))
+                if diagnostics_fail:
+                    raise ClientError({"Error": {"Code": "NoSuchVersion"}}, "GetObject")
+                return {"Body": io.BytesIO(tail.encode())}
+
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                test.assertFalse(lock.held, "the failure is published outside the backend lock")
+                return super().put_parameter(Name, Value, **kwargs)
+
+        fleet_ssm = FleetSSM()
+        fleet_ssm.values = self.fleet_ssm.values
+        clients = {("ssm", False): self.store, ("ssm", True): fleet_ssm, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb,
+                   ("lambda", False): self.publisher, ("logs", False): Logs()}
+        def client(name, fleet=False, region=None):
+            if name == "s3":
+                self.assertEqual((fleet, region), (False, "us-east-2"), "diagnostics are read from the factory's bucket")
+                return S3()
+            return clients[(name, fleet)]
+        self.factory.client = client
+        self.factory.reconcile()
+        return instance_id, reads, fleet_ssm
+
+    def test_failure_parameter_never_copies_short_log_values(self):
+        _, _, fleet_ssm = self.failure_fixture()
+        encoded = json.dumps(fleet_ssm.values["/fcvm-fleet/ami-factory-failure"])
+        for opaque in ("Q3Z4mW9P2h8N", "M7vSp8R4K2dQ", "D3vmQ8w2R5pN", "S8nV9kQ2R4zM"):
+            with self.subTest(opaque=opaque):
+                self.assertNotIn(opaque, encoded)
+
+    def test_a_failed_request_publishes_its_sanitized_cause_to_the_fleet(self):
+        instance_id, reads, fleet_ssm = self.failure_fixture()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual((value["version"], value["request_id"], value["source_sha"], value["status"], value["build_status"]),
+                         (1, INPUT_SHA, SOURCE_SHA, "failed", "FAILED"))
+        self.assertEqual(value["reason"], "build_failed_or_expired")
+        self.assertEqual(value["executor_error"], "builder_command_failed")
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual(value["unavailable"], [])
+        s3 = [kwargs for kind, kwargs in reads if kind == "s3"]
+        self.assertEqual(len(s3), 1)
+        self.assertEqual((s3[0]["Bucket"], s3[0]["VersionId"]), ("fixture-factory", "fixture-version"))
+        self.assertEqual(s3[0]["Key"], "builders/arn:aws:ec2:us-east-1:123456789012:instance/" + instance_id + "/diagnostics/host-build.log")
+        self.assertEqual(value["diagnostic_codes"], ["disk_full", "adb_install_failed"])
+        encoded = json.dumps(value)
+        for private in ("123456789012", instance_id, "10.21.41.120", "2600:1f14", "fixture.invalid", "AKIDFIXTURE",
+                        "fixture-bearer-value", "fixture-version", "/aws/codebuild", "stream-1"):
+            self.assertNotIn(private, encoded)
+        self.assertLessEqual(len(json.dumps(value, separators=(",", ":")).encode()), 4000)
+        # Published once: a later reconcile of the failed request leaves the parameter alone.
+        writes = len(fleet_ssm.writes)
+        self.factory.reconcile()
+        self.assertEqual(len(fleet_ssm.writes), writes)
+
+    def test_an_unreadable_log_or_diagnostics_still_publishes_and_says_so(self):
+        _, _, fleet_ssm = self.failure_fixture(logs_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual((value["executor_error"], value["phase"], value["diagnostic_codes"]), (None, None, []))
+        self.assertEqual(value["unavailable"], ["executor_log"])
+        self.setUp()
+        _, _, fleet_ssm = self.failure_fixture(diagnostics_fail=True)
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual((value["diagnostic_codes"], value["unavailable"]), ([], ["phase_diagnostics"]))
+        self.setUp()
+        _, reads, fleet_ssm = self.failure_fixture(version_id="null")
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual(value["phase"], {"kind": "host", "phase": "build"})
+        self.assertEqual(value["unavailable"], ["phase_diagnostics"])
+        self.assertFalse(any(kind == "s3" for kind, _ in reads), "never read an unversioned archive")
+
+    def test_failure_parameter_keeps_only_recognized_metadata(self):
+        _, _, fleet_ssm = self.failure_fixture()
+        self.factory.publish_failure(
+            {"request_id": INPUT_SHA, "status": "failed", "source_sha": "another private value",
+             "message": "some private error detail"},
+            build={"buildStatus": "unexpected private status"})
+        value = fleet_ssm.values["/fcvm-fleet/ami-factory-failure"]
+        self.assertEqual((value["reason"], value["source_sha"], value["build_status"]), ("unknown_failure", None, None))
+        self.assertNotIn("private", json.dumps(value))
+
+    def test_viewer_path_failure_keeps_only_its_code(self):
+        class Logs:
+            def get_log_events(self, **kwargs):
+                return {"events": [{"message": "RuntimeError: candidate viewer path failed: example private detail"}]}
+        self.factory.client = lambda *args: Logs()
+        self.assertEqual(self.factory.executor_failure({"logs": {"groupName": "group", "streamName": "stream"}}),
+                         ("viewer_path_failed", None))
+
+    def test_publisher_rollback_reports_once_during_repeated_cleanup(self):
+        for lease_expired in (False, True):
+            with self.subTest(lease_expired=lease_expired):
+                self.setUp()
+                path = "/fcvm-fleet/ami-factory-failure"
+                self.factory.env["FAILURE_PARAMETER"] = path
+                ended = self.succeed()
+                if lease_expired:
+                    self.time = ended + mod.PUBLICATION_SECONDS + 1
+                record = self.store.values["/factory/requests/" + INPUT_SHA]
+                record.update(status="failed", message="publication rolled back; automatic replay refused")
+                # EC2 termination has not settled on the first two reconciliation ticks.
+                self.factory.gone = lambda *args: False
+                self.factory.reconcile()
+                self.factory.reconcile()
+                self.factory.gone = lambda *args: True
+                self.factory.reconcile()
+                self.assertEqual(self.fleet_ssm.writes.count(path), 1)
+                status = self.fleet_ssm.values[path]
+                self.assertEqual((status["reason"], status["build_status"]), ("publication_rolled_back", "SUCCEEDED"))
+                self.assertEqual(self.factory.request_record(INPUT_SHA)["message"],
+                                 "publication rolled back; automatic replay refused")
+                self.assertIsNone(self.store.values["/factory/control"]["active"])
+                self.assertEqual(self.publisher.calls, [], "a rolled-back request cannot be replayed")
+
+    def test_failures_are_published_newest_last_after_the_queue_settles(self):
+        # A failed build is retired and the pending request's start is refused in one reconcile:
+        # the parameter ends on the refused request, and it is written once the queue holds
+        # neither intent.
+        self.factory.env.update(FAILURE_PARAMETER="/fcvm-fleet/ami-factory-failure")
+        self.factory.journal(BUILD)
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        newer = "5" * 64
+        self.store.values["/factory/requests/" + newer] = {"request_id": newer, "status": "queued", "source_sha": SOURCE_SHA,
+            "input_sha256": newer, "priority": "normal", "build_id": None, "not_before": 0}
+        self.store.values["/factory/control"]["pending"] = newer
+        def refuse(**kwargs):
+            raise ClientError({"Error": {"Code": "AccountLimitExceededException"}}, "StartBuild")
+        self.cb.start_build = refuse
+        order = []
+        test = self
+        class FleetSSM(Store):
+            def put_parameter(self, Name, Value, **kwargs):
+                control = test.store.values["/factory/control"]
+                test.assertIsNone(control.get("active"), "published while the queue still held an intent")
+                order.append(json.loads(Value)["request_id"])
+                return super().put_parameter(Name, Value, **kwargs)
+        fleet = FleetSSM()
+        clients = {("ssm", False): self.store, ("ssm", True): fleet, ("ec2", True): self.ec2,
+                   ("codebuild", False): self.cb, ("dynamodb", False): self.ddb, ("lambda", False): self.publisher}
+        self.factory.client = lambda name, fleet=False, region=None: clients[(name, fleet)]
+        self.factory.reconcile()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "failed")
+        self.assertEqual(self.factory.request_record(newer)["status"], "failed")
+        self.assertEqual(order, [INPUT_SHA, newer])
+        self.assertEqual(fleet.values["/fcvm-fleet/ami-factory-failure"]["request_id"], newer)
+        self.assertEqual(fleet.values["/fcvm-fleet/ami-factory-failure"]["reason"], "start_rejected")
+
+    def test_failure_parameter_is_the_fleet_accounts_and_only_the_dispatcher_writes_it(self):
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        parameter = re.search(r'^resource "aws_ssm_parameter" "fcvm_ami_failure" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn("provider    = aws.fcvm_fleet_east1", parameter)
+        self.assertIn('name        = "/fcvm-fleet/ami-factory-failure"', parameter)
+        self.assertNotIn("ami-pipeline", re.search(r'name\s*=\s*"([^"]+)"', parameter).group(1),
+                         "the fleet's role cannot read the factory's /fcvm-fleet/ami-pipeline/ state")
+        self.assertIn("ignore_changes = [value]", parameter)
+        broker = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('{ Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", '
+                      'Resource = aws_ssm_parameter.fcvm_ami_failure.arn }', broker)
+        dispatch = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('Action = "logs:GetLogEvents", Resource = "${aws_cloudwatch_log_group.fcvm_ami_codebuild.arn}:log-stream:*"', dispatch)
+        self.assertIn('Action = ["s3:GetObject", "s3:GetObjectVersion"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*/diagnostics/*"', dispatch)
+        function = re.search(r'^resource "aws_lambda_function" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(function, r"FAILURE_PARAMETER\s*=\s*aws_ssm_parameter\.fcvm_ami_failure\.name")
+        self.assertRegex(function, r"PIPELINE_REGION\s*=\s*local\.fcvm_fleet_home_region")
+        self.assertRegex(function, r'RELEASE_REGION\s*=\s*local\.fcvm_ami_region')
+        self.assertRegex(source, r'fcvm_ami_region\s*=\s*"us-east-1"')
+
+    def retired_pending(self):
+        source = "3e36a3a36e13fdb03168b77ff6257a707e6654d1"
+        request = "/factory/requests/" + INPUT_SHA
+        control = {"active": None, "pending": INPUT_SHA, "last_normal_day": "2026-11-13", "last_source": source}
+        self.store.values["/factory/control"] = control
+        self.store.values[request].update(status="queued", priority="normal", build_id=None, not_before=NOW - 1,
+                                          source_sha=source)
+        self.queue_prepared = True
+        return source, request, control
+
+    def test_retired_source_stays_queued_while_paused_and_never_starts_on_unpause(self):
+        source, request, control = self.retired_pending()
+        before = copy.deepcopy(self.store.values)
+        self.factory.env["ENABLED"] = "false"
+        self.factory.reconcile()
+        self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
+        self.assertEqual((self.store.values, self.store.writes, self.cb.starts), (before, [], []))
+
+        self.factory.env["ENABLED"] = "true"
+        status = self.factory.request({"action": "status", "request_id": INPUT_SHA})
+        self.assertEqual((status["status"], self.store.values["/factory/control"]),
+                         ("superseded", {**control, "pending": None}))
+        self.assertIn("fleet host fails to load boot user data", status["message"])
+        self.assertEqual((self.store.writes, self.cb.starts, self.cb.stops), ([request, "/factory/control"], [], []))
+
+        self.store.writes.clear()
+        self.factory.reconcile()
+        with patch.object(mod, "public_github") as github, self.assertRaisesRegex(mod.Refused, "source retired"):
+            self.factory.request({"action": "request", "source_sha": source, "input_sha256": INPUT_SHA, "priority": "critical"})
+        github.assert_not_called()
+        self.assertEqual((self.store.writes, self.cb.starts, self.cb.stops), ([], [], []))
+
+        fixed_source = "d613d813befeac90e1a38924bf909056024f5a12"
+        fixed = self.request("critical", "6" * 64, source_sha=fixed_source)
+        self.assertEqual(fixed["status"], "building")
+        self.assertEqual([build["sourceVersion"] for build in self.cb.starts], [fixed_source])
+
+    def test_retired_source_retries_terminal_write_and_keeps_uncertain_work(self):
+        _, request, control = self.retired_pending()
+        original_put = self.store.put_parameter
+
+        def interrupted_put(Name, Value, **kw):
+            if Name == "/factory/control":
+                raise TimeoutError("control write interrupted")
+            return original_put(Name, Value, **kw)
+
+        with patch.object(self.store, "put_parameter", side_effect=interrupted_put), self.assertRaises(TimeoutError):
+            self.factory.reconcile()
+        self.assertEqual(self.store.values[request]["status"], "superseded")
+        self.assertEqual(self.store.values["/factory/control"], control)
+        self.factory.reconcile()
+        self.assertEqual(self.store.values["/factory/control"], {**control, "pending": None})
+        self.assertEqual(self.cb.starts, [])
+
+        for fields in ({"start_attempted": NOW - 20}, {"build_id": BUILD}, {"status": "awaiting-publish"}):
+            with self.subTest(fields=fields):
+                self.setUp()
+                _, request, _ = self.retired_pending()
+                self.store.values[request].update(fields)
+                saved = copy.deepcopy(self.store.values)
+                with self.assertRaisesRegex(mod.Refused, "uncertain start|unexpected status"):
+                    self.factory.reconcile()
+                self.assertEqual((self.store.values, self.store.writes, self.cb.starts, self.cb.stops),
+                                 (saved, [], [], []))
+
+    def test_retired_source_preserves_an_active_intent_with_unknown_start_result(self):
+        _, request, control = self.retired_pending()
+        self.store.values[request]["start_attempted"] = NOW - 20
+        control["active"] = {"intent": INPUT_SHA}
+        self.cb.builds.clear()  # CodeBuild may have accepted StartBuild without a visible result yet.
+        before = copy.deepcopy(self.store.values)
+        self.factory.env["ENABLED"] = "false"
+        self.factory.reconcile()
+        self.factory.env["ENABLED"] = "true"
+        self.factory.reconcile()
+        self.assertEqual((self.store.values, self.store.writes, self.cb.starts, self.cb.stops),
+                         (before, [], [], []))
+
+    def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
+        # 2026-11-14: generation twelve broke staging; the factory is paused until the boot fix
+        # and the launch-path gate are in. The pause reaches the dispatcher as ENABLED=false,
+        # which starts nothing, while the launch templates still follow the release pointer.
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
+        self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
+        # what ENABLED=false does with a queued normal request whose window has opened
+        self.store.values.pop("/factory/control", None)
+        self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
+        self.queue_prepared = True
+        queued = self.request("normal")
+        self.assertEqual(queued["status"], "queued")
+        self.factory.env["ENABLED"] = "false"
+        self.time += 7 * 3600
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts, [])
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "queued")
+        self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
+        self.assertEqual(self.cb.starts, [])
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

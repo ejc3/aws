@@ -94,11 +94,14 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Resource = "*"
       },
       {
+        # Canonical's Ubuntu AMIs report the "amazon" owner alias, which
+        # ec2:Owner also gives to other verified publishers. Match the source
+        # AMI's account instead, as scripts/build-ami.sh does when selecting it.
         Sid       = "LaunchUbuntuImage"
         Effect    = "Allow"
         Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:us-west-1::image/*"
-        Condition = { StringEquals = { "ec2:Owner" = "099720109477" } }
+        Condition = { StringEquals = { "aws:ResourceAccount" = "099720109477" } }
       },
       {
         Sid    = "UseIsolatedRunnerNetwork"

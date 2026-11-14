@@ -7,7 +7,7 @@
 #                           domain. It holds episode transcripts and dynamic-ad alignments, about 150 KB an episode,
 #                           under production/transcripts/<id>.json and production/alignment/<id>.json. The production
 #                           Worker binds it as PODCASTS (dolphin-labs web/wrangler.jsonc) and serves from it. Objects
-#                           expire after 180 days; the pipeline keeps 120 days of episodes.
+#                           expire after 240 days, longer than any episode record (up to 217 days).
 #
 #   dolphin-labs/podcasts-r2   Secrets Manager (us-west-1) in the Dolphin account: the bucket's S3 API credentials as
 #                           JSON {R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET}, for the podcast
@@ -53,11 +53,13 @@ resource "cloudflare_r2_bucket_lifecycle" "dolphin_labs_podcasts" {
   account_id  = var.cloudflare_account_id
   bucket_name = cloudflare_r2_bucket.dolphin_labs_podcasts.name
   rules = [{
-    id         = "expire-after-180-days"
-    enabled    = true
+    id      = "expire-after-240-days"
+    enabled = true
+    # At least as long as the longest podcast episode record (dolphin-labs: publication + 210 days, plus 7 after
+    # the last write), so an old episode never outlives its description, transcript or alignment (dolphin-labs#1283).
     conditions = { prefix = "" }
     delete_objects_transition = {
-      condition = { type = "Age", max_age = 180 * 24 * 3600 }
+      condition = { type = "Age", max_age = 240 * 24 * 3600 }
     }
     # R2's default rule for a new bucket, which a managed lifecycle would otherwise remove.
     abort_multipart_uploads_transition = {

@@ -32,7 +32,7 @@ def run_arguments(event):
     lane = event.get("lane")
     if lane == "fargate":
         if not SUBNET:
-            raise ValueError("the campaign network is retired (boot_race_enabled = false)")
+            raise ValueError("Fargate benchmarking is disabled: no campaign subnet is configured")
         return {
             "taskDefinition": FARGATE_FAMILY,
             "launchType": "FARGATE",

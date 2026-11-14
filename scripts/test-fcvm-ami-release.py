@@ -120,11 +120,40 @@ class ReleaseContracts(unittest.TestCase):
             ("host/x86_64/a4a0bd3e", "ami-04c3294f21cb88942", "host"),
             ("host/x86_64/92a26793", "ami-09ac99f69700ec306", "host"),
             ("tile/x86_64/92a26793", "ami-094ca9c62a284a389", "tile"),
+            ("host/x86_64/343b2287", "ami-05923927f810a2ce9", "host"),
         ):
             with self.subTest(resource_key=key):
                 self.assertRegex(catalog.group(1), r'"' + re.escape(key)
                                  + r'"\s*=\s*\{\s*image\s*=\s*"' + image
                                  + r'",\s*kind\s*=\s*"' + kind + r'"\s*\}')
+
+    def test_a_reviewed_build_region_host_is_tagged_there_and_its_release_copy_found_by_lineage(self):
+        catalog = re.search(r"fcvm_ami_build_region_reviewed\s*=\s*\{(.*?)\n  \}", self.release, re.S)
+        self.assertIsNotNone(catalog)
+        entries = re.findall(r'"(host/x86_64/[0-9a-f]{8})"\s*=\s*\{\s*image\s*=\s*"(ami-[0-9a-f]{17})",\s*'
+                             r'kind\s*=\s*"host",\s*name\s*=\s*"(fcvm-fleet-host-x86_64-[0-9a-f]{8}-[0-9]{12})"\s*\}',
+                             catalog.group(1))
+        self.assertEqual([key for key, _, _ in entries],
+                         ["host/x86_64/fb2f5c36", "host/x86_64/853eb034", "host/x86_64/0e910245", "host/x86_64/cad0ddad"])
+        for key, _, name in entries:
+            self.assertEqual(name[23:31], key[-8:])
+        for name, key in (("fcvm_ami_build_region_kind", "FleetImageKind"),
+                          ("fcvm_ami_build_region_validated", "FleetImageValidated")):
+            with self.subTest(resource=name):
+                block = re.search(r'resource "aws_ec2_tag" "' + name + r'" \{(.*?)\n\}', self.release, re.S)
+                self.assertIsNotNone(block)
+                self.assertIn("provider    = aws.fcvm_fleet_west2", block.group(1))
+                self.assertIn("for_each    = local.fcvm_ami_build_region_reviewed", block.group(1))
+                self.assertIn('key         = "' + key + '"', block.group(1))
+        copies = re.search(r'data "aws_ami_ids" "fcvm_ami_build_region_copies" \{(.*?)\n\}', self.release, re.S)
+        self.assertIsNotNone(copies)
+        body = copies.group(1)
+        self.assertIn("provider = aws.fcvm_fleet_east1", body)
+        # the names and description the publisher's regional_copy gives a copy of the original
+        self.assertIn('values = [each.value.name, "${each.value.name}-copy-2", "${each.value.name}-copy-3"]', body)
+        self.assertIn('values = ["copy of ${each.value.image} from us-west-2"]', body)
+        self.assertRegex(body, r'name\s*=\s*"state"\s*values\s*=\s*\["available"\]')
+        self.assertRegex(body, r'name\s*=\s*"tag:FleetImageValidated"\s*values\s*=\s*\["true"\]')
 
     def test_published_images_are_copied_out_of_the_staging_region_only_as_a_record(self):
         pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
@@ -216,6 +245,7 @@ class ReleaseContracts(unittest.TestCase):
             (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 128),
             (r"module\.[a-z0-9_]+\.host_user_data_sha256", lambda v: 64),
             (r'join\(",", local\.fcvm_ami_copy_regions\)', lambda v: 15 * copy_regions),
+            (r"tostring\(var\.[a-z0-9_]+\)", lambda v: 5),
         ]
         total = 2
         for key, value in pairs:

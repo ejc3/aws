@@ -30,9 +30,10 @@ class BucketTests(unittest.TestCase):
         self.assertIn("enabled     = false", block("cloudflare_r2_managed_domain", "dolphin_labs_podcasts"))
         self.assertNotIn("cloudflare_r2_custom_domain", code(TF))
 
-    def test_objects_outlive_the_pipelines_120_days(self):
+    def test_objects_outlive_the_longest_episode_record(self):
         rule = block("cloudflare_r2_bucket_lifecycle", "dolphin_labs_podcasts")
-        self.assertIn("max_age = 180 * 24 * 3600", rule)
+        # The longest episode record lives for 217 days. Keep the 240-day margin.
+        self.assertIn("max_age = 240 * 24 * 3600", rule)
         self.assertIn('conditions = { prefix = "" }', rule)
 
 

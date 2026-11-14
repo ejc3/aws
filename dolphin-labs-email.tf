@@ -58,8 +58,11 @@ locals {
   dolphin_verified_destinations = local.dolphin_enabled ? [for a in data.cloudflare_email_routing_addresses.verified[0].result : lower(a.email)] : []
   dolphin_work_aliases = {
     for k, v in {
-      ej    = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward : ""
-      steve = local.dolphin_enabled && contains(local.dolphin_verified_destinations, lower(local.dolphin_steve_email)) ? local.dolphin_steve_email : ""
+      ej = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward : ""
+      # The address Dolphin's own emails are sent from (TestFlight replies, reports to data providers): a reply to
+      # it reaches the owner instead of being refused for having no route (added 2026-11-13, when one would have been).
+      feedback = local.dolphin_privacy_enabled ? local.dolphin_privacy_forward : ""
+      steve    = local.dolphin_enabled && contains(local.dolphin_verified_destinations, lower(local.dolphin_steve_email)) ? local.dolphin_steve_email : ""
     } : k => v if v != ""
   }
 }

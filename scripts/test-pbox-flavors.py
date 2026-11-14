@@ -678,19 +678,49 @@ args = sys.argv[1:]
 a = " ".join(args)
 open(os.environ["FAKE_LOG"], "a").write(json.dumps(args) + "\n")
 if "get-parameter" in a:
-    print(os.environ.get("FAKE_POINTER") or '{"region": "us-east-2", "x86_image": "ami-0x86home", "fallback": {}}')
+    if os.environ.get("FAKE_DISCOVERY_ERROR"):
+        sys.exit(254)
+    print(os.environ.get("FAKE_POINTER") or '{"region": "us-east-2", "x86_image": "ami-0x86home", "fallback": {"regions": {}}}')
+elif "get-spot-placement-scores" in a:
+    print("9\tus-east-2\tuse2-az3")
+elif "describe-availability-zones" in a:
+    print("use2-az3\tus-east-2c")
 elif "describe-launch-template-versions" in a:
     print("spot")
 elif "describe-instances" in a and "PublicIpAddress" in a:
     print("203.0.113.9" if os.environ.get("FAKE_RUNNING") else "None")
+elif "describe-instances" in a and "{id:InstanceId,type:InstanceType" in a:
+    if os.environ.get("FAKE_TYPE_ERROR"):
+        sys.exit(254)
+    tags = [{"Key": "Name", "Value": "parallel-box-5"}]
+    if os.environ.get("FAKE_FRESH"):
+        tags.append({"Key": "Fallback", "Value": "true"})
+    print(os.environ.get("FAKE_INCUMBENT_JSON") or json.dumps({
+        "id": "i-0running", "type": os.environ["FAKE_RUNNING"],
+        "state": os.environ.get("FAKE_INCUMBENT_STATE", "running"), "az": "us-east-2a" if os.environ.get("FAKE_FRESH") else "us-east-2c",
+        "tags": tags,
+    }))
 elif "describe-instances" in a and "InstanceType" in a:
+    if "--instance-ids" in args and os.environ.get("FAKE_TYPE_ERROR"):
+        sys.exit(254)
     print(os.environ.get("FAKE_RUNNING") or "None")
 elif "describe-instances" in a and "InstanceId" in a:
-    print("i-0running" if os.environ.get("FAKE_RUNNING") else "None")
+    if os.environ.get("FAKE_SLOT_ERROR"):
+        sys.exit(254)
+    in_region = os.environ.get("FAKE_SLOT_REGION") in (None, args[args.index("--region") + 1])
+    print("i-0running" if os.environ.get("FAKE_RUNNING") and in_region else "None")
+elif "describe-instances" in a and "Fallback" in a:
+    if os.environ.get("FAKE_NAME_LOOKUP_ERROR"):
+        sys.exit(254)
+    print("true" if os.environ.get("FAKE_FRESH") else "None")
 elif "describe-instances" in a and "InstanceLifecycle" in a:
     print("spot")
 elif "describe-instances" in a:
     print("None")
+elif "describe-volumes" in a and "Attachments[?State==" in a:
+    print(os.environ.get("FAKE_ATTACHED", "None"))
+elif "describe-volumes" in a and "VolumeId,State,AvailabilityZone,Attachments" in a and os.environ.get("FAKE_NAME_LOOKUP_ERROR"):
+    print("vol-1\tavailable\tus-east-2c\tNone")
 elif "describe-volumes" in a and "[State," in a:
     print("available\tNone")
 elif "describe-volumes" in a and "AvailabilityZone" in a:
@@ -712,18 +742,22 @@ else:
 class ScriptRuns(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
-        for name, body in (("aws", FAKE_AWS), ("ssh", "#!/bin/sh\nexit 255\n"), ("sleep", "#!/bin/sh\nexit 0\n")):
+        ssh = '#!/bin/sh\nprintf "%s\\n" "$*" >> "$FAKE_SSH_LOG"\nexit "${FAKE_SSH_RC:-255}"\n'
+        for name, body in (("aws", FAKE_AWS), ("ssh", ssh), ("sleep", "#!/bin/sh\nexit 0\n")):
             p = self.tmp / name
             p.write_text(body)
             p.chmod(p.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls"
+        self.ssh_log = self.tmp / "ssh-calls"
 
-    def pbox(self, *args, user="ejc3", running="", pointer=""):
-        if self.log.exists():
-            self.log.unlink()
+    def pbox(self, *args, user="ejc3", running="", pointer="", fresh="", type_error="", slot_error="", **extra_env):
+        for log in (self.log, self.ssh_log):
+            log.unlink(missing_ok=True)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
-                   MEMBER_BOX_USER=user, FAKE_RUNNING=running, FAKE_POINTER=pointer)
+                   MEMBER_BOX_USER=user, FAKE_RUNNING=running, FAKE_POINTER=pointer, FAKE_FRESH=fresh,
+                   FAKE_TYPE_ERROR=type_error, FAKE_SLOT_ERROR=slot_error, FAKE_SSH_LOG=str(self.ssh_log))
         env.pop("PARALLEL_BOX_REGION", None)
+        env.update(extra_env)
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
 
@@ -765,6 +799,108 @@ class ScriptRuns(unittest.TestCase):
                 self.assertEqual(self.launched_types(), v[4])
                 runs = [c for c in self.calls() if "run-instances" in c]
                 self.assertTrue(all("LaunchTemplateName=parallel-box-5,Version=$Latest" in c for c in runs))
+
+    def test_local_nvme_launch_and_capacity_both_exclude_diskless_metal(self):
+        rc, _, err = self.pbox("up", "5", "kvm-96", "--local-nvme")
+        self.assertEqual(rc, 3, err)  # fake home is out of capacity
+        self.assertEqual(self.launched_types(), ["c8gd.metal-24xl", "m8gd.metal-24xl"])
+        self.assertIn("up 5 kvm-96 --local-nvme --fallback", err)
+
+        rc, out, err = self.pbox("capacity", "5", "kvm-96", "--local-nvme")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("us-east-2c home", out)
+        [call] = [c for c in self.calls() if "get-spot-placement-scores" in c]
+        self.assertEqual(call[call.index("--instance-types") + 1:call.index("--query")],
+                         ["c8gd.metal-24xl", "m8gd.metal-24xl"])
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_refuses_incompatible_or_unverified_occupied_slot(self):
+        for running, error in (("c8g.metal-24xl", ""), ("m8g.metal-24xl", ""),
+                               ("i8g.24xlarge", ""), ("c8gd.metal-24xl", "1")):
+            with self.subTest(running=running, type_error=error):
+                rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", running=running, type_error=error)
+                self.assertEqual(rc, 1, err)
+                self.assertEqual(out, "")
+                self.assertIn("Refusing --local-nvme", err)
+                [lookup] = [c for c in self.calls() if any("InstanceType" in arg for arg in c)]
+                self.assertIn("i-0running", lookup)
+                self.assertFalse(any(set(c) & {"run-instances", "attach-volume", "terminate-instances"}
+                                     for c in self.calls()))
+
+    def test_local_nvme_reuses_ohio_fallback_even_if_the_name_lookup_would_fail(self):
+        rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", running="m8gd.metal-24xl", fresh="1",
+                                 FAKE_NAME_LOOKUP_ERROR="1", FAKE_SSH_RC="0")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("region=us-east-2 az=us-east-2a", out)
+        self.assertIn("id=i-0running work=fresh", out)
+        self.assertFalse(any(set(c) & {"run-instances", "describe-volumes", "attach-volume", "terminate-instances"}
+                             for c in self.calls()))
+        reads = [c for c in self.calls() if "describe-instances" in c]
+        self.assertIn("--filters", reads[0])  # finding the initial slot is the only lookup by name
+        self.assertTrue(all("--instance-ids" in c and "i-0running" in c for c in reads[1:]))
+        self.assertNotIn("usermod", self.ssh_log.read_text())
+
+    def test_local_nvme_refuses_an_inactive_or_malformed_incumbent(self):
+        args = ("up", "5", "kvm-96", "--local-nvme")
+        for mock in ({"FAKE_INCUMBENT_STATE": "stopping"}, {"FAKE_INCUMBENT_JSON": "null"},
+                     {"FAKE_INCUMBENT_JSON": '{"id":"i-0replacement","type":"c8gd.metal-24xl","state":"running",'
+                                             '"az":"us-east-2c","tags":[{"Key":"Name","Value":"parallel-box-5"}]}'},
+                     {"FAKE_INCUMBENT_JSON": '{"id":"i-0running","type":"c8gd.metal-24xl","state":"running",'
+                                             '"az":"us-east-2c","tags":[{"Key":"Name","Value":"parallel-box-5"},'
+                                             '{"Key":"Fallback","Value":"unknown"}]}'}):
+            with self.subTest(mock=mock):
+                rc, out, err = self.pbox(*args, running="c8gd.metal-24xl", **mock)
+                self.assertEqual((rc, out), (1, ""), err)
+                self.assertIn("could not verify the active instance and work mode", err)
+                self.assertFalse(any(set(c) & {"run-instances", "describe-volumes", "attach-volume", "terminate-instances"}
+                                     for c in self.calls()))
+
+    def test_local_nvme_never_repairs_or_terminates_an_existing_home_box(self):
+        args = ("up", "5", "kvm-96", "--local-nvme")
+        for attached, expect in (("i-0replacement", 1), ("None", 1), ("i-0running", 0)):
+            with self.subTest(attached=attached):
+                rc, out, err = self.pbox(*args, running="c8gd.metal-24xl", FAKE_ATTACHED=attached, FAKE_SSH_RC="0")
+                self.assertEqual(rc, expect, err)
+                if expect:
+                    self.assertIn("already attached to i-0running; nothing was changed", err)
+                else:
+                    self.assertIn("id=i-0running work=persistent", out)
+                self.assertFalse(any(set(c) & {"run-instances", "attach-volume", "terminate-instances"}
+                                     for c in self.calls()))
+
+    def test_local_nvme_requires_valid_discovery_even_with_a_region_override(self):
+        args = ("up", "5", "kvm-96", "--local-nvme")
+        for pointer, mock in (("not-json", {}), ('{"region":"us-east-2","fallback":{}}', {}),
+                              ("", {"FAKE_DISCOVERY_ERROR": "1"})):
+            with self.subTest(pointer=pointer, mock=mock):
+                rc, out, err = self.pbox(*args, pointer=pointer, PARALLEL_BOX_REGION="us-west-2", **mock)
+                self.assertEqual((rc, out), (1, ""), err)
+                self.assertIn("Refusing --local-nvme", err)
+                self.assertEqual(len(self.calls()), 1)
+                self.assertIn("get-parameter", self.calls()[0])
+
+        rc, _, err = self.pbox(*args, running="c8g.metal-24xl", PARALLEL_BOX_REGION="us-west-2",
+                               FAKE_SLOT_REGION="us-east-2")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("c8g.metal-24xl, not a compatible KVM host", err)
+        lookups = [c for c in self.calls() if "describe-instances" in c and "--filters" in c]
+        self.assertEqual([c[c.index("--region") + 1] for c in lookups], ["us-west-2", "us-east-2"])
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_does_not_launch_when_slot_lookup_fails(self):
+        rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", slot_error="1")
+        self.assertEqual(rc, 1, err)
+        self.assertEqual(out, "")
+        self.assertIn("could not verify whether parallel-box-5 is in use", err)
+        self.assertEqual(self.launched_types(), [])
+
+    def test_local_nvme_requires_kvm96_up_or_capacity_before_aws_calls(self):
+        for args in (("up", "storage-96"), ("capacity", "kvm-192"), ("status",), ("up",)):
+            with self.subTest(args=args):
+                rc, _, err = self.pbox(*args, "--local-nvme")
+                self.assertEqual(rc, 2, err)
+                self.assertIn("--local-nvme only applies", err)
+                self.assertEqual(self.calls(), [])
 
     def test_only_an_x86_type_gets_the_published_x86_image(self):
         rc, _, err = self.pbox("up", "2", "kvm-gpu-96")
