@@ -22,6 +22,8 @@ jobs:
       - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: 1.10.3
+          # The Browser Run policy test sends expressions to terraform console on stdin.
+          terraform_wrapper: false
 
       # A full plan reads credential-bearing state and managed secret values.
       # Never restore AWS credentials here to make a refresh pass; full drift
