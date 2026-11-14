@@ -9,14 +9,17 @@ variable "fcvm_ami_pipeline_enabled" {
 # Pauses the factory's builds without touching the release pointer or the launch templates
 # (which fcvm_ami_pipeline_enabled also switches). While paused the dispatcher starts no
 # build: a queued request stays queued, a new request is answered "disabled", and nothing
-# reaches the publisher. Paused 2026-11-14: generation twelve, the factory's first published
-# pair, booted on staging without its user data (ejc3/aws#823; the host kernel loads its ENA
-# driver after cloud-init looks for a NIC), and its acceptance did not boot the candidate
-# through the fleet's launch path. Unpause once ejc3/fcvm has the boot fix and that gate.
+# reaches the publisher. It was paused on 2026-11-14 because generation twelve, the factory's first
+# published pair, booted on staging without its user data (ejc3/aws#823; the host kernel loaded
+# its ENA driver after cloud-init looked for a NIC), and its acceptance did not boot the
+# candidate through the fleet's launch path. ejc3/fcvm now has both: ENA built into the host
+# kernel (ejc3/fcvm#1874) and the launch-path proof in the validator (ejc3/fcvm#1876, #1878),
+# and its request workflow refuses a source without them (ejc3/fcvm#1873). The one request
+# queued from before the fix is retired by the dispatcher (#852).
 variable "fcvm_ami_factory_paused" {
   description = "Start no factory build; requests stay queued or are answered disabled"
   type        = bool
-  default     = true
+  default     = false
 }
 
 locals {
