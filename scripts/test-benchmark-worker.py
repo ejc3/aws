@@ -48,7 +48,9 @@ class Worker(unittest.TestCase):
 
     def test_launch_is_one_pinned_instance_without_overrides(self):
         self.ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test", "State": {"Name": "pending"}}]}
-        self.assertEqual(self.invoke(action="up")["instance"], "i-test")
+        self.assertEqual(self.invoke(action="up"), {
+            "instance": "i-test", "state": "pending", "public_ipv4": "192.0.2.1", "launched": True,
+        })
         self.ec2.run_instances.assert_called_once_with(
             LaunchTemplate={"LaunchTemplateId": "lt-123", "Version": "7"}, MinCount=1, MaxCount=1,
         )
@@ -58,9 +60,9 @@ class Worker(unittest.TestCase):
 
     def test_up_reuses_eni_owner_status_and_never_launches_a_second(self):
         self.attached()
-        self.assertEqual(self.invoke(action="up"), {
-            "instance": "i-example", "state": "running", "public_ipv4": "192.0.2.1",
-        })
+        expected = {"instance": "i-example", "state": "running", "public_ipv4": "192.0.2.1"}
+        self.assertEqual(self.invoke(action="up"), expected)
+        self.assertEqual(self.invoke(action="status"), expected)
         self.ec2.run_instances.assert_not_called()
 
     def test_down_is_bound_to_the_instance_observed_by_the_caller(self):

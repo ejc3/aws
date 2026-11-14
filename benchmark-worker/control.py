@@ -35,12 +35,14 @@ def lambda_handler(event, _context):
     instance = current()
     if action == "down" and instance and instance["InstanceId"] != expected:
         raise ValueError("the worker changed; refusing to terminate a different instance")
+    launched = False
     if action == "up" and not instance:
         instance = EC2.run_instances(
             LaunchTemplate={"LaunchTemplateId": os.environ["TEMPLATE"], "Version": os.environ["VERSION"]},
             MinCount=1,
             MaxCount=1,
         )["Instances"][0]
+        launched = True
     if not instance:
         return {"state": "absent"}
     iid = instance["InstanceId"]
@@ -51,4 +53,7 @@ def lambda_handler(event, _context):
         if state not in {"shutting-down", "terminated"}:
             EC2.terminate_instances(InstanceIds=[iid])
             state = "shutting-down"
-    return {"state": state, "instance": iid, "public_ipv4": os.environ["PUBLIC_IPV4"]}
+    result = {"state": state, "instance": iid, "public_ipv4": os.environ["PUBLIC_IPV4"]}
+    if launched:
+        result["launched"] = True
+    return result
