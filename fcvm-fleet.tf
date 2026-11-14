@@ -113,6 +113,11 @@ locals {
   # One past the last place's port: GPU slots, Windows sandboxes and Minecraft servers.
   fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : r.offset + r.count if m != "aggregate"]...)
 
+  # Public Java Edition joins (TCP 25565 over IPv6) to the Minecraft mode servers: the owner chose open joins in
+  # offline mode (2026-11-08). The kill switch: false removes the rule in every region with one apply, with no new
+  # image; the servers and the page keep running for viewers (ejc3/fcvm docs/fleet/minecraft.md, "Public joins").
+  fcvm_fleet_minecraft_public_join = true
+
   # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
   # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
   # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
@@ -433,6 +438,7 @@ module "fcvm_fleet_east2" {
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
+  minecraft_public_join     = local.fcvm_fleet_minecraft_public_join
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -453,6 +459,7 @@ module "fcvm_fleet_west2" {
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
+  minecraft_public_join     = local.fcvm_fleet_minecraft_public_join
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -493,6 +500,7 @@ module "fcvm_fleet_east1" {
   slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
+  minecraft_public_join     = local.fcvm_fleet_minecraft_public_join
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"

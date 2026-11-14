@@ -121,6 +121,11 @@ variable "windows_host_amis" {
   }
 }
 
+variable "minecraft_public_join" {
+  description = "Whether the fleet security group admits public Java Edition joins (TCP 25565 over IPv6) to the Minecraft mode servers. false closes it without a new image."
+  type        = bool
+}
+
 variable "minecraft_host_amis" {
   description = "Exact reviewed host AMIs whose fcvm has Minecraft mode and the tile image; their hosts run four Minecraft servers."
   type        = set(string)
@@ -382,6 +387,20 @@ resource "aws_security_group" "fleet" {
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
+  # Public Java Edition joins to the Minecraft mode servers, each at its own IPv6 address (ejc3/fcvm
+  # docs/fleet/minecraft.md, "Public joins": Pumpkin in offline mode, with per-source connection and rate limits on
+  # the host, a player cap and a login timeout). minecraft_public_join = false closes it with one apply.
+  dynamic "ingress" {
+    for_each = var.minecraft_public_join ? [25565] : []
+    content {
+      description      = "Minecraft Java Edition to the Minecraft mode servers, each at its own IPv6 address"
+      from_port        = ingress.value
+      to_port          = ingress.value
+      protocol         = "tcp"
+      ipv6_cidr_blocks = ["::/0"]
+    }
+  }
+
 
   egress {
     description      = "All outbound"
