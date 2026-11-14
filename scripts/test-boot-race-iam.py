@@ -125,26 +125,29 @@ class StandingDriver(unittest.TestCase):
 
     def test_driver_reaper_and_cap_are_on_by_default(self):
         self.assertIn("default = true", block('variable "boot_race_enabled"'))
+        self.assertRegex(TF, r"boot_race_driver_enabled\s*= var\.boot_race_enabled && var\.enable_firecracker_instance")
+        self.assertIn("value = local.boot_race_driver_enabled ?", block('output "boot_race"'))
         for header in ('resource "aws_iam_role" "boot_race_driver"',
                        'resource "aws_iam_role_policy" "boot_race_driver"',
                        'resource "aws_budgets_budget_action" "boot_race"'):
-            self.assertIn("count = var.boot_race_enabled ? 1 : 0", block(header), header)
+            self.assertIn("count = local.boot_race_driver_enabled ? 1 : 0", block(header), header)
         self.assertIn('state = var.boot_race_enabled ? "ENABLED" : "DISABLED"',
                       block('resource "aws_scheduler_schedule" "boot_race_reaper"'))
 
-    def test_no_campaign_window_or_source_instance_remains(self):
+    def test_no_campaign_window_remains(self):
         for gone in ("boot_race_campaign", "boot_race_assume_conditions", "aws:CurrentTime", "aws:TokenIssueTime",
-                     "ec2:SourceInstanceARN", "DenyAfterCampaignExpiry", "DenySessionsFromBeforeCampaign"):
+                     "DenyAfterCampaignExpiry", "DenySessionsFromBeforeCampaign"):
             self.assertNotIn(gone, TF)
 
-    def test_dev_server_role_is_trusted_unconditionally_with_no_inline_grant(self):
+    def test_only_primary_arm_instance_credentials_are_trusted_with_no_inline_grant(self):
         trust = block('resource "aws_iam_role" "boot_race_driver"')
         self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", trust)
-        self.assertNotIn("Condition", trust)
+        self.assertIn('Condition = { ArnEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }', trust)
         # The trust policy alone admits the role within the account; dev-server-role's inline policies are full.
         self.assertNotRegex(TF, r"role\s*=\s*aws_iam_role\.dev_server\.")
-        self.assertIn("policy = data.aws_iam_policy_document.boot_race_driver.json",
-                      block('resource "aws_iam_role_policy" "boot_race_driver"'))
+        policy = block('resource "aws_iam_role_policy" "boot_race_driver"')
+        self.assertIn("policy = data.aws_iam_policy_document.boot_race_driver.json", policy)
+        self.assertIn("depends_on = [aws_budgets_budget_action.boot_race]", policy)
 
     def test_the_driver_keeps_its_tag_template_and_type_scopes(self):
         driver = block('data "aws_iam_policy_document" "boot_race_driver"')
@@ -182,6 +185,12 @@ class SpendCap(unittest.TestCase):
         tag = block('resource "aws_ce_cost_allocation_tag" "project"')
         self.assertIn('tag_key = "Project"', tag)
         self.assertIn('status = "Active"', tag)
+        self.assertIn('prevent_destroy = true', tag)
+
+    def test_the_driver_uploads_workload_code_but_cannot_change_function_configuration(self):
+        grants = set().union(*(set(acts) for acts, _, _ in statements("boot_race_driver")))
+        self.assertIn("lambda:UpdateFunctionCode", grants)
+        self.assertNotIn("lambda:UpdateFunctionConfiguration", grants)
 
     def test_breaching_the_budget_caps_the_driver_without_a_person(self):
         action = block('resource "aws_budgets_budget_action" "boot_race"')
@@ -199,19 +208,33 @@ class SpendCap(unittest.TestCase):
         self.assertIn('Resource = "*"', cap)
         allowed = set(re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', cap[cap.index("NotAction"):cap.index("Resource")]))
         for cleanup in ("ec2:StopInstances", "ec2:TerminateInstances", "ec2:DeregisterImage", "ec2:DeleteSnapshot",
-                        "ecr:BatchDeleteImage"):
+                        "ecs:StopTask", "ecr:BatchDeleteImage"):
             self.assertIn(cleanup, allowed)
-        for spend in ("ec2:RunInstances", "ec2:StartInstances", "ec2:CreateImage", "lambda:InvokeFunction",
+        for spend in ("ec2:RunInstances", "ec2:StartInstances", "ec2:CreateImage", "ecs:RunTask", "lambda:InvokeFunction",
                       "lambda:InvokeFunctionUrl", "lambda:UpdateFunctionCode", "ecr:PutImage"):
             self.assertNotIn(spend, allowed)
         for verb in allowed:
             self.assertRegex(verb.split(":")[1], r"^(Stop|Terminate|Deregister|Delete|BatchDelete|Describe|List|Get|Filter)",
                              verb)
 
+    def test_stop_only_path_is_held_to_tasks_in_the_exact_cluster(self):
+        grants = [(r, st) for actions, r, st in statements("boot_race_driver") if "ecs:StopTask" in actions]
+        self.assertEqual(len(grants), 1)
+        resources, statement = grants[0]
+        self.assertEqual(resources.strip(), "local.boot_race_task_arn")
+        self.assertRegex(TF, r'boot_race_task_arn\s*= "\$\{local\.boot_race_ecs_arn\}:task/boot-race/\*"')
+        self.assertIn('variable = "ecs:cluster"', statement)
+        self.assertIn('values   = [aws_ecs_cluster.boot_race.arn]', statement)
+        self.assertFalse(any("ecs:RunTask" in acts for acts, _, _ in statements("boot_race_driver")))
+        cap = block('resource "aws_iam_policy" "boot_race_spend_cap"')
+        self.assertIn('Effect = "Deny" Action = "ecs:StopTask" '
+                      'NotResource = local.boot_race_task_arn', cap)
+
     def test_the_budget_role_may_only_attach_the_cap_to_the_driver(self):
         trust = block('resource "aws_iam_role" "boot_race_budget_action"')
         self.assertIn('Principal = { Service = "budgets.amazonaws.com" }', trust)
         self.assertIn('"aws:SourceAccount" = local.boot_race_account', trust)
+        self.assertIn('ArnLike = { "aws:SourceArn" = "arn:aws:budgets::${local.boot_race_account}:budget/*" }', trust)
         grant = block('resource "aws_iam_role_policy" "boot_race_budget_action"')
         self.assertIn('Action = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)
         self.assertIn('Resource = "arn:aws:iam::${local.boot_race_account}:role/boot-race-driver"', grant)

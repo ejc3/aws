@@ -893,40 +893,43 @@ with `scripts/test-opencode-setup.py` in CI.
 
 ### fcvm boot benchmark (boot-race)
 
-The driver role, the reaper schedule and a spend cap are on by default, so a
-campaign needs nothing from the jumpbox. The fcvm dev host (`dev-server-role`)
-may assume `boot-race-driver` at any time; it runs `creds.sh` and delivers
-one-hour sessions over SSH to the Ohio Spot pbox that drives the benchmark (the
-pbox's own `dev-ebs-only` credentials cannot assume the role). The role is
-`arn:aws:iam::<account>:role/boot-race-driver`, the name `creds.sh` builds.
+Boot-race is available without a per-run jumpbox apply. Run `creds.sh` on the
+primary FCVM ARM instance. Only instance-role credentials issued to that instance
+can assume `arn:aws:iam::<account>:role/boot-race-driver`; other hosts using
+`dev-server-role` and the Ohio pbox's `dev-ebs-only` role cannot. The script
+delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
 
-What bounds the standing role without a person:
-
-- Scope: launches only through the two boot-race launch templates, only
-  `c8g.medium`, only resources tagged `Project=boot-race`; ECS tasks only
-  through `boot-race-launcher`.
-- `boot-race-reaper`, every 15 minutes: terminates boot-race instances after
-  3 hours, stops tasks after 1 hour, removes images and snapshots after a day.
-- `boot-race-monthly`, a $25 monthly budget on `Project=boot-race` spend: at
-  80% it notifies `cost-alerts`; at 100% its action attaches
-  `boot-race-spend-cap` to the driver role, which denies everything except
-  stop, terminate, deregister, delete and reads, so `cleanup` and `leftovers`
-  still run. Budget data lags the bill by hours. The cap stays attached until an
-  administrator reverses the action in AWS Budgets.
+- The driver can launch only `c8g.medium` instances through the two boot-race
+  templates, tagging instances, volumes and interfaces `Project=boot-race`. ECS
+  runs go through the fixed `boot-race-launcher`. Run one campaign at a time:
+  cleanup also removes the shared tagged EC2 resources and pushed ECR image.
+- The reaper checks every 15 minutes. It terminates instances after 3 hours,
+  stops tasks after 1 hour, and removes images and snapshots after a day. These
+  age limits don't cap the number of concurrent launches.
+- The `boot-race-monthly` budget alerts at $20 and blocks new driver work at $25
+  of reported `Project=boot-race` costs. The denial leaves cleanup and reads
+  available, including direct task stops in the boot-race cluster. Run `cleanup`
+  and `leftovers` from a benchmark checkout that supports direct ECS stops: the
+  budget blocks the legacy launcher because it can start tasks.
+- Verify the `Project` billing tag is Active and the budget action is monitoring
+  before the first campaign. Tag activation can take up to 24 hours. Budget data
+  can lag by hours and excludes untagged costs, including the separate Ohio
+  pbox, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
+  deny at the start of the next month; an administrator can reverse it sooner.
 
 The Fargate lane stays off: its ECR interface endpoints bill hourly and change
 ECR DNS for every Ohio pbox. With the
-[benchmark driver](https://github.com/ejc3/fcvm/pull/1539), pass
+[benchmark driver](https://github.com/ejc3/fcvm/tree/main/bench/boot-race), pass
 `--lanes fcvm-file,fcvm-uffd,ec2-launch,ec2-start,ec2-hibernate,ecs-ec2,lambda-cold,lambda-warm`;
 do not run the default nine-lane command. Restoring Fargate requires a separate
 reviewed change with a reliable endpoint teardown.
 
 After a campaign, copy the data out, run the benchmark's `cleanup` and
-`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper
-removes compute left behind; the regular cleanup deletes ECR images. The
-uploaded Lambda workload stays in the two inactive IAM-only functions and is
-replaced on the next run. To turn the whole thing off, set
-`boot_race_enabled = false` and apply.
+`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper does
+not remove the pushed ECR image, so complete the harness cleanup. The uploaded
+Lambda workload stays in the two inactive IAM-only functions and is replaced
+on the next run. To remove the driver and disable the reaper, clean up any
+leftovers first, then set `boot_race_enabled = false` and apply.
 
 ### Cloudflare Browser Run benchmark credential
 
