@@ -113,6 +113,7 @@ resource "aws_launch_template" "benchmark_worker" {
   instance_market_options {
     market_type = "spot"
     spot_options {
+      max_price                      = "1.50"
       spot_instance_type             = "one-time"
       instance_interruption_behavior = "terminate"
     }
@@ -198,7 +199,7 @@ resource "aws_iam_role_policy" "benchmark_worker_control" {
         ]
         Condition = {
           ArnEquals    = { "ec2:LaunchTemplate" = aws_launch_template.benchmark_worker[0].arn }
-          StringEquals = { "aws:RequestTag/Name" = local.benchmark_worker_name }
+          StringEquals = { "aws:RequestTag/Name" = local.benchmark_worker_name, "aws:RequestTag/Project" = "benchmark-worker" }
         }
       },
       {
@@ -211,7 +212,9 @@ resource "aws_iam_role_policy" "benchmark_worker_control" {
           aws_security_group.benchmark_worker[0].arn,
           "arn:aws:ec2:${local.boot_race_region}::image/${var.parallel_box_ami_ohio}",
         ]
-        Condition = { ArnEquals = { "ec2:LaunchTemplate" = aws_launch_template.benchmark_worker[0].arn } }
+        Condition = {
+          ArnEquals = { "ec2:LaunchTemplate" = aws_launch_template.benchmark_worker[0].arn }
+        }
       },
       {
         Effect    = "Allow"

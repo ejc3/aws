@@ -107,6 +107,7 @@ class Boundaries(unittest.TestCase):
         self.assertNotIn('dev_hop', template)
         self.assertIn('instance_type = "c8gd.metal-24xl"', template)
         self.assertIn('market_type = "spot"', template)
+        self.assertRegex(template, r'max_price\s*= "1\.50"')
         self.assertNotIn("instance_initiated_shutdown_behavior", template)
         self.assertIn('http_tokens                 = "required"', template)
         self.assertIn('local.pbox_local_nvme_setup', template)

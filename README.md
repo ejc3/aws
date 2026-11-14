@@ -913,12 +913,14 @@ dev-hop key, and uses IAM credentials from its own instance profile for the
 benchmark. There is no credential copy or per-run jumpbox apply.
 
 Only one worker fits its fixed network interface. Bootstrap checks `/dev/kvm`
-and prepares disposable instance storage under `/mnt/nvme`. If the fixed Spot
-type is out of capacity, `up` fails without starting an on-demand instance.
-Use `scripts/benchmark-worker.sh ssh 'command'` to prepare and run from the
-worker. Copy results out before `scripts/benchmark-worker.sh down <instance-id>`.
-The scheduler terminates any worker left for six hours. Its reserved IPv4 costs
-$0.005/hour (about $3.65/month) even when the worker is down.
+and prepares disposable instance storage under `/mnt/nvme`. The worker bids up
+to $1.50/hour for Spot. If capacity is unavailable at that price, `up` fails
+without starting an on-demand instance. Use `scripts/benchmark-worker.sh ssh
+'command'` to prepare and run from the worker. Copy results out before
+`scripts/benchmark-worker.sh down <instance-id>`; the worker's disk and temporary
+login key are not retained. A scheduler checks every five minutes and terminates
+workers older than six hours. Its reserved IPv4 costs $0.005/hour (about
+$3.65/month) even when the worker is down.
 
 - The driver can launch only `c8g.medium` instances through the two boot-race
   templates, tagging instances, volumes and interfaces `Project=boot-race`. ECS
@@ -934,8 +936,9 @@ $0.005/hour (about $3.65/month) even when the worker is down.
   budget blocks the legacy launcher because it can start tasks.
 - Verify the `Project` billing tag is Active and the budget action is monitoring
   before the first campaign. Tag activation can take up to 24 hours. Budget data
-  can lag by hours and excludes untagged costs, including the dedicated Ohio
-  worker itself, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
+  can lag by hours and excludes costs without the exact tag, including the
+  dedicated Ohio worker. The $25 action is a backstop; the worker has its own
+  Spot price and lifetime limits. AWS Budgets removes the
   deny at the start of the next month; an administrator can reverse it sooner.
 
 The Fargate lane stays off: its ECR interface endpoints bill hourly and change
@@ -946,7 +949,7 @@ do not run the default nine-lane command. Restoring Fargate requires a separate
 reviewed change with a reliable endpoint teardown.
 
 After a campaign, copy the data out, run the benchmark's `cleanup` and
-`leftovers`, terminate the campaign pbox, and stop `creds.sh`. The reaper does
+`leftovers`, then terminate the benchmark worker. The reaper does
 not remove the pushed ECR image, so complete the harness cleanup. The uploaded
 Lambda workload stays in the two inactive IAM-only functions and is replaced
 on the next run. To remove the driver and disable the reaper, clean up any
