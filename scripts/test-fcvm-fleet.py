@@ -105,13 +105,12 @@ class HostTests(unittest.TestCase):
                                     configured[1]), ["95217caa", "a4a0bd3e", "92a26793", "343b2287"])
         # and every copy the publisher has made of a reviewed build-region host
         self.assertEqual(configured[2], "flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids])")
-        windows = "ami-0dddddddddddddddd"   # the publisher's copy of the 853eb034 host, a build-region copy too
-        self.assertRegex(east, r'windows_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
-        # Minecraft mode needs the same image: its agent is the first with --minecraft, so the flag is never in
-        # every host's arguments, only in the boot-image case below.
+        windows = "ami-0dddddddddddddddd"   # cad0ddad: the first host with the /still route removed
+        legacy_windows = ("ami-0bbbbbbbbbbbbbbb", "ami-0eeeeeeeeeeeeeee")  # 853eb034 and 0e910245
+        self.assertEqual(re.search(r'windows_host_amis\s*=\s*(.+)', east)[1],
+                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids')
+        # Legacy copies still carry Minecraft and potato, but the widened public ports
+        # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)
         self.assertEqual(MOD.count("--minecraft ${var.minecraft_count}"), 1)
         self.assertRegex(east, r'minecraft_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
@@ -141,9 +140,10 @@ class HostTests(unittest.TestCase):
             )
             curl.chmod(0o700)
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
-                                                   "|".join(sorted([oldest, older, rollback, previous, candidate, windows])))
+                                                   "|".join(sorted([oldest, older, rollback, previous, candidate, windows, *legacy_windows])))
             boot = boot.replace('${join("|", sort(tolist(var.windows_host_amis)))}', windows)
-            boot = boot.replace('${join("|", sort(tolist(var.minecraft_host_amis)))}', windows)
+            boot = boot.replace('${join("|", sort(tolist(var.minecraft_host_amis)))}',
+                                "|".join(sorted([windows, *legacy_windows])))
             boot = boot.replace("${var.windows_count}", "4").replace("${var.minecraft_count}", "4")
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
@@ -152,8 +152,8 @@ class HostTests(unittest.TestCase):
                 (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
                 (candidate, "--phones 2 --potato-players 96"),
-                # every older image, a rollback included, gets no --minecraft; only the 853eb034 copy does
                 (windows, "--phones 2 --potato-players 96 --windows 4 --minecraft 4"),
+                *((actual, "--phones 2 --potato-players 96 --minecraft 4") for actual in legacy_windows),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
                 ("no-token", "--phones 2"),
                 ("no-ami", "--phones 2"),

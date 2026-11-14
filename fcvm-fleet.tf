@@ -461,13 +461,10 @@ module "fcvm_fleet_east1" {
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
     local.fcvm_ami_bootstrap["host/x86_64/343b2287"].image,
   ], flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids]))
-  # Windows mode (?mode=windows, ejc3/fcvm docs/fleet/windows-sandboxes.md): a host booted from the publisher's copy of
-  # the 853eb034 host runs four disposable Windows Server 2025 evaluation desktops (--windows 4), CPU-only Cloud
-  # Hypervisor VMs restored from a snapshot the agent takes of the AMI's image; the image and the bridge come from
-  # /etc/fcvm-fleet/windows.env, which the AMI's build writes. Older images' agents have no --windows, so the argument
-  # follows the boot image, as potato mode does. Staging only, behind Cloudflare Access: a public launch needs the
-  # owner's go-ahead (the evaluation's terms).
-  windows_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
+  # Only images that remove the unauthenticated Windows bridge /still route (ejc3/fcvm#1839)
+  # may start Windows on the shared public viewer ports. A rollback to the 853eb034 or
+  # 0e910245 host images keeps the other modes but must not start a Windows bridge.
+  windows_host_amis = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids
   # Minecraft mode (?mode=minecraft, ejc3/fcvm docs/fleet/minecraft.md): a host booted from the publisher's copy of the
   # 853eb034 host, the first with fcvm's --minecraft and the tile image (ejc3/fcvm#1757 to #1762), runs four Pumpkin
   # servers (--minecraft 4), CPU-only fcvm VMs restored from a gold snapshot the agent makes of the tile image, each at
