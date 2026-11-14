@@ -1562,6 +1562,12 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
+- **Cloudflare Browser Run**, primary fcvm-arm. `cloudflare-browser-run` (us-west-1) is JSON `{ account_id, api_token }`:
+  a standing Cloudflare token with Browser Run Write for the fcvm hosted Chromium and Kitesurf benchmark.
+  The secret allows administrators and dev-server-role credentials issued to the primary fcvm-arm instance.
+  Cloudflare also checks the primary ARM Elastic IPv4 and host IPv6. Run the hosted Quick Actions on fcvm-arm
+  with the token in the benchmark process environment. Keep it out of argv, logs, files and commits.
+  Browser usage is billable. Rotate with `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
 - **fcvm.dev DNS propagation tests**, metal boxes. `fcvm-dns-test-token` (us-west-1) is a Cloudflare token with DNS Read
   and DNS Write on the fcvm.dev zone and nothing else (`fcvm-dns-test.tf`), usable only from the dev fleet's subnets
   (IPv6) and the metal boxes' Elastic IPs, and it expires 90 days after its date was last set. It is for creating,

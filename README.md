@@ -925,17 +925,20 @@ images and any workload the reaper missed; verify both before retiring. Then
 commit `boot_race_enabled = false` and clear `boot_race_campaign`, apply,
 and confirm the role is gone and the schedule disabled.
 
-### Cloudflare Browser Run benchmark credential
+### Cloudflare Browser Run token
 
-Ordinary applies keep `cloudflare-browser-run` in Secrets Manager empty and
-readable only by administrators. For an approved experiment, commit an explicit
-`browser_run_window` (UTC start and end, at most one hour) before applying. The
-account token has only Browser Run Write, is valid only within that fixed
-window, and accepts only the primary jumpbox's Elastic IPv4. An administrator
-can make reviewed direct API requests over IPv4 and pass results to the
-benchmark; do not run a benchmark checkout on the jumpbox or copy the token to
-a dev box. Afterward, remove the window from Git and apply. Cloudflare rejects
-the token after the deadline even if cleanup has not run.
+`cloudflare-browser-run` in Secrets Manager (us-west-1) holds a standing
+Cloudflare token with Browser Run Write on this account and no other
+permission (`browser-run.tf`), as JSON `{ account_id, api_token }`. The fcvm
+render benchmark uses it for Browser Run's Chromium and its hosted Kitesurf
+engine (`?browser=kitesurf`). Run the hosted Quick Actions benchmark on the
+primary fcvm-arm instance. It fetches the credential there without a jumpbox
+step. The secret accepts EC2 credentials issued to that instance or
+administrators; the Cloudflare token accepts only its Elastic IPv4 and host
+IPv6. A stop/start keeps those addresses; Terraform updates the grant on
+replacement. Keep the token in the benchmark process environment and out of
+arguments, logs, artifacts and disk. Browser usage is billable. Rotate with
+`terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
