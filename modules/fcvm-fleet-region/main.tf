@@ -758,8 +758,13 @@ output "host_user_data_sha256" {
 }
 
 output "host_minecraft_java_security_group_arns" {
-  description = "Additional host-only Java ingress group; never include in the tile role or coordinator's tile groups."
-  value       = local.hosts_on ? aws_security_group.minecraft_java[*].arn : []
+  description = "Java ingress group ARN for the dedicated x86_64 host-template policy."
+  value       = local.hosts_on && contains(local.host_archs, "x86_64") ? aws_security_group.minecraft_java[*].arn : []
+}
+
+output "host_minecraft_java_template_arn" {
+  description = "Exact x86_64 host launch template used by the dedicated Java ingress policy."
+  value       = var.minecraft_java_access != null ? try(aws_launch_template.host["x86_64"].arn, null) : null
 }
 
 output "host_subnet_ids" {

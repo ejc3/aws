@@ -540,7 +540,6 @@ locals {
     var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis in var.fcvm_fleet_host_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}" if ami != ""]]),
     flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"] if length(m.host_template_names) > 0]),
     [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}" if length(m.host_template_names) > 0],
-    module.fcvm_fleet_east1.host_minecraft_java_security_group_arns,
     local.fcvm_fleet_host_template_arns,
     ["arn:aws:ec2:us-east-1::image/ami-none"],
   )
@@ -774,7 +773,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
   role     = aws_iam_role.fcvm_fleet_coordinator_task.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "StateObject"
         Effect   = "Allow"
@@ -1005,7 +1004,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource  = [aws_iam_role.fcvm_fleet_host.arn, aws_iam_role.fcvm_fleet_tile.arn]
         Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
       },
-    ]
+      ], [for group in module.fcvm_fleet_east1.host_minecraft_java_security_group_arns : {
+        # CreateFleet checks resources in its template through RunInstances. The
+        # Java group must come from Virginia's x86 template, not request overrides.
+        Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = group
+        Condition = {
+          ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }
+          Bool      = { "ec2:IsLaunchTemplateResource" = "true" }
+        }
+    }])
   })
 }
 

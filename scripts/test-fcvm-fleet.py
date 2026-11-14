@@ -72,9 +72,18 @@ class NetworkTests(unittest.TestCase):
         for template in ("tile", "tile_on_demand", "tile_pool"):
             self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
         self.assertNotIn("minecraft_java", block('resource "aws_security_group" "fleet"', MOD))
-        tile_refs, host_refs = TF.split("fcvm_fleet_host_referenced_arns = concat(", 1)
-        self.assertNotIn("host_minecraft_java_security_group_arns", tile_refs)
-        self.assertTrue(host_refs.lstrip().split("\n  )", 1)[0].count("host_minecraft_java_security_group_arns") == 1)
+        self.assertEqual(TF.count("host_minecraft_java_security_group_arns"), 1)
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        start = "for group in module.fcvm_fleet_east1.host_minecraft_java_security_group_arns"
+        dedicated = policy.split(start, 1)[1]
+        self.assertIn('Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"', dedicated)
+        self.assertIn('Action   = "ec2:RunInstances"', dedicated)
+        self.assertIn('Resource = group', dedicated)
+        self.assertIn('ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }', dedicated)
+        self.assertIn('Bool      = { "ec2:IsLaunchTemplateResource" = "true" }', dedicated)
+        self.assertNotIn('IfExists', dedicated)
+        source_template = block('output "host_minecraft_java_template_arn"', MOD)
+        self.assertIn('aws_launch_template.host["x86_64"].arn', source_template)
 
     def test_ipv4_opening_requires_all_supplied_images_to_have_the_private_reviewed_guard(self):
         self.assertIn('data "aws_ami" "guarded"', MOD, "Public IPv4 requires AMI guard admission first")
