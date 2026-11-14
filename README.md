@@ -967,6 +967,14 @@ replacement. Keep the token in the benchmark process environment and out of
 arguments, logs, artifacts and disk. Browser usage is billable. Rotate with
 `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
 
+The dedicated Ohio benchmark worker can run the same hosted Quick Actions
+directly alongside its local trials. It loads a separate Browser Run credential
+from Secrets Manager; Cloudflare restricts that credential to the worker's
+reserved public IPv4 and IPv6 addresses. Ordinary and member pboxes cannot
+retrieve it. The worker makes the Cloudflare request itself, so the measured
+latency includes the worker's network path. Delete the worker when done;
+launching it and running browser trials can incur charges.
+
 ### Temporary EC2 Mac builds: `macpbox`
 
 `macpbox status` discovers the shared build host and `macpbox quote` reads current AWS

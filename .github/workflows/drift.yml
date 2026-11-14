@@ -38,5 +38,8 @@ jobs:
       - name: Verify CI privilege boundaries
         run: python3 scripts/test-ci-security.py
 
+      - name: Verify the Browser Run worker credential boundary
+        run: python3 -S -B scripts/test-browser-run-worker.py
+
       - name: Saved plans reject intervening coordinator releases (synthetic SSM only)
         run: python3 -S -B scripts/test-fcvm-stale-plan.py
