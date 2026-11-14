@@ -773,7 +773,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
   role     = aws_iam_role.fcvm_fleet_coordinator_task.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = concat([
+    Statement = [
       {
         Sid      = "StateObject"
         Effect   = "Allow"
@@ -1004,19 +1004,38 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource  = [aws_iam_role.fcvm_fleet_host.arn, aws_iam_role.fcvm_fleet_tile.arn]
         Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
       },
-      ], [for group in module.fcvm_fleet_east1.host_minecraft_java_security_group_arns : {
-        # CreateFleet checks resources in its template through RunInstances. The
-        # Java group must come from Virginia's x86 template, not request overrides.
-        Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"
-        Effect   = "Allow"
-        Action   = "ec2:RunInstances"
-        Resource = group
-        Condition = {
-          ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }
-          Bool      = { "ec2:IsLaunchTemplateResource" = "true" }
-        }
-    }])
+    ]
   })
+}
+
+# The existing coordinator role is near its aggregate inline policy limit.
+# Keep the Java grant separate. CreateFleet authorizes template resources via
+# RunInstances; the group must come from the Virginia x86 template, not an override.
+resource "aws_iam_policy" "fcvm_fleet_coordinator_java" {
+  provider    = aws.fcvm_fleet
+  count       = length(module.fcvm_fleet_east1.host_minecraft_java_security_group_arns)
+  name        = "fcvm-fleet-coordinator-java"
+  description = "Allow the Fleet coordinator to use the Virginia host template's Java ingress group."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"
+      Effect   = "Allow"
+      Action   = "ec2:RunInstances"
+      Resource = module.fcvm_fleet_east1.host_minecraft_java_security_group_arns[count.index]
+      Condition = {
+        ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }
+        Bool      = { "ec2:IsLaunchTemplateResource" = "true" }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java" {
+  provider   = aws.fcvm_fleet
+  count      = length(aws_iam_policy.fcvm_fleet_coordinator_java)
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn
 }
 
 resource "aws_security_group" "fcvm_fleet_coordinator" {

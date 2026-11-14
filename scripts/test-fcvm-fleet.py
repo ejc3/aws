@@ -72,13 +72,17 @@ class NetworkTests(unittest.TestCase):
         for template in ("tile", "tile_on_demand", "tile_pool"):
             self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
         self.assertNotIn("minecraft_java", block('resource "aws_security_group" "fleet"', MOD))
-        self.assertEqual(TF.count("host_minecraft_java_security_group_arns"), 1)
-        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
-        start = "for group in module.fcvm_fleet_east1.host_minecraft_java_security_group_arns"
-        dedicated = policy.split(start, 1)[1]
+        self.assertEqual(TF.count("host_minecraft_java_security_group_arns"), 2)
+        inline = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        self.assertNotIn("host_minecraft_java", inline, "Keep the new grant outside the nearly-full inline policy")
+        dedicated = block('resource "aws_iam_policy" "fcvm_fleet_coordinator_java"')
         self.assertIn('Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"', dedicated)
         self.assertIn('Action   = "ec2:RunInstances"', dedicated)
-        self.assertIn('Resource = group', dedicated)
+        self.assertIn('Resource = module.fcvm_fleet_east1.host_minecraft_java_security_group_arns[count.index]', dedicated)
+        self.assertNotIn('"ec2:CreateFleet"', dedicated)
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java"')
+        self.assertIn('role       = aws_iam_role.fcvm_fleet_coordinator_task.name', attachment)
+        self.assertIn('policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn', attachment)
         self.assertIn('ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }', dedicated)
         self.assertIn('Bool      = { "ec2:IsLaunchTemplateResource" = "true" }', dedicated)
         self.assertNotIn('IfExists', dedicated)
