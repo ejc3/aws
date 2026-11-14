@@ -893,22 +893,37 @@ with `scripts/test-opencode-setup.py` in CI.
 
 ### One-off fcvm boot benchmark
 
-`boot_race_enabled` defaults to false. An ordinary apply leaves the benchmark driver's
-role absent and the cleanup schedule disabled. It provisions no Fargate endpoints and
-leaves ECR DNS unchanged for existing Ohio pboxes.
+The driver and cleanup schedule are disabled by default. For an approved run,
+prepare one Ohio Spot pbox as the benchmark worker before enabling anything.
+Separately designate one primary-region EC2 dev host with `dev-server-role`
+to run `creds.sh` and deliver short sessions over SSH to the Ohio worker; the
+pbox's own `dev-ebs-only` credentials cannot assume the role. Commit
+`boot_race_enabled = true` with `boot_race_campaign`: the exact source dev
+instance ARN and fixed UTC start and end timestamps at most three hours apart.
+Use a unique, nonoverlapping window each time; never extend or reuse its start.
+Review the plan and apply from fresh main. AssumeRole checks the EC2 identity
+that issued the source credentials, not the network origin; AWS denies requests
+signed with the resulting STS sessions after expiry.
 
-When the [benchmark driver](https://github.com/ejc3/fcvm/pull/1539) has a reviewed revision
-ready to run, commit the activation setting and apply that revision of this repository.
-Review the plan for the driver role and the isolated Fargate subnet, route table, and
-endpoints. The two ECR interface endpoints cost about $0.02/hour together plus data
-processing. During the campaign, their private DNS also applies to other boxes in the
-Ohio VPC. Run the campaign from its pbox after the plan is applied.
+The limited campaign keeps the Fargate lane disabled. It creates no paid ECR
+interface endpoints and does not change ECR DNS for other Ohio pboxes. With the
+[benchmark driver](https://github.com/ejc3/fcvm/pull/1539), pass
+`--lanes fcvm-file,fcvm-uffd,ec2-launch,ec2-start,ec2-hibernate,ecs-ec2,lambda-cold,lambda-warm`;
+do not run the default nine-lane command. Restoring the private Fargate lane
+requires a separate reviewed change with a reliable endpoint teardown.
 
-Afterward, confirm no live or stopped instances, ECS tasks, workload AMIs, snapshots,
-or workload images remain. Keep the cleanup schedule enabled until that check passes.
-Restore `boot_race_enabled = false` in Git, apply, and confirm AWS reports that the
-campaign endpoints and driver role are gone. The dormant reaper remains available for
-admin recovery if any campaign resources still need cleanup.
+Copy the data out and stop early enough to run the benchmark's `cleanup` and
+`leftovers` before the window expires. Terminate the exact campaign pbox and
+verify there are no remaining campaign instances, tasks, AMIs, snapshots or
+workload images, stop `creds.sh`, and remove the worker's cached credentials.
+The reaper can recover left-behind compute after credentials expire, but does not
+remove ECR images or reset the two IAM-only benchmark functions' uploaded code.
+The regular cleanup deletes ECR images; the uploaded Lambda workload stays in
+those dedicated, inactive functions and is replaced on the next run. If cleanup
+cannot finish inside the window, an administrator clears the remaining ECR
+images and any workload the reaper missed; verify both before retiring. Then
+commit `boot_race_enabled = false` and clear `boot_race_campaign`, apply,
+and confirm the role is gone and the schedule disabled.
 
 ### Cloudflare Browser Run benchmark credential
 

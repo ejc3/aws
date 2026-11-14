@@ -108,7 +108,7 @@ class SharedRoute(unittest.TestCase):
         self.assertNotRegex(TF, r'resource "aws_route" ')
 
     def test_fargate_and_the_endpoints_live_in_the_campaign_subnet(self):
-        self.assertIn('SUBNET         = var.boot_race_enabled ? aws_subnet.boot_race[0].id : ""', TF)
+        self.assertIn('SUBNET         = local.boot_race_fargate_enabled ? aws_subnet.boot_race[0].id : ""', TF)
         ecr = TF[TF.index('resource "aws_vpc_endpoint" "boot_race_ecr"'):]
         self.assertIn("subnet_ids          = [aws_subnet.boot_race[0].id]", ecr[:ecr.index("\n}\n")])
         route_table = TF[TF.index('resource "aws_route_table" "boot_race"'):]
@@ -129,14 +129,37 @@ class Retirement(unittest.TestCase):
         self.assertIn('state = var.boot_race_enabled ? "ENABLED" : "DISABLED"',
                       block('resource "aws_scheduler_schedule" "boot_race_reaper"'))
 
-    def test_the_switch_removes_the_subnet_and_every_endpoint(self):
+    def test_opening_driver_never_opens_fargate_network(self):
+        self.assertIn("boot_race_fargate_enabled = false", TF)
         for header in ('resource "aws_subnet" "boot_race"', 'resource "aws_route_table" "boot_race"',
-                       'resource "aws_route_table_association" "boot_race"',
-                       'resource "aws_security_group" "boot_race_endpoints"', 'resource "aws_vpc_endpoint" "boot_race_s3"'):
-            block = TF[TF.index(header):]
-            self.assertIn("count = var.boot_race_enabled ? 1 : 0", re.sub(r"\s+", " ", block[:block.index("\n}\n")]), header)
+                       'resource "aws_route_table_association" "boot_race"', 'resource "aws_security_group" "boot_race_endpoints"',
+                       'resource "aws_vpc_endpoint" "boot_race_s3"'):
+            chunk = TF[TF.index(header):]
+            self.assertIn("count = local.boot_race_fargate_enabled ? 1 : 0",
+                          re.sub(r"\s+", " ", chunk[:chunk.index("\n}\n")]), header)
         ecr = TF[TF.index('resource "aws_vpc_endpoint" "boot_race_ecr"'):]
-        self.assertIn('var.boot_race_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])', ecr[:ecr.index("\n}\n")])
+        self.assertIn('local.boot_race_fargate_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])',
+                      ecr[:ecr.index("\n}\n")])
+
+    def test_exact_operator_and_window_bound_both_assume_role_policies(self):
+        self.assertIn("!var.boot_race_enabled || var.boot_race_campaign != null", TF)
+        self.assertIn('instance/i-[0-9a-f]{17}$', TF)
+        self.assertIn('timeadd(var.boot_race_campaign.starts_at, "3h")', TF)
+        self.assertIn('"ec2:SourceInstanceARN" = var.boot_race_campaign.source_instance_arn', TF)
+        self.assertIn('DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.starts_at }', TF)
+        self.assertRegex(TF, r'DateLessThan\s*= \{ "aws:CurrentTime" = var.boot_race_campaign.expires_at \}')
+        self.assertEqual(TF.count("Condition = local.boot_race_assume_conditions"), 2)
+
+    def test_already_issued_sts_sessions_expire_and_cannot_carry_forward(self):
+        for sid, op, field, value in (
+            ("DenyAfterCampaignExpiry", "DateGreaterThanEquals", "aws:CurrentTime", "expires_at"),
+            ("DenySessionsFromBeforeCampaign", "DateLessThan", "aws:TokenIssueTime", "starts_at"),
+        ):
+            chunk = TF.split(f'Sid       = "{sid}"', 1)[1]
+            self.assertTrue(chunk.startswith(
+                f'\n        Effect    = "Deny"\n        Action    = "*"\n        Resource  = "*"\n'
+                f'        Condition = {{ {op} = {{ "{field}" = var.boot_race_campaign.{value} }} }}'
+            ), sid)
 
 
 if __name__ == "__main__":

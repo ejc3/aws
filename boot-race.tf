@@ -17,15 +17,15 @@
 # TCP 8080 (the workload) and 22 (to install the workload on the AMI builder) from the parallel-box group only, and
 # the function URLs take IAM auth only. Every instance and task is started by the driver and terminated or stopped by
 # it when its samples are taken, and boot-race-reaper expires whatever a failed or interrupted campaign leaves (instances
-# after 3 hours, tasks after 1 hour, images and snapshots after a day). The two ECR interface endpoints bill while they
-# exist (about $0.02 an hour together).
+# after 3 hours, tasks after 1 hour, images and snapshots after a day). The Fargate lane is held off until there is
+# a reviewed teardown for its billed ECR interface endpoints.
 #
 # The driver uses boot-race-driver, which the dev role assumes. Its grants are scoped to these resources by ARN or by
 # the Project=boot-race tag, and RunInstances is pinned to the two launch templates below, in the same shape as
 # parallel-box-control (parallel-box-launch.tf). ECS tasks are run and stopped only by boot-race-launcher, a
 # Terraform-owned function whose code fixes the cluster, the task definitions and the Fargate network (the
 # dedicated boot-race subnet, the boot-race group, no public IP); Fargate pulls the image through ECR endpoints in the VPC.
-# The driver role, campaign network and reaper schedule are disabled by default; see README.md for activation and retirement.
+# The driver role and reaper are disabled by default; see README.md for activation and retirement.
 
 locals {
   boot_race_region  = "us-east-2"
@@ -564,8 +564,8 @@ resource "aws_lambda_function" "boot_race_launcher" {
       CLUSTER        = aws_ecs_cluster.boot_race.name
       FARGATE_FAMILY = aws_ecs_task_definition.boot_race_fargate.family
       EC2_FAMILY     = aws_ecs_task_definition.boot_race_ec2.family
-      # Empty once the campaign network is retired (boot_race_enabled = false): the Fargate lane is then refused.
-      SUBNET         = var.boot_race_enabled ? aws_subnet.boot_race[0].id : ""
+      # Empty until a reviewed expiry path exists for the paid endpoints: the Fargate lane is refused.
+      SUBNET         = local.boot_race_fargate_enabled ? aws_subnet.boot_race[0].id : ""
       SECURITY_GROUP = aws_security_group.boot_race.id
     }
   }
@@ -769,16 +769,54 @@ resource "aws_scheduler_schedule" "boot_race_reaper" {
 # Private DNS on the interface endpoints applies to the whole VPC, so while they exist new ECR connections from any
 # subnet resolve to them; their group admits HTTPS from the VPC's own range so those keep working.
 #
-# After confirming campaign cleanup, setting boot_race_enabled back to false removes the subnet, its route table,
-# the three endpoints and their group, and with them the endpoints' hourly charge.
+# The bounded campaign covers all existing lanes except Fargate. Keep the Fargate
+# definition available for separate review; neither opening the benchmark window
+# nor a stale window may create hourly ECR endpoints or change VPC-wide ECR DNS.
 variable "boot_race_enabled" {
-  description = "Activate the boot-race campaign: driver access, scoped reaper schedule and billed Fargate network"
+  description = "Enable the scoped boot-race driver and reaper, for an explicitly approved campaign window."
   type        = bool
   default     = false
+
+  validation {
+    condition     = !var.boot_race_enabled || var.boot_race_campaign != null
+    error_message = "An enabled boot race requires one designated EC2 operator and an explicit UTC window."
+  }
+}
+
+variable "boot_race_campaign" {
+  description = "Exact ARN of the source EC2 instance using dev-server-role and the approved UTC campaign window."
+  type = object({
+    source_instance_arn = string
+    starts_at           = string
+    expires_at          = string
+  })
+  default = null
+
+  validation {
+    condition = var.boot_race_campaign == null ? true : try(
+      can(regex("^arn:aws:ec2:${var.aws_region}:${data.aws_caller_identity.current.account_id}:instance/i-[0-9a-f]{17}$", var.boot_race_campaign.source_instance_arn)) &&
+      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", var.boot_race_campaign.starts_at)) &&
+      can(regex("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$", var.boot_race_campaign.expires_at)) &&
+      timecmp(var.boot_race_campaign.starts_at, var.boot_race_campaign.expires_at) < 0 &&
+      timecmp(var.boot_race_campaign.expires_at, timeadd(var.boot_race_campaign.starts_at, "3h")) <= 0,
+      false
+    )
+    error_message = "Use an exact EC2 instance ARN in the primary account and Region and a positive UTC window of at most three hours."
+  }
+}
+
+locals {
+  boot_race_fargate_enabled = false
+  # Used in both the source identity policy and the driver's trust policy.
+  boot_race_assume_conditions = var.boot_race_campaign == null ? null : {
+    StringEquals          = { "ec2:SourceInstanceARN" = var.boot_race_campaign.source_instance_arn }
+    DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.starts_at }
+    DateLessThan          = { "aws:CurrentTime" = var.boot_race_campaign.expires_at }
+  }
 }
 
 resource "aws_subnet" "boot_race" {
-  count                   = var.boot_race_enabled ? 1 : 0
+  count                   = local.boot_race_fargate_enabled ? 1 : 0
   provider                = aws.ohio
   vpc_id                  = aws_vpc.ohio_pbox.id
   cidr_block              = "10.12.3.0/24"
@@ -788,21 +826,21 @@ resource "aws_subnet" "boot_race" {
 }
 
 resource "aws_route_table" "boot_race" {
-  count    = var.boot_race_enabled ? 1 : 0
+  count    = local.boot_race_fargate_enabled ? 1 : 0
   provider = aws.ohio
   vpc_id   = aws_vpc.ohio_pbox.id
   tags     = merge(local.boot_race_tag, { Name = "boot-race" })
 }
 
 resource "aws_route_table_association" "boot_race" {
-  count          = var.boot_race_enabled ? 1 : 0
+  count          = local.boot_race_fargate_enabled ? 1 : 0
   provider       = aws.ohio
   subnet_id      = aws_subnet.boot_race[0].id
   route_table_id = aws_route_table.boot_race[0].id
 }
 
 resource "aws_security_group" "boot_race_endpoints" {
-  count       = var.boot_race_enabled ? 1 : 0
+  count       = local.boot_race_fargate_enabled ? 1 : 0
   provider    = aws.ohio
   name_prefix = "boot-race-endpoints-"
   description = "boot-race ECR interface endpoints: HTTPS from inside the parallel-box VPC"
@@ -824,7 +862,7 @@ resource "aws_security_group" "boot_race_endpoints" {
 }
 
 resource "aws_vpc_endpoint" "boot_race_ecr" {
-  for_each            = var.boot_race_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])
+  for_each            = local.boot_race_fargate_enabled ? toset(["ecr.api", "ecr.dkr"]) : toset([])
   provider            = aws.ohio
   vpc_id              = aws_vpc.ohio_pbox.id
   service_name        = "com.amazonaws.${local.boot_race_region}.${each.key}"
@@ -836,7 +874,7 @@ resource "aws_vpc_endpoint" "boot_race_ecr" {
 }
 
 resource "aws_vpc_endpoint" "boot_race_s3" {
-  count             = var.boot_race_enabled ? 1 : 0
+  count             = local.boot_race_fargate_enabled ? 1 : 0
   provider          = aws.ohio
   vpc_id            = aws_vpc.ohio_pbox.id
   service_name      = "com.amazonaws.${local.boot_race_region}.s3"
@@ -856,6 +894,7 @@ resource "aws_iam_role" "boot_race_driver" {
       Effect    = "Allow"
       Principal = { AWS = aws_iam_role.dev_server.arn }
       Action    = "sts:AssumeRole"
+      Condition = local.boot_race_assume_conditions
     }]
   })
   tags = local.boot_race_tag
@@ -1128,10 +1167,30 @@ data "aws_iam_policy_document" "boot_race_driver" {
 }
 
 resource "aws_iam_role_policy" "boot_race_driver" {
-  count  = var.boot_race_enabled ? 1 : 0
-  name   = "boot-race-driver"
-  role   = aws_iam_role.boot_race_driver[0].id
-  policy = data.aws_iam_policy_document.boot_race_driver.json
+  count = var.boot_race_enabled ? 1 : 0
+  name  = "boot-race-driver"
+  role  = aws_iam_role.boot_race_driver[0].id
+  # Reject late calls even from an already-issued STS session. A different
+  # campaign also cannot reactivate a session issued before its opening.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat(jsondecode(data.aws_iam_policy_document.boot_race_driver.json).Statement, [
+      {
+        Sid       = "DenyAfterCampaignExpiry"
+        Effect    = "Deny"
+        Action    = "*"
+        Resource  = "*"
+        Condition = { DateGreaterThanEquals = { "aws:CurrentTime" = var.boot_race_campaign.expires_at } }
+      },
+      {
+        Sid       = "DenySessionsFromBeforeCampaign"
+        Effect    = "Deny"
+        Action    = "*"
+        Resource  = "*"
+        Condition = { DateLessThan = { "aws:TokenIssueTime" = var.boot_race_campaign.starts_at } }
+      },
+    ])
+  })
 }
 
 # The dev role may assume the driver role and nothing more.
@@ -1142,10 +1201,11 @@ resource "aws_iam_role_policy" "dev_server_boot_race" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid      = "AssumeBootRaceDriver"
-      Effect   = "Allow"
-      Action   = "sts:AssumeRole"
-      Resource = aws_iam_role.boot_race_driver[0].arn
+      Sid       = "AssumeBootRaceDriver"
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Resource  = aws_iam_role.boot_race_driver[0].arn
+      Condition = local.boot_race_assume_conditions
     }]
   })
 }
