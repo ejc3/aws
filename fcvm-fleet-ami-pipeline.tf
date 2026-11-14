@@ -774,6 +774,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
+      FACTORY_PAUSED    = tostring(var.fcvm_ami_factory_paused)
       HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
       # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies". The release
       # configuration is in the bundle (publisher-config.json).

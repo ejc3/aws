@@ -245,6 +245,7 @@ class ReleaseContracts(unittest.TestCase):
             (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 128),
             (r"module\.[a-z0-9_]+\.host_user_data_sha256", lambda v: 64),
             (r'join\(",", local\.fcvm_ami_copy_regions\)', lambda v: 15 * copy_regions),
+            (r"tostring\(var\.[a-z0-9_]+\)", lambda v: 5),
         ]
         total = 2
         for key, value in pairs:
