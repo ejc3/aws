@@ -61,23 +61,6 @@ resource "aws_security_group" "boot_race" {
   description = "boot-race workloads: TCP 8080 and SSH from the parallel boxes only"
   vpc_id      = aws_vpc.ohio_pbox.id
 
-  # Keep existing Ohio pbox access until the legacy campaign drains.
-  ingress {
-    description     = "The workload, from the parallel boxes"
-    from_port       = 8080
-    to_port         = 8080
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ohio_pbox.id]
-  }
-
-  ingress {
-    description     = "SSH, from the parallel boxes (installing the workload on the AMI builder)"
-    from_port       = 22
-    to_port         = 22
-    protocol        = "tcp"
-    security_groups = [aws_security_group.ohio_pbox.id]
-  }
-
   dynamic "ingress" {
     for_each = local.benchmark_worker_enabled ? toset([22, 8080]) : toset([])
     content {
