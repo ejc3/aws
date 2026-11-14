@@ -420,6 +420,19 @@ class FactoryTests(unittest.TestCase):
         self.launch("tile-build")
         self.assertEqual(self.ec2.launches[-1]["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 32)
 
+    def test_the_host_image_root_has_room_for_the_store_and_a_host_kernel(self):
+        # The host image keeps its packed store (about 28 GB) on the root disk as the S3
+        # restore's fallback. With 64 GB the root of a gpubox from the cad0ddad image had 416 MB
+        # free, and installing a 7.3.3 host kernel there failed ("No space left on device"). The
+        # host builder's root, which every host booted from the image inherits, is 96 GB, and
+        # the role allows exactly that.
+        self.launch()
+        self.assertEqual(self.ec2.launches[0]["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 96)
+        tf = (Path(__file__).resolve().parent.parent / "fcvm-fleet-ami-pipeline.tf").read_text()
+        cap = re.search(r'Sid = "FixedRoot".*?NumericLessThanEquals = \{ "ec2:VolumeSize" = (\d+) \}', tf, re.S)
+        self.assertIsNotNone(cap, "no root volume size cap in the builder role")
+        self.assertEqual(int(cap.group(1)), max(mod.VOLUMES.values()))
+
     def test_definite_capacity_rejection_frees_queue_without_retrying_slot(self):
         def rejected(**kwargs):
             raise mod.ClientError({"Error": {"Code": "InsufficientInstanceCapacity", "Message": "fixture"}}, "RunInstances")
