@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
-VOLUMES = {"host": 64, "tile": 32}
+VOLUMES = {"host": 96, "tile": 32}
 LEGACY_TIMEOUT_MINUTES = 240
 EXTENDED_TIMEOUT_MINUTES = 360
 # First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
