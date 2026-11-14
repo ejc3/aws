@@ -99,7 +99,10 @@ def execution_timeout_minutes(source):
     if source == EXTENDED_TIMEOUT_SOURCE:
         return EXTENDED_TIMEOUT_MINUTES
     try:
-        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source)
+        # Ancestry only, from page two: page one carries every changed file's patch, and over the
+        # long history since EXTENDED_TIMEOUT_SOURCE it passes public_github's 2 MiB bound, which
+        # gave generation fifteen's build the 240-minute limit and expired it mid-validation.
+        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source + "?per_page=1&page=2")
     except (OSError, ValueError, Refused):
         # Missing ancestry proof is not permission to extend the legacy bound.
         return LEGACY_TIMEOUT_MINUTES
