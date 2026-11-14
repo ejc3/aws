@@ -51,6 +51,15 @@ variable "fcvm_fleet_tile_amis" {
   default = { "us-east-1" = { x86_64 = "ami-094ca9c62a284a389" } }
 }
 
+# First apply the rollback-safe host bootstrap with the extra ports closed. Once
+# the live default and every regional attachment have been checked, a separate
+# Terraform change enables Windows and Minecraft viewers over IPv4.
+variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
+  description = "Open IPv4 viewer TLS for Windows and Minecraft after the rollback-safe bootstrap is live."
+  type        = bool
+  default     = false
+}
+
 locals {
   # The two switches (see the header).
   fcvm_fleet_hosts_enabled       = true
@@ -112,7 +121,9 @@ locals {
   fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1
+    to = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? (
+      local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1
+    ) : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",

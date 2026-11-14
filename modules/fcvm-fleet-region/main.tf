@@ -353,7 +353,7 @@ resource "aws_security_group" "fleet" {
   }
 
   ingress {
-    description = "GPU slot, Windows sandbox and Minecraft server TLS over IPv4"
+    description = "GPU slot renderer TLS over IPv4"
     from_port   = var.slot_tls_ports.from
     to_port     = var.slot_tls_ports.to
     protocol    = "tcp"

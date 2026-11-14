@@ -643,10 +643,14 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows"
                       " + local.fcvm_fleet_host_minecraft", TF)
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        # Every place's port, and with aggregated streaming the host aggregator's port after them.
-        self.assertIn(
-            "to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
-            "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1", TF)
+        # Before the bootstrap is deployed, the rule retains its exact previous range and description.
+        gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
+        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= false$")
+        ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
+        self.assertIn(f"to = var.{gate} ? (", ports)
+        self.assertIn(") : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", ports)
+        self.assertIn("local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
+                      "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1", ports)
         self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places", TF)
         # The counts the agent is started with are the ones the range was sized for, in every region.
         self.assertIn('agent_args="$agent_args --windows ${var.windows_count}"', MOD)
@@ -661,6 +665,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertEqual(len(rules), 2, rules)
         slots = [rule for rule in rules if "var.slot_tls_ports" in rule]
         self.assertEqual(len(slots), 1)
+        self.assertIn('description = "GPU slot renderer TLS over IPv4"', slots[0])
         self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
         self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
         self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
