@@ -28,8 +28,10 @@ data "aws_network_interface" "browser_run_arm" {
 
 locals {
   browser_run_dev_role = aws_iam_role.dev_server.arn
-  browser_run_arm_arns = aws_instance.firecracker_dev[*].arn
-  browser_run_arm_ipv4 = [for eip in aws_eip.firecracker_dev_next : "${eip.public_ip}/32"]
+  # Secrets Manager's resource-policy validator rejects ec2:SourceInstanceARN. EC2 is the sole
+  # trusted assumer of this role and sets aws:userid to the unique role ID plus the instance ID.
+  browser_run_arm_userids = [for instance in aws_instance.firecracker_dev : "${aws_iam_role.dev_server.unique_id}:${instance.id}"]
+  browser_run_arm_ipv4    = [for eip in aws_eip.firecracker_dev_next : "${eip.public_ip}/32"]
   browser_run_arm_ipv6 = flatten([
     for eni in data.aws_network_interface.browser_run_arm : [for ip in eni.ipv6_addresses : "${ip}/128"]
   ])
@@ -66,20 +68,20 @@ resource "aws_secretsmanager_secret_policy" "cloudflare_browser_run" {
           ArnNotLike = {
             "aws:PrincipalArn" = concat(
               local.games_mp_admin_principals,
-              length(local.browser_run_arm_arns) == 1 ? [local.browser_run_dev_role] : [],
+              length(local.browser_run_arm_userids) == 1 ? [local.browser_run_dev_role] : [],
             )
           }
         }
       }],
-      [for instance_arn in local.browser_run_arm_arns : {
+      [for user_id in local.browser_run_arm_userids : {
         Sid       = "ReadFromPrimaryArmCredentials"
         Effect    = "Allow"
         Principal = { AWS = local.browser_run_dev_role }
         Action    = "secretsmanager:GetSecretValue"
         Resource  = aws_secretsmanager_secret.cloudflare_browser_run.arn
-        Condition = { ArnEquals = { "ec2:SourceInstanceARN" = instance_arn } }
+        Condition = { StringEquals = { "aws:userid" = user_id } }
       }],
-      [for instance_arn in local.browser_run_arm_arns : {
+      [for user_id in local.browser_run_arm_userids : {
         # An identity-policy Allow added later must not bypass the instance restriction.
         Sid       = "DenyDevRoleWithoutPrimaryArmCredentials"
         Effect    = "Deny"
@@ -87,8 +89,8 @@ resource "aws_secretsmanager_secret_policy" "cloudflare_browser_run" {
         Action    = local.browser_run_read_actions
         Resource  = aws_secretsmanager_secret.cloudflare_browser_run.arn
         Condition = {
-          ArnEquals            = { "aws:PrincipalArn" = local.browser_run_dev_role }
-          ArnNotEqualsIfExists = { "ec2:SourceInstanceARN" = instance_arn }
+          ArnEquals               = { "aws:PrincipalArn" = local.browser_run_dev_role }
+          StringNotEqualsIfExists = { "aws:userid" = user_id }
         }
       }],
     )

@@ -65,7 +65,10 @@ class BrowserRunTests(unittest.TestCase):
 
     def test_the_dev_grant_requires_credentials_issued_to_the_managed_primary_arm(self):
         self.assertIn("browser_run_dev_role = aws_iam_role.dev_server.arn", TF)
-        self.assertIn("browser_run_arm_arns = aws_instance.firecracker_dev[*].arn", TF)
+        self.assertIn('for instance in aws_instance.firecracker_dev : "${aws_iam_role.dev_server.unique_id}:${instance.id}"', TF)
+        trust = block('resource "aws_iam_role"', "dev_server", (ROOT / "dev-instance-common.tf").read_text())
+        self.assertIn('Principal = { Service = "ec2.amazonaws.com" }', trust)
+        self.assertEqual(trust.count("Principal"), 1)
         policy = block('resource "aws_secretsmanager_secret_policy"', "cloudflare_browser_run")
         self.assertIn("block_public_policy = true", policy)
         allow_sid = 'Sid       = "ReadFromPrimaryArmCredentials"'
@@ -76,8 +79,8 @@ class BrowserRunTests(unittest.TestCase):
         self.assertIn('Effect    = "Allow"', allow)
         self.assertIn("Principal = { AWS = local.browser_run_dev_role }", allow)
         self.assertIn('Action    = "secretsmanager:GetSecretValue"', allow)
-        self.assertIn('Condition = { ArnEquals = { "ec2:SourceInstanceARN" = instance_arn } }', allow)
-        self.assertEqual(policy.count('for instance_arn in local.browser_run_arm_arns'), 2)
+        self.assertIn('Condition = { StringEquals = { "aws:userid" = user_id } }', allow)
+        self.assertEqual(policy.count('for user_id in local.browser_run_arm_userids'), 2)
         self.assertNotRegex(TF, r"aws_iam_role\.(nextjs_dev|dev_ebs_only)")
 
     def test_wrong_or_missing_instance_provenance_cannot_be_allowed_by_an_identity_policy(self):
@@ -88,8 +91,8 @@ class BrowserRunTests(unittest.TestCase):
         self.assertIn('Effect    = "Deny"', deny)
         self.assertIn('Principal = "*"', deny)
         self.assertIn('Action    = local.browser_run_read_actions', deny)
-        self.assertIn('ArnEquals            = { "aws:PrincipalArn" = local.browser_run_dev_role }', deny)
-        self.assertIn('ArnNotEqualsIfExists = { "ec2:SourceInstanceARN" = instance_arn }', deny)
+        self.assertIn('ArnEquals               = { "aws:PrincipalArn" = local.browser_run_dev_role }', deny)
+        self.assertIn('StringNotEqualsIfExists = { "aws:userid" = user_id }', deny)
         self.assertIn('"secretsmanager:GetSecretValue",\n    "secretsmanager:BatchGetSecretValue",', TF)
 
     def test_administration_stays_exempt_and_a_missing_arm_fails_closed(self):
@@ -105,7 +108,7 @@ class BrowserRunTests(unittest.TestCase):
         self.assertIn('ArnNotLike = {', deny)
         self.assertIn('"aws:PrincipalArn" = concat(', deny)
         self.assertIn('local.games_mp_admin_principals,', deny)
-        self.assertIn('length(local.browser_run_arm_arns) == 1 ? [local.browser_run_dev_role] : []', deny)
+        self.assertIn('length(local.browser_run_arm_userids) == 1 ? [local.browser_run_dev_role] : []', deny)
 
     def test_the_payload_is_written_after_the_policy(self):
         payload = block('resource "aws_secretsmanager_secret_version"', "cloudflare_browser_run")
