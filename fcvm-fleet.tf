@@ -51,13 +51,13 @@ variable "fcvm_fleet_tile_amis" {
   default = { "us-east-1" = { x86_64 = "ami-094ca9c62a284a389" } }
 }
 
-# First apply the rollback-safe host bootstrap with the extra ports closed. Once
-# the live default and every regional attachment have been checked, a separate
-# Terraform change enables Windows and Minecraft viewers over IPv4.
+# The rollback-safe host bootstrap is live (every host template's default starts Windows only on
+# an image without the bridges' /still route, ejc3/fcvm#1839), so Windows and Minecraft viewers
+# are admitted over IPv4 on their declared ports.
 variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
   description = "Open IPv4 viewer TLS for Windows and Minecraft after the rollback-safe bootstrap is live."
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {

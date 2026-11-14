@@ -708,9 +708,10 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : "
                       "r.offset + r.count if m != \"aggregate\"]...)", TF)
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        # Before the bootstrap is deployed, the rule retains its exact previous range and description.
+        # The rollback-safe bootstrap is live, so the gate is open: Windows and Minecraft viewers reach
+        # their ports over IPv4. Closing it again (false) puts the rule back to the GPU slots' range.
         gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
-        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= false$")
+        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= true$")
         ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
         self.assertIn(f"to = var.{gate} ? (", ports)
         self.assertIn(") : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", ports)
