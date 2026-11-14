@@ -6,6 +6,19 @@ variable "fcvm_ami_pipeline_enabled" {
   default     = true
 }
 
+# Pauses the factory's builds without touching the release pointer or the launch templates
+# (which fcvm_ami_pipeline_enabled also switches). While paused the dispatcher starts no
+# build: a queued request stays queued, a new request is answered "disabled", and nothing
+# reaches the publisher. Paused 2026-11-14: generation twelve, the factory's first published
+# pair, booted on staging without its user data (ejc3/aws#823; the host kernel loads its ENA
+# driver after cloud-init looks for a NIC), and its acceptance did not boot the candidate
+# through the fleet's launch path. Unpause once ejc3/fcvm has the boot fix and that gate.
+variable "fcvm_ami_factory_paused" {
+  description = "Start no factory build; requests stay queued or are answered disabled"
+  type        = bool
+  default     = true
+}
+
 locals {
   # Reviewed legacy transitions never accept caller-supplied images or fake factory provenance.
   fcvm_ami_reviewed_seed = {
@@ -352,7 +365,7 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
   publish                        = true
   environment {
     variables = {
-      ENABLED           = tostring(var.fcvm_ami_pipeline_enabled)
+      ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)
       PROJECT_NAME      = local.fcvm_ami_project
       CONTROL_REGION    = var.aws_region
       CONTROL_ACCOUNT   = data.aws_caller_identity.current.account_id
@@ -761,6 +774,7 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
       ASSET_BUCKET      = aws_s3_bucket.fcvm_fleet_assets.id
       ASSET_REGION      = local.fcvm_fleet_home_region
       DISPATCH_FUNCTION = aws_lambda_function.fcvm_ami_dispatch.arn
+      FACTORY_PAUSED    = tostring(var.fcvm_ami_factory_paused)
       HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256
       # Comma-separated; the copy record is RELEASE_PARAMETER with "-copies". The release
       # configuration is in the bundle (publisher-config.json).

@@ -1478,6 +1478,10 @@ class Publisher:
             return self.run_restore_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ipv4-host-release":
             return self.run_ipv4_host_release(event)
+        # A factory build that was already running when the factory was paused
+        # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
+        # actions above are how a release is changed while paused.
+        need(self.env.get("FACTORY_PAUSED") != "true", "factory promotion is paused (fcvm_ami_factory_paused)")
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
