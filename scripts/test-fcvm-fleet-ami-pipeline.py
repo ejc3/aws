@@ -1560,5 +1560,106 @@ class FactoryTests(unittest.TestCase):
         self.assertRegex(function, r'RELEASE_REGION\s*=\s*local\.fcvm_ami_region')
         self.assertRegex(source, r'fcvm_ami_region\s*=\s*"us-east-1"')
 
+    def retired_pending(self):
+        source = "3e36a3a36e13fdb03168b77ff6257a707e6654d1"
+        request = "/factory/requests/" + INPUT_SHA
+        control = {"active": None, "pending": INPUT_SHA, "last_normal_day": "2026-11-13", "last_source": source}
+        self.store.values["/factory/control"] = control
+        self.store.values[request].update(status="queued", priority="normal", build_id=None, not_before=NOW - 1,
+                                          source_sha=source)
+        self.queue_prepared = True
+        return source, request, control
+
+    def test_retired_source_stays_queued_while_paused_and_never_starts_on_unpause(self):
+        source, request, control = self.retired_pending()
+        before = copy.deepcopy(self.store.values)
+        self.factory.env["ENABLED"] = "false"
+        self.factory.reconcile()
+        self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
+        self.assertEqual((self.store.values, self.store.writes, self.cb.starts), (before, [], []))
+
+        self.factory.env["ENABLED"] = "true"
+        status = self.factory.request({"action": "status", "request_id": INPUT_SHA})
+        self.assertEqual((status["status"], self.store.values["/factory/control"]),
+                         ("superseded", {**control, "pending": None}))
+        self.assertIn("fleet host fails to load boot user data", status["message"])
+        self.assertEqual((self.store.writes, self.cb.starts, self.cb.stops), ([request, "/factory/control"], [], []))
+
+        self.store.writes.clear()
+        self.factory.reconcile()
+        with patch.object(mod, "public_github") as github, self.assertRaisesRegex(mod.Refused, "source retired"):
+            self.factory.request({"action": "request", "source_sha": source, "input_sha256": INPUT_SHA, "priority": "critical"})
+        github.assert_not_called()
+        self.assertEqual((self.store.writes, self.cb.starts, self.cb.stops), ([], [], []))
+
+        fixed_source = "d613d813befeac90e1a38924bf909056024f5a12"
+        fixed = self.request("critical", "6" * 64, source_sha=fixed_source)
+        self.assertEqual(fixed["status"], "building")
+        self.assertEqual([build["sourceVersion"] for build in self.cb.starts], [fixed_source])
+
+    def test_retired_source_retries_terminal_write_and_keeps_uncertain_work(self):
+        _, request, control = self.retired_pending()
+        original_put = self.store.put_parameter
+
+        def interrupted_put(Name, Value, **kw):
+            if Name == "/factory/control":
+                raise TimeoutError("control write interrupted")
+            return original_put(Name, Value, **kw)
+
+        with patch.object(self.store, "put_parameter", side_effect=interrupted_put), self.assertRaises(TimeoutError):
+            self.factory.reconcile()
+        self.assertEqual(self.store.values[request]["status"], "superseded")
+        self.assertEqual(self.store.values["/factory/control"], control)
+        self.factory.reconcile()
+        self.assertEqual(self.store.values["/factory/control"], {**control, "pending": None})
+        self.assertEqual(self.cb.starts, [])
+
+        for fields in ({"start_attempted": NOW - 20}, {"build_id": BUILD}, {"status": "awaiting-publish"}):
+            with self.subTest(fields=fields):
+                self.setUp()
+                _, request, _ = self.retired_pending()
+                self.store.values[request].update(fields)
+                saved = copy.deepcopy(self.store.values)
+                with self.assertRaisesRegex(mod.Refused, "uncertain start|unexpected status"):
+                    self.factory.reconcile()
+                self.assertEqual((self.store.values, self.store.writes, self.cb.starts, self.cb.stops),
+                                 (saved, [], [], []))
+
+    def test_retired_source_preserves_an_active_intent_with_unknown_start_result(self):
+        _, request, control = self.retired_pending()
+        self.store.values[request]["start_attempted"] = NOW - 20
+        control["active"] = {"intent": INPUT_SHA}
+        self.cb.builds.clear()  # CodeBuild may have accepted StartBuild without a visible result yet.
+        before = copy.deepcopy(self.store.values)
+        self.factory.env["ENABLED"] = "false"
+        self.factory.reconcile()
+        self.factory.env["ENABLED"] = "true"
+        self.factory.reconcile()
+        self.assertEqual((self.store.values, self.store.writes, self.cb.starts, self.cb.stops),
+                         (before, [], [], []))
+
+    def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
+        # 2026-11-14: generation twelve broke staging; the factory is paused until the boot fix
+        # and the launch-path gate are in. The pause reaches the dispatcher as ENABLED=false,
+        # which starts nothing, while the launch templates still follow the release pointer.
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
+        self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
+        # what ENABLED=false does with a queued normal request whose window has opened
+        self.store.values.pop("/factory/control", None)
+        self.store.values.pop("/factory/requests/" + INPUT_SHA, None)
+        self.queue_prepared = True
+        queued = self.request("normal")
+        self.assertEqual(queued["status"], "queued")
+        self.factory.env["ENABLED"] = "false"
+        self.time += 7 * 3600
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts, [])
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "queued")
+        self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
+        self.assertEqual(self.cb.starts, [])
+
 if __name__ == "__main__":
     unittest.main(buffer=True)

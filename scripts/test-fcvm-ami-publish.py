@@ -2,6 +2,7 @@
 """Credential-free publisher transactions against strict in-memory AWS fakes."""
 import base64
 import copy
+import re
 import datetime
 import hashlib
 import http.client
@@ -1686,6 +1687,92 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values, before)
         self.assertEqual(self.ec2.selected, [])
 
+    FACTORY_BUILD = "fcvm-fleet-image-factory:00000000-0000-4000-8000-000000000012"
+    FACTORY_SOURCE = "5cb0257d07e95129ad91ab45d0f804bd669b5b58"
+    FACTORY_HOST = "ami-0f00000000000012a"
+    FACTORY_TILE = "ami-0f00000000000012b"
+
+    def generation_eleven_rollback_fixture(self, *, factory_build=None):
+        """Generation eleven live (the cad0ddad host), then the image factory's generation twelve: a new
+        version of every template naming its host and tile, selected, and its receipt. The publisher's
+        constants are filled from both receipts, as they are from the live ones."""
+        event, ten = self.reviewed_ipv4_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        eleven = copy.deepcopy(self.fleet_ssm.values["/release"])
+        host = self.ids[0]
+        versions = {}
+        for template in self.ids:
+            table = self.ec2.templates[template]
+            number = table["default"] + 1
+            factory = copy.deepcopy(table["versions"][table["default"]])
+            factory.update(VersionNumber=number, VersionDescription="fleet-image-factory")
+            factory["LaunchTemplateData"]["ImageId"] = self.FACTORY_HOST if template == host else self.FACTORY_TILE
+            table["versions"][number] = factory
+            table["default"] = number
+            versions["us-east-1/" + template] = number
+        twelve = copy.deepcopy(eleven)
+        twelve.update(generation=12, source_sha=self.FACTORY_SOURCE, build_id=self.FACTORY_BUILD, versions=versions,
+                      previous={k: v for k, v in eleven.items() if k != "previous"},
+                      host_amis={"us-east-1": {"x86_64": self.FACTORY_HOST}},
+                      tile_amis={"us-east-1": {"x86_64": self.FACTORY_TILE}})
+        self.fleet_ssm.values["/release"] = copy.deepcopy(twelve)
+        for name, value in (("IPV4_HOST_COPY", eleven["host_amis"]["us-east-1"]["x86_64"]),
+                            ("IPV4_HOST_VERSION", eleven["versions"]["us-east-1/" + host]),
+                            ("FACTORY_TWELVE_BUILD", factory_build or self.FACTORY_BUILD),
+                            ("FACTORY_TWELVE_SOURCE", self.FACTORY_SOURCE),
+                            ("FACTORY_TWELVE_HOST", self.FACTORY_HOST),
+                            ("FACTORY_TWELVE_TILE", self.FACTORY_TILE)):
+            patcher = mock.patch.object(MODULE.Publisher, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-generation-eleven-rollback"}, eleven, twelve
+
+    def test_reviewed_rollback_puts_generation_eleven_back_after_the_factory_generation_twelve(self):
+        event, eleven, twelve = self.generation_eleven_rollback_fixture()
+        before = copy.deepcopy(self.ec2.templates)
+        publisher = self.publisher()
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 13})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (13, self.IPV4_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-generation-eleven-rollback:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_generation_eleven_rollback())))
+        self.assertEqual(after["host_amis"], eleven["host_amis"])
+        self.assertEqual(after["tile_amis"], eleven["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in twelve.items() if k != "previous"})
+        for template in self.ids:
+            table = self.ec2.templates[template]
+            old = before[template]["versions"][before[template]["default"]]
+            new = table["versions"][table["default"]]
+            # A new version of the factory's: generation eleven's image and nothing else changed.
+            self.assertEqual(table["default"], before[template]["default"] + 1)
+            self.assertEqual(after["versions"]["us-east-1/" + template], table["default"])
+            kind = "host" if template == self.ids[0] else "tile"
+            self.assertEqual(new["LaunchTemplateData"]["ImageId"], eleven[kind + "_amis"]["us-east-1"]["x86_64"])
+            self.assertEqual(MODULE.without_image(new["LaunchTemplateData"]), MODULE.without_image(old["LaunchTemplateData"]))
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 13})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_rollback_refuses_a_predecessor_other_than_the_factory_receipt_it_names(self):
+        event, _, _ = self.generation_eleven_rollback_fixture(
+            factory_build="fcvm-fleet-image-factory:00000000-0000-4000-8000-000000000099")
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            self.publisher().run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_reviewed_rollback_names_the_live_receipts(self):
+        self.assertRegex(MODULE.Publisher.IPV4_HOST_COPY, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_HOST, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_TILE, r"^ami-[0-9a-f]{17}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_SOURCE, r"^[0-9a-f]{40}$")
+        self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_BUILD, r"^fcvm-fleet-image-factory:[0-9a-f-]{36}$")
+        self.assertIs(type(MODULE.Publisher.IPV4_HOST_VERSION), int)
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
@@ -2447,6 +2534,24 @@ class PublisherTests(unittest.TestCase):
             with self.assertRaises(MODULE.Refused):
                 MODULE.Publisher(self.env, {}, config=path)
 
+
+    def test_a_paused_factory_build_is_not_promoted_but_reviewed_actions_are(self):
+        # A build already running when the factory was paused (fcvm_ami_factory_paused) still
+        # finishes and asks to publish; it must not promote. A reviewed action still can.
+        source = (Path(MODULE.__file__).parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        publisher_tf = re.search(r'^resource "aws_lambda_function" "fcvm_ami_publish" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertRegex(publisher_tf, r"FACTORY_PAUSED\s*=\s*tostring\(var\.fcvm_ami_factory_paused\)")
+        self.env["FACTORY_PAUSED"] = "true"
+        before = copy.deepcopy(self.fleet_ssm.values["/release"])
+        with self.assertRaises(MODULE.Refused) as caught:
+            self.publisher().run(self.event)
+        self.assertIn("paused", str(caught.exception))
+        self.assertEqual(self.fleet_ssm.values["/release"], before)
+        self.assertEqual((self.ec2.created, self.ec2.tagged, self.assets.copies), ([], [], []))
+        self.assertEqual(self.seed_success(self.publisher(), self.legacy_seed()), {"status": "promoted", "generation": 1})
+        self.setUp()
+        self.env["FACTORY_PAUSED"] = "false"
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

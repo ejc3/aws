@@ -397,6 +397,57 @@ class Publisher:
             },
         }, host_only=True)
 
+    # The generation-eleven receipt (/fcvm-fleet/ami-release version 12, 2026-11-13): the publisher's
+    # us-east-1 copy of the cad0ddad host it names, and the host template version it selects.
+    IPV4_HOST_COPY = "ami-0ab1b335605d4902c"
+    IPV4_HOST_VERSION = 34
+    # The generation-twelve receipt (version 13, 2026-11-14), which the image factory published from
+    # ejc3/fcvm 5cb0257d: its build, its images in us-east-1, and that it selected the next version of
+    # every template (host 35, tiles 15, 18 and 18).
+    FACTORY_TWELVE_BUILD = "fcvm-fleet-image-factory:4481950e-b4f6-4121-a8d5-4f6323d0c990"
+    FACTORY_TWELVE_SOURCE = "5cb0257d07e95129ad91ab45d0f804bd669b5b58"
+    FACTORY_TWELVE_HOST = "ami-0af4efcc4f8abe951"
+    FACTORY_TWELVE_TILE = "ami-05219ce75766aea15"
+
+    def ipv4_host_receipt(self):
+        """The generation-eleven receipt, as reviewed_ipv4_host_release's publication wrote it."""
+        ipv4 = self.reviewed_ipv4_host_release()
+        host = next(t for t in self.templates if t["kind"] == "host")
+        region = self.env["COMPUTE_REGION"]
+        return {
+            "version": 1, "generation": 11, "source_sha": ipv4["source_sha"],
+            "build_id": "reviewed-ipv4-host-release:" + digest(encoded(ipv4)),
+            "guard_sha256": self.env["GUARD_SHA256"],
+            "versions": {**ipv4["expected"]["versions"], host["region"] + "/" + host["id"]: self.IPV4_HOST_VERSION},
+            "previous": {k: v for k, v in ipv4["expected"].items() if k != "previous"},
+            "host_amis": {region: {"x86_64": self.IPV4_HOST_COPY}},
+            "tile_amis": {region: {"x86_64": ipv4["images"]["tile"]}},
+        }
+
+    def reviewed_generation_eleven_rollback(self):
+        eleven = self.ipv4_host_receipt()
+        region = self.env["COMPUTE_REGION"]
+        # Generation twelve's host image boots fcvm's host kernel with no initramfs, so the network
+        # driver loads after cloud-init's first stage has looked for a network interface. cloud-init
+        # then never reaches the instance metadata service, runs no user data, and the host's fleet
+        # agent has no arguments and does not start: no GPU slot, phone, Windows sandbox or Minecraft
+        # server on staging. This puts back generation eleven's host and tile images, on which the
+        # staging viewer smoke passed on every tile, as the next generation. Its predecessor is the
+        # exact generation-twelve receipt.
+        return self.reviewed_pair({
+            "source_sha": eleven["source_sha"],
+            "images": {"host": self.IPV4_HOST_COPY, "tile": eleven["tile_amis"][region]["x86_64"]},
+            "expected": {
+                "version": 1, "generation": 12, "source_sha": self.FACTORY_TWELVE_SOURCE,
+                "build_id": self.FACTORY_TWELVE_BUILD,
+                "guard_sha256": self.env["GUARD_SHA256"],
+                "versions": {key: number + 1 for key, number in eleven["versions"].items()},
+                "previous": {k: v for k, v in eleven.items() if k != "previous"},
+                "host_amis": {region: {"x86_64": self.FACTORY_TWELVE_HOST}},
+                "tile_amis": {region: {"x86_64": self.FACTORY_TWELVE_TILE}},
+            },
+        })
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -619,6 +670,13 @@ class Publisher:
         need(event == {"action": "activate-reviewed-ipv4-host-release"},
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
+
+    def run_generation_eleven_rollback(self, event):
+        need(event == {"action": "activate-reviewed-generation-eleven-rollback"},
+             "reviewed rollback accepts no caller configuration")
+        # Both images are already in the release region, and Terraform's host bootstrap already
+        # names the host's (it is in every boot-image list), so the templates change only their image.
+        return self.run_reviewed(self.reviewed_generation_eleven_rollback(), "reviewed-generation-eleven-rollback")
 
     def run_windows_host_release(self, event):
         need(event == {"action": "activate-reviewed-windows-host-release"},
@@ -1478,6 +1536,12 @@ class Publisher:
             return self.run_restore_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ipv4-host-release":
             return self.run_ipv4_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-generation-eleven-rollback":
+            return self.run_generation_eleven_rollback(event)
+        # A factory build that was already running when the factory was paused
+        # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
+        # actions above are how a release is changed while paused.
+        need(self.env.get("FACTORY_PAUSED") != "true", "factory promotion is paused (fcvm_ami_factory_paused)")
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None

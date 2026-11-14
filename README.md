@@ -522,6 +522,12 @@ Routine publication leaves active machines running and takes effect on later
 starts or idle recycling. It never restarts the administration, Next.js or metal
 development servers.
 
+On factory-managed host templates, a newly published AMI can start Potato players
+or Minecraft servers when it contains both the matching rootful Podman image and
+an installed Fleet agent that accepts the matching option. Windows sandboxes still
+require an explicitly reviewed boot AMI ID: older Windows bridges can carry the
+same assets while exposing an unauthenticated `/still` endpoint.
+
 The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
 builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
 pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatcher redrives
@@ -686,6 +692,19 @@ address (ejc3/fcvm#1833), its Windows bridges run on an IPv6-enabled network
 (ejc3/fcvm#1839). It is released by the same apply, invoke, apply, invoke
 sequence; the second apply lists the copy in `windows_host_amis` and
 `minecraft_host_amis` beside the earlier ones.
+
+The fixed action `{"action":"activate-reviewed-generation-eleven-rollback"}`
+puts generation eleven's host and tile images back as generation thirteen. Its
+predecessor is the exact generation-twelve receipt that the image factory
+published from fcvm 5cb0257d (`FACTORY_TWELVE_*` in `publish.py`), and any other
+live receipt is refused. That host image boots fcvm's host kernel without an
+initramfs, so the network driver loads after cloud-init's first stage has looked
+for a network interface; cloud-init never reaches the instance metadata service,
+runs no user data, and the fleet agent never gets its arguments, so the host runs
+no GPU slot, phone, Windows sandbox or Minecraft server. Both images of
+generation eleven are already in us-east-1 and every boot-image list names its
+host, so after the apply that deploys this publisher one invoke makes a new version of each
+template with only its image changed and selects it.
 
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|

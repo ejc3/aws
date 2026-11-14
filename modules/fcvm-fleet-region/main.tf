@@ -133,8 +133,18 @@ variable "minecraft_host_amis" {
 }
 
 variable "slot_tls_ports" {
-  description = "The GPU host ports each slot's renderer TLS port is forwarded on, for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
+  description = "The GPU host ports each place's TLS port is forwarded on (GPU slots, then Windows sandboxes, then Minecraft servers), for IPv4 viewers (fcvm fleet agent --tls-publish-base)"
   type        = object({ from = number, to = number })
+}
+
+variable "windows_count" {
+  description = "Windows sandboxes on a host booted from one of windows_host_amis (--windows); their TLS ports follow the GPU slots'."
+  type        = number
+}
+
+variable "minecraft_count" {
+  description = "Minecraft servers on a host booted from one of minecraft_host_amis (--minecraft); their TLS ports follow the sandboxes'."
+  type        = number
 }
 
 variable "host_profile_name" {
@@ -254,34 +264,41 @@ locals {
       %{if length(var.windows_host_amis) > 0~}
       # An agent from an older image has no --windows and would refuse it.
       case "$boot_ami" in
-        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows 4" ;;
+        ${join("|", sort(tolist(var.windows_host_amis)))}) agent_args="$agent_args --windows ${var.windows_count}" ;;
       esac
       %{endif~}
       %{if length(var.minecraft_host_amis) > 0~}
       # An agent from an older image has no --minecraft and would refuse it.
       case "$boot_ami" in
-        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft 4" ;;
+        ${join("|", sort(tolist(var.minecraft_host_amis)))}) agent_args="$agent_args --minecraft ${var.minecraft_count}" ;;
       esac
       %{endif~}
     fi
     unset token boot_ami
     %{endif~}
-    # The modes the boot image itself carries. The lists above name reviewed copies, and the
-    # factory's publisher changes ImageId without an apply, so a factory image is in none of
-    # them (ejc3/aws#823). An image's build writes windows.env and loads the potato and
-    # Minecraft images only when its agent has the matching argument.
-    case " $agent_args " in
-      *" --windows "*) ;;
-      *) if [ -s /etc/fcvm-fleet/windows.env ]; then agent_args="$agent_args --windows 4"; fi ;;
-    esac
-    case " $agent_args " in
-      *" --potato-players "*) ;;
-      *) if /usr/bin/podman image exists localhost/fcvm-potato:fleet 2>/dev/null; then agent_args="$agent_args --potato-players 96"; fi ;;
-    esac
-    case " $agent_args " in
-      *" --minecraft "*) ;;
-      *) if /usr/bin/podman image exists localhost/fcvm-minecraft:fleet 2>/dev/null; then agent_args="$agent_args --minecraft 4"; fi ;;
-    esac
+    %{~if var.ami_release_parameter_arn != ""~}
+    # The factory publisher can change ImageId while retaining this bootstrap.
+    # An unlisted image can run a mode only if it has both that mode's image in
+    # root's Podman store and the flag in its installed agent. Windows remains
+    # allowlisted above: the presence of its assets does not prove /still is safe.
+    have_mode_artifact() {
+      case " $agent_args " in *" $1 "*|*" $1="*) return 1 ;; esac
+      /usr/bin/timeout -k 1 10 /usr/bin/podman image exists "$2" 2>/dev/null
+    }
+    potato_present=false
+    minecraft_present=false
+    if have_mode_artifact --potato-players localhost/fcvm-potato:fleet; then potato_present=true; fi
+    if have_mode_artifact --minecraft localhost/fcvm-minecraft:fleet; then minecraft_present=true; fi
+    if { "$potato_present" || "$minecraft_present"; } &&
+      mode_help=$(/usr/bin/timeout -k 1 10 /usr/local/bin/fcvm fleet agent --help 2>/dev/null); then
+      if "$potato_present" && grep -Eq -- '^[[:space:]]+--potato-players([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --potato-players 96"
+      fi
+      if "$minecraft_present" && grep -Eq -- '^[[:space:]]+--minecraft([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --minecraft ${var.minecraft_count}"
+      fi
+    fi
+    %{endif~}
     printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
     systemctl enable fcvm-fleet-agent.service
     systemctl start --no-block fcvm-fleet-agent.service
