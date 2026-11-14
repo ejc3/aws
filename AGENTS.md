@@ -1562,6 +1562,12 @@ Available if a task needs them; neither needs a key on disk.
   people's addresses) and nothing that writes. `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value
   --region us-west-1 --secret-id cloudflare-observability-token --query SecretString --output text)`; never onto a
   command line, into a file in a repo or a commit. Rotate with `terraform apply -replace=cloudflare_account_token.observability_read`.
+- **Cloudflare Browser Run**, metal boxes. `cloudflare-browser-run` (us-west-1) is JSON `{ account_id, api_token }`: a
+  standing Cloudflare token with Browser Run Write on the account and nothing else (`browser-run.tf`), for the fcvm render
+  benchmark (Browser Run's Chromium and its hosted Kitesurf engine). It creates billable browser sessions; it cannot touch
+  Workers, DNS, Access or zones. Not IP-pinned. Readable by dev-server-role (the secret's own resource policy) and admins.
+  Export both fields from `get-secret-value` into the environment; never onto a command line, into a file in a repo or a
+  commit. Rotate with `terraform apply -replace=cloudflare_account_token.browser_run`.
 - **fcvm.dev DNS propagation tests**, metal boxes. `fcvm-dns-test-token` (us-west-1) is a Cloudflare token with DNS Read
   and DNS Write on the fcvm.dev zone and nothing else (`fcvm-dns-test.tf`), usable only from the dev fleet's subnets
   (IPv6) and the metal boxes' Elastic IPs, and it expires 90 days after its date was last set. It is for creating,
