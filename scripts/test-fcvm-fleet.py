@@ -113,12 +113,13 @@ class HostTests(unittest.TestCase):
         # Minecraft mode needs the same image: its agent is the first with --minecraft, so the flag is never in
         # every host's arguments, only in the boot-image case below.
         self.assertNotIn('"--minecraft', TF)
-        self.assertEqual(MOD.count("--minecraft 4"), 1)
+        # once for a listed boot image, once for an image that carries the Minecraft tile image
+        self.assertEqual(MOD.count("--minecraft 4"), 2)
         self.assertRegex(east, r'minecraft_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
-        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
+        guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    # The modes the boot image itself carries.", 1)[0]
         # the nested Windows case, rendered as Terraform does when the list is not empty
         windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"
         minecraft_if = "      %{if length(var.minecraft_host_amis) > 0~}\n"
@@ -164,6 +165,42 @@ class HostTests(unittest.TestCase):
                     )
                     self.assertEqual(result.stdout, expected)
                     self.assertNotIn("fixture-token", result.stderr)
+
+    def test_a_host_takes_the_modes_its_boot_image_carries(self):
+        # ejc3/aws#823: generation twelve, a factory image, is in none of the reviewed AMI lists, so its
+        # hosts started with no --windows, --minecraft or --potato-players. The bootstrap now also reads
+        # the modes from the image: windows.env (written by the image's build) and the potato and Minecraft
+        # images in root's podman store. A flag already given by a list is not added twice.
+        start = MOD.index("    # The modes the boot image itself carries.")
+        end = MOD.index("    printf 'FLEET_AGENT_ARGS=%s", start)
+        block = textwrap.dedent(MOD[start:end])
+        self.assertNotIn("%{", block)
+        with tempfile.TemporaryDirectory() as temp:
+            podman = Path(temp) / "podman"
+            podman.write_text('#!/bin/bash\ntest "$1 $2" = "image exists" || exit 90\n'
+                              'case " $IMAGES " in *" $3 "*) exit 0;; *) exit 1;; esac\n')
+            podman.chmod(0o700)
+            env_file = Path(temp) / "windows.env"
+            script = block.replace("/usr/bin/podman", str(podman)).replace("/etc/fcvm-fleet/windows.env", str(env_file))
+            every = "localhost/fcvm-potato:fleet localhost/fcvm-minecraft:fleet"
+            for before, images, windows, expected in (
+                ("--phones 2", every, True, "--phones 2 --windows 4 --potato-players 96 --minecraft 4"),
+                ("--phones 2", "", False, "--phones 2"),
+                ("--phones 2", "localhost/fcvm-potato:fleet", False, "--phones 2 --potato-players 96"),
+                # a listed image already has its flags: none is added twice
+                ("--phones 2 --potato-players 96 --windows 4 --minecraft 4", every, True,
+                 "--phones 2 --potato-players 96 --windows 4 --minecraft 4"),
+            ):
+                with self.subTest(before=before, images=images, windows=windows):
+                    if windows:
+                        env_file.write_text('WINDOWS_AGENT_ARGS="--windows-image /x"\n')
+                    elif env_file.exists():
+                        env_file.unlink()
+                    result = subprocess.run(
+                        ["/bin/bash", "-eu", "-c", f"agent_args='{before}'\n" + script + '\nprintf "%s" "$agent_args"'],
+                        env=dict(os.environ, IMAGES=images), capture_output=True, text=True, timeout=5)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout, expected)
 
     def test_hosts_ask_for_a_prefix_only_and_imdsv2_hop_1(self):
         lt = block('resource "aws_launch_template" "host"', MOD)

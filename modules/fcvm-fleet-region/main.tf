@@ -266,6 +266,22 @@ locals {
     fi
     unset token boot_ami
     %{endif~}
+    # The modes the boot image itself carries. The lists above name reviewed copies, and the
+    # factory's publisher changes ImageId without an apply, so a factory image is in none of
+    # them (ejc3/aws#823). An image's build writes windows.env and loads the potato and
+    # Minecraft images only when its agent has the matching argument.
+    case " $agent_args " in
+      *" --windows "*) ;;
+      *) if [ -s /etc/fcvm-fleet/windows.env ]; then agent_args="$agent_args --windows 4"; fi ;;
+    esac
+    case " $agent_args " in
+      *" --potato-players "*) ;;
+      *) if /usr/bin/podman image exists localhost/fcvm-potato:fleet 2>/dev/null; then agent_args="$agent_args --potato-players 96"; fi ;;
+    esac
+    case " $agent_args " in
+      *" --minecraft "*) ;;
+      *) if /usr/bin/podman image exists localhost/fcvm-minecraft:fleet 2>/dev/null; then agent_args="$agent_args --minecraft 4"; fi ;;
+    esac
     printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
     systemctl enable fcvm-fleet-agent.service
     systemctl start --no-block fcvm-fleet-agent.service
