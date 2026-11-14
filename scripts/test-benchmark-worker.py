@@ -12,11 +12,12 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 TF = (ROOT / "benchmark-worker.tf").read_text()
+BOOT_RACE_TF = (ROOT / "boot-race.tf").read_text()
 
 
-def block(header):
-    start = TF.index(header)
-    return TF[start:TF.index("\n}\n", start)]
+def block(header, source=TF):
+    start = source.index(header)
+    return source[start:source.index("\n}\n", start)]
 
 
 class Worker(unittest.TestCase):
@@ -100,6 +101,13 @@ class Worker(unittest.TestCase):
 
 
 class Boundaries(unittest.TestCase):
+    def test_workload_ingress_is_from_the_dedicated_worker_only(self):
+        group = block('resource "aws_security_group" "boot_race"', BOOT_RACE_TF)
+        self.assertNotRegex(group, r"(?m)^  ingress\s*\{")
+        self.assertRegex(group, r"for_each = local\.benchmark_worker_enabled \? toset\(\[22, 8080\]\)")
+        self.assertIn("security_groups = [aws_security_group.benchmark_worker[0].id]", group)
+        self.assertEqual(group.count('dynamic "ingress"'), 1)
+
     def test_only_the_controller_has_launch_and_passrole(self):
         operator = block('resource "aws_iam_role_policy" "benchmark_worker_operator"')
         operator_trust = block('resource "aws_iam_role" "benchmark_worker_operator"')
