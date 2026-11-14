@@ -107,3 +107,52 @@ resource "aws_iam_role_policy_attachment" "cloudflare_observability_read" {
   role       = each.value
   policy_arn = aws_iam_policy.cloudflare_observability_read.arn
 }
+
+# A rule includes its private forwarding destination. Keep this Dolphin-only credential behind the same
+# administration boundary as people/addresses, independent of the dev boxes' logs and metrics token above.
+# Permission group id verified via GET /accounts/<id>/tokens/permission_groups (Email Routing Rules Read, zone scope).
+resource "cloudflare_account_token" "dolphin_email_routing_read" {
+  provider   = cloudflare.token_minter
+  count      = local.dolphin_enabled ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "dolphin-email-routing-read-terraform"
+  policies = [{
+    effect            = "allow"
+    permission_groups = [{ id = "1b600d9d8062443e986a973f097e728a" }]
+    resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })
+  }]
+}
+
+resource "aws_secretsmanager_secret" "dolphin_email_routing_read" {
+  count                   = local.dolphin_enabled ? 1 : 0
+  name                    = "cloudflare-dolphin-email-routing-read-token"
+  description             = "Administration-only raw Cloudflare token: read Email Routing rules on dolphin-labs.dev."
+  recovery_window_in_days = 7
+  tags                    = { Name = "cloudflare-dolphin-email-routing-read-token", Project = "dolphin-labs" }
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_email_routing_read" {
+  count               = local.dolphin_enabled ? 1 : 0
+  secret_arn          = aws_secretsmanager_secret.dolphin_email_routing_read[count.index].arn
+  block_public_policy = true
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]
+      Resource  = "*"
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "dolphin_email_routing_read" {
+  count         = local.dolphin_enabled ? 1 : 0
+  secret_id     = aws_secretsmanager_secret.dolphin_email_routing_read[count.index].id
+  secret_string = cloudflare_account_token.dolphin_email_routing_read[count.index].value
+
+  # The access boundary must exist before the first readable token value.
+  depends_on = [aws_secretsmanager_secret_policy.dolphin_email_routing_read]
+}

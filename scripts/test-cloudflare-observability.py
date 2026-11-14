@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """The read-only Cloudflare logs and metrics token (cloudflare-observability.tf): only Read permission groups, account-wide
-and on every zone, nothing that names people (Access audit logs), readable by administration and the two dev-box roles."""
+and on every zone, readable by administration and the two dev-box roles. The separate token for private Dolphin mail
+rules follows the people/addresses administration boundary."""
 import re
 import unittest
 from pathlib import Path
@@ -25,12 +26,19 @@ ZONE = {
 }
 ACCESS_AUDIT_LOGS_READ = "b05b28e839c54467a7d6cba5d3abb5a3"
 ACCESS_SCIM_LOGS_READ = "e985ca9351db460faebbe8681c48e560"
+EMAIL_ROUTING_RULES_READ = "1b600d9d8062443e986a973f097e728a"
 
 
 def block(name):
     m = re.search(r"^  %s = \{\n(.*?)^  \}" % name, TF, re.S | re.M)
     assert m, name
     return set(re.findall(r'"([0-9a-f]{32})"', m.group(1)))
+
+
+def resource(kind, name):
+    m = re.search(r'^resource "%s" "%s" \{\n(.*?)^\}' % (kind, name), TF, re.S | re.M)
+    assert m, (kind, name)
+    return m.group(1)
 
 
 class TokenTests(unittest.TestCase):
@@ -45,10 +53,16 @@ class TokenTests(unittest.TestCase):
             self.assertNotIn(gid, TF)
 
     def test_the_account_policy_and_the_every_zone_policy(self):
-        self.assertIn('jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', TF)
-        self.assertIn('"com.cloudflare.api.account.zone.*" = "*"', TF)
-        self.assertIn("provider   = cloudflare.token_minter", TF)
-        self.assertNotIn("expires_on", TF, "long-lived, rotated by -replace")
+        token = resource("cloudflare_account_token", "observability_read")
+        policies = re.findall(r"(?ms)^    \{\n(.*?)^    \},", token)
+        self.assertEqual(len(policies), 2)
+        self.assertIn('jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', policies[0])
+        self.assertIn("local.cloudflare_observability_account_groups", policies[0])
+        self.assertIn('"com.cloudflare.api.account.zone.*" = "*"', policies[1])
+        self.assertIn("local.cloudflare_observability_zone_groups", policies[1])
+        self.assertNotIn(EMAIL_ROUTING_RULES_READ, token)
+        self.assertIn("provider   = cloudflare.token_minter", token)
+        self.assertNotIn("expires_on", token, "long-lived, rotated by -replace")
 
 
 class ReaderTests(unittest.TestCase):
@@ -57,6 +71,42 @@ class ReaderTests(unittest.TestCase):
         self.assertIn("concat(local.games_mp_admin_principals, local.cloudflare_observability_readers)", TF)
         self.assertIn('for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }', TF)
         self.assertIn('actions   = ["secretsmanager:GetSecretValue"]', TF)
+
+
+
+class DolphinEmailRoutingTests(unittest.TestCase):
+    def test_only_the_dolphin_zone_and_rules_read_permission(self):
+        token = resource("cloudflare_account_token", "dolphin_email_routing_read")
+        self.assertRegex(token, r'(?m)^  provider\s*= cloudflare\.token_minter$')
+        self.assertRegex(token, r'(?m)^  account_id\s*= var\.cloudflare_account_id$')
+        policy = re.search(r"(?ms)^  policies = \[\{\n(.*?)^  \}\]$", token).group(1)
+        self.assertEqual([line.strip() for line in policy.splitlines()], [
+            'effect            = "allow"',
+            f'permission_groups = [{{ id = "{EMAIL_ROUTING_RULES_READ}" }}]',
+            'resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })',
+        ])
+        self.assertEqual(TF.count(EMAIL_ROUTING_RULES_READ), 1)
+
+    def test_secret_uses_admin_boundary_before_it_gets_a_value(self):
+        name = "dolphin_email_routing_read"
+        container = resource("aws_secretsmanager_secret", name)
+        policy = resource("aws_secretsmanager_secret_policy", name)
+        version = resource("aws_secretsmanager_secret_version", name)
+        self.assertRegex(container, r'(?m)^  name\s*= "cloudflare-dolphin-email-routing-read-token"$')
+        self.assertIn("block_public_policy = true", policy)
+        self.assertIn("aws_secretsmanager_secret.dolphin_email_routing_read[count.index].arn", policy)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Principal = "*"', policy)
+        self.assertIn('["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]', policy)
+        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals }', policy)
+        self.assertIn("depends_on = [aws_secretsmanager_secret_policy.dolphin_email_routing_read]", version)
+        self.assertIn("aws_secretsmanager_secret.dolphin_email_routing_read[count.index].id", version)
+        self.assertIn("cloudflare_account_token.dolphin_email_routing_read[count.index].value", version)
+        for kind in ("cloudflare_account_token", "aws_secretsmanager_secret",
+                     "aws_secretsmanager_secret_policy", "aws_secretsmanager_secret_version"):
+            self.assertRegex(resource(kind, name), r"(?m)^  count\s*= local\.dolphin_enabled \? 1 : 0$")
+        self.assertNotIn(name, resource("aws_iam_policy", "cloudflare_observability_read"))
+        self.assertNotIn(name, resource("aws_iam_role_policy_attachment", "cloudflare_observability_read"))
 
 
 if __name__ == "__main__":
