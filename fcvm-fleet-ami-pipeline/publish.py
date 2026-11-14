@@ -748,11 +748,34 @@ class Publisher:
                 return {}
             raise
 
+    def fleet_images(self, release):
+        """Count the fleet's live hosts and tiles by whether they run the release's image: a smoke
+        can verify a release only on machines booted from it (a routine publication leaves running
+        machines on the image they booted)."""
+        region = self.env["COMPUTE_REGION"]
+        want = {"fcvm-fleet-" + kind: release[kind + "_amis"][region]["x86_64"] for kind in ("host", "tile")}
+        counts = {"release_hosts": 0, "other": 0}
+        arguments = {"Filters": [{"Name": "tag:Purpose", "Values": sorted(want)},
+                                 {"Name": "instance-state-name", "Values": ["pending", "running"]}]}
+        for _ in range(20):
+            page = self.client("ec2", True).describe_instances(**arguments)
+            for reservation in page["Reservations"]:
+                for item in reservation["Instances"]:
+                    purpose = {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get("Purpose")
+                    if item.get("ImageId") != want.get(purpose):
+                        counts["other"] += 1
+                    elif purpose == "fcvm-fleet-host":
+                        counts["release_hosts"] += 1
+            if not page.get("NextToken"):
+                return counts
+            arguments["NextToken"] = page["NextToken"]
+        raise Refused("Fleet inventory exceeds its fixed bound")
+
     def gate(self, event):
         """The release gate the staging viewer smoke drives (ejc3/fcvm fleet/ami/release_gate.py).
 
-        status: the live generation and whether the gate has verified it. verify N: the smoke passed
-        on generation N. rollback N: the smoke failed on generation N; the live release goes back
+        status: the live generation, whether the gate has verified it, and whether every live host and
+        tile runs its images. verify N: the smoke passed on generation N, on hosts booted from it. rollback N: the smoke failed on generation N; the live release goes back
         to its `previous` unless the gate already verified N. A rollback's own receipt is recorded
         as verified, so the next smoke cannot roll it back to the release it withdrew."""
         need(isinstance(event, dict) and event.get("action") in {"status", "verify", "rollback"}
@@ -763,11 +786,17 @@ class Publisher:
         gate = self.gate_record()
         rolled_back = str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX)
         if event["action"] == "status":
+            # current: no live host or tile runs another image, so a smoke now exercises this release
+            # (with nothing running, the smoke wakes the fleet from the templates, which name it).
             return {"generation": active.get("generation"), "source_sha": active.get("source_sha"),
-                    "verified": gate.get("verified_generation") == active.get("generation"), "rollback": rolled_back}
+                    "verified": gate.get("verified_generation") == active.get("generation"), "rollback": rolled_back,
+                    "current": self.fleet_images(active)["other"] == 0}
         n = event["generation"]
         if event["action"] == "verify":
             need(active.get("generation") == n, "the live release is not that generation")
+            images = self.fleet_images(active)
+            need(images["other"] == 0 and images["release_hosts"] > 0,
+                 "the smoke did not run on hosts booted from this release")
             self.save(self.env["STATE_PREFIX"] + "/gate", {"verified_generation": n, "build_id": active.get("build_id")})
             return {"status": "verified", "generation": n}
         if rolled_back and (active.get("previous") or {}).get("generation") == n:

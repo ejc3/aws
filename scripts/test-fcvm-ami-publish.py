@@ -1850,7 +1850,8 @@ class PublisherTests(unittest.TestCase):
         host, *tiles = self.ids
         before = copy.deepcopy(self.ec2.templates)
         self.assertEqual(self.publisher().gate({"action": "status"}),
-                         {"generation": 11, "source_sha": self.IPV4_SOURCE, "verified": False, "rollback": False})
+                         {"generation": 11, "source_sha": self.IPV4_SOURCE, "verified": False, "rollback": False,
+                          "current": True})
         self.assertEqual(self.publisher().gate({"action": "rollback", "generation": 11}),
                          {"status": "rolled_back", "generation": 12})
         after = self.fleet_ssm.values["/release"]
@@ -1897,12 +1898,38 @@ class PublisherTests(unittest.TestCase):
 
     def test_the_gate_does_not_roll_back_a_verified_generation(self):
         _, eleven = self.generation_eleven_live()
+        self.fleet_host(eleven["host_amis"]["us-east-1"]["x86_64"])
         self.assertEqual(self.publisher().gate({"action": "verify", "generation": 11}), {"status": "verified", "generation": 11})
         with self.assertRaisesRegex(MODULE.Refused, "the gate verified this generation"):
             self.publisher().gate({"action": "rollback", "generation": 11})
         with self.assertRaisesRegex(MODULE.Refused, "the live release is not that generation"):
             self.publisher().gate({"action": "rollback", "generation": 10})
         self.assertEqual(self.fleet_ssm.values["/release"], eleven)
+
+    def fleet_host(self, image, number=200, state="running"):
+        name = "i-" + format(number, "017x")
+        self.ec2.instances[name] = {"InstanceId": name, "ImageId": image, "InstanceType": "g4dn.metal",
+            "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-host"}], "State": {"Name": state}}
+        return name
+
+    def test_the_gate_verifies_only_a_smoke_on_hosts_booted_from_the_release(self):
+        ten, eleven = self.generation_eleven_live()
+        new, old = eleven["host_amis"]["us-east-1"]["x86_64"], ten["host_amis"]["us-east-1"]["x86_64"]
+        # Nothing running: a smoke wakes the fleet from the templates, which name the release.
+        self.assertTrue(self.publisher().gate({"action": "status"})["current"])
+        # ...but nothing ran on it, so there is nothing to verify yet.
+        with self.assertRaisesRegex(MODULE.Refused, "did not run on hosts booted from this release"):
+            self.publisher().gate({"action": "verify", "generation": 11})
+        # A routine publication leaves a running host on the image it booted: not current, no verify.
+        self.fleet_host(old, number=201)
+        self.fleet_host(new, number=202)
+        self.assertFalse(self.publisher().gate({"action": "status"})["current"])
+        with self.assertRaisesRegex(MODULE.Refused, "did not run on hosts booted from this release"):
+            self.publisher().gate({"action": "verify", "generation": 11})
+        # Once that host is gone, the smoke on the release's host verifies it.
+        self.ec2.instances["i-" + format(201, "017x")]["State"]["Name"] = "terminated"
+        self.assertTrue(self.publisher().gate({"action": "status"})["current"])
+        self.assertEqual(self.publisher().gate({"action": "verify", "generation": 11}), {"status": "verified", "generation": 11})
 
     def test_the_gate_handler_takes_only_its_three_requests(self):
         for event in ({"action": "rollback"}, {"action": "rollback", "generation": "11"},
