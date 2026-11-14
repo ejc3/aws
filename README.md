@@ -910,6 +910,18 @@ Restore `boot_race_enabled = false` in Git, apply, and confirm AWS reports that 
 campaign endpoints and driver role are gone. The dormant reaper remains available for
 admin recovery if any campaign resources still need cleanup.
 
+### Cloudflare Browser Run benchmark credential
+
+Ordinary applies keep `cloudflare-browser-run` in Secrets Manager empty and
+readable only by administrators. For an approved experiment, commit an explicit
+`browser_run_window` (UTC start and end, at most one hour) before applying. The
+account token has only Browser Run Write, is valid only within that fixed
+window, and accepts only the primary jumpbox's Elastic IPv4. An administrator
+can make reviewed direct API requests over IPv4 and pass results to the
+benchmark; do not run a benchmark checkout on the jumpbox or copy the token to
+a dev box. Afterward, remove the window from Git and apply. Cloudflare rejects
+the token after the deadline even if cleanup has not run.
+
 ### Temporary EC2 Mac builds: `macpbox`
 
 `macpbox status` discovers the shared build host and `macpbox quote` reads current AWS

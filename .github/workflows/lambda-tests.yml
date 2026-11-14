@@ -367,7 +367,7 @@ jobs:
       - name: "Cloudflare observability token: read-only groups, account and zones, no Access logs, dev boxes may read it"
         run: python3 -S -B scripts/test-cloudflare-observability.py
 
-      - name: "Browser Run token: Browser Rendering Write on the account only, looked up by name, metal boxes may read it"
+      - name: "Browser Run token: explicit short window, administrator-only, exact permission and primary jumpbox IPv4"
         run: python3 -S -B scripts/test-browser-run.py
 
       - name: "fcvm.dev DNS test token: DNS Read and Write on fcvm.dev only, dev-fleet client IPs from Terraform, an expiry, dev-server-role reads it"

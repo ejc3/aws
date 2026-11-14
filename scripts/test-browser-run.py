@@ -1,55 +1,63 @@
 #!/usr/bin/env python3
-"""The Browser Run token (browser-run.tf): Browser Rendering Write on this account only, minted through the token
-minter from a permission group looked up by exact name, stored with the account id in a container that only
-administration and dev-server-role may read."""
+"""Offline contracts for the opt-in administrator Browser Run credential."""
+from pathlib import Path
 import re
 import unittest
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+
+ROOT = Path(__file__).resolve().parents[1]
 TF = (ROOT / "browser-run.tf").read_text()
-CODE = "\n".join(line for line in TF.splitlines() if not line.lstrip().startswith("#"))
 
 
-def resource(kind, name):
-    m = re.search(r'^(resource|data) "%s" "%s" \{\n.*?^\}' % (kind, name), CODE, re.S | re.M)
-    assert m, (kind, name)
-    return m.group()
+def block(kind, name, source=TF):
+    match = re.search(r'^%s "%s" \{\n.*?^\}' % (kind, name), source, re.S | re.M)
+    assert match, (kind, name)
+    return match.group()
 
 
-class TokenTests(unittest.TestCase):
-    def test_one_permission_group_by_exact_name_on_the_account(self):
-        lookup = resource("cloudflare_account_api_token_permission_groups_list", "browser_rendering_write")
-        self.assertIn('name       = "Browser Rendering Write"', lookup)
-        self.assertIn('scope      = "com.cloudflare.api.account"', lookup)
-        self.assertIn("provider   = cloudflare.token_minter", lookup)
-        self.assertIn('if g.name == "Browser Rendering Write"', CODE)
-        token = resource("cloudflare_account_token", "browser_run")
-        self.assertIn("provider   = cloudflare.token_minter", token)
-        self.assertIn("length(local.browser_run_permission_group_ids) == 1", token)
-        self.assertEqual(token.count("effect            ="), 1, "one policy")
-        self.assertIn('jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', token)
-        self.assertNotIn("zone", token)
-        self.assertNotIn("expires_on", token, "long-lived, rotated by -replace")
+class BrowserRunTests(unittest.TestCase):
+    def test_default_and_expired_windows_do_not_mint_or_store_a_payload(self):
+        window = block("variable", "browser_run_window")
+        self.assertIn("default = null", window)
+        self.assertIn('timeadd(var.browser_run_window.starts_at, "1h")', window)
+        self.assertIn("timecmp(var.browser_run_window.starts_at, var.browser_run_window.expires_at) < 0", window)
+        self.assertIn("var.browser_run_window == null ? false", TF)
+        self.assertIn("timecmp(plantimestamp(), var.browser_run_window.expires_at) < 0", TF)
+        self.assertIn('"${var.browser_run_window.starts_at}/${var.browser_run_window.expires_at}"', TF)
+        for kind, name in (
+            ('data "cloudflare_account_api_token_permission_groups_list"', "browser_rendering_write"),
+            ('resource "cloudflare_account_token"', "browser_run"),
+            ('resource "aws_secretsmanager_secret_version"', "cloudflare_browser_run"),
+        ):
+            self.assertRegex(block(kind, name), r"for_each\s*=\s*local\.browser_run_leases")
 
-    def test_no_other_permission_group_id_is_named(self):
-        self.assertEqual(re.findall(r'"[0-9a-f]{32}"', CODE), [])
-
-
-class ReaderTests(unittest.TestCase):
-    def test_administration_and_the_metal_boxes_read_it_and_no_one_else(self):
-        policy = resource("aws_secretsmanager_secret_policy", "cloudflare_browser_run")
-        self.assertIn("Principal = { AWS = aws_iam_role.dev_server.arn }", policy)
+    def test_only_administrators_may_retrieve_the_secret(self):
+        policy = block('resource "aws_secretsmanager_secret_policy"', "cloudflare_browser_run")
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Principal = "*"', policy)
         self.assertIn(
-            '"aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn])', policy)
-        self.assertNotIn("nextjs_dev", CODE)
-        self.assertNotIn("dev_ebs_only", CODE)
+            'Action    = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]', policy
+        )
+        self.assertIn('"aws:PrincipalArn" = local.games_mp_admin_principals', policy)
+        self.assertNotRegex(TF, r"aws_iam_role\.(dev_server|nextjs_dev|dev_ebs_only)")
+        payload = block('resource "aws_secretsmanager_secret_version"', "cloudflare_browser_run")
+        self.assertIn("depends_on = [aws_secretsmanager_secret_policy.cloudflare_browser_run]", payload)
 
-    def test_the_secret_holds_the_account_id_and_the_token(self):
-        version = resource("aws_secretsmanager_secret_version", "cloudflare_browser_run")
-        self.assertIn("account_id = var.cloudflare_account_id", version)
-        self.assertIn("api_token  = cloudflare_account_token.browser_run.value", version)
+    def test_token_is_time_and_ip_bound_with_exactly_one_permission(self):
+        lookup = block('data "cloudflare_account_api_token_permission_groups_list"', "browser_rendering_write")
+        token = block('resource "cloudflare_account_token"', "browser_run")
+        self.assertIn('name       = "Browser Run Write"', lookup)
+        self.assertIn('scope      = "com.cloudflare.api.account"', lookup)
+        self.assertIn("provider   = cloudflare.token_minter", token)
+        self.assertIn("not_before = each.value.starts_at", token)
+        self.assertIn("expires_on = each.value.expires_at", token)
+        self.assertIn('request_ip = { in = [for ip in aws_eip.jumpbox : "${ip.public_ip}/32"] }', token)
+        self.assertIn("length(aws_eip.jumpbox) == 1", token)
+        self.assertIn('if g.name == "Browser Run Write"]) == 1', token)
+        self.assertEqual(token.count("permission_groups = ["), 1)
+        self.assertNotIn("cloudflare_account_token.workers_deploy", TF)
+        self.assertNotIn("kitesurf", (ROOT / "workers-deploy.tf").read_text().lower())
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)

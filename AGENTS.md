@@ -1496,10 +1496,6 @@ Available if a task needs them; neither needs a key on disk.
   grants only. Do not call the utility verified until real login, generation and renewal
   checks pass; a paid website account is not an official API.
 
-- **Cloudflare Browser Run** (Browser Rendering, for fcvm's render benchmark), metal boxes only. One JSON secret,
-  `cloudflare-browser-run` (us-west-1), holds `account_id` and `api_token` (Browser Rendering Write on the account,
-  nothing else; `browser-run.tf`). Export with `jq -r '"export CLOUDFLARE_ACCOUNT_ID=\(.account_id|@sh)
-  export CLOUDFLARE_API_TOKEN=\(.api_token|@sh)"'`, never onto a command line. It bills per browser hour.
 - **Browserbase** (hosted headless browsers, for pages that block plain requests), metal boxes and
   nextjs-dev. One JSON secret, `browserbase/credentials` (us-west-1), holds `BROWSERBASE_API_KEY` and
   `BROWSERBASE_PROJECT_ID`; only dev-server-role, nextjs-dev-role, the dolphin-labs news pass's Lambda
