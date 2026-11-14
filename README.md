@@ -706,6 +706,17 @@ generation eleven are already in us-east-1 and every boot-image list names its
 host, so after the apply that deploys this publisher one invoke makes a new version of each
 template with only its image changed and selects it.
 
+The fixed action `{"action":"activate-reviewed-ena-host-release"}` advances
+only the exact generation-thirteen receipt (the rollback, derived by
+`generation_eleven_rollback_receipt()`) to the signed c12ad070 host, built by
+hand in us-west-2, as generation fourteen. Its host kernel has the EC2 network
+driver built in (ejc3/fcvm#1874), so a first boot finds its network interface
+before cloud-init's first stage looks for one. It is released by the same
+apply, invoke, apply, invoke sequence as generation eleven. Since #851 the host
+takes its Minecraft and potato modes from what the image carries; Windows stays
+an allowlist of images without the bridges' `/still` route, so the second apply
+also lists the copy in `windows_host_amis`.
+
 | Resource | Region / purchase | Persistent state | Purpose and lifecycle |
 |---|---|---|---|
 | `jumpbox` | `us-west-1`, on-demand `t4g.large` | 40 GB protected `/home/ubuntu` EBS; separate 40 GB root | Primary admin host. Runs Terraform with an administrator instance role and stays up. |
