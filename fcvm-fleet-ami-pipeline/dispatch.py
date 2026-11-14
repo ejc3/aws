@@ -1,6 +1,7 @@
 """Fixed factory request queue and four-slot broker. No caller-defined EC2 parameters."""
 import base64
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+import copy
 import datetime
 import hashlib
 import hmac
@@ -24,11 +25,46 @@ LEGACY_TIMEOUT_MINUTES = 240
 EXTENDED_TIMEOUT_MINUTES = 360
 # First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
 EXTENDED_TIMEOUT_SOURCE = "063042ae40a1a6df3f1b4fc7d72fc3625a427058"
+# This exact source was queued before the pause and boots without fleet user data (aws#850).
+RETIRED_SOURCE_SHA = "3e36a3a36e13fdb03168b77ff6257a707e6654d1"
+RETIRED_SOURCE_REASON = "source retired: fleet host fails to load boot user data"
 PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 INPUT = re.compile(r"^[0-9a-f]{64}$")
 PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority", "build_id", "not_before", "deadline_unix", "publication_deadline_unix", "message", "ci_head_sha", "ci_run_id")
+
+
+# Cross-account failure status. Log text can include output from any builder subprocess.
+# Classify known symptoms without copying any log text or regex capture to the Fleet account.
+FAILURE_VERSION = 1
+FAILURE_LOG_EVENTS = 200
+FAILURE_TAIL_BYTES = 32 * 1024
+PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
+FAILURE_REASONS = {
+    "CodeBuild definitively rejected the request before starting": "start_rejected",
+    "CodeBuild execution lease does not match its journal": "invalid_execution_lease",
+    "publication lease expired": "publication_lease_expired",
+    "publication rolled back; automatic replay refused": "publication_rolled_back",
+    "factory stopped or reached its fixed deadline": "build_failed_or_expired",
+}
+BUILD_STATUSES = ("FAILED", "FAULT", "STOPPED", "TIMED_OUT", "SUCCEEDED", "IN_PROGRESS", "QUEUED")
+EXECUTOR_ERRORS = (
+    (re.compile(r"^RuntimeError: candidate viewer path failed:"), "viewer_path_failed"),
+    (re.compile(r"^(?:__main__\.)?BuilderCommandFailed:"), "builder_command_failed"),
+    (re.compile(r"^(?:[A-Za-z_][\w.]*\.)?TimeoutError:"), "executor_timeout"),
+)
+DIAGNOSTIC_CODES = (
+    (re.compile(r"no space left on device|disk quota exceeded", re.I), "disk_full"),
+    (re.compile(r"adb(?:: failed to| could not) install|INSTALL_FAILED_", re.I), "adb_install_failed"),
+    (re.compile(r"failed to fetch|temporary failure resolving", re.I), "download_failed"),
+    (re.compile(r"permission denied|access denied", re.I), "permission_denied"),
+    (re.compile(r"timed out|deadline exceeded", re.I), "timeout"),
+)
+
+
+def diagnostic_codes(text):
+    return [code for pattern, code in DIAGNOSTIC_CODES if pattern.search(text)]
 
 
 class Refused(Exception):
@@ -149,6 +185,7 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
+        self.failures = []
 
     def client(self, service, fleet=False, region=None):
         # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
@@ -159,7 +196,9 @@ class Factory:
             if fleet:
                 creds = self.client("sts").assume_role(RoleArn=self.env["FLEET_ROLE"], RoleSessionName="image-factory-broker")["Credentials"]
                 kw.update(aws_access_key_id=creds["AccessKeyId"], aws_secret_access_key=creds["SecretAccessKey"], aws_session_token=creds["SessionToken"])
-            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}), **kw)
+            # These reads are diagnostic only and run in the single-concurrency dispatcher.
+            timeouts = {"connect_timeout": 2, "read_timeout": 3} if service in ("logs", "s3") else {}
+            self.clients[key] = boto3.client(service, config=Config(retries={"total_max_attempts": 1}, **timeouts), **kw)
         return self.clients[key]
 
     def release_ssm(self):
@@ -454,6 +493,8 @@ class Factory:
             raise Refused("invalid image request")
         if self.env.get("ENABLED") != "true":
             return {"request_id": event["input_sha256"], "status": "disabled", "message": "factory automation is disabled"}
+        if event["source_sha"] == RETIRED_SOURCE_SHA:
+            raise Refused(RETIRED_SOURCE_REASON)
         request_id = event["input_sha256"]
         existing = self.load("/requests/" + request_id)
         if existing:
@@ -529,8 +570,103 @@ class Factory:
         self.save(suffix, journal)
         return complete
 
+    def executor_failure(self, build):
+        """A fixed executor error code and a validated archive locator; the locator stays internal."""
+        logs = build.get("logs") or {}
+        group, stream = logs.get("groupName"), logs.get("streamName")
+        if not isinstance(group, str) or not isinstance(stream, str):
+            return None, None
+        events = self.client("logs").get_log_events(logGroupName=group, logStreamName=stream,
+            startFromHead=False, limit=FAILURE_LOG_EVENTS)["events"]
+        error, receipt = None, None
+        for event in events:
+            message = str(event.get("message", "")).strip()
+            if message.startswith('{"phaseDiagnostics"'):
+                try:
+                    value = json.loads(message)["phaseDiagnostics"]
+                except (ValueError, KeyError, TypeError):
+                    continue
+                kind = value.get("kind") if isinstance(value, dict) else None
+                if isinstance(kind, str) and value.get("phase") in PHASES.get(kind, ()):
+                    version = value.get("version_id")
+                    if not isinstance(version, str) or not 0 < len(version) <= 1024 or version == "null":
+                        version = None
+                    receipt = {"kind": kind, "phase": value["phase"], "version_id": version}
+            else:
+                for pattern, code in EXECUTOR_ERRORS:
+                    if pattern.match(message):
+                        error = code
+                        break
+        return error, receipt
+
+    def phase_diagnostic_codes(self, journal, receipt):
+        """Classify a bounded read of one archived phase from its builder's prefix."""
+        instance_id = journal["slots"].get(receipt["kind"] + "-build", {}).get("instance_id")
+        if not receipt.get("version_id") or not isinstance(instance_id, str) or not re.fullmatch(r"i-[0-9a-f]{17}", instance_id):
+            return None
+        key = ("builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/"
+               + instance_id + "/diagnostics/" + receipt["kind"] + "-" + receipt["phase"] + ".log")
+        response = self.client("s3", False, self.env["PIPELINE_REGION"]).get_object(Bucket=self.env["PIPELINE_BUCKET"],
+            Key=key, VersionId=receipt["version_id"], Range="bytes=-" + str(FAILURE_TAIL_BYTES))
+        with closing(response["Body"]) as body:
+            return diagnostic_codes(body.read(FAILURE_TAIL_BYTES).decode("utf-8", "replace"))
+
+    def publish_failure(self, record, journal=None, build=None):
+        """Write fixed failure codes and validated build metadata; never forward free-form text."""
+        name = self.env.get("FAILURE_PARAMETER")
+        request_id, source = record.get("request_id"), record.get("source_sha")
+        if (not name or record.get("status") != "failed" or not isinstance(request_id, str)
+                or not INPUT.fullmatch(request_id)):
+            return
+        message = record.get("message")
+        reason = FAILURE_REASONS.get(message, "unknown_failure") if isinstance(message, str) else "unknown_failure"
+        status = (build or {}).get("buildStatus")
+        value = {"version": FAILURE_VERSION, "request_id": request_id,
+                 "source_sha": source if isinstance(source, str) and SHA.fullmatch(source) else None,
+                 "status": "failed", "reason": reason, "failed_at": int(self.now()),
+                 "build_status": status if status in BUILD_STATUSES else None,
+                 "executor_error": None, "phase": None, "diagnostic_codes": [], "unavailable": []}
+        receipt = None
+        if build is not None:
+            try:
+                value["executor_error"], receipt = self.executor_failure(build)
+                if receipt:
+                    value["phase"] = {"kind": receipt["kind"], "phase": receipt["phase"]}
+            except Exception:
+                value["unavailable"].append("executor_log")
+        if receipt:
+            try:
+                codes = self.phase_diagnostic_codes(journal, receipt) if journal is not None else None
+            except Exception:
+                codes = None
+            if codes is None:
+                value["unavailable"].append("phase_diagnostics")
+            else:
+                value["diagnostic_codes"] = codes
+        try:
+            self.release_ssm().put_parameter(Name=name, Type="String", Overwrite=True,
+                Value=json.dumps(value, separators=(",", ":")))
+        except Exception as error:
+            print(json.dumps({"failure_parameter_error": type(error).__name__}))
+
+    def queue_failure(self, record, journal=None, build=None):
+        # A publisher rollback can leave a request failed before the dispatcher sees it.
+        # Track the best-effort report separately from the request's terminal state.
+        if not self.env.get("FAILURE_PARAMETER") or record.get("failure_report_queued") is True:
+            return
+        record["failure_report_queued"] = True
+        self.save("/requests/" + record["request_id"], record)
+        self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
+
     def reconcile(self):
-        publication = self.reconcile_control()
+        self.failures = []
+        try:
+            publication = self.reconcile_control()
+        finally:
+            # In the order they were recorded, so the parameter ends on the newest.
+            failures, self.failures = self.failures, []
+            for failure in failures:
+                self.publish_failure(*failure)
         if publication is not None:
             # The publisher takes this same mutex. Invoke only after releasing it.
             response = self.client("lambda").invoke(FunctionName=self.env["PUBLISH_FUNCTION"], InvocationType="Event",
@@ -559,6 +695,7 @@ class Factory:
                     if control.get("pending") == start_record["request_id"]:
                         control["pending"] = None
                         pending = None
+                    self.queue_failure(start_record)
                     self.save("/control", control)
                     start_record = None
             elif active:
@@ -571,7 +708,7 @@ class Factory:
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
-                if succeeded:
+                if succeeded and record["status"] != "failed":
                     if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
                         raise Refused("successful build has no final execution receipt")
                     publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
@@ -579,7 +716,17 @@ class Factory:
                     if self.now() >= publication_deadline:
                         release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
-                if preempt or expired or failed or publication_expired or invalid_lease:
+                if record["status"] == "failed":
+                    # Preserve the publisher's rollback reason even after its lease expires.
+                    self.queue_failure(record, journal, build)
+                    if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
+                        self.client("codebuild").stop_build(id=active)
+                    self.cleanup(journal)
+                    if not self.gone(suffix, journal):
+                        return
+                    control["active"] = None
+                    self.save("/control", control)
+                elif preempt or expired or failed or publication_expired or invalid_lease:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
                     self.cleanup(journal)
@@ -589,11 +736,13 @@ class Factory:
                                "factory stopped or reached its fixed deadline")
                     record.update(status="superseded" if preempt else "failed", message=message)
                     self.save("/requests/" + record["request_id"], record)
+                    if record["status"] == "failed":
+                        self.queue_failure(record, journal, build)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
                     self.save("/control", control)
-                elif record["status"] in ("promoted", "failed", "superseded"):
+                elif record["status"] in ("promoted", "superseded"):
                     self.cleanup(journal)
                     if not self.gone(suffix, journal):
                         return
@@ -617,6 +766,17 @@ class Factory:
                     return
             if start_record is None:
                 if not pending or self.env.get("ENABLED") != "true":
+                    return
+                if pending.get("source_sha") == RETIRED_SOURCE_SHA:
+                    if pending.get("start_attempted") or pending.get("build_id"):
+                        raise Refused("retired request has an uncertain start")
+                    if pending["status"] not in ("queued", "superseded"):
+                        raise Refused("retired pending request has an unexpected status")
+                    # Save terminal status first so a lost control write can be retried safely.
+                    pending.update(status="superseded", message=RETIRED_SOURCE_REASON)
+                    self.save("/requests/" + pending["request_id"], pending)
+                    control["pending"] = None
+                    self.save("/control", control)
                     return
                 today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
                 if pending["priority"] == "normal" and (self.now() < pending["not_before"] or control.get("last_normal_day") == today):
@@ -650,6 +810,9 @@ class Factory:
                     if acquired:
                         control = self.load("/control", {})
                         if control.get("active") == {"intent": record["request_id"]}:
+                            # Queue the failure while the durable no_build intent can still
+                            # recover it, then clear the intent before publishing outside the lock.
+                            self.queue_failure(record)
                             control["active"] = None
                             if control.get("pending") == record["request_id"]:
                                 control["pending"] = None

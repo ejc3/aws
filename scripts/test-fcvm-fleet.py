@@ -105,17 +105,18 @@ class HostTests(unittest.TestCase):
                                     configured[1]), ["95217caa", "a4a0bd3e", "92a26793", "343b2287"])
         # and every copy the publisher has made of a reviewed build-region host
         self.assertEqual(configured[2], "flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids])")
-        windows = "ami-0dddddddddddddddd"   # the publisher's copy of the 853eb034 host, a build-region copy too
-        self.assertRegex(east, r'windows_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/0e910245"\]\.ids\)\n')
-        # Minecraft mode needs the same image: its agent is the first with --minecraft, so the flag is never in
-        # every host's arguments, only in the boot-image case below.
+        windows = "ami-0dddddddddddddddd"   # cad0ddad: the first host with the /still route removed
+        legacy_windows = ("ami-0bbbbbbbbbbbbbbb", "ami-0eeeeeeeeeeeeeee")  # 853eb034 and 0e910245
+        self.assertEqual(re.search(r'windows_host_amis\s*=\s*(.+)', east)[1],
+                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids')
+        # Legacy copies still carry Minecraft and potato, but the widened public ports
+        # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)
-        self.assertEqual(MOD.count("--minecraft 4"), 1)
+        self.assertEqual(MOD.count("--minecraft ${var.minecraft_count}"), 1)
         self.assertRegex(east, r'minecraft_host_amis\s*=\s*concat\(data\.aws_ami_ids\.fcvm_ami_build_region_copies'
                                r'\["host/x86_64/853eb034"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
-                               r'\["host/x86_64/0e910245"\]\.ids\)\n')
+                               r'\["host/x86_64/0e910245"\]\.ids, data\.aws_ami_ids\.fcvm_ami_build_region_copies'
+                               r'\["host/x86_64/cad0ddad"\]\.ids\)\n')
         guard = MOD.split('%{if length(var.potato_host_amis) > 0~}\n', 1)[1].split("    %{endif~}\n    printf 'FLEET_AGENT_ARGS", 1)[0]
         # the nested Windows case, rendered as Terraform does when the list is not empty
         windows_if = "      %{if length(var.windows_host_amis) > 0~}\n"
@@ -139,9 +140,11 @@ class HostTests(unittest.TestCase):
             )
             curl.chmod(0o700)
             boot = textwrap.dedent(guard).replace('${join("|", sort(tolist(var.potato_host_amis)))}',
-                                                   "|".join(sorted([oldest, older, rollback, previous, candidate, windows])))
+                                                   "|".join(sorted([oldest, older, rollback, previous, candidate, windows, *legacy_windows])))
             boot = boot.replace('${join("|", sort(tolist(var.windows_host_amis)))}', windows)
-            boot = boot.replace('${join("|", sort(tolist(var.minecraft_host_amis)))}', windows)
+            boot = boot.replace('${join("|", sort(tolist(var.minecraft_host_amis)))}',
+                                "|".join(sorted([windows, *legacy_windows])))
+            boot = boot.replace("${var.windows_count}", "4").replace("${var.minecraft_count}", "4")
             boot = boot.replace("/usr/bin/curl", str(curl))
             for actual, expected in (
                 (oldest, "--phones 2 --potato-players 96"),
@@ -149,8 +152,8 @@ class HostTests(unittest.TestCase):
                 (rollback, "--phones 2 --potato-players 96"),
                 (previous, "--phones 2 --potato-players 96"),
                 (candidate, "--phones 2 --potato-players 96"),
-                # every older image, a rollback included, gets no --minecraft; only the 853eb034 copy does
                 (windows, "--phones 2 --potato-players 96 --windows 4 --minecraft 4"),
+                *((actual, "--phones 2 --potato-players 96 --minecraft 4") for actual in legacy_windows),
                 ("ami-051db4be56ae7f6b0", "--phones 2"),
                 ("no-token", "--phones 2"),
                 ("no-ami", "--phones 2"),
@@ -632,12 +635,28 @@ class SlotV4Tests(unittest.TestCase):
     def test_slot_publish_contract_and_ipv4_ingress_agree(self):
         base = int(re.search(r"fcvm_fleet_slot_tls_port_base = (\d+)", TF).group(1))
         slots = int(re.search(r"fcvm_fleet_host_gpu_slots\s+= (\d+)", TF).group(1))
-        self.assertEqual((base, slots), (20200, 8))
+        windows = int(re.search(r"fcvm_fleet_host_windows\s+= (\d+)", TF).group(1))
+        minecraft = int(re.search(r"fcvm_fleet_host_minecraft\s+= (\d+)", TF).group(1))
+        self.assertEqual((base, slots, windows, minecraft), (20200, 8, 4, 4))
+        # The agent numbers its TLS ports GPUs, then Windows sandboxes, then Minecraft servers: the range
+        # covers every place, so an IPv4 viewer reaches a sandbox (20208 to 20211) and a server (20212 to 20215).
+        self.assertIn("fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows"
+                      " + local.fcvm_fleet_host_minecraft", TF)
         self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
-        # The slots' ports, and with aggregated streaming the host aggregator's port after them.
-        self.assertIn(
-            "to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
-            "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", TF)
+        # Before the bootstrap is deployed, the rule retains its exact previous range and description.
+        gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
+        self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= false$")
+        ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
+        self.assertIn(f"to = var.{gate} ? (", ports)
+        self.assertIn(") : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1", ports)
+        self.assertIn("local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
+                      "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1", ports)
+        self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places", TF)
+        # The counts the agent is started with are the ones the range was sized for, in every region.
+        self.assertIn('agent_args="$agent_args --windows ${var.windows_count}"', MOD)
+        self.assertIn('agent_args="$agent_args --minecraft ${var.minecraft_count}"', MOD)
+        self.assertEqual(len(re.findall(r"windows_count\s*=\s*local\.fcvm_fleet_host_windows\n", TF)), 3)
+        self.assertEqual(len(re.findall(r"minecraft_count\s*=\s*local\.fcvm_fleet_host_minecraft\n", TF)), 3)
         # The agent forwards from the same base.
         self.assertIn('"--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}"', TF)
         self.assertIn('"--public-ipv4-from-imds"', TF)
@@ -646,6 +665,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertEqual(len(rules), 2, rules)
         slots = [rule for rule in rules if "var.slot_tls_ports" in rule]
         self.assertEqual(len(slots), 1)
+        self.assertIn('description = "GPU slot renderer TLS over IPv4"', slots[0])
         self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
         self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
         self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
@@ -745,11 +765,12 @@ class AggregatedTests(unittest.TestCase):
         self.assertIn("count    = local.fcvm_fleet_aggregated || local.fcvm_fleet_broadcast ? 1 : 0", dual)
 
     def test_the_host_aggregator_port_follows_the_slots(self):
+        # After every place's port: the GPU slots', the Windows sandboxes' and the Minecraft servers'.
         self.assertIn(
-            "fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots", TF)
+            "fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places", TF)
         priv = int(re.search(r"fcvm_fleet_aggregate_port\s+= (\d+)", TF).group(1))
         # The private listener is outside the admitted range.
-        self.assertFalse(20200 <= priv <= 20208, priv)
+        self.assertFalse(20200 <= priv <= 20216, priv)
 
 class BroadcastTests(unittest.TestCase):
     """The broadcast (ejc3/fcvm "Broadcast mode") is one switch: the coordinator's flags, its task size, its

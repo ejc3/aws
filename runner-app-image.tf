@@ -71,7 +71,8 @@ locals {
       script = "node-web-runner.sh"
       # .github/workflows/ci.yml, cloudflare-stage.yml, refresh-publish.yml; web/package-lock.json;
       # rust-toolchain.toml (the engine, built natively and to WebAssembly by cf:build and the engine job, and the
-      # policy lint; every job installs it through .github/actions/engine-rust).
+      # policy lint; every job installs it through .github/actions/engine-rust);
+      # ci.yml's PostgreSQL step (the Aurora DSQL shadow tests start a throwaway PostgreSQL 16 with initdb).
       versions = {
         NODE_MAJOR          = "22"
         PYTHON_VERSIONS     = "3.11"
@@ -80,6 +81,7 @@ locals {
         RUST_TOOLCHAIN      = "1.99.1"
         RUST_COMPONENTS     = "rustfmt,clippy"
         RUST_TARGETS        = "wasm32-unknown-unknown"
+        APT_PACKAGES        = "postgresql-16"
       }
     }
     "dolphin-films-runner" = {

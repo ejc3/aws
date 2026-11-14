@@ -51,6 +51,15 @@ variable "fcvm_fleet_tile_amis" {
   default = { "us-east-1" = { x86_64 = "ami-094ca9c62a284a389" } }
 }
 
+# First apply the rollback-safe host bootstrap with the extra ports closed. Once
+# the live default and every regional attachment have been checked, a separate
+# Terraform change enables Windows and Minecraft viewers over IPv4.
+variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
+  description = "Open IPv4 viewer TLS for Windows and Minecraft after the rollback-safe bootstrap is live."
+  type        = bool
+  default     = false
+}
+
 locals {
   # The two switches (see the header).
   fcvm_fleet_hosts_enabled       = true
@@ -90,24 +99,31 @@ locals {
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
   # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
   # are in the home region, not the host's.
-  # The IPv4 path to a GPU host's slots: its one public IPv4 address, slot i's renderer TLS forwarded on port base + i.
-  # The agent's --tls-publish-base and the fleet security group's port range both come from these two numbers.
+  # The IPv4 path to a GPU host's tiles: its one public IPv4 address, place i's TLS forwarded on port base + i. The agent
+  # numbers its places GPUs first (the wall's and the phones'), then Windows sandboxes, then Minecraft servers (ejc3/fcvm
+  # src/fleet/agent/mod.rs), so the range covers all three. The agent's --tls-publish-base, its --windows and --minecraft
+  # counts and the fleet security group's port range all come from these numbers.
   fcvm_fleet_slot_tls_port_base = 20200
   fcvm_fleet_host_gpu_slots     = 8 # a g4dn.metal's T4s
+  fcvm_fleet_host_windows       = 4
+  fcvm_fleet_host_minecraft     = 4
+  fcvm_fleet_host_tls_places    = local.fcvm_fleet_host_gpu_slots + local.fcvm_fleet_host_windows + local.fcvm_fleet_host_minecraft
 
   # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
   # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
   # per tile). On needs a host AMI and a coordinator image with --aggregate-tls-port and --ec2-aggregate-tls (fcvm #1232's
   # stack); an image without them refuses the argument and does not start, so the switch moves with the images.
   fcvm_fleet_aggregated = false
-  # A host aggregator's IPv4 path: the port after the slots', on the host's public IPv4 address (one address per host, a
-  # port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
+  # A host aggregator's IPv4 path: the port after every place's, on the host's public IPv4 address (one address per host,
+  # a port per stream). Over IPv6 it has its own address, <host prefix>::1, on 443. Its private listener (layout, stats) is
   # on fcvm_fleet_aggregate_port, which the security group does not admit.
-  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots
+  fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places
   fcvm_fleet_aggregate_port     = 20300
   fcvm_fleet_slot_tls_ports = {
     from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+    to = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? (
+      local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places - 1
+    ) : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
   }
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
@@ -407,6 +423,8 @@ module "fcvm_fleet_east2" {
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -425,6 +443,8 @@ module "fcvm_fleet_west2" {
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
@@ -452,20 +472,19 @@ module "fcvm_fleet_east1" {
     local.fcvm_ami_bootstrap["host/x86_64/92a26793"].image,
     local.fcvm_ami_bootstrap["host/x86_64/343b2287"].image,
   ], flatten([for copies in data.aws_ami_ids.fcvm_ami_build_region_copies : copies.ids]))
-  # Windows mode (?mode=windows, ejc3/fcvm docs/fleet/windows-sandboxes.md): a host booted from the publisher's copy of
-  # the 853eb034 host runs four disposable Windows Server 2025 evaluation desktops (--windows 4), CPU-only Cloud
-  # Hypervisor VMs restored from a snapshot the agent takes of the AMI's image; the image and the bridge come from
-  # /etc/fcvm-fleet/windows.env, which the AMI's build writes. Older images' agents have no --windows, so the argument
-  # follows the boot image, as potato mode does. Staging only, behind Cloudflare Access: a public launch needs the
-  # owner's go-ahead (the evaluation's terms).
-  windows_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids)
+  # Only images that remove the unauthenticated Windows bridge /still route (ejc3/fcvm#1839)
+  # may start Windows on the shared public viewer ports. A rollback to the 853eb034 or
+  # 0e910245 host images keeps the other modes but must not start a Windows bridge.
+  windows_host_amis = data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids
   # Minecraft mode (?mode=minecraft, ejc3/fcvm docs/fleet/minecraft.md): a host booted from the publisher's copy of the
   # 853eb034 host, the first with fcvm's --minecraft and the tile image (ejc3/fcvm#1757 to #1762), runs four Pumpkin
   # servers (--minecraft 4), CPU-only fcvm VMs restored from a gold snapshot the agent makes of the tile image, each at
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image. The
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
-  minecraft_host_amis       = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids)
+  minecraft_host_amis       = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
   slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  windows_count             = local.fcvm_fleet_host_windows
+  minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"

@@ -14,11 +14,8 @@
 #            (versions and deployments, to line logs up with a release), Logs Read (Logpush jobs), Allow Request
 #            Tracer Read
 #   zones:   Analytics Read, Logs Read, Zone Observability Read, Health Checks Read
-#   dolphin-labs.dev only: Email Routing Rules Read (which alias forwards where, to trace a refused reply or a bounce)
 # Deliberately left out: Access audit and SCIM logs (they carry people's email addresses), Security Center insights,
-# Email Routing Addresses (the account's list of every verified destination), and anything that can write. A routing rule
-# names its forward destination; limit that permission to the Dolphin zone where the owner asked to trace replies.
-# Not IP-pinned: the dev boxes egress over IPv6 and IPv4 from several addresses.
+# and anything that can write. Not IP-pinned: the dev boxes egress over IPv6 and IPv4 from several addresses.
 #
 #   export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 \
 #     --secret-id cloudflare-observability-token --query SecretString --output text)
@@ -68,15 +65,6 @@ resource "aws_secretsmanager_secret_policy" "cloudflare_observability_token" {
   })
 }
 
-# Email Routing Rules Read has no pinned id here: the token cannot list permission groups, so the id is looked up by name
-# at plan time through the minter (the name URL-encoded, as cloudflare.tf does for Workers Scripts Write).
-data "cloudflare_account_api_token_permission_groups_list" "email_routing_rules_read" {
-  provider   = cloudflare.token_minter
-  account_id = var.cloudflare_account_id
-  name       = "Email%20Routing%20Rules%20Read"
-  scope      = "com.cloudflare.api.account.zone"
-}
-
 resource "cloudflare_account_token" "observability_read" {
   provider   = cloudflare.token_minter
   account_id = var.cloudflare_account_id
@@ -91,11 +79,6 @@ resource "cloudflare_account_token" "observability_read" {
       effect            = "allow"
       permission_groups = [for id in values(local.cloudflare_observability_zone_groups) : { id = id }]
       resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = { "com.cloudflare.api.account.zone.*" = "*" } })
-    },
-    {
-      effect            = "allow"
-      permission_groups = [{ id = one(data.cloudflare_account_api_token_permission_groups_list.email_routing_rules_read.result).id }]
-      resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })
     },
   ]
 }
@@ -123,4 +106,53 @@ resource "aws_iam_role_policy_attachment" "cloudflare_observability_read" {
   for_each   = { dev_server = aws_iam_role.dev_server.name, nextjs_dev = aws_iam_role.nextjs_dev.name }
   role       = each.value
   policy_arn = aws_iam_policy.cloudflare_observability_read.arn
+}
+
+# A rule includes its private forwarding destination. Keep this Dolphin-only credential behind the same
+# administration boundary as people/addresses, independent of the dev boxes' logs and metrics token above.
+# Permission group id verified via GET /accounts/<id>/tokens/permission_groups (Email Routing Rules Read, zone scope).
+resource "cloudflare_account_token" "dolphin_email_routing_read" {
+  provider   = cloudflare.token_minter
+  count      = local.dolphin_enabled ? 1 : 0
+  account_id = var.cloudflare_account_id
+  name       = "dolphin-email-routing-read-terraform"
+  policies = [{
+    effect            = "allow"
+    permission_groups = [{ id = "1b600d9d8062443e986a973f097e728a" }]
+    resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.dolphin_zone_id}" = "*" })
+  }]
+}
+
+resource "aws_secretsmanager_secret" "dolphin_email_routing_read" {
+  count                   = local.dolphin_enabled ? 1 : 0
+  name                    = "cloudflare-dolphin-email-routing-read-token"
+  description             = "Administration-only raw Cloudflare token: read Email Routing rules on dolphin-labs.dev."
+  recovery_window_in_days = 7
+  tags                    = { Name = "cloudflare-dolphin-email-routing-read-token", Project = "dolphin-labs" }
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_email_routing_read" {
+  count               = local.dolphin_enabled ? 1 : 0
+  secret_arn          = aws_secretsmanager_secret.dolphin_email_routing_read[count.index].arn
+  block_public_policy = true
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]
+      Resource  = "*"
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
+    }]
+  })
+}
+
+resource "aws_secretsmanager_secret_version" "dolphin_email_routing_read" {
+  count         = local.dolphin_enabled ? 1 : 0
+  secret_id     = aws_secretsmanager_secret.dolphin_email_routing_read[count.index].id
+  secret_string = cloudflare_account_token.dolphin_email_routing_read[count.index].value
+
+  # The access boundary must exist before the first readable token value.
+  depends_on = [aws_secretsmanager_secret_policy.dolphin_email_routing_read]
 }

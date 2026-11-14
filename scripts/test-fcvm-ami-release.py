@@ -134,7 +134,7 @@ class ReleaseContracts(unittest.TestCase):
                              r'kind\s*=\s*"host",\s*name\s*=\s*"(fcvm-fleet-host-x86_64-[0-9a-f]{8}-[0-9]{12})"\s*\}',
                              catalog.group(1))
         self.assertEqual([key for key, _, _ in entries],
-                         ["host/x86_64/fb2f5c36", "host/x86_64/853eb034", "host/x86_64/0e910245"])
+                         ["host/x86_64/fb2f5c36", "host/x86_64/853eb034", "host/x86_64/0e910245", "host/x86_64/cad0ddad"])
         for key, _, name in entries:
             self.assertEqual(name[23:31], key[-8:])
         for name, key in (("fcvm_ami_build_region_kind", "FleetImageKind"),
@@ -245,6 +245,7 @@ class ReleaseContracts(unittest.TestCase):
             (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 128),
             (r"module\.[a-z0-9_]+\.host_user_data_sha256", lambda v: 64),
             (r'join\(",", local\.fcvm_ami_copy_regions\)', lambda v: 15 * copy_regions),
+            (r"tostring\(var\.[a-z0-9_]+\)", lambda v: 5),
         ]
         total = 2
         for key, value in pairs:
