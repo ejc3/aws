@@ -54,6 +54,28 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("from_port        = 443", coord)
         self.assertIn("to_port          = 443", coord)
 
+    def test_java_join_probe_is_virginia_host_only_and_not_open_to_the_internet(self):
+        for region in ("east2", "west2"):
+            self.assertNotIn("minecraft_java_access", block('module "fcvm_fleet_%s"' % region))
+        east = block('module "fcvm_fleet_east1"')
+        self.assertIn('host_ami    = "ami-0c3ea14848ddbeb93"', east)
+        self.assertIn('one(flatten(aws_instance.jumpbox[*].ipv6_addresses))', east)
+        self.assertNotIn('"::/0"', east)
+        guard = block('resource "aws_vpc_security_group_ingress_rule" "minecraft_java"', MOD)
+        self.assertRegex(guard, r"cidr_ipv6\s*=\s*var\.minecraft_java_access\.source_cidr")
+        for field in ("from_port", "to_port"):
+            self.assertRegex(guard, rf"{field}\s*=\s*25565")
+        self.assertNotIn("cidr_ipv4", guard)
+        host = block('resource "aws_launch_template" "host"', MOD)
+        self.assertIn('var.gpu_amis[each.key] == try(var.minecraft_java_access.host_ami, "")', host)
+        self.assertIn("aws_security_group.minecraft_java[*].id", host)
+        for template in ("tile", "tile_on_demand", "tile_pool"):
+            self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
+        self.assertNotIn("minecraft_java", block('resource "aws_security_group" "fleet"', MOD))
+        tile_refs, host_refs = TF.split("fcvm_fleet_host_referenced_arns = concat(", 1)
+        self.assertNotIn("host_minecraft_java_security_group_arns", tile_refs)
+        self.assertTrue(host_refs.lstrip().split("\n  )", 1)[0].count("host_minecraft_java_security_group_arns") == 1)
+
     def test_ipv4_opening_requires_all_supplied_images_to_have_the_private_reviewed_guard(self):
         self.assertIn('data "aws_ami" "guarded"', MOD, "Public IPv4 requires AMI guard admission first")
         admitted = block('data "aws_ami" "guarded"', MOD)
@@ -90,6 +112,81 @@ class NetworkTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_java_guard_runs_before_agent_on_every_start_and_uses_the_booted_image(self):
+        user_data = MOD.split("user_data = base64encode(<<-EOT", 1)[1].split("\n  EOT", 1)[0]
+        before_env, after_env = user_data.split("printf 'FLEET_AGENT_ARGS", 1)
+        self.assertIn("/etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf", before_env)
+        self.assertIn("ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard", before_env)
+        self.assertIn("systemctl daemon-reload", before_env)
+        self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", after_env)
+        guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
+        image = "ami-0c3ea14848ddbeb93"
+        with tempfile.TemporaryDirectory() as temp:
+            curl = Path(temp) / "curl"
+            curl.write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                set -eu
+                case "${!#}" in
+                  */api/token) test "$BOOT_AMI" != no-token; printf fixture-token;;
+                  */meta-data/ami-id|*/meta-data/mac|*/network/interfaces/macs/00:01:02:03:04:05/ipv6-prefix)
+                    test "$(cat)" = 'X-aws-ec2-metadata-token: fixture-token'
+                    case "${!#}" in
+                      *ami-id) test "$BOOT_AMI" != no-image; printf "%s" "$BOOT_AMI";;
+                      *ipv6-prefix) printf "%s" "$PREFIX";;
+                      *mac) printf 00:01:02:03:04:05;;
+                    esac;;
+                  *) exit 90;;
+                esac
+            """).lstrip())
+            curl.chmod(0o700)
+            nft = Path(temp) / "nft"
+            nft.write_text('#!/bin/bash\ncat\nexit "$NFT_STATUS"\n')
+            nft.chmod(0o700)
+            pci = Path(temp) / "pci"
+            (pci / "drivers/vfio-pci").mkdir(parents=True)
+            for i in range(8):
+                name = f"0000:{i:02d}:00.0"
+                dev = pci / "devices" / name
+                dev.mkdir(parents=True)
+                (dev / "vendor").write_text("0x10de\n")
+                (dev / "class").write_text("0x030200\n")
+                (pci / "drivers/vfio-pci" / name).symlink_to(dev)
+            script = (guard.replace("/usr/bin/curl", str(curl)).replace("/usr/sbin/nft", str(nft))
+                      .replace("/sys/bus/pci", str(pci)))
+            approved_prefix = "2001:db8:1:2:3::/80"
+            agent_args = "--windows 4 --minecraft 4"
+            cases = [(image, approved_prefix, agent_args, "8", "0", True),
+                     ("ami-0bbbbbbbbbbbbbbbb", approved_prefix, agent_args, "8", "0", False),
+                     ("no-token", approved_prefix, agent_args, "8", "0", False),
+                     ("no-image", approved_prefix, agent_args, "8", "0", False),
+                     (image, "2001:db8:1:2::/64", agent_args, "8", "0", False),
+                     (image, approved_prefix + "\n" + approved_prefix, agent_args, "8", "0", False),
+                     (image, approved_prefix, "--minecraft 4", "8", "0", False),
+                     (image, approved_prefix, agent_args, "7", "0", False),
+                     (image, approved_prefix, agent_args, "8", "1", True)]
+            allow = ("forward ip6 daddr { 2001:db8:1:2:3::e, 2001:db8:1:2:3::f, "
+                     "2001:db8:1:2:3::10, 2001:db8:1:2:3::11 } tcp dport 25565 return")
+            for actual, prefix, args, gpu_count, status, forward_allowed in cases:
+                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status):
+                    result = subprocess.run(
+                        ["/bin/bash", "-x", "-c", script, "--", image, gpu_count, "4", "4"],
+                        env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status,
+                                 FLEET_AGENT_ARGS=args, WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
+                        capture_output=True,
+                        text=True, check=False, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, int(status))
+                    self.assertIn("hook input priority -130", result.stdout)
+                    self.assertIn("hook forward priority -130", result.stdout)
+                    self.assertIn("input tcp dport 25565 drop", result.stdout)
+                    self.assertEqual(allow in result.stdout, forward_allowed)
+                    self.assertEqual("forward ip6 daddr" in result.stdout, forward_allowed)
+                    self.assertIn("forward tcp dport 25565 drop", result.stdout)
+                    if forward_allowed:
+                        self.assertLess(result.stdout.index(allow), result.stdout.index("forward tcp dport 25565 drop"))
+                    self.assertNotIn("fixture-token", result.stderr)
+                    self.assertNotIn("flush ruleset", result.stdout)
+
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
         # the same bootstrap with the candidate, current host, every rollback and failed IMDS.

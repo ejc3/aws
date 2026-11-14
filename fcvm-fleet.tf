@@ -489,7 +489,14 @@ module "fcvm_fleet_east1" {
   # servers (--minecraft 4), CPU-only fcvm VMs restored from a gold snapshot the agent makes of the tile image, each at
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image. The
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
-  minecraft_host_amis       = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
+  minecraft_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
+  # Gen14 carries #1844's host limits and the reviewed Pumpkin login timeout.
+  # Allow only the administration host for the first external Java proof.
+  minecraft_java_access = {
+    host_ami    = "ami-0c3ea14848ddbeb93"
+    gpu_slots   = local.fcvm_fleet_host_gpu_slots
+    source_cidr = "${one(flatten(aws_instance.jumpbox[*].ipv6_addresses))}/128"
+  }
   slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -533,6 +540,7 @@ locals {
     var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis in var.fcvm_fleet_host_amis : [for ami in values(amis) : "arn:aws:ec2:${r}::image/${ami}" if ami != ""]]),
     flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"] if length(m.host_template_names) > 0]),
     [for r, m in local.fcvm_fleet_regional : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${m.security_group_id}" if length(m.host_template_names) > 0],
+    module.fcvm_fleet_east1.host_minecraft_java_security_group_arns,
     local.fcvm_fleet_host_template_arns,
     ["arn:aws:ec2:us-east-1::image/ami-none"],
   )
