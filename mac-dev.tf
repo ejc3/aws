@@ -5,6 +5,18 @@ locals {
   macpbox_region = "us-west-2"
   macpbox_type   = "mac-m4pro.metal"
   macpbox_az     = "us-west-2b"
+
+  # Only the hosts that receive macpbox_tools connect to the public IPv4 listener.
+  # Next.js containers share their host's egress address; elastic IPs follow replacements.
+  macpbox_ssh_cidrs = sort(distinct([
+    for ip in concat(
+      aws_eip.jumpbox[*].public_ip,
+      aws_eip.jumpbox_2[*].public_ip,
+      aws_eip.firecracker_dev_next[*].public_ip,
+      aws_eip.x86_dev[*].public_ip,
+      aws_eip.nextjs_dev[*].public_ip,
+    ) : "${ip}/32"
+  ]))
 }
 
 data "aws_vpc" "macpbox" {
@@ -57,11 +69,11 @@ resource "aws_security_group" "macpbox" {
   vpc_id      = data.aws_vpc.macpbox.id
 
   ingress {
-    description = "Public-key SSH for approved admin and dev-hop clients"
+    description = "Public-key SSH from managed admin and dev clients"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+    cidr_blocks = local.macpbox_ssh_cidrs
   }
   egress {
     from_port   = 0
