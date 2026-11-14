@@ -904,11 +904,21 @@ with `scripts/test-opencode-setup.py` in CI.
 
 ### fcvm boot benchmark (boot-race)
 
-Boot-race is available without a per-run jumpbox apply. Run `creds.sh` on the
-primary FCVM ARM instance. Only instance-role credentials issued to that instance
-can assume `arn:aws:iam::<account>:role/boot-race-driver`; other hosts using
-`dev-server-role` and the Ohio pbox's `dev-ebs-only` role cannot. The script
-delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
+Boot-race runs on a dedicated Ohio Spot worker. On the primary FCVM ARM host,
+use `scripts/benchmark-worker.sh up` from this checkout and save its returned
+instance ID. Use `scripts/benchmark-worker.sh status` during startup, then
+`scripts/benchmark-worker.sh ssh 'cloud-init status --wait'`. This only admits
+a temporary SSH key for the primary ARM operator. The worker has no shared
+dev-hop key, and uses IAM credentials from its own instance profile for the
+benchmark. There is no credential copy or per-run jumpbox apply.
+
+Only one worker fits its fixed network interface. Bootstrap checks `/dev/kvm`
+and prepares disposable instance storage under `/mnt/nvme`. If the fixed Spot
+type is out of capacity, `up` fails without starting an on-demand instance.
+Use `scripts/benchmark-worker.sh ssh 'command'` to prepare and run from the
+worker. Copy results out before `scripts/benchmark-worker.sh down <instance-id>`.
+The scheduler terminates any worker left for six hours. Its reserved IPv4 costs
+$0.005/hour (about $3.65/month) even when the worker is down.
 
 - The driver can launch only `c8g.medium` instances through the two boot-race
   templates, tagging instances, volumes and interfaces `Project=boot-race`. ECS
@@ -924,8 +934,8 @@ delivers one-hour sessions over SSH to the Ohio Spot pbox running the benchmark.
   budget blocks the legacy launcher because it can start tasks.
 - Verify the `Project` billing tag is Active and the budget action is monitoring
   before the first campaign. Tag activation can take up to 24 hours. Budget data
-  can lag by hours and excludes untagged costs, including the separate Ohio
-  pbox, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
+  can lag by hours and excludes untagged costs, including the dedicated Ohio
+  worker itself, so $25 is a backstop, not a billing ceiling. AWS Budgets removes the
   deny at the start of the next month; an administrator can reverse it sooner.
 
 The Fargate lane stays off: its ECR interface endpoints bill hourly and change
