@@ -108,7 +108,8 @@ class HostTests(unittest.TestCase):
         windows = "ami-0dddddddddddddddd"   # cad0ddad: the first host with the /still route removed
         legacy_windows = ("ami-0bbbbbbbbbbbbbbb", "ami-0eeeeeeeeeeeeeee")  # 853eb034 and 0e910245
         self.assertEqual(re.search(r'windows_host_amis\s*=\s*(.+)', east)[1],
-                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids')
+                         'concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids, '
+                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids)')
         # Legacy copies still carry Minecraft and potato, but the widened public ports
         # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)

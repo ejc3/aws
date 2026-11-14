@@ -122,11 +122,19 @@ locals {
   # Minecraft view sockets on the host's IPv4 address (ejc3/fcvm#1833), the Windows bridges on an IPv6-enabled podman
   # network (ejc3/fcvm#1837), the bridges' unauthenticated /still route removed (ejc3/fcvm#1839), and the other changes
   # on fcvm main from 0e910245 to cad0ddad.
+  #
+  # c12ad070: built from ejc3/fcvm main c12ad070, revised from an unreleased a8245c00 image: everything in cad0ddad's,
+  # plus fcvm's host kernel with the EC2 network driver built in (ejc3/fcvm#1874), so a first boot finds its network
+  # interface before cloud-init's first stage looks for one, the phone's GPU retake beside the bring-up
+  # (ejc3/fcvm#1872), the bake's hugepage-prefilled check on the phone clone (ejc3/fcvm#1871), the public Minecraft
+  # join limits (ejc3/fcvm#1844), the GPU restore path (ejc3/fcvm#1850, #1855, #1867, #1869, #1875), and the other
+  # changes on fcvm main from cad0ddad to c12ad070.
   fcvm_ami_build_region_reviewed = {
     "host/x86_64/fb2f5c36" = { image = "ami-0d176763f9f33416e", kind = "host", name = "fcvm-fleet-host-x86_64-fb2f5c36-202611072303" }
     "host/x86_64/853eb034" = { image = "ami-0925206c2b9eac0fe", kind = "host", name = "fcvm-fleet-host-x86_64-853eb034-202611091050" }
     "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
     "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
+    "host/x86_64/c12ad070" = { image = "ami-0c2656522631215d1", kind = "host", name = "fcvm-fleet-host-x86_64-c12ad070-202611141114" }
   }
 }
 

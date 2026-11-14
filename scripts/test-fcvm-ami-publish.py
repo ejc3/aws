@@ -1774,6 +1774,66 @@ class PublisherTests(unittest.TestCase):
         self.assertRegex(MODULE.Publisher.FACTORY_TWELVE_BUILD, r"^fcvm-fleet-image-factory:[0-9a-f-]{36}$")
         self.assertIs(type(MODULE.Publisher.IPV4_HOST_VERSION), int)
 
+    ENA_SOURCE = "c12ad070012a74308ba37236127d6dbd5316ceda"
+    ENA_IMAGE = "ami-0c2656522631215d1"
+    ENA_NAME = "fcvm-fleet-host-x86_64-c12ad070-202611141114"
+
+    def reviewed_ena_host_fixture(self):
+        """Generation thirteen live (the rollback to generation eleven's images after the factory's
+        generation twelve), and the c12ad070 host built by hand in us-west-2 and tagged validated there."""
+        event, _, _ = self.generation_eleven_rollback_fixture()
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 13})
+        thirteen = copy.deepcopy(self.fleet_ssm.values["/release"])
+        catalog = (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertRegex(catalog, rf'"host/x86_64/{self.ENA_SOURCE[:8]}"\s*=\s*{{ image = "{self.ENA_IMAGE}", kind = "host", '
+                                  rf'name = "{self.ENA_NAME}" }}')
+        image = copy.deepcopy(self.west.images[self.IPV4_IMAGE])
+        image.update(ImageId=self.ENA_IMAGE, Name=self.ENA_NAME, State="available",
+                     Description="fcvm fleet: " + self.ENA_NAME, SourceImageId=self.IPV4_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[self.ENA_IMAGE] = image
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return {"action": "activate-reviewed-ena-host-release"}, thirteen
+
+    def test_reviewed_ena_host_releases_generation_fourteen_after_the_rollback(self):
+        event, thirteen = self.reviewed_ena_host_fixture()
+        host, *tiles = self.ids
+        old_templates = copy.deepcopy(self.ec2.templates)
+        publisher, copied, version = self.release_through_second_apply(self.windows_publisher, event, thirteen, self.ENA_SOURCE)
+        self.assertEqual(self.ec2.copies[-1][0], self.ENA_IMAGE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 14})
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (14, self.ENA_SOURCE))
+        self.assertEqual(after["build_id"], "reviewed-ena-host-release:"
+                         + MODULE.digest(MODULE.encoded(publisher.reviewed_ena_host_release())))
+        self.assertEqual(after["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(after["tile_amis"], thirteen["tile_amis"])
+        self.assertEqual(after["previous"], {k: v for k, v in thirteen.items() if k != "previous"})
+        self.assertEqual(after["versions"], {**thirteen["versions"], "us-east-1/" + host: version + 2})
+        for tile in tiles:
+            self.assertEqual(self.ec2.templates[tile], old_templates[tile])
+        # A replay is the same receipt.
+        self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 14})
+        self.assertIsNone(self.ddb.item)
+
+    def test_reviewed_ena_host_refuses_a_live_receipt_other_than_the_rollback(self):
+        # The live receipt is still the factory's generation twelve: the rollback has not run.
+        event, _, _ = self.generation_eleven_rollback_fixture()
+        image = copy.deepcopy(self.west.images[self.IPV4_IMAGE])
+        image.update(ImageId=self.ENA_IMAGE, Name=self.ENA_NAME, State="available",
+                     Description="fcvm fleet: " + self.ENA_NAME, SourceImageId=self.IPV4_IMAGE,
+                     SourceImageRegion="us-west-2")
+        self.west.images[self.ENA_IMAGE] = image
+        twelve = copy.deepcopy(self.fleet_ssm.values["/release"])
+        ena = {"action": "activate-reviewed-ena-host-release"}
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, ena, twelve, self.ENA_SOURCE)
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "reviewed transition requires its unchanged predecessor"):
+            publisher.run(ena)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
         modules = {"boto3": sdk, "botocore": types.ModuleType("botocore"),

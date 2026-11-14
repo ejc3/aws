@@ -448,6 +448,37 @@ class Publisher:
             },
         })
 
+    def generation_eleven_rollback_receipt(self):
+        """The generation-thirteen receipt, as reviewed_generation_eleven_rollback's publication wrote it:
+        generation eleven's images, and the next version of every template after generation twelve's."""
+        rollback = self.reviewed_generation_eleven_rollback()
+        twelve = rollback["expected"]
+        region = self.env["COMPUTE_REGION"]
+        return {
+            "version": 1, "generation": 13, "source_sha": rollback["source_sha"],
+            "build_id": "reviewed-generation-eleven-rollback:" + digest(encoded(rollback)),
+            "guard_sha256": self.env["GUARD_SHA256"],
+            "versions": {key: number + 1 for key, number in twelve["versions"].items()},
+            "previous": {k: v for k, v in twelve.items() if k != "previous"},
+            "host_amis": {region: {"x86_64": rollback["images"]["host"]}},
+            "tile_amis": {region: {"x86_64": rollback["images"]["tile"]}},
+        }
+
+    def reviewed_ena_host_release(self):
+        thirteen = self.generation_eleven_rollback_receipt()
+        # Generation fourteen: the c12ad070 host. Its host kernel has the EC2 network driver (ENA)
+        # built in (ejc3/fcvm#1874), so a fresh boot finds its network interface before cloud-init's first
+        # stage looks for one and runs its user data, which generation twelve's did not. A phone's GPU
+        # retake starts beside the bring-up (ejc3/fcvm#1872), and the bake fails an image whose phone clone
+        # does not restore from prefilled hugepages (ejc3/fcvm#1871). It also carries everything since
+        # cad0ddad: the public Minecraft join limits (ejc3/fcvm#1844) and the GPU restore path (ejc3/fcvm#1850,
+        # #1855, #1867, #1869). Its predecessor is the generation-thirteen receipt (the rollback).
+        return self.reviewed_pair({
+            "source_sha": "c12ad070012a74308ba37236127d6dbd5316ceda",
+            "images": {"host": "ami-0c2656522631215d1", "tile": thirteen["tile_amis"][self.env["COMPUTE_REGION"]]["x86_64"]},
+            "expected": thirteen,
+        }, host_only=True)
+
     def github_source_json(self, path, proof):
         connection = http.client.HTTPSConnection("api.github.com", timeout=10)
         try:
@@ -670,6 +701,11 @@ class Publisher:
         need(event == {"action": "activate-reviewed-ipv4-host-release"},
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
+
+    def run_ena_host_release(self, event):
+        need(event == {"action": "activate-reviewed-ena-host-release"},
+             "reviewed host release accepts no caller configuration")
+        return self.run_build_region_host_release(self.reviewed_ena_host_release(), "reviewed-ena-host-release")
 
     def run_generation_eleven_rollback(self, event):
         need(event == {"action": "activate-reviewed-generation-eleven-rollback"},
@@ -1541,6 +1577,8 @@ class Publisher:
             return self.run_ipv4_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-generation-eleven-rollback":
             return self.run_generation_eleven_rollback(event)
+        if isinstance(event, dict) and event.get("action") == "activate-reviewed-ena-host-release":
+            return self.run_ena_host_release(event)
         # A factory build that was already running when the factory was paused
         # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
         # actions above are how a release is changed while paused.
