@@ -528,12 +528,13 @@ an installed Fleet agent that accepts the matching option. Windows sandboxes sti
 require an explicitly reviewed boot AMI ID: older Windows bridges can carry the
 same assets while exposing an unauthenticated `/still` endpoint.
 
-Virginia's direct Minecraft Java join starts with an IPv6 TCP/25565 probe restricted
-to the administration jumpbox. The separate security group is attached only to
-reviewed GPU hosts, never EC2 tiles or other regions. Before each agent start the
-host checks its boot AMI, delegated prefix and guest layout, and admits that port
-only to the Minecraft servers. Missing or unexpected metadata keeps Java closed;
-browser viewing continues to use the existing viewer ports.
+Virginia's live Minecraft tiles expose the hostname for each launch. Use that
+hostname from Minecraft Java Edition on an IPv6 connection; the game listens on
+TCP/25565. The separate group attaches only to reviewed GPU hosts in Virginia.
+On each agent start the host checks its actual boot AMI, delegated prefix and
+guest layout before admitting Java traffic to the four game slots. Older or
+unverified AMIs and unexpected boot metadata leave Java closed; existing browser
+viewer ports continue to work independently.
 
 The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
 builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
