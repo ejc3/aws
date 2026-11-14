@@ -491,11 +491,11 @@ module "fcvm_fleet_east1" {
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
   minecraft_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
   # Gen14 carries #1844's host limits and the reviewed Pumpkin login timeout.
-  # Allow only the administration host for the first external Java proof.
+  # The verified public join is IPv6-only; the host independently checks the AMI and game slots.
   minecraft_java_access = {
     host_ami    = "ami-0c3ea14848ddbeb93"
     gpu_slots   = local.fcvm_fleet_host_gpu_slots
-    source_cidr = "${one(flatten(aws_instance.jumpbox[*].ipv6_addresses))}/128"
+    source_cidr = "::/0"
   }
   slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows

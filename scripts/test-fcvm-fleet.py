@@ -54,13 +54,12 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("from_port        = 443", coord)
         self.assertIn("to_port          = 443", coord)
 
-    def test_java_join_probe_is_virginia_host_only_and_not_open_to_the_internet(self):
+    def test_public_java_join_is_virginia_host_only_and_ipv6_only(self):
         for region in ("east2", "west2"):
             self.assertNotIn("minecraft_java_access", block('module "fcvm_fleet_%s"' % region))
         east = block('module "fcvm_fleet_east1"')
         self.assertIn('host_ami    = "ami-0c3ea14848ddbeb93"', east)
-        self.assertIn('one(flatten(aws_instance.jumpbox[*].ipv6_addresses))', east)
-        self.assertNotIn('"::/0"', east)
+        self.assertIn('source_cidr = "::/0"', east)
         guard = block('resource "aws_vpc_security_group_ingress_rule" "minecraft_java"', MOD)
         self.assertRegex(guard, r"cidr_ipv6\s*=\s*var\.minecraft_java_access\.source_cidr")
         for field in ("from_port", "to_port"):
