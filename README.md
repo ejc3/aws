@@ -992,6 +992,9 @@ or ask the jumpbox to execute a command. A stopped or missing Mac is reported, n
 silently allocated or restarted by a status, SSH, or workspace command.
 Installing the CLI does not grant a member account the owner's dev-hop key; an account
 without an authorized SSH identity can still inspect status and pricing.
+SSH is admitted only from the managed IPv4 addresses of those five AWS hosts;
+Next.js containers use their host address. From a personal device, use an
+existing SSH route to one of the AWS clients and run `macpbox ssh` there.
 
 Every **new** lease needs the owner's direct approval in the current conversation, after
 showing the quote and minimum charge. The current Oregon M4 Pro host price is **$1.97/hour,
