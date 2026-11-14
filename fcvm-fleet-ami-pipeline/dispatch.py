@@ -25,6 +25,9 @@ LEGACY_TIMEOUT_MINUTES = 240
 EXTENDED_TIMEOUT_MINUTES = 360
 # First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
 EXTENDED_TIMEOUT_SOURCE = "063042ae40a1a6df3f1b4fc7d72fc3625a427058"
+# This exact source was queued before the pause and boots without fleet user data (aws#850).
+RETIRED_SOURCE_SHA = "3e36a3a36e13fdb03168b77ff6257a707e6654d1"
+RETIRED_SOURCE_REASON = "source retired: fleet host fails to load boot user data"
 PUBLICATION_SECONDS = 24 * 60 * 60
 GUARD_PURPOSE = "fcvm-fleet-ami-builder"
 SHA = re.compile(r"^[0-9a-f]{40}$")
@@ -490,6 +493,8 @@ class Factory:
             raise Refused("invalid image request")
         if self.env.get("ENABLED") != "true":
             return {"request_id": event["input_sha256"], "status": "disabled", "message": "factory automation is disabled"}
+        if event["source_sha"] == RETIRED_SOURCE_SHA:
+            raise Refused(RETIRED_SOURCE_REASON)
         request_id = event["input_sha256"]
         existing = self.load("/requests/" + request_id)
         if existing:
@@ -761,6 +766,17 @@ class Factory:
                     return
             if start_record is None:
                 if not pending or self.env.get("ENABLED") != "true":
+                    return
+                if pending.get("source_sha") == RETIRED_SOURCE_SHA:
+                    if pending.get("start_attempted") or pending.get("build_id"):
+                        raise Refused("retired request has an uncertain start")
+                    if pending["status"] not in ("queued", "superseded"):
+                        raise Refused("retired pending request has an unexpected status")
+                    # Save terminal status first so a lost control write can be retried safely.
+                    pending.update(status="superseded", message=RETIRED_SOURCE_REASON)
+                    self.save("/requests/" + pending["request_id"], pending)
+                    control["pending"] = None
+                    self.save("/control", control)
                     return
                 today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
                 if pending["priority"] == "normal" and (self.now() < pending["not_before"] or control.get("last_normal_day") == today):
