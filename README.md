@@ -1541,7 +1541,12 @@ kid-sports-highlights. They are in the org's Default runner group, which serves 
 provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
 run on the mini. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the MacBook's
 `gww-ci` and `kidsports-ci` VMs serve the same labels, jobs split between the two Macs; a job that must build on the
-mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`).
+mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
+dropped again right after (`gh auth refresh -r admin:org -s read:org`), because GitHub applies the scope to every org
+the login reaches, not just dolphin-labs-hq. The Default group's visibility is "selected": a repository can use its
+runners only once it is on the group's list, which was empty. dolphin-labs, dolphin-films and kid-sports-highlights were
+added on 2026-11-14 (`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo id>`); a new
+repository needs the same before its jobs can run here. Nothing in Terraform manages the org's runner groups.
 
 **Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (below),
 an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an org admin of dolphin-labs-hq
@@ -1611,6 +1616,11 @@ Kept so the next machine goes faster.
   instead of running. `mac-vm-setup.sh` checks for a VM with `tart get`.
 - **Growing a guest's disk can fail while it is still booting**, and `set -e` then ended the first run with no message.
   It now says so; running the script again finishes it (the disk went from 41 to 93 GB on skevh).
+- **`gh auth refresh` in a terminal tab stopped at "Authenticate Git with your GitHub credentials? (Y/n)"**, which an
+  agent cannot answer there. `GH_PROMPT_DISABLED=1 gh auth refresh ...` skips the prompt and prints the device code.
+  Approving it in the browser also offered single sign-on for an unrelated org (par-msl): "Continue" skips it.
+- **The runners registered but could serve nothing at first**: the org's Default runner group lists repositories
+  ("selected") and its list was empty (above).
 - **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
   administration-only connector tokens.
 - **The base image download is slow**: 27.3 GB compressed from ghcr.io at about 1% a minute. Start `tart pull` first.
