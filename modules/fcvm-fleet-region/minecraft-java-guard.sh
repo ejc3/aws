@@ -144,7 +144,10 @@ forward = [line.strip() for line in os.environ["FORWARD"].splitlines() if line.s
 if join != want:
     print("FCVM-MC-JOIN is not exactly the agent's connlimit (4 per source /64) and hashlimit (12/min, burst 6, "
           "per source /64) rules with a TCP reset")
-elif not forward or forward[0] != jump:
+elif forward.count(jump) != 1:
+    # A second copy makes every SYN pass the limits twice (two hashlimit tokens each).
+    print("FORWARD does not hold exactly one jump to FCVM-MC-JOIN for tcp dport 25565")
+elif forward[0] != jump:
     netavark = '-A FORWARD -m comment --comment "netavark firewall plugin rules" -j NETAVARK_FORWARD'
     if jump in forward and forward[:forward.index(jump)] == [netavark]:
         print("move: netavark's jump is ahead of the jump to FCVM-MC-JOIN")

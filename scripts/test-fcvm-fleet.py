@@ -322,6 +322,7 @@ class HostTests(unittest.TestCase):
             "netavark with another comment": (
                 ['-A FORWARD -m comment --comment "other" -j NETAVARK_FORWARD', jump], False, None),
             "netavark and no jump": ([netavark], False, [netavark]),
+            "two jumps": ([jump, netavark, jump], False, None),
         }
         with tempfile.TemporaryDirectory() as temp:
             t = Path(temp)
