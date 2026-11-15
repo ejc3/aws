@@ -464,6 +464,82 @@ JSON
             self.assertEqual(self.req("GET", path, {"X-aws-ec2-metadata-token": tok})[0], 404, path)
 
 
+
+class ImdsPrefetchTests(unittest.TestCase):
+    """A new session takes over a second (an `aws sts assume-role` run) and the CLI waits one second, once: a request
+    that has to wait for one fails with NoCredentials. So sessions are issued at start and renewed early in the
+    background, and a request is answered from the cache at once, even while its session is being renewed."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        d = Path(cls.tmp.name)
+        (d / "config.json").write_text(json.dumps(CONFIG))
+        # As slow as the real one, and every session within PREFETCH_BEFORE of its end, so each round renews it.
+        fake(d, "aws", """{ printf '%s\\n' "$@"; echo ---; } >> "$CALLS"
+sleep 1.2
+exp=$(python3 -c 'import datetime as d; print((d.datetime.now(d.timezone.utc) + d.timedelta(minutes=18)).strftime("%Y-%m-%dT%H:%M:%SZ"))')
+cat <<JSON
+{"Credentials": {"AccessKeyId": "AKIAFAKE", "SecretAccessKey": "secret", "SessionToken": "tok", "Expiration": "$exp"}}
+JSON
+""")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            cls.port = sock.getsockname()[1]
+        cls.calls = d / "calls"
+        env = dict(os.environ, NEXTJS_CT_CONFIG=str(d / "config.json"), NEXTJS_CT_IMDS_PORT=str(cls.port),
+                   NEXTJS_CT_AWS=str(d / "aws"), NEXTJS_CT_REAL_IMDS="http://127.0.0.1:9", NEXTJS_CT_IMDS_REFRESH_EVERY="0.2",
+                   NEXTJS_CT_IMDS_USERS=json.dumps({"127.0.0.1": "alice", "127.0.0.2": "boss", "127.0.0.4": "dave"}), CALLS=str(cls.calls))
+        cls.proc = subprocess.Popen(["python3", "-I", str(HOST / "nextjs-ct-imds")], env=env,
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait()
+        cls.tmp.cleanup()
+
+    def sessions(self, user):
+        return self.calls.read_text().count(f"ct-{user}\n") if self.calls.exists() else 0
+
+    def wait_for(self, check, seconds=15):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            if check():
+                return True
+            time.sleep(0.1)
+        return False
+
+    def credentials_in(self, host):
+        """Seconds a container waits for its credentials, as the CLI asks: token, then the role's credentials."""
+        c = http.client.HTTPConnection(host, self.port, timeout=5)
+        began = time.monotonic()
+        c.request("PUT", "/latest/api/token", headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"})
+        tok = c.getresponse().read().decode()
+        c.request("GET", "/latest/meta-data/iam/security-credentials/nextjs-dev-role", headers={"X-aws-ec2-metadata-token": tok})
+        r = c.getresponse()
+        body = r.read().decode()
+        self.assertEqual(r.status, 200, body)
+        self.assertEqual(json.loads(body)["AccessKeyId"], "AKIAFAKE")
+        return time.monotonic() - began
+
+    def test_sessions_are_issued_at_start_and_renewed_before_anyone_asks(self):
+        self.assertTrue(self.wait_for(lambda: self.sessions("alice") >= 2 and self.sessions("boss") >= 2),
+                        "both entitled containers get a session, then a renewal, with no request")
+        self.assertEqual(self.sessions("dave"), 0, "a member with no session policy gets none, and no refusal each round")
+
+    def test_a_request_never_waits_for_a_renewal(self):
+        # The fake logs a call as it starts: a second call for alice means her first session is cached.
+        self.assertTrue(self.wait_for(lambda: self.sessions("alice") >= 2))
+        # Renewals now run back to back (each 1.2 s, alice's half the time): asks over three seconds land during
+        # alice's own renewals too, and every one is answered well inside the CLI's one second.
+        waits = []
+        for _ in range(12):
+            waits.append(self.credentials_in("127.0.0.1"))
+            time.sleep(0.25)
+        self.assertLess(max(waits), 0.5, waits)
+
+
 class NdevSyncTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

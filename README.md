@@ -1630,8 +1630,11 @@ Kept so the next machine goes faster.
   does not have: its only key to fcvm-arm is a security key, and the call sat waiting for a touch. Every client's key
   is now read through Run Command, as the nextjs-ct ones already were, so a `--lan` run needs only the admin AWS session
   and no ssh to fcvm-arm.
-- **The first `ssh skevh-mac` from Steve's container failed with `NoCredentials`** in the Access proxy (its container's
-  first AWS call); the next two connected. Retry once before debugging the route.
+- **The first `ssh skevh-mac` from Steve's container after an idle hour failed with `NoCredentials`** in the Access
+  proxy; every retry connected. `nextjs-ct-imds` issued an expired session on request, an `aws sts assume-role` run
+  of over a second, and the CLI waits one second, once: it hung up (the broker logged `BrokenPipeError`) and the next
+  call found the session cached. Any member's first AWS call after an idle hour could fail the same way. The broker now
+  issues every container's session at start and renews it in the background before a request would have to.
 - **Running `scripts/test-mac-ssh-client.py` on the MacBook took `ssh mac` down** (Cloudflare 1033 for the fcvm agents
   until it was noticed). The connector's reload runs detached; in the test it outlived its temp dir, so its bare
   `launchctl` fell through to the real one and booted out the real `com.ejcampbell.macbook-ssh.cloudflared`. The test
