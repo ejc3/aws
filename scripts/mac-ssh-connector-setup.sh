@@ -111,10 +111,10 @@ case "$ALIAS" in
     ;;
   *) usage ;;
 esac
-# fcvm-arm is needed for the two-hop route and for a fcvm client's key: found up front then, so a missing address stops
-# the run before anything is touched. A --lan run with no fcvm client (skevh-mac) does without it.
+# fcvm-arm's address is needed only for the two-hop route (the clients' keys are read through Run Command): found up
+# front then, so a missing address stops the run before anything is touched. A --lan run does without it.
 FCVM=""
-if [ -z "$LAN" ] || [[ " $CLIENTS" == *" fcvm:"* ]]; then
+if [ -z "$LAN" ]; then
   FCVM=$(fcvm_host)
 fi
 
@@ -149,20 +149,29 @@ clean_key() {
   printf '%s' "$key"
 }
 
-# One nextjs-ct account's key, read from that account's own file in its own Run Command, so one account's file can
-# never stand in for another's.
-nextjs_key() {
-  local user=$1 cmd_id
+# One account's key on one box, read from that account's own file in its own Run Command, so one account's file can
+# never stand in for another's. Run Command, not ssh, so this works wherever the operator has an admin AWS session (the
+# jumpbox, or a Mac signed in to Identity Center whose only key to fcvm-arm is a security key that wants a touch).
+box_key() {
+  local instance=$1 user=$2 cmd_id
   [[ $user =~ ^[a-z][a-z0-9]*$ ]] || return 1
-  cmd_id=$(aws ssm send-command --region "$REGION" --instance-ids "$NEXTJS_ID" --document-name AWS-RunShellScript \
+  cmd_id=$(aws ssm send-command --region "$REGION" --instance-ids "$instance" --document-name AWS-RunShellScript \
     --parameters "$(python3 -c 'import json,sys; print(json.dumps({"commands": [sys.argv[1]]}))' "cat /home/$user/.ssh/to-$ALIAS.pub")" \
     --query Command.CommandId --output text)
-  aws ssm wait command-executed --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" >/dev/null 2>&1 || true
-  aws ssm get-command-invocation --region "$REGION" --command-id "$cmd_id" --instance-id "$NEXTJS_ID" \
+  aws ssm wait command-executed --region "$REGION" --command-id "$cmd_id" --instance-id "$instance" >/dev/null 2>&1 || true
+  aws ssm get-command-invocation --region "$REGION" --command-id "$cmd_id" --instance-id "$instance" \
     --query StandardOutputContent --output text
 }
 
-echo "1/6 reaching $ALIAS ${LAN:+over the LAN as $LAN}${LAN:-from fcvm-arm}"
+# A running instance by one tag, or nothing.
+running_instance() {
+  local id
+  id=$(aws ec2 describe-instances --region "$REGION" --filters "Name=tag:$1,Values=$2" Name=instance-state-name,Values=running \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text)
+  [ -n "$id" ] && [ "$id" != None ] && printf '%s' "$id"
+}
+
+if [ -n "$LAN" ]; then echo "1/6 reaching $ALIAS over the LAN as $LAN"; else echo "1/6 reaching $ALIAS from fcvm-arm"; fi
 [ "$(on_mac "'uname -sm'")" = "Darwin arm64" ] || { echo "$ALIAS is not reachable, or is not a macOS arm64 Mac" >&2; exit 1; }
 
 echo "2/6 Remote Login takes keys only"
@@ -194,25 +203,23 @@ REMOTE
 
 echo "3/6 the clients' public keys"
 KEYS=""
+FCVM_ID=""
 NEXTJS_ID=""
 for client in $CLIENTS; do
   box=${client%%:*} user=${client#*:}
   case "$box" in
     fcvm)
       [ "$user" = ubuntu ] || { echo "only ubuntu on fcvm-arm" >&2; exit 1; }
-      key=$(clean_key "$(on_fcvm "cat ~/.ssh/to-$ALIAS.pub" 2>/dev/null || true)") ||
+      [ -n "$FCVM_ID" ] || FCVM_ID=$(running_instance Name fcvm-metal-arm) || { echo "fcvm-metal-arm is not running" >&2; exit 1; }
+      key=$(clean_key "$(box_key "$FCVM_ID" ubuntu || true)") ||
         { echo "fcvm-arm ubuntu has no single valid ~/.ssh/to-$ALIAS.pub (mac-ssh-client.tf makes it)" >&2; exit 1; }
       KEYS+="$key fcvm-arm ubuntu -> $ALIAS"$'\n'
       ;;
     nextjs)
-      if [ -z "$NEXTJS_ID" ]; then
-        # The containerized box (nextjs-ct.tf), found by its Box tag, which it keeps through the cutover (its Name
-        # becomes nextjs-dev then). Each account's container home is the host's /home/<account>.
-        NEXTJS_ID=$(aws ec2 describe-instances --region "$REGION" --filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running \
-          --query 'Reservations[0].Instances[0].InstanceId' --output text)
-        [ -n "$NEXTJS_ID" ] && [ "$NEXTJS_ID" != None ] || { echo "the nextjs-ct box is not running" >&2; exit 1; }
-      fi
-      key=$(clean_key "$(nextjs_key "$user" || true)") ||
+      # The containerized box (nextjs-ct.tf), found by its Box tag, which it keeps through the cutover (its Name
+      # becomes nextjs-dev then). Each account's container home is the host's /home/<account>.
+      [ -n "$NEXTJS_ID" ] || NEXTJS_ID=$(running_instance Box nextjs-ct) || { echo "the nextjs-ct box is not running" >&2; exit 1; }
+      key=$(clean_key "$(box_key "$NEXTJS_ID" "$user" || true)") ||
         { echo "nextjs-ct $user has no single valid ~/.ssh/to-$ALIAS.pub (the container's provision makes it at setup)" >&2; exit 1; }
       KEYS+="$key nextjs $user -> $ALIAS"$'\n'
       ;;

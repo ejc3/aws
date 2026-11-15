@@ -1626,6 +1626,12 @@ Kept so the next machine goes faster.
 - **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
   administration-only connector tokens.
 - **The base image download is slow**: 27.3 GB compressed from ghcr.io at about 1% a minute. Start `tart pull` first.
+- **The connector script read fcvm-arm's client key over ssh with the jumpbox's `fcvm-ec2` key**, which the MacBook
+  does not have: its only key to fcvm-arm is a security key, and the call sat waiting for a touch. Every client's key
+  is now read through Run Command, as the nextjs-ct ones already were, so a `--lan` run needs only the admin AWS session
+  and no ssh to fcvm-arm.
+- **The first `ssh skevh-mac` from Steve's container failed with `NoCredentials`** in the Access proxy (its container's
+  first AWS call); the next two connected. Retry once before debugging the route.
 
 ## Start a Codex session
 
