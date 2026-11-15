@@ -13,9 +13,11 @@
 #         carry the join limits (MINECRAFT_JOIN_LIMITS=enforced in minecraft.env, written
 #         by ejc3/fcvm fleet/ami/host/build.sh); that is a precondition, not the proof;
 #       - the slot layout matches the deployment's counts;
-#       - the agent's FCVM-MC-JOIN chain is live in ip6tables with the connlimit (4 per
-#         /64) and hashlimit (12/min, burst 6, per /64) rules, each rejecting with a TCP
-#         reset, and FORWARD jumps to it for tcp dport 25565 before any ACCEPT.
+#       - the agent's FCVM-MC-JOIN chain is live in ip6tables and holds exactly its two
+#         rules, whole: connlimit (4 per source /64) and hashlimit (12/min, burst 6, per
+#         source /64), each rejecting with a TCP reset, and nothing else; and FORWARD's
+#         first rule is the jump to it for tcp dport 25565 (the agent inserts it first), so
+#         no earlier rule can return, accept or jump elsewhere for that traffic.
 #       The agent owns the chain (ejc3/fcvm src/fleet/agent/joinguard.rs installs it at
 #       start, before any server); this only reads it, waiting up to
 #       FCVM_JAVA_GUARD_WAIT seconds (default 300) for it to appear. Java is IPv6 only:
@@ -122,23 +124,24 @@ limits_missing() {
   JOIN="$join" FORWARD="$forward" /usr/bin/python3 - <<'PYTHON'
 import os
 
-join = os.environ["JOIN"].splitlines()
-forward = [line for line in os.environ["FORWARD"].splitlines() if line.startswith("-A FORWARD ")]
+# The agent's rules (ejc3/fcvm src/fleet/agent/joinguard.rs) as ip6tables -S prints them on the
+# host image (Ubuntu noble, ip6tables 1.8.10, nf_tables). Compared whole: an extra match, another
+# key (destination instead of source), other numbers or another target is not these rules. A
+# different iptables that prints them otherwise keeps Java closed.
 syn = "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN"
 reset = "-j REJECT --reject-with tcp-reset"
-connlimit = ["-A FCVM-MC-JOIN " + syn, "-m connlimit", "--connlimit-above 4 ", "--connlimit-mask 64 ", reset]
-hashlimit = ["-A FCVM-MC-JOIN " + syn, "-m hashlimit", "--hashlimit-above 12/min ", "--hashlimit-burst 6 ",
-             "--hashlimit-mode srcip ", "--hashlimit-srcmask 64 ", reset]
-rules = [line for line in join if line.startswith("-A FCVM-MC-JOIN ")]
-if len(rules) != 2 or not all(part in rules[0] for part in connlimit) or not all(part in rules[1] for part in hashlimit):
-    print("FCVM-MC-JOIN does not hold exactly the connlimit (4 per /64) and hashlimit (12/min, burst 6, per /64) "
-          "rules with a TCP reset")
-else:
-    jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
-    if jump not in forward:
-        print("FORWARD does not jump to FCVM-MC-JOIN for tcp dport 25565")
-    elif any("-j ACCEPT" in line for line in forward[:forward.index(jump)]):
-        print("FORWARD accepts traffic before its jump to FCVM-MC-JOIN")
+want = ["-N FCVM-MC-JOIN",
+        f"-A FCVM-MC-JOIN {syn} -m connlimit --connlimit-above 4 --connlimit-mask 64 --connlimit-saddr {reset}",
+        f"-A FCVM-MC-JOIN {syn} -m hashlimit --hashlimit-above 12/min --hashlimit-burst 6 --hashlimit-mode srcip "
+        f"--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 {reset}"]
+jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
+join = [line.strip() for line in os.environ["JOIN"].splitlines() if line.strip()]
+forward = [line.strip() for line in os.environ["FORWARD"].splitlines() if line.startswith("-A FORWARD ")]
+if join != want:
+    print("FCVM-MC-JOIN is not exactly the agent's connlimit (4 per source /64) and hashlimit (12/min, burst 6, "
+          "per source /64) rules with a TCP reset")
+elif not forward or forward[0] != jump:
+    print("FORWARD's first rule is not the jump to FCVM-MC-JOIN for tcp dport 25565")
 PYTHON
 }
 

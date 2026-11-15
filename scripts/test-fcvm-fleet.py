@@ -246,11 +246,34 @@ class HostTests(unittest.TestCase):
                            live_join.replace(" -j REJECT --reject-with tcp-reset", " -j ACCEPT"), live_forward),
                           (actual, approved_prefix, agent_args, "8", "0", False, marker,
                            "\n".join(live_join.splitlines()[:2]), live_forward)]
+            # Rules that pass a substring check but bypass or narrow the limits, as Ubuntu noble's
+            # ip6tables 1.8.10 (nf_tables) prints them. Each keeps Java closed.
+            connlimit, hashlimit = live_join.splitlines()[1:]
+            jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
+            bypasses = {
+                "earlier RETURN": (live_join, "\n".join(["-P FORWARD ACCEPT",
+                                                          "-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", jump])),
+                "earlier jump elsewhere": (live_join, "\n".join(["-P FORWARD ACCEPT",
+                                                                  "-A FORWARD -i br0 -j FCVM-OTHER", jump])),
+                "connlimit on marked packets only": (live_join.replace(
+                    connlimit, connlimit.replace(" -m connlimit ", " -m mark --mark 0x1 -m connlimit ")), live_forward),
+                "connlimit keyed by destination": (live_join.replace(
+                    connlimit, connlimit.replace("--connlimit-saddr", "--connlimit-daddr")), live_forward),
+                "hashlimit on marked packets only": (live_join.replace(
+                    hashlimit, hashlimit.replace(" -m hashlimit ", " -m mark --mark 0x1 -m hashlimit ")), live_forward),
+                "hashlimit keyed by destination": (live_join.replace(hashlimit, hashlimit.replace(
+                    "--hashlimit-mode srcip", "--hashlimit-mode dstip").replace(
+                    "--hashlimit-srcmask 64", "--hashlimit-dstmask 64")), live_forward),
+            }
+            for label, (join, forward) in bypasses.items():
+                for actual, marker in ((unlisted, enforced), (image, "")):
+                    cases.append((actual, approved_prefix, agent_args, "8", "0", False, marker, join, forward))
             allow = ("forward ip6 daddr { 2001:db8:1:2:3::e, 2001:db8:1:2:3::f, "
                      "2001:db8:1:2:3::10, 2001:db8:1:2:3::11 } tcp dport 25565 return")
+            labels = {rules: label for label, rules in bypasses.items()}
             for actual, prefix, args, gpu_count, status, forward_allowed, limits, join, forward in cases:
-                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status,
-                                  limits=limits, join=join, forward=forward):
+                with self.subTest(labels.get((join, forward), ""), actual=actual, prefix=prefix, args=args,
+                                  gpu_count=gpu_count, status=status, limits=limits, join=join, forward=forward):
                     limits_env.write_text(limits)
                     result = subprocess.run(
                         ["/bin/bash", "-x", "-c", script, "--", "open", approved_list, gpu_count, "4", "4"],
