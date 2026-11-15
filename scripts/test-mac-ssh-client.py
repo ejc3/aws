@@ -330,7 +330,9 @@ class Wiring(unittest.TestCase):
     def test_the_connector_reads_the_nextjs_keys_from_the_containerized_box(self):
         # The containers' homes are on nextjs-ct, found by a tag it keeps through the cutover (its Name changes then).
         self.assertIn('Box = "nextjs-ct"', (ROOT / "nextjs-ct.tf").read_text())
-        self.assertIn("--filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running", CONNECTOR.read_text())
+        text = CONNECTOR.read_text()
+        self.assertIn('--filters "Name=tag:$1,Values=$2" Name=instance-state-name,Values=running', text)
+        self.assertIn("running_instance Box nextjs-ct", text)
         self.assertNotIn("tag:Name,Values=nextjs-dev", CONNECTOR.read_text())
 
     def test_the_containers_snippet_sets_user_alias_and_secret_per_call(self):
@@ -477,10 +479,13 @@ sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).retu
         self.stub("aws", f"""#!/bin/sh
 echo "$*" >> {self.argv_log}
 case "$1 $2" in
-  "ec2 describe-instances") case "$*" in *"Name=tag:Box,Values=nextjs-ct "*) echo i-0123456789abcdef0 ;; *) echo None ;; esac ;;
-  "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
+  "ec2 describe-instances") case "$*" in *"Name=tag:Box,Values=nextjs-ct "*) echo i-0123456789abcdef0 ;;
+    *"Name=tag:Name,Values=fcvm-metal-arm "*) echo i-0fcfcfcfcfcfcfcf0 ;; *) echo None ;; esac ;;
+  "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*--instance-ids ||; s| .*||')-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
   "ssm wait") ;;
-  "ssm get-command-invocation") u=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); cat "{self.nextjs}/$u.pub" ;;
+  "ssm get-command-invocation") c=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); u=${{c#*-*-}}
+    # fcvm-arm's ubuntu keeps its key in the shared test home; each nextjs-ct account has its own file.
+    case "$c" in i-0fcfcfcfcfcfcfcf0-ubuntu) cat "{self.home}/.ssh/to-colton-mac.pub" 2>/dev/null ;; *) cat "{self.nextjs}/$u.pub" ;; esac ;;
   "secretsmanager get-secret-value") echo "{self.TOKEN}" ;;
   *) echo "unexpected aws $*" >&2; exit 1 ;;
 esac
@@ -598,7 +603,8 @@ esac
         self.assertIn("nextjs-ct colton has no single valid", result.stderr)
         log = self.argv_log.read_text()
         self.assertIn("cat /home/colton/.ssh/to-colton-mac.pub", log)
-        self.assertEqual(log.count("ssm send-command"), 1, "each account is read by its own command; colton's failed first")
+        self.assertEqual(log.count("cat /home/"), 2, "each account is read by its own command: fcvm-arm's, then colton's, "
+                         "which failed before ejc3's was read")
 
     def test_bad_arguments(self):
         for args in [(), ("nobody-mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:
