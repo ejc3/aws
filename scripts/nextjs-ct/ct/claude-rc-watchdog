@@ -3,5 +3,4 @@
 # in claude-rc-ensure alone (see its header for why there is exactly one judge).
 set -uo pipefail
 u=$(cat /etc/nextjs-ct/user)
-pgrep -u "$u" -x claude >/dev/null 2>&1 || exit 0
 exec /usr/local/bin/claude-rc-ensure "$u"

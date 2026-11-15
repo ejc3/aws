@@ -8,7 +8,10 @@ from pathlib import Path
 import http.client
 import json
 import os
+import pwd
 import re
+import select
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -1358,6 +1361,201 @@ else:raise AssertionError(operation)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(calls, [])
                 self.assertNotIn("completed", result.stdout)
+
+
+
+class ClaudeRemoteControlWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.home = self.root / "home"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        account = pwd.getpwuid(os.getuid()).pw_name
+        self.log = self.root / "keys"
+        self.log.touch()
+        recheck = self.root / "recheck"
+        user_file = self.root / "user"
+        user_file.write_text(account + "\n")
+        ensure = self.bin / "claude-rc-ensure"
+        ensure.write_text((CT / ensure.name).read_text().replace('H="/home/$WHO"', f'H="{self.home}"')
+                          .replace("STATEDIR=/var/lib/claude-rc-ensure", f'STATEDIR="{self.root / "state"}"'))
+        ensure.chmod(0o755)
+        self.watchdog = self.root / "watchdog"
+        self.watchdog.write_text((CT / "claude-rc-watchdog").read_text()
+                                 .replace("/etc/nextjs-ct/user", str(user_file))
+                                 .replace("/usr/local/bin/claude-rc-ensure", str(ensure)))
+        fake(self.bin, "sudo", '[[ "$1 $2 $3" == "-u $RC_ACCOUNT -H" ]] || exit 1\nshift 3\nexec "$@"\n')
+        fake(self.bin, "sleep", "exit 0\n")
+        fake(self.bin, "tmux", r"""
+count=$(( $(wc -l < "$RC_LOG") - RC_KEYS_BEFORE ))
+case "$1" in
+  list-windows)
+    [[ "$*" == *'#{pane_id} #{pane_pid} #{@tclaude_path}'* ]] || exit 1
+    printf '%%72 %s %s\n' "$RC_PANE_PID" "$RC_MARKER"
+    ;;
+  display-message)
+    [[ "$4" == %72 ]] || exit 1
+    if [[ "$5" == '#{pane_pid}' ]]; then
+      touch "$RC_RECHECK"
+      if [[ "$RC_SCREEN" == ended || ( "$RC_SCREEN" == after_moved && "$count" -ge 4 ) ]]; then
+        echo 1
+      else
+        echo "$RC_PANE_PID"
+      fi
+    else
+      echo /example/repo
+    fi
+    ;;
+  capture-pane)
+    [[ "${*: -1}" == %72 ]] || exit 1
+    case "$count" in
+      0)
+        if [[ "$RC_SCREEN" != healthy || "$*" == *" -S "* ]]; then
+          echo "Couldn't reconnect to your Remote Control session"
+        fi
+        case "$RC_SCREEN" in
+          overloaded) echo "Session creation failed" ;;
+          late_overload) [[ -e "$RC_RECHECK" ]] && echo "Session creation failed" ;;
+          busy) echo "Esc to interrupt" ;;
+        esac
+        echo '────────────────'
+        if [[ "$RC_SCREEN" == draft ]]; then
+          echo '❯ do not submit me'
+        else
+          echo '❯'
+        fi
+        [[ "$RC_SCREEN" == multiline ]] && echo '  continuation of draft'
+        [[ "$RC_SCREEN" != ambiguous ]] && echo '────────────────'
+        case "$RC_SCREEN" in
+          healthy|recovered) echo '  ? for shortcuts · /rc' ;;
+          connected) echo "Remote Control is connected" ;;
+        esac
+        ;;
+      1)
+        [[ "$RC_SCREEN" == old_disconnect ]] && echo "Remote Control disconnected."
+        echo "Disconnect this session"
+        ;;
+      4)
+        [[ "$RC_SCREEN" != no_disconnect ]] && echo "Remote Control disconnected."
+        case "$RC_SCREEN" in
+          after_busy) echo "Esc to interrupt" ;;
+          after_upstream) echo "Session creation failed" ;;
+          after_api_error) echo "API Error: 503" ;;
+        esac
+        echo '────────────────'
+        if [[ "$RC_SCREEN" == after_draft ]]; then echo '❯ do not submit me'; else echo '❯'; fi
+        echo '────────────────'
+        [[ "$RC_SCREEN" == after_recovery ]] && echo '  ? for shortcuts · /rc'
+        ;;
+      *) echo "Enable Remote Control" ;;
+    esac
+    ;;
+  send-keys) printf '%s\n' "$*" >> "$RC_LOG" ;;
+esac
+""")
+        self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', RC_ACCOUNT=account, RC_LOG=str(self.log),
+                        RC_RECHECK=str(recheck))
+
+    def process_tree(self, name, native):
+        parent = self.home / ".local/share/claude/versions" if native else self.root / "unrelated"
+        parent.mkdir(parents=True, exist_ok=True)
+        exe = parent / name
+        shutil.copy2("/bin/bash", exe)
+        # Have the renamed native executable report its own PID after exec,
+        # then block in its own read builtin. A parent's $! is visible before
+        # /proc/<pid>/exe can reliably describe the child that started.
+        tree = subprocess.Popen(
+            ["/bin/bash", "-c", r'''
+exec 3<&0
+"$1" --noprofile --norc -c 'printf "%s\n" "$$"; read -r _' <&3 &
+child=$!
+trap 'kill "$child" 2>/dev/null; wait "$child"; exit 0' TERM
+wait "$child"
+''', "pane", str(exe)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+
+        def cleanup():
+            if tree.poll() is None:
+                tree.terminate()
+            tree.communicate(timeout=3)
+
+        self.addCleanup(cleanup)
+        self.assertTrue(select.select([tree.stdout], [], [], 3)[0], "versioned fixture did not start")
+        ready = tree.stdout.readline().strip()
+        if not ready:
+            self.fail(f"versioned fixture exited before its ready signal: {tree.communicate(timeout=3)[1]}")
+        self.assertEqual(os.readlink(f"/proc/{int(ready)}/exe"), str(exe))
+        return tree.pid
+
+    def check_watchdog(self, pane, screen, marker="/example/repo"):
+        Path(self.env["RC_RECHECK"]).unlink(missing_ok=True)
+        env = dict(self.env, RC_PANE_PID=str(pane), RC_SCREEN=screen, RC_MARKER=marker,
+                   RC_KEYS_BEFORE=str(len(self.log.read_text().splitlines())))
+        return subprocess.run(["bash", str(self.watchdog)], env=env, check=True, text=True,
+                              capture_output=True, timeout=10).stdout
+
+    def test_native_claude_repairs_only_the_verified_pane(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.assertIn("re-enabled", self.check_watchdog(pane, "stale"))
+        self.assertEqual(self.log.read_text().splitlines(), [
+            "send-keys -t %72 /remote-control Enter",
+            "send-keys -t %72 Up",
+            "send-keys -t %72 Up",
+            "send-keys -t %72 Enter",
+            "send-keys -t %72 /remote-control Enter",
+            "send-keys -t %72 1",
+            "send-keys -t %72 Enter",
+        ])
+        self.assertIn("backing off", self.check_watchdog(pane, "stale"))
+        self.assertEqual(len(self.log.read_text().splitlines()), 7)
+
+    def test_healthy_native_claude_ignores_stale_error_in_scrollback(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.assertIn("nothing to repair", self.check_watchdog(pane, "healthy"))
+        self.assertFalse(self.log.read_text())
+
+    def test_managed_pane_needs_its_own_claude_and_an_explicit_failure(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.check_watchdog(1, "stale")
+        self.check_watchdog(pane, "stale", marker="")
+        self.assertIn("upstream 503", self.check_watchdog(pane, "overloaded"))
+        self.assertFalse(self.log.read_text())
+
+    def test_visible_error_does_not_interrupt_a_draft_busy_or_recovered_session(self):
+        pane = self.process_tree("2.1.325", native=True)
+        for screen in ("draft", "multiline", "busy", "recovered", "connected", "ambiguous", "ended", "late_overload"):
+            with self.subTest(screen=screen):
+                self.assertIn("has no idle stale prompt", self.check_watchdog(pane, screen))
+                self.assertFalse(self.log.read_text())
+
+    def test_second_command_requires_a_new_disconnect_and_same_idle_pane(self):
+        pane = self.process_tree("2.1.325", native=True)
+        for screen in ("after_draft", "after_busy", "after_recovery", "after_upstream",
+                       "after_api_error", "after_moved", "no_disconnect", "old_disconnect"):
+            with self.subTest(screen=screen):
+                for stamp in (self.root / "state").glob("*"):
+                    stamp.unlink()
+                self.log.write_text("")
+                self.assertIn("did not return to the idle disconnected prompt", self.check_watchdog(pane, screen))
+                self.assertEqual(self.log.read_text().splitlines(), [
+                    "send-keys -t %72 /remote-control Enter",
+                    "send-keys -t %72 Up",
+                    "send-keys -t %72 Up",
+                    "send-keys -t %72 Enter",
+                ])
+
+    def test_legacy_claude_process_is_still_recognized(self):
+        pane = self.process_tree("claude", native=False)
+        self.assertIn("nothing to repair", self.check_watchdog(pane, "healthy"))
+        self.assertFalse(self.log.read_text())
+
+    def test_same_version_name_outside_the_install_path_is_not_claude(self):
+        pane = self.process_tree("2.1.325", native=False)
+        self.check_watchdog(pane, "stale")
+        self.assertFalse(self.log.read_text())
 
 
 if __name__ == "__main__":
