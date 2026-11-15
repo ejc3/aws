@@ -132,7 +132,16 @@ class HostTests(unittest.TestCase):
         user_data = MOD.split("user_data = base64encode(<<-EOT", 1)[1].split("\n  EOT", 1)[0]
         before_env, after_env = user_data.split("printf 'FLEET_AGENT_ARGS", 1)
         self.assertIn("/etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf", before_env)
-        self.assertIn("ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard", before_env)
+        # Closed before the agent starts; opened by its own unit after the agent has installed
+        # the join limits and the guard has read them back.
+        self.assertIn("ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard close\n", before_env)
+        self.assertIn("ExecStartPost=/bin/systemctl --no-block restart fcvm-minecraft-java-open.service\n", before_env)
+        opener = before_env.split("cat > /etc/systemd/system/fcvm-minecraft-java-open.service <<'MINECRAFT_OPEN'\n", 1)[1].split("MINECRAFT_OPEN", 1)[0]
+        for line in ("After=fcvm-fleet-agent.service", "PartOf=fcvm-fleet-agent.service", "Type=oneshot",
+                     "EnvironmentFile=/etc/fcvm-fleet/agent.env", "EnvironmentFile=-/etc/fcvm-fleet/windows.env",
+                     "ExecStart=/usr/local/libexec/fcvm-minecraft-java-guard open "):
+            with self.subTest(line=line):
+                self.assertIn(line, opener)
         self.assertIn("systemctl daemon-reload", before_env)
         self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", after_env)
         guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
@@ -170,8 +179,32 @@ class HostTests(unittest.TestCase):
                 (dev / "class").write_text("0x030200\n")
                 (pci / "drivers/vfio-pci" / name).symlink_to(dev)
             limits_env = Path(temp) / "minecraft.env"
+            ip6tables = Path(temp) / "ip6tables"
+            ip6tables.write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                set -eu
+                test "$1" = -S
+                case "$2" in
+                  FCVM-MC-JOIN) test -n "${IP6_JOIN:-}" || exit 1; printf "%s\n" "$IP6_JOIN";;
+                  FORWARD) printf "%s\n" "$IP6_FORWARD";;
+                  *) exit 2;;
+                esac
+            """).lstrip())
+            ip6tables.chmod(0o700)
             script = (guard.replace("/usr/bin/curl", str(curl)).replace("/usr/sbin/nft", str(nft))
-                      .replace("/sys/bus/pci", str(pci)).replace("/etc/fcvm-fleet/minecraft.env", str(limits_env)))
+                      .replace("/sys/bus/pci", str(pci)).replace("/etc/fcvm-fleet/minecraft.env", str(limits_env))
+                      .replace("/usr/sbin/ip6tables", str(ip6tables)))
+            # ip6tables -S as the agent's chain prints on a host (ejc3/fcvm src/fleet/agent/joinguard.rs).
+            syn = "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN"
+            live_join = "\n".join([
+                "-N FCVM-MC-JOIN",
+                f"-A FCVM-MC-JOIN {syn} -m connlimit --connlimit-above 4 --connlimit-mask 64 --connlimit-saddr "
+                "-j REJECT --reject-with tcp-reset",
+                f"-A FCVM-MC-JOIN {syn} -m hashlimit --hashlimit-above 12/min --hashlimit-burst 6 --hashlimit-mode srcip "
+                "--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 -j REJECT --reject-with tcp-reset"])
+            live_forward = "\n".join(["-P FORWARD ACCEPT",
+                                      "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN",
+                                      "-A FORWARD -i veth0 -j ACCEPT"])
             approved_prefix = "2001:db8:1:2:3::/80"
             agent_args = "--windows 4 --minecraft 4"
             cases = [(image, approved_prefix, agent_args, "8", "0", True),
@@ -184,25 +217,45 @@ class HostTests(unittest.TestCase):
                      (image, approved_prefix, "--minecraft 4", "8", "0", False),
                      (image, approved_prefix, agent_args, "7", "0", False),
                      (image, approved_prefix, agent_args, "8", "1", True)]
-            cases = [case + ("",) for case in cases]
+            cases = [case + ("", live_join, live_forward) for case in cases]
             # An image off the list opens only when its build said its servers carry the join limits
             # (ejc3/fcvm#1915: MINECRAFT_JOIN_LIMITS=enforced in /etc/fcvm-fleet/minecraft.env), and
             # still only with the layout checks.
             unlisted = "ami-0ccccccccccccccc1"
             enforced = "MINECRAFT_JOIN_LIMITS=enforced\n"
-            cases += [(unlisted, approved_prefix, agent_args, "8", "0", True, enforced),
-                      (unlisted, approved_prefix, agent_args, "8", "0", False, "MINECRAFT_JOIN_LIMITS=enforced # x\n"),
-                      (unlisted, approved_prefix, "--minecraft 4", "8", "0", False, enforced),
-                      (unlisted, "2001:db8:1:2::/64", agent_args, "8", "0", False, enforced),
-                      ("no-image", approved_prefix, agent_args, "8", "0", False, enforced)]
+            cases += [(unlisted, approved_prefix, agent_args, "8", "0", True, enforced, live_join, live_forward),
+                      (unlisted, approved_prefix, agent_args, "8", "0", False, "MINECRAFT_JOIN_LIMITS=enforced # x\n",
+                       live_join, live_forward),
+                      (unlisted, approved_prefix, "--minecraft 4", "8", "0", False, enforced, live_join, live_forward),
+                      (unlisted, "2001:db8:1:2::/64", agent_args, "8", "0", False, enforced, live_join, live_forward),
+                      ("no-image", approved_prefix, agent_args, "8", "0", False, enforced, live_join, live_forward)]
+            # The marker is a precondition, not the proof: the live chain decides, for a listed image
+            # as for a marked one.
+            unhooked = "\n".join(["-P FORWARD ACCEPT", "-A FORWARD -i veth0 -j ACCEPT"])
+            accept_first = "\n".join(["-P FORWARD ACCEPT", "-A FORWARD -i veth0 -j ACCEPT",
+                                       "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"])
+            for actual, marker in ((unlisted, enforced), (image, "")):
+                cases += [(actual, approved_prefix, agent_args, "8", "0", False, marker, "", live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker, live_join, unhooked),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker, live_join, accept_first),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace("--connlimit-above 4 ", "--connlimit-above 40 "), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace("--hashlimit-burst 6 ", "--hashlimit-burst 60 "), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace(" -j REJECT --reject-with tcp-reset", " -j ACCEPT"), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           "\n".join(live_join.splitlines()[:2]), live_forward)]
             allow = ("forward ip6 daddr { 2001:db8:1:2:3::e, 2001:db8:1:2:3::f, "
                      "2001:db8:1:2:3::10, 2001:db8:1:2:3::11 } tcp dport 25565 return")
-            for actual, prefix, args, gpu_count, status, forward_allowed, limits in cases:
-                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status, limits=limits):
+            for actual, prefix, args, gpu_count, status, forward_allowed, limits, join, forward in cases:
+                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status,
+                                  limits=limits, join=join, forward=forward):
                     limits_env.write_text(limits)
                     result = subprocess.run(
-                        ["/bin/bash", "-x", "-c", script, "--", approved_list, gpu_count, "4", "4"],
-                        env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status,
+                        ["/bin/bash", "-x", "-c", script, "--", "open", approved_list, gpu_count, "4", "4"],
+                        env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status, IP6_JOIN=join,
+                                 IP6_FORWARD=forward, FCVM_JAVA_GUARD_WAIT="0",
                                  FLEET_AGENT_ARGS=args, WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
                         capture_output=True,
                         text=True, check=False, timeout=5,
@@ -218,6 +271,19 @@ class HostTests(unittest.TestCase):
                         self.assertLess(result.stdout.index(allow), result.stdout.index("forward tcp dport 25565 drop"))
                     self.assertNotIn("fixture-token", result.stderr)
                     self.assertNotIn("flush ruleset", result.stdout)
+
+    def test_java_guard_closes_before_the_agent_starts_whatever_the_host_holds(self):
+        guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
+        with tempfile.TemporaryDirectory() as temp:
+            nft = Path(temp) / "nft"
+            nft.write_text('#!/bin/bash\ncat\n')
+            nft.chmod(0o700)
+            result = subprocess.run(["/bin/bash", "-c", guard.replace("/usr/sbin/nft", str(nft)), "--", "close"],
+                                    capture_output=True, text=True, check=True, timeout=5)
+        self.assertIn("flush table ip6 fcvm_minecraft_java", result.stdout)
+        self.assertIn("input tcp dport 25565 drop", result.stdout)
+        self.assertIn("forward tcp dport 25565 drop", result.stdout)
+        self.assertNotIn("return", result.stdout)
 
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise

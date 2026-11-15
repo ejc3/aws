@@ -277,10 +277,25 @@ locals {
     cat > /usr/local/libexec/fcvm-minecraft-java-guard <<'MINECRAFT_GUARD'
     ${file("${path.module}/minecraft-java-guard.sh")}
     MINECRAFT_GUARD
+    # Closed before every agent start. Opened by its own unit once the agent (the one owner of
+    # the FCVM-MC-JOIN rules) has installed them and the guard has read them back live.
     cat > /etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf <<'MINECRAFT_UNIT'
     [Service]
-    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard ${join(",", var.minecraft_java_access.host_amis)} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard close
+    ExecStartPost=/bin/systemctl --no-block restart fcvm-minecraft-java-open.service
     MINECRAFT_UNIT
+    cat > /etc/systemd/system/fcvm-minecraft-java-open.service <<'MINECRAFT_OPEN'
+    [Unit]
+    Description=Open Minecraft Java joins once the agent's join limits are live
+    After=fcvm-fleet-agent.service
+    PartOf=fcvm-fleet-agent.service
+    [Service]
+    Type=oneshot
+    EnvironmentFile=/etc/fcvm-fleet/agent.env
+    EnvironmentFile=-/etc/fcvm-fleet/windows.env
+    TimeoutStartSec=420
+    ExecStart=/usr/local/libexec/fcvm-minecraft-java-guard open ${join(",", var.minecraft_java_access.host_amis)} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    MINECRAFT_OPEN
     systemctl daemon-reload
     %{endif~}
     agent_args='${var.host_agent_args}'
