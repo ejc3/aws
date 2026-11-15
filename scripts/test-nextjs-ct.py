@@ -296,18 +296,24 @@ esac
 
 
 class AdminKeyTests(unittest.TestCase):
-    """nextjs-ct-machine strips the instance key pair (the owner's key) from every account that does not
-    declare it; the owner's phone logs in to ejc3 with that key, so ejc3 must declare it and only ejc3."""
+    """Reprovisioning keeps the exact instance public key only for the three accounts the owner uses."""
 
-    def test_only_ejc3_declares_the_owner_key(self):
+    def test_owner_key_is_declared_only_for_ejc3_colton_and_connor(self):
         user_data = (ROOT / "nextjs-user-data.tf").read_text()
         key = re.search(r'echo "(ssh-ed25519 \S+ fcvm-ec2)" >> /home/ubuntu/.ssh/authorized_keys',
                         (ROOT / "runner-autoscale.tf").read_text()).group(1)
+        self.assertRegex(user_data, rf'(?m)^  nextjs_owner_phone_ssh_key\s*=\s*"{re.escape(key)}"$')
         keys = block(user_data, "nextjs_user_keys = {")
-        ejc3 = keys[keys.index("ejc3 = ["):]
-        ejc3 = ejc3[:ejc3.index("\n    ]")]
-        self.assertIn(f'"{key}"', ejc3)
-        self.assertEqual(keys.count(key), 1)
+        reference = "local.nextjs_owner_phone_ssh_key"
+        users = dict(re.findall(r'(?ms)^    (\w+) = \[(.*?)^    \]', keys))
+        self.assertEqual({user for user, entries in users.items() if reference in entries},
+                         {"ejc3", "colton", "connor"})
+        self.assertEqual(keys.count(reference), 3)
+        restricted = '"no-agent-forwarding ${' + reference + '}"'
+        self.assertIn(restricted, users["colton"])
+        self.assertIn(restricted, users["connor"])
+        self.assertNotIn(restricted, users["ejc3"])
+        self.assertRegex(users["colton"], r'"ssh-ed25519 \S+ colton"')
         machine = (SCRIPTS / "host" / "nextjs-ct-machine").read_text()
         self.assertIn("removed the admin key", machine)
 
