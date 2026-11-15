@@ -508,10 +508,10 @@ resource "aws_launch_template" "host" {
 
   network_interfaces {
     device_index = 0
-    # New Terraform defaults attach the extra group only to the reviewed
-    # image. Image-only publisher copies retain the bootstrap gate as well.
+    # Every Virginia host gets the Java group; the boot guard opens 25565 only
+    # on a listed image or one whose build says it carries the join limits.
     security_groups = concat([aws_security_group.fleet.id],
-      each.key == "x86_64" && contains(try(var.minecraft_java_access.host_amis, []), var.gpu_amis[each.key])
+      each.key == "x86_64" && var.minecraft_java_access != null
       ? aws_security_group.minecraft_java[*].id : []
     )
     associate_public_ip_address = true

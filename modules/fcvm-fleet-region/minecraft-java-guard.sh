@@ -20,7 +20,11 @@ read_imds() {
 if token=$(/usr/bin/curl --noproxy '*' -fsS --max-time 2 -X PUT \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/api/token" 2>/dev/null) &&
     [[ -n "$token" ]] &&
-    active=$(read_imds ami-id 2>/dev/null) && [[ ",$approved," == *",$active,"* ]] &&
+    active=$(read_imds ami-id 2>/dev/null) && [[ "$active" =~ ^ami-[a-f0-9]{17}$ ]] &&
+    # A listed image, or one whose build said its servers carry the join limits
+    # (ejc3/fcvm fleet/ami/host/build.sh writes this line only then).
+    { [[ ",$approved," == *",$active,"* ]] ||
+      /usr/bin/grep -qx 'MINECRAFT_JOIN_LIMITS=enforced' /etc/fcvm-fleet/minecraft.env 2>/dev/null; } &&
     mac=$(read_imds mac 2>/dev/null) && [[ "$mac" =~ ^([a-f0-9]{2}:){5}[a-f0-9]{2}$ ]] &&
     prefix=$(read_imds "network/interfaces/macs/$mac/ipv6-prefix" 2>/dev/null); then
   destinations=$(/usr/bin/python3 - "$prefix" "$2" "$3" "$4" <<'PYTHON'

@@ -68,7 +68,9 @@ class NetworkTests(unittest.TestCase):
             self.assertRegex(guard, rf"{field}\s*=\s*25565")
         self.assertNotIn("cidr_ipv4", guard)
         host = block('resource "aws_launch_template" "host"', MOD)
-        self.assertIn('contains(try(var.minecraft_java_access.host_amis, []), var.gpu_amis[each.key])', host)
+        # Every Virginia host gets the group; the boot guard opens 25565 only on a listed image or
+        # one that says it carries the join limits.
+        self.assertIn('each.key == "x86_64" && var.minecraft_java_access != null', host)
         self.assertIn("aws_security_group.minecraft_java[*].id", host)
         for template in ("tile", "tile_on_demand", "tile_pool"):
             self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
@@ -167,8 +169,9 @@ class HostTests(unittest.TestCase):
                 (dev / "vendor").write_text("0x10de\n")
                 (dev / "class").write_text("0x030200\n")
                 (pci / "drivers/vfio-pci" / name).symlink_to(dev)
+            limits_env = Path(temp) / "minecraft.env"
             script = (guard.replace("/usr/bin/curl", str(curl)).replace("/usr/sbin/nft", str(nft))
-                      .replace("/sys/bus/pci", str(pci)))
+                      .replace("/sys/bus/pci", str(pci)).replace("/etc/fcvm-fleet/minecraft.env", str(limits_env)))
             approved_prefix = "2001:db8:1:2:3::/80"
             agent_args = "--windows 4 --minecraft 4"
             cases = [(image, approved_prefix, agent_args, "8", "0", True),
@@ -181,10 +184,22 @@ class HostTests(unittest.TestCase):
                      (image, approved_prefix, "--minecraft 4", "8", "0", False),
                      (image, approved_prefix, agent_args, "7", "0", False),
                      (image, approved_prefix, agent_args, "8", "1", True)]
+            cases = [case + ("",) for case in cases]
+            # An image off the list opens only when its build said its servers carry the join limits
+            # (ejc3/fcvm#1915: MINECRAFT_JOIN_LIMITS=enforced in /etc/fcvm-fleet/minecraft.env), and
+            # still only with the layout checks.
+            unlisted = "ami-0ccccccccccccccc1"
+            enforced = "MINECRAFT_JOIN_LIMITS=enforced\n"
+            cases += [(unlisted, approved_prefix, agent_args, "8", "0", True, enforced),
+                      (unlisted, approved_prefix, agent_args, "8", "0", False, "MINECRAFT_JOIN_LIMITS=enforced # x\n"),
+                      (unlisted, approved_prefix, "--minecraft 4", "8", "0", False, enforced),
+                      (unlisted, "2001:db8:1:2::/64", agent_args, "8", "0", False, enforced),
+                      ("no-image", approved_prefix, agent_args, "8", "0", False, enforced)]
             allow = ("forward ip6 daddr { 2001:db8:1:2:3::e, 2001:db8:1:2:3::f, "
                      "2001:db8:1:2:3::10, 2001:db8:1:2:3::11 } tcp dport 25565 return")
-            for actual, prefix, args, gpu_count, status, forward_allowed in cases:
-                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status):
+            for actual, prefix, args, gpu_count, status, forward_allowed, limits in cases:
+                with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status, limits=limits):
+                    limits_env.write_text(limits)
                     result = subprocess.run(
                         ["/bin/bash", "-x", "-c", script, "--", approved_list, gpu_count, "4", "4"],
                         env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status,
