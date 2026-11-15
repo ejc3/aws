@@ -23,6 +23,7 @@ COLIN_PC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++R
 CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
 REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
 COLTON_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
+MINI_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYdgKiKL4C1d0sQT23eySkjw4xE9dTgmqpyIV7MQ7jY"
 
 
 def mac_map():
@@ -268,9 +269,9 @@ class MacSshClient(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    def test_the_map_pins_both_macs_and_colins_pc(self):
+    def test_the_map_pins_the_macs_the_mini_its_vms_and_colins_pc(self):
         macs = mac_map()
-        self.assertEqual(sorted(macs), ["colin-pc", "colton-mac", "mac"])
+        self.assertEqual(sorted(macs), ["ci-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
         self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
                                        "host_key_alias": "ejs-macbook-pro-via-fcvm",
                                        "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
@@ -281,6 +282,14 @@ class Wiring(unittest.TestCase):
         self.assertEqual(macs["colin-pc"], {"hostname": "colin-pc-ssh.cc-games.dev", "user": "colin",
                                             "host_key_alias": "colin-pc", "host_key": COLIN_PC_HOST_KEY, "make_key": True})
         self.assertIn('colin_pc_ssh_hostname = "colin-pc-ssh.cc-games.dev"', COLIN_PC)
+        self.assertEqual(macs["mini"], {"hostname": "mini-ssh.cc-games.dev", "user": "ejcampbell", "host_key_alias": "mini",
+                                        "host_key": MINI_HOST_KEY, "make_key": True})
+        self.assertIn('mini_ssh_hostname = "mini-ssh.cc-games.dev"', (ROOT / "mini-ssh.tf").read_text())
+        # The mini's VMs log in as the guest's admin, through their own SSH routes (mac-vms.tf: "<vm>-mac-ssh.cc-games.dev").
+        for vm in ("ci", "skevh"):
+            self.assertEqual({k: macs[f"{vm}-mac"][k] for k in ("hostname", "user", "host_key_alias", "make_key")},
+                             {"hostname": f"{vm}-mac-ssh.cc-games.dev", "user": "admin", "host_key_alias": f"{vm}-mac", "make_key": True})
+            self.assertRegex(macs[f"{vm}-mac"]["host_key"], r"^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$")
         self.assertIn('mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} '
                       '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n"])', SOURCE)
 
@@ -293,7 +302,9 @@ class Wiring(unittest.TestCase):
         self.assertEqual(snippet, "${local.pc_bootstrap_account}\nMAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
                                   "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
-                                  "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
+                                  "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=mini\nMAC_SECRET=mini-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=ci-mac\nMAC_SECRET=mac-vm-ci-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
 
     def test_a_daily_association_converges_the_running_fcvm_arm(self):
         assoc = SOURCE[SOURCE.index('resource "aws_ssm_association" "fcvm_mac_ssh_clients"'):]

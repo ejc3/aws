@@ -1368,7 +1368,7 @@ ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
 
 ### Machines outside AWS: never a key of theirs on `ubuntu`
 
-The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-pc`) is less
+The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh mini` and its VMs) is less
 trusted than the boxes: it may be compromised. So:
 
 - **No key of such a machine is authorized for `ubuntu`** (or any account an agent runs as) on a dev box, except the

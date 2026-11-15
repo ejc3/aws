@@ -8,6 +8,9 @@
 #   scripts/mac-ssh-connector-setup.sh colton-mac                       over the Mac's Cloudflare route (a re-run)
 #   scripts/mac-ssh-connector-setup.sh colton-mac --bootstrap-port 2224 over a temporary reverse tunnel the Mac keeps
 #                                                                       to fcvm-arm's 127.0.0.1:2224 (the first run)
+#   scripts/mac-ssh-connector-setup.sh mini --lan mini-lan              the Mac mini (mini-ssh.tf), from a Mac on its LAN
+#                                                                       with an Identity Center AdministratorAccess session:
+#                                                                       ssh mini-lan reaches the mini directly
 #
 # It reaches the Mac from fcvm-arm as `ssh <alias>` (mac-ssh-client.tf), which is fcvm-arm's own key and Host key pin;
 # --bootstrap-port only points that alias at 127.0.0.1:PORT with no proxy command, for the first run, when the
@@ -52,17 +55,21 @@ CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
-usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT]   (ALIAS: mac, colton-mac)" >&2; exit 2; }
+usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT | --lan SSH_DEST]   (ALIAS: mac, colton-mac, mini)" >&2; exit 2; }
 ALIAS=${1:-}
 shift || true
 BOOTSTRAP_PORT=""
+LAN=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --bootstrap-port) [ $# -ge 2 ] || usage; BOOTSTRAP_PORT=$2; shift 2 ;;
+    --lan) [ $# -ge 2 ] || usage; LAN=$2; shift 2 ;;
     *) usage ;;
   esac
 done
 [ -z "$BOOTSTRAP_PORT" ] || [[ $BOOTSTRAP_PORT =~ ^[0-9]{4,5}$ ]] || usage
+[ -z "$LAN" ] || [[ $LAN =~ ^[A-Za-z0-9][A-Za-z0-9.@_-]*$ ]] || usage
+[ -z "$LAN" ] || [ -z "$BOOTSTRAP_PORT" ] || usage
 
 # Per Mac: its connector-token secret, its clients (box:account) and the names of its connector's files, matching
 # macbook-ssh.tf / colton-mac-ssh.tf and mac-ssh-client.tf. The clients are exactly the accounts Terraform gives that
@@ -83,17 +90,49 @@ case "$ALIAS" in
     TOKEN_FILE=.cloudflared/colton-mac-ssh.token
     LOG_FILE=Library/Logs/colton-mac-ssh-cloudflared.log
     ;;
+  mini)
+    TUNNEL_SECRET=mini-ssh-tunnel-token
+    CLIENTS="fcvm:ubuntu nextjs:ejc3"
+    LABEL=com.ccgames.mini-ssh.cloudflared
+    TOKEN_FILE=.cloudflared/mini-ssh.token
+    LOG_FILE=Library/Logs/mini-ssh-cloudflared.log
+    ;;
+  # The Tart VMs on the mini (mac-vms.tf), set up INSIDE the guest through `tart exec` on the host, so --lan names the
+  # host. The guest's admin has passwordless sudo (the Cirrus Labs image), so step 2 needs nobody at the VM. One tunnel
+  # per VM serves both its routes (Screen Sharing and SSH).
+  ci-mac | skevh-mac)
+    VM=${ALIAS%-mac}
+    [ -n "$LAN" ] || { echo "$ALIAS is a VM on the mini: give --lan <the mini>" >&2; exit 2; }
+    TUNNEL_SECRET=mac-vm-$VM-tunnel-token
+    if [ "$VM" = ci ]; then CLIENTS="fcvm:ubuntu nextjs:ejc3"; else CLIENTS="nextjs:skevh"; fi
+    LABEL=com.ccgames.mac-vm-$VM.cloudflared
+    TOKEN_FILE=.cloudflared/mac-vm-$VM.token
+    LOG_FILE=Library/Logs/mac-vm-$VM-cloudflared.log
+    ;;
   *) usage ;;
 esac
-FCVM=$(fcvm_host)
+# fcvm-arm is needed only for a fcvm client's key (and the two-hop route); found on first use.
+FCVM=""
 
 MAC_SSH="$ALIAS"
 if [ -n "$BOOTSTRAP_PORT" ]; then
   MAC_SSH="-o ProxyCommand=none -o HostName=127.0.0.1 -o Port=$BOOTSTRAP_PORT $ALIAS"
 fi
-on_fcvm() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "$@"; }
-# Run something on the Mac: jumpbox -> fcvm-arm -> the Mac. stdin is passed through.
-on_mac() { on_fcvm "ssh -o BatchMode=yes -o ConnectTimeout=10 $MAC_SSH $*"; }
+on_fcvm() { [ -n "$FCVM" ] || FCVM=$(fcvm_host); ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "$@"; }
+# Run something on the Mac: jumpbox -> fcvm-arm -> the Mac, or with --lan straight to it. stdin is passed through. The
+# callers quote for the two-hop form, whose middle shell strips one level of quotes; `eval` strips the same level on
+# the one hop.
+if [ -n "${VM:-}" ]; then
+  # Inside the VM, as its admin: the host runs `tart exec -i` (stdin attached), the guest's bash does the eval.
+  on_mac() {
+    local cmd="eval $*"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "\$HOME/.local/bin/tart exec -i $VM /bin/bash -c $(printf '%q' "$cmd")"
+  }
+elif [ -n "$LAN" ]; then
+  on_mac() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "eval $*"; }
+else
+  on_mac() { on_fcvm "ssh -o BatchMode=yes -o ConnectTimeout=10 $MAC_SSH $*"; }
+fi
 
 # A client's public key as exactly `ssh-ed25519 <blob>`, or nothing. The text comes from another box, so it is refused
 # outright if it holds more than one line (extra keys, a line that ends the heredoc below, terminal escapes); only the
@@ -119,7 +158,7 @@ nextjs_key() {
     --query StandardOutputContent --output text
 }
 
-echo "1/6 reaching $ALIAS from fcvm-arm"
+echo "1/6 reaching $ALIAS ${LAN:+over the LAN as $LAN}${LAN:-from fcvm-arm}"
 [ "$(on_mac "'uname -sm'")" = "Darwin arm64" ] || { echo "$ALIAS is not reachable, or is not a macOS arm64 Mac" >&2; exit 1; }
 
 echo "2/6 Remote Login takes keys only"

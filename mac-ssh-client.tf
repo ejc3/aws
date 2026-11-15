@@ -10,6 +10,12 @@
 #                nextjs-dev, colton    colton-mac-ssh-access-nextjs-colton      nextjs-user-data.tf
 #                nextjs-dev, ejc3      colton-mac-ssh-access-nextjs-ejc3        nextjs-user-data.tf
 #   colin-pc     fcvm-arm, ubuntu      colin-pc-ssh-access-fcvm                 dev-user-data.tf (fcvm_mac_ssh_clients)
+#   mini         fcvm-arm, ubuntu      mini-ssh-access-fcvm                     dev-user-data.tf (fcvm_mac_ssh_clients)
+#                nextjs-ct, ejc3       mini-ssh-access-nextjs-ejc3              nextjs-ct-user-data.tf
+#   ci-mac       fcvm-arm, ubuntu      mac-vm-ci-ssh-access-fcvm                dev-user-data.tf (fcvm_mac_ssh_clients)
+#                nextjs-ct, ejc3       mac-vm-ci-ssh-access-nextjs-ejc3         nextjs-ct-user-data.tf
+#   skevh-mac    nextjs-ct, skevh      mac-vm-skevh-ssh-access-nextjs-skevh     nextjs-ct-user-data.tf
+# (mini is the Mac mini host, mini-ssh.tf; ci-mac and skevh-mac are the Tart VMs on it, mac-vms.tf.)
 #
 # The private key (~/.ssh/to-<alias>) never leaves its box. EJ's `to-mac` is never installed or made by anything: it
 # stays where the owner put it. For a Mac with make_key, the installer makes the account's key AS that account when it
@@ -32,6 +38,30 @@ locals {
       user           = "colton"
       host_key_alias = "colton-mac"
       host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
+      make_key       = true
+    }
+    # EJ's Mac mini, the host (mini-ssh.tf); its key read on the mini 2026-11-14.
+    mini = {
+      hostname       = "mini-ssh.cc-games.dev"
+      user           = "ejcampbell"
+      host_key_alias = "mini"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYdgKiKL4C1d0sQT23eySkjw4xE9dTgmqpyIV7MQ7jY"
+      make_key       = true
+    }
+    # The mini's VMs (mac-vms.tf): each guest's own /etc/ssh/ssh_host_ed25519_key.pub, read through `tart exec` on the
+    # mini. A VM rebuilt from the image has a new one.
+    ci-mac = {
+      hostname       = "ci-mac-ssh.cc-games.dev"
+      user           = "admin"
+      host_key_alias = "ci-mac"
+      host_key       = "@CI_MAC_HOST_KEY@"
+      make_key       = true
+    }
+    skevh-mac = {
+      hostname       = "skevh-mac-ssh.cc-games.dev"
+      user           = "admin"
+      host_key_alias = "skevh-mac"
+      host_key       = "@SKEVH_MAC_HOST_KEY@"
       make_key       = true
     }
     # Colin's Windows PC: OpenSSH Server's host key (C:\ProgramData\ssh\ssh_host_ed25519_key.pub, read on the PC).
@@ -247,7 +277,7 @@ else
 fi
 PCBOOT
 
-  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac` and `ssh colin-pc`, each with fcvm-arm's own service token, and the pcboot
+  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh mini` and `ssh ci-mac`, each with fcvm-arm's own service token, and the pcboot
   # account above. The arm setup script runs it at boot (dev-user-data.tf) and the association below runs it on the running
   # box, daily.
   fcvm_mac_ssh_clients = <<-FCVMMACS
@@ -262,6 +292,12 @@ MAC_SECRET=colton-mac-ssh-access-fcvm
 ${local.mac_ssh_client_setup}
 MAC_ALIAS=colin-pc
 MAC_SECRET=colin-pc-ssh-access-fcvm
+${local.mac_ssh_client_setup}
+MAC_ALIAS=mini
+MAC_SECRET=mini-ssh-access-fcvm
+${local.mac_ssh_client_setup}
+MAC_ALIAS=ci-mac
+MAC_SECRET=mac-vm-ci-ssh-access-fcvm
 ${local.mac_ssh_client_setup}
 FCVMMACS
 }
