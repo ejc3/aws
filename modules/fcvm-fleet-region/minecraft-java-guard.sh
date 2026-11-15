@@ -17,7 +17,11 @@
 #         rules, whole: connlimit (4 per source /64) and hashlimit (12/min, burst 6, per
 #         source /64), each rejecting with a TCP reset, and nothing else; and FORWARD's
 #         first rule is the jump to it for tcp dport 25565 (the agent inserts it first), so
-#         no earlier rule can return, accept or jump elsewhere for that traffic.
+#         no earlier rule can return, accept or jump elsewhere for that traffic. Podman's
+#         netavark inserts its own FORWARD jump at position 1 when the renderer containers
+#         start, after the agent: when that jump is the only rule ahead, the guard closes
+#         Java and moves the agent's jump back to position 1 before it checks again. It
+#         moves past nothing else.
 #       The agent owns the chain (ejc3/fcvm src/fleet/agent/joinguard.rs installs it at
 #       start, before any server); this only reads it, waiting up to
 #       FCVM_JAVA_GUARD_WAIT seconds (default 300) for it to appear. Java is IPv6 only:
@@ -141,13 +145,33 @@ if join != want:
     print("FCVM-MC-JOIN is not exactly the agent's connlimit (4 per source /64) and hashlimit (12/min, burst 6, "
           "per source /64) rules with a TCP reset")
 elif not forward or forward[0] != jump:
-    print("FORWARD's first rule is not the jump to FCVM-MC-JOIN for tcp dport 25565")
+    netavark = '-A FORWARD -m comment --comment "netavark firewall plugin rules" -j NETAVARK_FORWARD'
+    if jump in forward and forward[:forward.index(jump)] == [netavark]:
+        print("move: netavark's jump is ahead of the jump to FCVM-MC-JOIN")
+    else:
+        print("FORWARD's first rule is not the jump to FCVM-MC-JOIN for tcp dport 25565")
 PYTHON
+}
+
+# Put the agent's jump back at position 1, ahead of netavark's. Java is closed first, so
+# nothing reaches the servers on 25565 while the jump is briefly absent.
+move_jump_first() {
+  apply ""
+  /usr/sbin/ip6tables -D FORWARD -p tcp --dport 25565 -j FCVM-MC-JOIN &&
+    /usr/sbin/ip6tables -I FORWARD 1 -p tcp --dport 25565 -j FCVM-MC-JOIN
 }
 
 deadline=$(( $(date +%s) + ${FCVM_JAVA_GUARD_WAIT:-300} ))
 while :; do
   missing=$(limits_missing)
+  if [[ "$missing" == move:* ]] && [[ -z "${moved:-}" ]]; then
+    moved=1
+    if move_jump_first; then
+      say "moved the jump to FCVM-MC-JOIN ahead of netavark's"
+      continue
+    fi
+    missing="could not move the jump to FCVM-MC-JOIN ahead of netavark's"
+  fi
   if [[ -z "$missing" ]]; then
     apply "$destinations"
     say "opened 25565 to $destinations: the join limits are live"
