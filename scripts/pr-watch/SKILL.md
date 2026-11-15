@@ -107,8 +107,11 @@ to approve if it is safe; we have many code review agents"):
    SIGINT or SIGTERM, never SIGKILL: the wrapper turns either into Terraform's own cancel, which releases the state
    lock (a killed Terraform leaves it held for the next run). Remove the PR from `unapplied` only after an empty
    follow-up plan of everything: after a targeted apply, keep it there with `targeted` noted, and run one full plan
-   when nothing else is waiting or once a day (the state's `last_full_plan`), whichever comes first; an empty one
-   clears every `targeted` entry, and anything it shows is applied as any other change. A merge that
+   when nothing else is waiting or once a day (the state's `last_full_plan`), whichever comes first. From the
+   initialized fresh main worktree, run `bash scripts/publish-applied-status.sh` for that check. It plans everything
+   under both locks and publishes the result directly for dev boxes, even when this workflow runs outside a Claude
+   Stop hook. Exit 0 clears every `targeted` entry, exit 2 is pending, and exit 75 skips an ineligible or busy check;
+   neither a skipped nor a failed check clears anything. The private plan log path is printed. A merge that
    changed `scripts/pr-watch-install.sh` or `scripts/pr-watch/` also re-runs `scripts/pr-watch-install.sh --watcher`
    from that worktree before it is removed, so the running skill, hook and claim script are the merged ones. One Terraform
    run at a time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions

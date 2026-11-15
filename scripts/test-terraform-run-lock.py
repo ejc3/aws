@@ -301,11 +301,9 @@ class WiringTests(unittest.TestCase):
     def test_wrapper_never_adds_lock_false(self):
         self.assertNotIn("-lock=false", WRAPPER.read_text().split("set -u", 1)[1])
 
-    def test_hook_uses_the_wrapper_without_waiting_and_skips_on_75(self):
-        self.assertIn("TF_RUN_LOCK_NOWAIT=1 terraform plan", HOOK)
-        self.assertIn('if [ "$rc" -eq 75 ]; then', HOOK)
-        self.assertNotIn("aws-stop-hook-tfplan-", HOOK)  # one lock, the wrapper's
-        self.assertIn("pgrep -x 'terraform|terraform-provi'", HOOK)
+    def test_hook_delegates_publication_without_waiting(self):
+        self.assertIn("bash scripts/publish-applied-status.sh --if-idle", HOOK)
+        self.assertNotIn("terraform plan ", HOOK)
 
     def test_the_association_runs_daily_on_every_admin_box(self):
         self.assertIn('schedule_expression = "rate(1 day)"', TF)

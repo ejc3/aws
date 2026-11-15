@@ -4,9 +4,9 @@
 #
 # Dev boxes deliberately cannot read Terraform state or its lock table: state holds
 # credentials (the dev-hop private key, provider tokens) and these boxes run agents with
-# permission prompts disabled. Instead the jumpbox publishes what a full plan found, every
-# time the repo's Stop hook plans (.claude/hooks/verify-consistent.sh ->
-# scripts/publish-applied-status.sh), and only from a clean origin/main checkout:
+# permission prompts disabled. Instead scripts/publish-applied-status.sh runs a full
+# plan from an initialized, clean origin/main checkout on a jumpbox and publishes
+# what it found. The PR watcher and the repo's Stop hook use that command.
 #
 #   aws ssm get-parameter --region us-west-1 --name /infra/applied-status \
 #     --query Parameter.Value --output text

@@ -62,6 +62,13 @@ git commit -m "<what changed>"
 git push origin main
 ```
 
+After an apply, run `bash scripts/publish-applied-status.sh` from the initialized, clean
+`origin/main` worktree on a jumpbox to check all infrastructure and publish the result
+to `/infra/applied-status`. A targeted follow-up cannot mark all of main applied. The
+command returns Terraform's result (0 clean, 2 pending); 75 means no result was
+published because the check was ineligible or a lock was busy. It prints the path to its
+private diagnostic log.
+
 The jumpboxes already have Terraform, Git, the AWS CLI, this repository, and an EC2
 administrator instance role. There is no AWS login or credential-refresh step. The
 committed `.terraform.lock.hcl` keeps provider resolution identical across admin hosts;
