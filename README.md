@@ -1596,8 +1596,8 @@ Kept so the next machine goes faster.
   launchd agents are managed over SSH.
 - **The README was stale about the MacBook.** Its `ejc3` and `skevh` VMs no longer existed (`tart list` showed only
   `gww-ci`, plus `kidsports-ci` under `TART_HOME=/Volumes/Scratch/.tart-kidsports`); those two CI VMs come from
-  `ci-vm.sh` in dolphin-labs and kid-sports-highlights. The `ejc3` VM's routes in `mac-vms.tf` still exist with no VM
-  behind them.
+  `ci-vm.sh` in dolphin-labs and kid-sports-highlights. The `ejc3` VM's routes in `mac-vms.tf`, with no VM behind
+  them, were removed on 2026-11-15.
 - **Checking the change on a Mac.** Homebrew's Terraform is 1.5.7 and cannot parse this configuration (`ephemeral`,
   `removed`, `import` with `for_each`); 1.10.3 can, but the `ejc3/cloudflare` provider fork has no `darwin_arm64`
   build, so `terraform validate` runs only on Linux (CI's `drift.yml`). `scripts/test-mac-ssh-client.py` fails ten
