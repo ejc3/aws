@@ -802,15 +802,17 @@ class Publisher:
     def gate_evidence(event):
         evidence = event.get("evidence")
         if isinstance(evidence, dict) and evidence.get("kind") == "no_agent":
-            # The staging workflow read the coordinator's registered agents (ejc3/fcvm
-            # stage-smoke.py --agents) and found none of these hosts among them.
+            # The staging workflow read the coordinator's record of every host whose agent
+            # registered since `coordinator_since`, its start or resume (ejc3/fcvm
+            # stage-smoke.py --agents, /live fleet.agents), and found none of these hosts in it.
             hosts = evidence.get("hosts")
-            need(set(evidence) == {"kind", "hosts", "observed_at"}
+            need(set(evidence) == {"kind", "hosts", "observed_at", "coordinator_since"}
                  and isinstance(hosts, list) and 0 < len(hosts) <= 64
                  and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in hosts)
                  and len(set(hosts)) == len(hosts)
-                 and type(evidence["observed_at"]) is int and evidence["observed_at"] > 0,
-                 "a no-agent rollback names its hosts by digest and when the agents were read")
+                 and type(evidence["observed_at"]) is int and type(evidence["coordinator_since"]) is int
+                 and 0 < evidence["coordinator_since"] <= evidence["observed_at"],
+                 "a no-agent rollback names its hosts by digest, when the agents were read and since when")
             return evidence
         need(isinstance(evidence, dict) and set(evidence) == {"kind", "family", "hosts", "instances"}
              and evidence["kind"] == "image_failure" and evidence["family"] in ("v4", "v6"),
@@ -833,9 +835,12 @@ class Publisher:
             need("host" in placement["changed_kinds"], "the release's host image did not change")
             known = {digest("fcvm-release-gate\0" + instance): instance for instance in placement["release_hosts"]}
             need(set(evidence["hosts"]) == set(known), "a no-agent claim must name exactly the release's hosts")
-            observed = evidence["observed_at"] / 1000
-            need(all(observed - self.gate_host_boots[instance] >= self.GATE_NO_AGENT_SECONDS
-                     for instance in known.values()),
+            observed, since = evidence["observed_at"] / 1000, evidence["coordinator_since"] / 1000
+            boots = [self.gate_host_boots[instance] for instance in known.values()]
+            # The record began before each host launched, so it covers each host's whole life.
+            need(all(since <= boot for boot in boots),
+                 "the coordinator's registration record began after a release host launched")
+            need(all(observed - boot >= self.GATE_NO_AGENT_SECONDS for boot in boots),
                  "a release host was not up long enough for its agent to register")
             return
         if evidence is not None:

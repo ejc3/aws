@@ -2029,12 +2029,14 @@ class PublisherTests(unittest.TestCase):
         event = self.gate_event("rollback", evidence=evidence)
         self.assertEqual(self.publisher().gate(event)["status"], "rolled_back")
 
-    def no_agent_event(self, status, *, hosts=None, observed=None):
+    def no_agent_event(self, status, *, hosts=None, observed=None, since=None):
         hosts = status["placement"]["release_hosts"] if hosts is None else hosts
         observed = time.time() if observed is None else observed
+        # The coordinator has been up since well before the hosts launched (an hour by default).
+        since = observed - 3600 if since is None else since
         return self.gate_event("rollback", status=status, evidence={
             "kind": "no_agent", "hosts": sorted(MODULE.digest("fcvm-release-gate\0" + i) for i in hosts),
-            "observed_at": int(observed * 1000)})
+            "observed_at": int(observed * 1000), "coordinator_since": int(since * 1000)})
 
     def test_the_gate_rolls_back_a_release_whose_hosts_registered_no_agent(self):
         # A host image whose agent never starts gives the viewer smoke no tile to probe. The
@@ -2064,15 +2066,22 @@ class PublisherTests(unittest.TestCase):
                                          "not read just now"),
             "the observation is in the future": (dict(observed=now + MODULE.Publisher.GATE_CLOCK_SKEW_SECONDS + 120),
                                                  "not read just now"),
+            # A coordinator that restarted after the hosts launched has a record that does not
+            # cover their first minutes: their agents may have registered before it began.
+            "the record began after a host launched": (dict(since=now - 300), "record began after a release host"),
         }
         for label, (kwargs, reason) in cases.items():
             with self.subTest(label):
                 with self.assertRaisesRegex(MODULE.Refused, reason):
                     self.publisher().gate(self.no_agent_event(status, **kwargs))
-        for evidence in ({"kind": "no_agent", "hosts": [], "observed_at": int(now * 1000)},
-                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": "now"},
-                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": int(now * 1000), "family": "v4"},
-                         {"kind": "no_agent", "hosts": ["0" * 64, "0" * 64], "observed_at": int(now * 1000)}):
+        ms, since = int(now * 1000), int((now - 3600) * 1000)
+        for evidence in ({"kind": "no_agent", "hosts": [], "observed_at": ms, "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": "now", "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms, "coordinator_since": since,
+                          "family": "v4"},
+                         {"kind": "no_agent", "hosts": ["0" * 64, "0" * 64], "observed_at": ms, "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms, "coordinator_since": ms + 1}):
             with self.subTest(evidence=evidence):
                 with self.assertRaisesRegex(MODULE.Refused, "names its hosts by digest"):
                     self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
