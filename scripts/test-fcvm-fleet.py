@@ -304,21 +304,35 @@ exit 1
             shell = (textwrap.dedent(fallback).replace('/usr/local/bin/fcvm', str(fcvm))
                      .replace('/usr/bin/podman', str(podman))
                      .replace('/etc/fcvm-fleet/windows.env', str(windows_env))
-                     .replace('${var.minecraft_count}', '3'))
+                     .replace('${var.minecraft_count}', '3')
+                     .replace('${var.windows_count}', '2'))
             potato_image = 'localhost/fcvm-potato:fleet'
             minecraft_image = 'localhost/fcvm-minecraft:fleet'
             both_images = f'{potato_image} {minecraft_image}'
             both_flags = '--potato-players --minecraft --windows'
-            for name, before, images, help_text, suffix in (
-                ('factory host with both', '', both_images, both_flags, ' --potato-players 96 --minecraft 3'),
-                ('only Minecraft image', '', minecraft_image, both_flags, ' --minecraft 3'),
-                ('only potato flag', '', both_images, '--potato-players --minecraft-image --windows', ' --potato-players 96'),
-                ('neither image; legacy Windows config present', '', '', both_flags, ''),
-                ('old agent with both images', '', both_images, '--potato-image --minecraft-image --windows', ''),
-                ('help probe failure', '', both_images, 'fails', ''),
-                ('reviewed image keeps existing arguments once', ' --windows 4 --potato-players 96 --minecraft=3', both_images, both_flags, ''),
+            legacy = 'WINDOWS_AGENT_ARGS=--windows-image /legacy-image\n'
+            # The image's build writes this line only when its bridge refuses /still on the public
+            # ports (ejc3/fcvm#1839, fleet/ami/host/build.sh).
+            refusing = legacy + 'WINDOWS_BRIDGE_STILL=refused\n'
+            for name, before, images, help_text, suffix, windows in (
+                ('factory host whose bridge refuses /still', '', both_images, both_flags,
+                 ' --potato-players 96 --minecraft 3 --windows 2', refusing),
+                ('refusing bridge, old agent without --windows', '', both_images, '--potato-players --minecraft',
+                 ' --potato-players 96 --minecraft 3', refusing),
+                ('refusing bridge and no mode images', '', '', both_flags, ' --windows 2', refusing),
+                ('a marker with anything else on its line is not the marker', '', '', both_flags, '',
+                 legacy + 'WINDOWS_BRIDGE_STILL=refused # comment\n'),
+                ('reviewed Windows image is not given --windows twice', ' --windows 4', '', both_flags, '', refusing),
+                ('factory host with both', '', both_images, both_flags, ' --potato-players 96 --minecraft 3', legacy),
+                ('only Minecraft image', '', minecraft_image, both_flags, ' --minecraft 3', legacy),
+                ('only potato flag', '', both_images, '--potato-players --minecraft-image --windows', ' --potato-players 96', legacy),
+                ('neither image; legacy Windows config present', '', '', both_flags, '', legacy),
+                ('old agent with both images', '', both_images, '--potato-image --minecraft-image --windows', '', legacy),
+                ('help probe failure', '', both_images, 'fails', '', legacy),
+                ('reviewed image keeps existing arguments once', ' --windows 4 --potato-players 96 --minecraft=3', both_images, both_flags, '', legacy),
             ):
                 with self.subTest(name=name):
+                    windows_env.write_text(windows)
                     result = subprocess.run(
                         ['/bin/bash', '-eu', '-c', f"agent_args='--phones 2{before}'\n" + shell + '\nprintf "%s" "$agent_args"'],
                         env=dict(os.environ, IMAGES=images, HELP=help_text), capture_output=True, text=True, check=True, timeout=5,
