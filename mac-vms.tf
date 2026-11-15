@@ -1,9 +1,15 @@
-# macOS VMs on EJ's MacBook Pro, one per person, reachable through Cloudflare.
+# macOS VMs, each reachable through Cloudflare on its own tunnel.
 #
-# Each VM is a Tart clone of ghcr.io/cirruslabs/macos-tahoe-base on the MacBook. It signs
-# its own `admin` account in at boot, so it always has a desktop, and runs its OWN
-# cloudflared connector for its own tunnel -- nothing depends on the VM's NAT address,
-# and one VM's connector token cannot serve the other VM's hostnames.
+#   ejc3   EJ's MacBook Pro (route kept; the VM itself no longer exists there, checked 2026-11-14)
+#   skevh  Steve's, on the Mac mini (moved from the MacBook 2026-11-14)
+#   ci     CI's, on the Mac mini: GitHub Actions runners (scripts/mac-vm-setup.sh)
+#
+# A Mac runs at most two macOS VMs at once (Virtualization.framework's limit), so the mini is full with skevh and ci.
+#
+# Each VM is a Tart clone of ghcr.io/cirruslabs/macos-tahoe-base. It signs its own `admin`
+# account in at boot, so it always has a desktop, and runs its OWN cloudflared connector for
+# its own tunnel -- nothing depends on the VM's NAT address, and one VM's connector token
+# cannot serve the other VM's hostnames.
 #
 # Per VM, two TCP routes:
 #   <vm>-mac.cc-games.dev      -> the VM's Screen Sharing (localhost:5900)
@@ -14,24 +20,32 @@
 #   open vnc://localhost:5901                       # sign in as admin
 #   ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@<vm>-mac-ssh.cc-games.dev
 #
-# Who gets in:
-#   ejc3  -- EJ only (the browser-manager owner policy: Google or one-time PIN)
-#   skevh -- GitHub members of dolphin-labs-hq, like *.dolphin-labs.dev
+# Who gets in, in a browser or with cloudflared on a person's machine:
+#   ejc3, ci -- EJ only (the browser-manager owner policy: Google or one-time PIN)
+#   skevh    -- GitHub members of dolphin-labs-hq, like *.dolphin-labs.dev
+# and, on the SSH route only, the EC2 accounts in mac_vm_ssh_clients, each with its own service token (the colton-mac
+# pattern; their `ssh <vm>-mac` comes from mac-ssh-client.tf):
+#   ci     fcvm-arm ubuntu, nextjs-ct ejc3
+#   skevh  nextjs-ct skevh
 #
-# The VM itself (Tart install, image, launchd agents, in-VM connector, SSH keys, the
-# admin password, see below) is set up on the MacBook; see README "macOS VMs on the MacBook".
+# The VM itself is set up from a Mac on the host's LAN: the image, its launchd agent and the owner's keys by
+# scripts/mac-vm-setup.sh, the in-VM connector and the clients' keys by scripts/mac-ssh-connector-setup.sh <vm>-mac;
+# see README "The Mac mini". The admin password below is applied by hand (README).
 
 locals {
+  mac_vm_owner = {
+    policy_id = cloudflare_zero_trust_access_policy.browser_manager_owner.id
+    idps = concat(
+      cloudflare_zero_trust_access_identity_provider.google[*].id,
+      [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
+    )
+    auto_redirect = false
+  }
+
   mac_vms = merge(
     {
-      ejc3 = {
-        policy_id = cloudflare_zero_trust_access_policy.browser_manager_owner.id
-        idps = concat(
-          cloudflare_zero_trust_access_identity_provider.google[*].id,
-          [cloudflare_zero_trust_access_identity_provider.onetimepin.id],
-        )
-        auto_redirect = false
-      }
+      ejc3 = local.mac_vm_owner
+      ci   = local.mac_vm_owner
     },
     # skevh rides on the dolphin GitHub identity provider, so it exists only with that zone.
     local.dolphin_enabled ? {
@@ -45,10 +59,24 @@ locals {
 
   mac_vm_routes = merge([
     for vm, _ in local.mac_vms : {
-      "${vm}-vnc" = { vm = vm, hostname = "${vm}-mac.cc-games.dev", service = "tcp://localhost:5900" }
-      "${vm}-ssh" = { vm = vm, hostname = "${vm}-mac-ssh.cc-games.dev", service = "ssh://localhost:22" }
+      "${vm}-vnc" = { vm = vm, kind = "vnc", hostname = "${vm}-mac.cc-games.dev", service = "tcp://localhost:5900" }
+      "${vm}-ssh" = { vm = vm, kind = "ssh", hostname = "${vm}-mac-ssh.cc-games.dev", service = "ssh://localhost:22" }
     }
   ]...)
+
+  # EC2 accounts that may SSH into a VM: one service token and one secret each (JSON: client_id, client_secret, hostname).
+  # `box` says which role reads it: fcvm (dev-server-role, pinned to fcvm-arm's instance, in assume-constellation-terraform)
+  # or nextjs (nextjs-dev-role, mini-ssh.tf; members' sessions deny every token but their own, nextjs-ct-user-data.tf).
+  mac_vm_ssh_clients = merge(
+    {
+      ci-fcvm        = { vm = "ci", box = "fcvm", who = "fcvm-arm ubuntu" }
+      ci-nextjs-ejc3 = { vm = "ci", box = "nextjs", who = "nextjs ejc3" }
+    },
+    local.dolphin_enabled ? {
+      skevh-nextjs-skevh = { vm = "skevh", box = "nextjs", who = "nextjs skevh" }
+    } : {},
+  )
+  mac_vm_ssh_client_vms = toset([for c in values(local.mac_vm_ssh_clients) : c.vm])
 
   mac_vm_secret_readers = [
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root",
@@ -86,12 +114,45 @@ resource "cloudflare_zero_trust_access_application" "mac_vm" {
   allowed_idps              = local.mac_vms[each.value.vm].idps
   auto_redirect_to_identity = local.mac_vms[each.value.vm].auto_redirect
 
-  # The policy attachment MUST be declared here; see cc_games_dev in cloudflare.tf.
-  policies = [
-    {
-      id         = local.mac_vms[each.value.vm].policy_id
-      precedence = 1
-    },
+  # The policy attachment MUST be declared here; see cc_games_dev in cloudflare.tf. The EC2 clients' service tokens
+  # open the SSH route only, never Screen Sharing.
+  policies = concat(
+    [
+      {
+        id         = local.mac_vms[each.value.vm].policy_id
+        precedence = 1
+      },
+    ],
+    each.value.kind == "ssh" && contains(local.mac_vm_ssh_client_vms, each.value.vm) ? [
+      {
+        id         = cloudflare_zero_trust_access_policy.mac_vm_ssh_clients[each.value.vm].id
+        precedence = 2
+      },
+    ] : [],
+  )
+}
+
+resource "cloudflare_zero_trust_access_service_token" "mac_vm_ssh" {
+  for_each   = local.mac_vm_ssh_clients
+  account_id = var.cloudflare_account_id
+  name       = "mac-vm-${each.key}"
+  duration   = "8760h"
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# Per VM: its EC2 clients' service tokens, and no person.
+resource "cloudflare_zero_trust_access_policy" "mac_vm_ssh_clients" {
+  for_each = local.mac_vm_ssh_client_vms
+
+  account_id       = var.cloudflare_account_id
+  name             = "Mac VM ${each.key} SSH: clients' service tokens"
+  decision         = "non_identity"
+  session_duration = "12h"
+  include = [
+    for k in sort(keys(local.mac_vm_ssh_clients)) : { service_token = { token_id = cloudflare_zero_trust_access_service_token.mac_vm_ssh[k].id } }
+    if local.mac_vm_ssh_clients[k].vm == each.key
   ]
 }
 
@@ -219,6 +280,42 @@ resource "aws_secretsmanager_secret_policy" "mac_vm" {
   })
 }
 
+resource "aws_secretsmanager_secret" "mac_vm_ssh_access" {
+  for_each                = local.mac_vm_ssh_clients
+  name                    = "mac-vm-${each.value.vm}-ssh-access-${trimprefix(each.key, "${each.value.vm}-")}"
+  description             = "Cloudflare Access service token for ${each.value.who}'s SSH to the ${each.value.vm} Mac VM (JSON: client_id, client_secret, hostname)"
+  recovery_window_in_days = 30
+  tags                    = { Managed = "terraform", Name = "mac-vm-${each.value.vm}-ssh-access-${trimprefix(each.key, "${each.value.vm}-")}" }
+}
+
+resource "aws_secretsmanager_secret_version" "mac_vm_ssh_access" {
+  for_each  = local.mac_vm_ssh_clients
+  secret_id = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].id
+  secret_string = jsonencode({
+    client_id     = cloudflare_zero_trust_access_service_token.mac_vm_ssh[each.key].client_id
+    client_secret = cloudflare_zero_trust_access_service_token.mac_vm_ssh[each.key].client_secret
+    hostname      = "${each.value.vm}-mac-ssh.cc-games.dev"
+  })
+}
+
+resource "aws_secretsmanager_secret_policy" "mac_vm_ssh_access" {
+  for_each   = local.mac_vm_ssh_clients
+  secret_arn = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndItsClientCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
+      Condition = {
+        ArnNotLike = { "aws:PrincipalArn" = concat(local.mac_vm_secret_readers, [each.value.box == "fcvm" ? aws_iam_role.dev_server.arn : aws_iam_role.nextjs_dev.arn]) }
+      }
+    }]
+  })
+}
+
 output "mac_vms" {
   description = "Mac VM routes (no credentials)"
   value = {
@@ -227,6 +324,7 @@ output "mac_vms" {
       ssh_hostname       = "${vm}-mac-ssh.cc-games.dev"
       tunnel_secret_name = aws_secretsmanager_secret.mac_vm_tunnel[vm].name
       admin_secret_name  = aws_secretsmanager_secret.mac_vm_admin[vm].name
+      ssh_access_secrets = { for k, c in local.mac_vm_ssh_clients : k => aws_secretsmanager_secret.mac_vm_ssh_access[k].name if c.vm == vm }
     }
   }
 }

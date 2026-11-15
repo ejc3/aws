@@ -249,6 +249,16 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
       Resource = aws_secretsmanager_secret.fcvm_dns_test_token.arn
+      }, {
+      # fcvm-arm ubuntu's Cloudflare Access tokens for `ssh mini` and `ssh ci-mac` (mini-ssh.tf, mac-vms.tf), its instance only.
+      Sid    = "ReadTheMiniSshTokens"
+      Effect = "Allow"
+      Action = "secretsmanager:GetSecretValue"
+      Resource = concat(
+        [aws_secretsmanager_secret.mini_ssh_access["fcvm"].arn],
+        [for k, c in local.mac_vm_ssh_clients : aws_secretsmanager_secret.mac_vm_ssh_access[k].arn if c.box == "fcvm"],
+      )
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
     }]
   })
   tags = { Name = "assume-constellation-terraform", Managed = "terraform" }

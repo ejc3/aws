@@ -95,6 +95,9 @@ locals {
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:macbook-ssh-access-nextjs-ejc3-*"],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-ejc3-*"],
+        # The Mac mini and its CI VM (mini-ssh.tf, mac-vms.tf).
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mini-ssh-access-nextjs-ejc3-*"],
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mac-vm-ci-ssh-access-nextjs-ejc3-*"],
       )
     },
     {
@@ -229,6 +232,7 @@ locals {
   nextjs_ct_member_machine_tokens = {
     colton = "colton-mac-ssh-access-nextjs-colton"
     colin  = "colin-pc-ssh-access-nextjs-colin"
+    skevh  = "mac-vm-skevh-ssh-access-nextjs-skevh"
   }
   nextjs_ct_member_machine_ssh = { for u in local.nextjs_ct_member_users : u => [for s in [{
     Sid      = "MemberMachineTokensOwnOnly"
@@ -306,12 +310,19 @@ locals {
 
   # The Macs each account reaches, inside its own container only, the same as on nextjs-dev (mac-ssh-client.tf): alias
   # => that account's own Cloudflare Access service token, read through the container's own AWS session at connect
-  # time. `mac` (the MacBook) is ejc3's alone; `colton-mac` is colton's and ejc3's (owner, 2026-10-19). Every other
+  # time. `mac` (the MacBook) is ejc3's alone; `colton-mac` is colton's and ejc3's (owner, 2026-10-19); `mini` (the Mac
+  # mini) and `ci-mac` (its CI VM) are ejc3's, `skevh-mac` (Steve's VM on it) is skevh's (owner, 2026-11-14). Every other
   # member's session policy denies these tokens (above). No reverse tunnel and nothing listening on the box.
   nextjs_ct_mac_clients = {
-    ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }
+    ejc3 = {
+      mac        = "macbook-ssh-access-nextjs-ejc3"
+      colton-mac = "colton-mac-ssh-access-nextjs-ejc3"
+      mini       = "mini-ssh-access-nextjs-ejc3"
+      ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"
+    }
     colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }
     colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }
+    skevh  = { skevh-mac = "mac-vm-skevh-ssh-access-nextjs-skevh" }
   }
   # Run as root in the container by provision, once per alias: mac-ssh.sh <account> <alias> <secret>.
   nextjs_ct_mac_ssh = <<-MACSSH
