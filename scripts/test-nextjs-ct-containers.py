@@ -637,7 +637,8 @@ class HostAccountTests(unittest.TestCase):
 
 class MacTests(unittest.TestCase):
     """Each account's container reaches its Macs the way every box does (owner, 2026-10-18: "cloudflare only"):
-    `mac` for ejc3 alone, `colton-mac` for colton and ejc3 (2026-10-19), each with that account's own token."""
+    `mac` for ejc3 alone, `colton-mac` for colton and ejc3 (2026-10-19), `mini` and `ci-mac` for ejc3 and `skevh-mac` for
+    skevh (2026-11-14), each with that account's own token."""
 
     def test_the_shared_cloudflare_client_runs_per_alias_with_the_accounts_own_token(self):
         body = TF.split("nextjs_ct_mac_ssh = <<-MACSSH\n", 1)[1].split("\nMACSSH\n", 1)[0]
@@ -645,10 +646,17 @@ class MacTests(unittest.TestCase):
             self.assertIn(line, body)
         self.assertLess(body.index("${local.mac_cloudflared_install}"), body.index("${local.mac_ssh_client_setup}"))
         clients = TF.split("nextjs_ct_mac_clients = {", 1)[1].split("\n  }\n", 1)[0]
-        self.assertIn('ejc3   = { mac = "macbook-ssh-access-nextjs-ejc3", colton-mac = "colton-mac-ssh-access-nextjs-ejc3" }', clients)
+        self.assertIn('    ejc3 = {\n'
+                      '      mac        = "macbook-ssh-access-nextjs-ejc3"\n'
+                      '      colton-mac = "colton-mac-ssh-access-nextjs-ejc3"\n'
+                      '      mini       = "mini-ssh-access-nextjs-ejc3"\n'
+                      '      ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"\n'
+                      '    }\n', clients)
         self.assertIn('colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }', clients)
         self.assertIn('colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }', clients)
-        self.assertEqual(clients.count(" = {"), 3)  # nobody else
+        # Steve's VM on the Mac mini (mac-vms.tf), his own token only.
+        self.assertIn('skevh  = { skevh-mac = "mac-vm-skevh-ssh-access-nextjs-skevh" }', clients)
+        self.assertEqual(clients.count(" = {"), 4)  # nobody else
         self.assertIn("macs       = lookup(local.nextjs_ct_mac_clients, u, {})", TF)
         self.assertNotIn("macbook-ssh.sh", TF + (CT / "provision").read_text())
         snippet = TF.split("nextjs_ct_mac_ssh = <<-MACSSH", 1)[1].split("\nMACSSH", 1)[0]
