@@ -1399,7 +1399,11 @@ case "$1" in
     [[ "$4" == %72 ]] || exit 1
     if [[ "$5" == '#{pane_pid}' ]]; then
       touch "$RC_RECHECK"
-      if [[ "$RC_SCREEN" == ended ]]; then echo 1; else echo "$RC_PANE_PID"; fi
+      if [[ "$RC_SCREEN" == ended || ( "$RC_SCREEN" == after_moved && "$count" -ge 4 ) ]]; then
+        echo 1
+      else
+        echo "$RC_PANE_PID"
+      fi
     else
       echo /example/repo
     fi
@@ -1429,7 +1433,22 @@ case "$1" in
           connected) echo "Remote Control is connected" ;;
         esac
         ;;
-      1) echo "Disconnect this session" ;;
+      1)
+        [[ "$RC_SCREEN" == old_disconnect ]] && echo "Remote Control disconnected."
+        echo "Disconnect this session"
+        ;;
+      4)
+        [[ "$RC_SCREEN" != no_disconnect ]] && echo "Remote Control disconnected."
+        case "$RC_SCREEN" in
+          after_busy) echo "Esc to interrupt" ;;
+          after_upstream) echo "Session creation failed" ;;
+          after_api_error) echo "API Error: 503" ;;
+        esac
+        echo '────────────────'
+        if [[ "$RC_SCREEN" == after_draft ]]; then echo '❯ do not submit me'; else echo '❯'; fi
+        echo '────────────────'
+        [[ "$RC_SCREEN" == after_recovery ]] && echo '  ? for shortcuts · /rc'
+        ;;
       *) echo "Enable Remote Control" ;;
     esac
     ;;
@@ -1511,6 +1530,22 @@ wait "$child"
             with self.subTest(screen=screen):
                 self.assertIn("has no idle stale prompt", self.check_watchdog(pane, screen))
                 self.assertFalse(self.log.read_text())
+
+    def test_second_command_requires_a_new_disconnect_and_same_idle_pane(self):
+        pane = self.process_tree("2.1.325", native=True)
+        for screen in ("after_draft", "after_busy", "after_recovery", "after_upstream",
+                       "after_api_error", "after_moved", "no_disconnect", "old_disconnect"):
+            with self.subTest(screen=screen):
+                for stamp in (self.root / "state").glob("*"):
+                    stamp.unlink()
+                self.log.write_text("")
+                self.assertIn("did not return to the idle disconnected prompt", self.check_watchdog(pane, screen))
+                self.assertEqual(self.log.read_text().splitlines(), [
+                    "send-keys -t %72 /remote-control Enter",
+                    "send-keys -t %72 Up",
+                    "send-keys -t %72 Up",
+                    "send-keys -t %72 Enter",
+                ])
 
     def test_legacy_claude_process_is_still_recognized(self):
         pane = self.process_tree("claude", native=False)
