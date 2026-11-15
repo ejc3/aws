@@ -277,10 +277,25 @@ locals {
     cat > /usr/local/libexec/fcvm-minecraft-java-guard <<'MINECRAFT_GUARD'
     ${file("${path.module}/minecraft-java-guard.sh")}
     MINECRAFT_GUARD
+    # Closed before every agent start. Opened by its own unit once the agent (the one owner of
+    # the FCVM-MC-JOIN rules) has installed them and the guard has read them back live.
     cat > /etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf <<'MINECRAFT_UNIT'
     [Service]
-    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard ${join(",", var.minecraft_java_access.host_amis)} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard close
+    ExecStartPost=/bin/systemctl --no-block restart fcvm-minecraft-java-open.service
     MINECRAFT_UNIT
+    cat > /etc/systemd/system/fcvm-minecraft-java-open.service <<'MINECRAFT_OPEN'
+    [Unit]
+    Description=Open Minecraft Java joins once the agent's join limits are live
+    After=fcvm-fleet-agent.service
+    PartOf=fcvm-fleet-agent.service
+    [Service]
+    Type=oneshot
+    EnvironmentFile=/etc/fcvm-fleet/agent.env
+    EnvironmentFile=-/etc/fcvm-fleet/windows.env
+    TimeoutStartSec=420
+    ExecStart=/usr/local/libexec/fcvm-minecraft-java-guard open ${join(",", var.minecraft_java_access.host_amis)} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    MINECRAFT_OPEN
     systemctl daemon-reload
     %{endif~}
     agent_args='${var.host_agent_args}'
@@ -314,23 +329,34 @@ locals {
     %{~if var.ami_release_parameter_arn != ""~}
     # The factory publisher can change ImageId while retaining this bootstrap.
     # An unlisted image can run a mode only if it has both that mode's image in
-    # root's Podman store and the flag in its installed agent. Windows remains
-    # allowlisted above: the presence of its assets does not prove /still is safe.
+    # root's Podman store and the flag in its installed agent. Windows needs more
+    # than its assets, whose presence does not prove /still is safe: the line the
+    # image's build writes into windows.env only when its bridge refuses /still on
+    # the public ports (ejc3/fcvm#1839, fleet/ami/host/build.sh). An image from
+    # before that cannot carry it.
     have_mode_artifact() {
       case " $agent_args " in *" $1 "*|*" $1="*) return 1 ;; esac
       /usr/bin/timeout -k 1 10 /usr/bin/podman image exists "$2" 2>/dev/null
     }
     potato_present=false
     minecraft_present=false
+    windows_present=false
     if have_mode_artifact --potato-players localhost/fcvm-potato:fleet; then potato_present=true; fi
     if have_mode_artifact --minecraft localhost/fcvm-minecraft:fleet; then minecraft_present=true; fi
-    if { "$potato_present" || "$minecraft_present"; } &&
+    case " $agent_args " in
+      *" --windows "*|*" --windows="*) ;;
+      *) if /usr/bin/grep -qx 'WINDOWS_BRIDGE_STILL=refused' /etc/fcvm-fleet/windows.env 2>/dev/null; then windows_present=true; fi ;;
+    esac
+    if { "$potato_present" || "$minecraft_present" || "$windows_present"; } &&
       mode_help=$(/usr/bin/timeout -k 1 10 /usr/local/bin/fcvm fleet agent --help 2>/dev/null); then
       if "$potato_present" && grep -Eq -- '^[[:space:]]+--potato-players([[:space:]=]|$)' <<< "$mode_help"; then
         agent_args="$agent_args --potato-players 96"
       fi
       if "$minecraft_present" && grep -Eq -- '^[[:space:]]+--minecraft([[:space:]=]|$)' <<< "$mode_help"; then
         agent_args="$agent_args --minecraft ${var.minecraft_count}"
+      fi
+      if "$windows_present" && grep -Eq -- '^[[:space:]]+--windows([[:space:]=]|$)' <<< "$mode_help"; then
+        agent_args="$agent_args --windows ${var.windows_count}"
       fi
     fi
     %{endif~}
@@ -497,10 +523,10 @@ resource "aws_launch_template" "host" {
 
   network_interfaces {
     device_index = 0
-    # New Terraform defaults attach the extra group only to the reviewed
-    # image. Image-only publisher copies retain the bootstrap gate as well.
+    # Every Virginia host gets the Java group; the boot guard opens 25565 only
+    # on a listed image or one whose build says it carries the join limits.
     security_groups = concat([aws_security_group.fleet.id],
-      each.key == "x86_64" && contains(try(var.minecraft_java_access.host_amis, []), var.gpu_amis[each.key])
+      each.key == "x86_64" && var.minecraft_java_access != null
       ? aws_security_group.minecraft_java[*].id : []
     )
     associate_public_ip_address = true
