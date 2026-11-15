@@ -66,14 +66,14 @@ locals {
 
   # EC2 accounts that may SSH into a VM: one service token and one secret each (JSON: client_id, client_secret, hostname).
   # `box` says which role reads it: fcvm (dev-server-role, pinned to fcvm-arm's instance, in assume-constellation-terraform)
-  # or nextjs (nextjs-dev-role, mini-ssh.tf; members' sessions deny every token but their own, nextjs-ct-user-data.tf).
+  # or nextjs (each account's exact nextjs-dev-role session, mini-ssh.tf).
   mac_vm_ssh_clients = merge(
     {
-      ci-fcvm        = { vm = "ci", box = "fcvm", who = "fcvm-arm ubuntu" }
-      ci-nextjs-ejc3 = { vm = "ci", box = "nextjs", who = "nextjs ejc3" }
+      ci-fcvm        = { vm = "ci", box = "fcvm", who = "fcvm-arm ubuntu", nextjs_user = null }
+      ci-nextjs-ejc3 = { vm = "ci", box = "nextjs", who = "nextjs ejc3", nextjs_user = "ejc3" }
     },
     local.dolphin_enabled ? {
-      skevh-nextjs-skevh = { vm = "skevh", box = "nextjs", who = "nextjs skevh" }
+      skevh-nextjs-skevh = { vm = "skevh", box = "nextjs", who = "nextjs skevh", nextjs_user = "skevh" }
     } : {},
   )
   mac_vm_ssh_client_vms = toset([for c in values(local.mac_vm_ssh_clients) : c.vm])
@@ -296,6 +296,9 @@ resource "aws_secretsmanager_secret_version" "mac_vm_ssh_access" {
     client_secret = cloudflare_zero_trust_access_service_token.mac_vm_ssh[each.key].client_secret
     hostname      = "${each.value.vm}-mac-ssh.cc-games.dev"
   })
+
+  # Publish credentials only after the secret has its read boundary.
+  depends_on = [aws_secretsmanager_secret_policy.mac_vm_ssh_access]
 }
 
 resource "aws_secretsmanager_secret_policy" "mac_vm_ssh_access" {
@@ -303,16 +306,25 @@ resource "aws_secretsmanager_secret_policy" "mac_vm_ssh_access" {
   secret_arn = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "OnlyAdministrationAndItsClientCanRead"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
-      Condition = {
-        ArnNotLike = { "aws:PrincipalArn" = concat(local.mac_vm_secret_readers, [each.value.box == "fcvm" ? aws_iam_role.dev_server.arn : aws_iam_role.nextjs_dev.arn]) }
-      }
-    }]
+    Statement = concat(
+      [{
+        Sid       = "OnlyAdministrationAndItsClientCanRead"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
+        Condition = {
+          ArnNotLike = { "aws:PrincipalArn" = concat(local.mac_vm_secret_readers, [each.value.box == "fcvm" ? aws_iam_role.dev_server.arn : aws_iam_role.nextjs_dev.arn]) }
+        }
+      }],
+      [for user in [each.value.nextjs_user] : merge(local.nextjs_mac_ssh_deny_wrong_session, {
+        Resource = aws_secretsmanager_secret.mac_vm_ssh_access[each.key].arn
+        Condition = {
+          ArnEquals       = { "aws:PrincipalArn" = aws_iam_role.nextjs_dev.arn }
+          StringNotEquals = { "aws:userid" = "${local.nextjs_mac_ssh_userid_prefix}${user}" }
+        }
+      }) if user != null],
+    )
   })
 }
 

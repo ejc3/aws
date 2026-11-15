@@ -8,7 +8,7 @@
 # one per client account, each in its own secret, plus EJ in a browser through the browser-manager owner policy.
 #
 #   fcvm-arm, ubuntu       mini-ssh-access-fcvm           (fcvm-arm's instance only)
-#   nextjs-ct, ejc3        mini-ssh-access-nextjs-ejc3    (nextjs-dev-role; every member container's session denies it)
+#   nextjs-ct, ejc3        mini-ssh-access-nextjs-ejc3    (nextjs-dev-role's ct-ejc3 session only)
 #
 # The mini also hosts two Tart macOS VMs, Steve's (`skevh`) and CI's (`ci`), each with its own tunnel (mac-vms.tf). The
 # mini's Remote Login reaches the host account, and from there `tart exec` reaches inside either VM: holding `ssh mini`
@@ -23,10 +23,22 @@ locals {
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/*/AWSReservedSSO_AdministratorAccess_*",
     "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-reserved/sso.amazonaws.com/AWSReservedSSO_AdministratorAccess_*",
   ]
-  # One service token and one secret per client account. `reader` is the one role besides administration that may read it.
+  # One service token per client. On Next.js the role is shared, so bind each grant to the account's IMDS session.
   mini_ssh_clients = {
-    fcvm        = { token_name = "mini-ssh-fcvm-arm", secret = "mini-ssh-access-fcvm", reader = aws_iam_role.dev_server.arn, who = "fcvm-arm ubuntu" }
-    nextjs-ejc3 = { token_name = "mini-ssh-nextjs-ejc3", secret = "mini-ssh-access-nextjs-ejc3", reader = aws_iam_role.nextjs_dev.arn, who = "nextjs ejc3" }
+    fcvm        = { token_name = "mini-ssh-fcvm-arm", secret = "mini-ssh-access-fcvm", reader = aws_iam_role.dev_server.arn, who = "fcvm-arm ubuntu", nextjs_user = null }
+    nextjs-ejc3 = { token_name = "mini-ssh-nextjs-ejc3", secret = "mini-ssh-access-nextjs-ejc3", reader = aws_iam_role.nextjs_dev.arn, who = "nextjs ejc3", nextjs_user = "ejc3" }
+  }
+  nextjs_mac_ssh_secrets = concat(
+    [for k, c in local.mini_ssh_clients : { arn = aws_secretsmanager_secret.mini_ssh_access[k].arn, user = c.nextjs_user } if c.nextjs_user != null],
+    [for k, c in local.mac_vm_ssh_clients : { arn = aws_secretsmanager_secret.mac_vm_ssh_access[k].arn, user = c.nextjs_user } if c.nextjs_user != null],
+  )
+  # The host IMDS broker assigns ct-<user> from the container's gateway; container sessions cannot re-assume the role.
+  nextjs_mac_ssh_userid_prefix = "${aws_iam_role.nextjs_dev.unique_id}:ct-"
+  nextjs_mac_ssh_deny_wrong_session = {
+    Sid       = "DenyOtherNextjsSessions"
+    Effect    = "Deny"
+    Principal = "*"
+    Action    = "secretsmanager:GetSecretValue"
   }
 }
 
@@ -168,6 +180,9 @@ resource "aws_secretsmanager_secret_version" "mini_ssh_access" {
     client_secret = cloudflare_zero_trust_access_service_token.mini_ssh[each.key].client_secret
     hostname      = local.mini_ssh_hostname
   })
+
+  # Publish credentials only after the secret has its read boundary.
+  depends_on = [aws_secretsmanager_secret_policy.mini_ssh_access]
 }
 
 resource "aws_secretsmanager_secret_policy" "mini_ssh_access" {
@@ -175,35 +190,43 @@ resource "aws_secretsmanager_secret_policy" "mini_ssh_access" {
   secret_arn = aws_secretsmanager_secret.mini_ssh_access[each.key].arn
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "OnlyAdministrationAndItsClientCanRead"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.mini_ssh_access[each.key].arn
-      Condition = {
-        ArnNotLike = { "aws:PrincipalArn" = concat(local.mini_ssh_admins, [each.value.reader]) }
-      }
-    }]
+    Statement = concat(
+      [{
+        Sid       = "OnlyAdministrationAndItsClientCanRead"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.mini_ssh_access[each.key].arn
+        Condition = {
+          ArnNotLike = { "aws:PrincipalArn" = concat(local.mini_ssh_admins, [each.value.reader]) }
+        }
+      }],
+      [for user in [each.value.nextjs_user] : merge(local.nextjs_mac_ssh_deny_wrong_session, {
+        Resource = aws_secretsmanager_secret.mini_ssh_access[each.key].arn
+        Condition = {
+          ArnEquals       = { "aws:PrincipalArn" = aws_iam_role.nextjs_dev.arn }
+          StringNotEquals = { "aws:userid" = "${local.nextjs_mac_ssh_userid_prefix}${user}" }
+        }
+      }) if user != null],
+    )
   })
 }
 
 # fcvm-arm's read of its token is a statement in assume-constellation-terraform (constellation-account.tf): dev-server-role's
-# inline policies are at IAM's 10,240-character total. nextjs-dev-role's is here; members' sessions deny it
-# (nextjs-ct-user-data.tf, OwnerOnlySecrets).
+# inline policies are at IAM's 10,240-character total. Bind the Next.js role's new allows to their exact sessions;
+# older sessions may not carry the newer secret denials from nextjs-ct-user-data.tf.
 resource "aws_iam_role_policy" "nextjs_dev_mini_ssh" {
   name = "read-mini-ssh"
   role = aws_iam_role.nextjs_dev.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect = "Allow"
-      Action = "secretsmanager:GetSecretValue"
-      # Its own token for the mini, and the nextjs accounts' tokens for the mini's VMs (mac-vms.tf).
-      Resource = concat(
-        [aws_secretsmanager_secret.mini_ssh_access["nextjs-ejc3"].arn],
-        [for k, c in local.mac_vm_ssh_clients : aws_secretsmanager_secret.mac_vm_ssh_access[k].arn if c.box == "nextjs"],
-      )
+    Statement = [for s in local.nextjs_mac_ssh_secrets : {
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = s.arn
+      Condition = {
+        StringEquals = { "aws:userid" = "${local.nextjs_mac_ssh_userid_prefix}${s.user}" }
+      }
     }]
   })
 }
