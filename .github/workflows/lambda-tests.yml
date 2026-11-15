@@ -212,6 +212,8 @@ jobs:
         run: python3 -S -B scripts/test-nextjs-ct.py
       - name: Containerized nextjs box, container layer (offline)
         run: python3 -S -B scripts/test-nextjs-ct-containers.py
+      - name: Next.js memory history attribution and retention
+        run: python3 -S -B scripts/test-nextjs-memory-history.py
       - name: Next.js disk-pressure worktree cleanup (offline)
         run: |
           python3 -S -B scripts/test-nextjs-worktree-prune-host.py

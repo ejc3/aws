@@ -2015,6 +2015,16 @@ upstream default branch or a verified GitHub merge of the exact worktree head.
 dedicated SSM association installs the timer without rerunning Next.js setup
 or starting cleanup during installation.
 
+**Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
+every 30 seconds. The recorder keeps bounded, root-only files in
+`/var/log/nextjs-memory`, on the host's EBS volume. These put memory, swap and
+pressure alongside container cgroup usage and the largest processes. They
+record process names and counters; they do not read command lines, environment
+variables or process contents. Inspect the files after an incident to see which
+workloads were growing before the box became unreachable. The separate SSM
+association follows replacement hosts and installs only the recorder and its
+timer. It does not rerun Next.js provisioning or restart any existing service.
+
 **The zone follows the account, not a flag.** `colton` and `connor` publish to
 `https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.
 `/usr/local/bin/ndev-zone` is the single source of truth for user -> zone -> tunnel, and
