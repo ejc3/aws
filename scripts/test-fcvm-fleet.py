@@ -218,7 +218,8 @@ class HostTests(unittest.TestCase):
         legacy_windows = ("ami-0bbbbbbbbbbbbbbb", "ami-0eeeeeeeeeeeeeee")  # 853eb034 and 0e910245
         self.assertEqual(re.search(r'windows_host_amis\s*=\s*(.+)', east)[1],
                          'concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids, '
-                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids)')
+                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids, '
+                         '["ami-089b83ada9f380d5e"])')
         # Legacy copies still carry Minecraft and potato, but the widened public ports
         # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)
