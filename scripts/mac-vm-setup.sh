@@ -236,8 +236,14 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
   set -e
   mkdir -p ~/runners && cd ~/runners
   tarball=actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
-  [ -f \$tarball ] || curl -fsSLo \$tarball https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/\$tarball
-  echo '$RUNNER_SHA256  '\$tarball | shasum -a 256 -c - >/dev/null
+  # Kept only once its checksum matches: a cut-off or wrong download is never the file a re-run finds.
+  ok() { echo '$RUNNER_SHA256  '\$1 | shasum -a 256 -c - >/dev/null 2>&1; }
+  if ! ok \$tarball; then
+    rm -f \$tarball \$tarball.part
+    curl -fsSLo \$tarball.part https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/\$tarball
+    ok \$tarball.part || { rm -f \$tarball.part; echo \"runner \$tarball did not match its pinned sha256\" >&2; exit 1; }
+    mv -f \$tarball.part \$tarball
+  fi
 ")"
 for i in $(seq 1 "$CI_COUNT"); do
   name="mini-$i"
