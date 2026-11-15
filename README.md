@@ -1534,15 +1534,18 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
 unlock once.
 
-**The CI VM's runners** (`scripts/mac-vm-setup.sh ci --lan mini-lan --runners`): GitHub Actions runners for every
-private repository whose jobs ask for a self-hosted macOS runner, named `mini-<repo>-<n>`, labelled with the job's
-label and `mini`: dolphin-labs (`gww-ios`, 2), dolphin-films (`gww-ios`, 1) and kid-sports-highlights
-(`kidsports-ios`, 2). The VM is provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the
-build tools, a signing keychain), run on the mini. The MacBook's `gww-ci` and `kidsports-ci` VMs still serve the same
-labels; GitHub gives a job to whichever is idle.
+**The CI VM's runners** (`scripts/mac-vm-setup.sh ci --lan mini-lan --runners`): one pool of four GitHub Actions
+runners at the `dolphin-labs-hq` organization (owner, 2026-11-14), named `mini-<n>` and labelled `gww-ios`,
+`kidsports-ios` and `mini`, so any idle one takes a self-hosted macOS job from dolphin-labs, dolphin-films or
+kid-sports-highlights. They are in the org's Default runner group, which serves private repositories only. The VM is
+provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
+run on the mini. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the MacBook's
+`gww-ci` and `kidsports-ci` VMs serve the same labels, jobs split between the two Macs; a job that must build on the
+mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`).
 
 **Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (the mini's LAN address, key `~/.ssh/to-mini`),
-an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an admin of the repositories:
+an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an org admin of dolphin-labs-hq
+(`admin:org` scope):
 
 ```bash
 scripts/mac-vm-setup.sh skevh --lan mini-lan                  # prints the guest's host key: pin it in mac-ssh-client.tf

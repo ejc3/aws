@@ -8,11 +8,12 @@
 #   scripts/mac-vm-setup.sh ci    --lan mini-lan --runners    then: Xcode and the build tools in ci, and its runners
 #
 # --runners (ci only) runs dolphin-labs' own apps/native/scripts/ci-vm.sh `provision` on the mini against ci (Xcode
-# copied in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers
-# GitHub Actions runners in the VM for every private repository whose jobs ask for a self-hosted macOS runner
-# (CI_RUNNERS below), each named mini-<repo>-<n> and labelled with the job's label and `mini`. Registration tokens are
-# minted with this Mac's gh login (an admin of each repository) and reach the VM on stdin only. A runner already
-# registered is left alone.
+# copied in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
+# pool of GitHub Actions runners in the VM at the dolphin-labs-hq ORGANIZATION (owner, 2026-11-14), so any idle one
+# takes any repository's job: named mini-<n>, labelled with every label those repositories' macOS jobs ask for
+# (CI_LABELS below) and `mini`. They join the org's Default runner group, which serves private repositories only.
+# Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
+# and reach the VM on stdin only. A runner already registered is left alone.
 #
 # On the mini (ssh <mini>), as its login user, with Tart at ~/.local/bin/tart (README "The Mac mini"):
 #   * clones the VM from the base image pinned below, by digest, and sizes it (ci 9 cores / 36 GB / 200 GB disk, skevh
@@ -29,10 +30,13 @@ set -euo pipefail
 BASE=ghcr.io/cirruslabs/macos-tahoe-base@sha256:1b093499716409d29e8b5336844528e1cae375db97d2ad8e5aeff78cf0da201e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-# The ci VM's runners: repository, the label its jobs ask for, how many. All private (self-hosted runners must never
-# serve a public repository's pull requests). The MacBook's own gww-ci and kidsports-ci VMs serve the first and last
-# too; GitHub gives a job to whichever matching runner is idle.
-CI_RUNNERS="dolphin-labs-hq/dolphin-labs:gww-ios:2 dolphin-labs-hq/dolphin-films:gww-ios:1 dolphin-labs-hq/kid-sports-highlights:kidsports-ios:2"
+# The ci VM's org-wide pool. The labels are what the org's private repositories' self-hosted macOS jobs ask for:
+# gww-ios (dolphin-labs, dolphin-films) and kidsports-ios (kid-sports-highlights). Four at once is what 9 cores and
+# 36 GB hold for Xcode builds. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the
+# MacBook's gww-ci and kidsports-ci VMs serve the same labels, jobs split between the two Macs.
+CI_ORG=dolphin-labs-hq
+CI_LABELS=gww-ios,kidsports-ios
+CI_COUNT=4
 # The runner, pinned: dolphin-labs' ci-vm.sh's version and the SHA-256 GitHub publishes for it.
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
@@ -175,26 +179,22 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
   [ -f \$tarball ] || curl -fsSLo \$tarball https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/\$tarball
   echo '$RUNNER_SHA256  '\$tarball | shasum -a 256 -c - >/dev/null
 ")"
-for entry in $CI_RUNNERS; do
-  IFS=: read -r repo label count <<<"$entry"
-  short=${repo#*/}
-  for i in $(seq 1 "$count"); do
-    name="mini-$short-$i"
-    if on_host "\$HOME/.local/bin/tart exec $VM test -f /Users/admin/runners/$name/.runner"; then
-      echo "   $name: already registered"
-      continue
-    fi
-    # A token per runner (they last an hour), on stdin end to end: gh -> ssh -> tart exec -> config.sh.
-    gh api -X POST "repos/$repo/actions/runners/registration-token" --jq .token |
-      on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
-        set -e
-        token=\$(cat)
-        mkdir -p ~/runners/$name && cd ~/runners/$name
-        [ -x ./config.sh ] || tar xzf ../actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
-        ./config.sh --unattended --url https://github.com/$repo --token \"\$token\" --name $name --labels $label,mini --work _work --replace >/dev/null
-        ./svc.sh install >/dev/null
-        ./svc.sh start >/dev/null
-      ")"
-    echo "   $name: registered for $repo ($label)"
-  done
+for i in $(seq 1 "$CI_COUNT"); do
+  name="mini-$i"
+  if on_host "\$HOME/.local/bin/tart exec $VM test -f /Users/admin/runners/$name/.runner"; then
+    echo "   $name: already registered"
+    continue
+  fi
+  # A token per runner (they last an hour), on stdin end to end: gh -> ssh -> tart exec -> config.sh.
+  gh api -X POST "orgs/$CI_ORG/actions/runners/registration-token" --jq .token |
+    on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
+      set -e
+      token=\$(cat)
+      mkdir -p ~/runners/$name && cd ~/runners/$name
+      [ -x ./config.sh ] || tar xzf ../actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
+      ./config.sh --unattended --url https://github.com/$CI_ORG --token \"\$token\" --name $name --labels $CI_LABELS,mini --work _work --replace >/dev/null
+      ./svc.sh install >/dev/null
+      ./svc.sh start >/dev/null
+    ")"
+  echo "   $name: registered at $CI_ORG ($CI_LABELS,mini)"
 done
