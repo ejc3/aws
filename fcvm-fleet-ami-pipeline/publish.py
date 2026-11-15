@@ -872,7 +872,7 @@ class Publisher:
             receipt = self.gate_receipt(active)
             rolled_back = str(receipt["build_id"]).startswith(self.ROLLBACK_PREFIX)
             placement, _ = self.fleet_placement(active)
-            return {**receipt, "verified": rolled_back or receipt == self.gate_record(),
+            return {**receipt, "verified": receipt == self.gate_record(),
                     "rollback": rolled_back, "placement": placement}
         evidence = self.gate_evidence(event) if action == "rollback" else None
         receipt, expected = event["receipt"], event["placement"]
@@ -889,13 +889,18 @@ class Publisher:
             live_receipt = self.gate_receipt(active)
             rolled_back = active["build_id"].startswith(self.ROLLBACK_PREFIX)
             if action == "rollback" and rolled_back and self.gate_receipt(active.get("previous") or {}) == receipt:
+                # The previous attempt may have committed its pointer before recording verification.
+                if self.gate_record() != live_receipt:
+                    self.save(self.env["STATE_PREFIX"] + "/gate", live_receipt)
                 return self.gate_rollback_answer(active)
             need(live_receipt == receipt, "the live release is not that exact receipt")
-            need(not rolled_back, "the live release is a rollback; it is not rolled back again")
             if action == "verify":
+                # A later scheduled smoke can verify a rolled-back receipt if the original caller
+                # lost its response and cannot retry the exact rollback request.
                 self.require_gate_placement(active, expected)
                 self.save(self.env["STATE_PREFIX"] + "/gate", live_receipt)
                 return {"status": "verified", **live_receipt}
+            need(not rolled_back, "the live release is a rollback; it is not rolled back again")
             verified = self.gate_record()
             need(verified != live_receipt, "the gate verified this release; it is not rolled back")
             config, host_only = self.rollback_to_previous(active, verified)

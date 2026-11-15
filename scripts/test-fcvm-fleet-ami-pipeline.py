@@ -742,22 +742,23 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(len(self.publisher.calls), 1)
 
     def test_completed_withdrawal_clears_the_exact_factory_request_without_redrive(self):
-        for replaced in (False, True):
-            with self.subTest(replaced=replaced):
+        for retry_status in (None, "building", "promoted", "superseded", "failed"):
+            with self.subTest(retry_status=retry_status):
                 case = FactoryTests()
                 case.setUp()
                 try:
-                    case.succeed()
+                    ended = case.succeed()
                     case.store.values["/factory/publications/" + mod.digest(BUILD)] = {"build_id": BUILD, "status": "withdrawn"}
                     case.fleet_ssm.values["/release"] = {"build_id": "rollback-to-previous:done"}
                     key = "/factory/requests/" + INPUT_SHA
-                    if replaced:
-                        case.store.values[key]["build_id"] = "a-different-retry-for-the-same-input"
+                    if retry_status:
+                        case.store.values[key].update(build_id="a-different-retry-for-the-same-input", status=retry_status)
+                        case.time = ended + mod.PUBLICATION_SECONDS + 1
                     before = copy.deepcopy(case.store.values[key])
                     case.factory.reconcile()
                     self.assertIsNone(case.store.values["/factory/control"]["active"])
                     self.assertEqual(case.publisher.calls, [])
-                    if replaced:
+                    if retry_status:
                         self.assertEqual(case.store.values[key], before)
                     else:
                         self.assertEqual(case.store.values[key]["status"], "failed")

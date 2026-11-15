@@ -2199,6 +2199,55 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.created, changes["created"])
         self.assertEqual(self.fleet_ssm.values["/release"], changes["pointer"])
 
+    def gate_rollback_with_lost_verify_write(self):
+        _, active = self.generation_eleven_live()
+        old_host = self.gate_instance(active)
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        save = publisher.save
+
+        def fail_final_verification(name, value, fleet=False):
+            if name == "/factory/gate":
+                self.assertIsNotNone(self.ddb.item)
+                self.assertEqual(publisher.gate_receipt(self.fleet_ssm.values["/release"]), value)
+                raise RuntimeError("verification unavailable after pointer committed")
+            return save(name, value, fleet)
+
+        with mock.patch.object(publisher, "save", side_effect=fail_final_verification):
+            with self.assertRaisesRegex(RuntimeError, "verification unavailable"):
+                publisher.gate(verdict)
+        status = self.publisher().gate({"action": "status"})
+        self.assertTrue(status["rollback"])
+        self.assertFalse(status["verified"])
+        return verdict, old_host, copy.deepcopy(self.fleet_ssm.values["/release"])
+
+    def test_exact_rollback_replay_repairs_interrupted_verification_under_lock(self):
+        verdict, _, active = self.gate_rollback_with_lost_verify_write()
+        created = list(self.ec2.created)
+        publisher = self.publisher()
+        save = publisher.save
+
+        def check_locked(name, value, fleet=False):
+            self.assertEqual(name, "/factory/gate")
+            self.assertEqual(value, publisher.gate_receipt(active))
+            self.assertIsNotNone(self.ddb.item)
+            return save(name, value, fleet)
+
+        with mock.patch.object(publisher, "save", side_effect=check_locked):
+            self.assertEqual(publisher.gate(verdict)["status"], "rolled_back")
+        self.assertEqual(self.ec2.created, created)
+        self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_a_new_smoke_can_verify_rollback_if_the_original_request_was_lost(self):
+        _, old_host, active = self.gate_rollback_with_lost_verify_write()
+        self.ec2.instances[old_host]["State"]["Name"] = "terminated"
+        self.gate_instance(active, number=884)
+        with self.assertRaisesRegex(MODULE.Refused, "not rolled back again"):
+            self.publisher().gate(self.gate_event("rollback"))
+        event = self.gate_event("verify")
+        self.assertEqual(self.publisher().gate(event), {"status": "verified", **event["receipt"]})
+        self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
     def test_the_gate_handler_takes_only_its_three_requests(self):
         for event in ({"action": "rollback"}, {"action": "rollback", "generation": "11"},
                       {"action": "rollback", "receipt": {"generation": 11, "build_id": "x"}, "placement": "a" * 64},

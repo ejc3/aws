@@ -732,7 +732,7 @@ class Factory:
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
-                if succeeded and record["status"] not in ("failed", "promoted", "superseded"):
+                if succeeded:
                     publication = self.load("/publications/" + digest(active), {})
                     if publication.get("build_id") == active and publication.get("status") == "withdrawn":
                         release = json.loads(self.release_ssm().get_parameter(
@@ -742,7 +742,7 @@ class Factory:
                             # The publisher records intent before the pointer commits. Only a
                             # moved pointer under this same mutex makes the withdrawal terminal.
                             # The request key can now name another retry: never overwrite it.
-                            if record.get("build_id") == active:
+                            if record.get("build_id") == active and record["status"] not in ("failed", "promoted", "superseded"):
                                 record.update(status="failed", message="publication rolled back; automatic replay refused")
                                 self.save("/requests/" + record["request_id"], record)
                                 self.queue_failure(record, journal, build)
