@@ -93,7 +93,7 @@ resource "aws_iam_role_policy" "fcvm_stage_ci" {
         Resource = aws_ecr_repository.fcvm_fleet_coordinator.arn
       },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_coordinator_release.arn },
-      # The image release gate (fcvm-fleet-ami-pipeline.tf): status, verify or rollback of the live generation.
+      # The image release gate (fcvm-fleet-ami-pipeline.tf): status and exact-receipt smoke verdicts.
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_release_gate.arn },
       {
         Sid    = "NeverAdministerOrReadCredentials"

@@ -6,7 +6,7 @@ Every new template version differs solely in ImageId.
 """
 import base64
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import datetime
 import hashlib
 import http.client
@@ -708,37 +708,11 @@ class Publisher:
         return self.run_build_region_host_release(self.reviewed_ena_host_release(), "reviewed-ena-host-release")
 
     ROLLBACK_PREFIX = "rollback-to-previous:"
+    GATE_HOST_SETTLE_SECONDS = 300
 
-    def rollback_to_previous(self):
-        """The live release's own `previous` pair as a reviewed transition from the live receipt.
-
-        Refused when the live release names no previous release, when the previous pair has no
-        image, or when the live release is itself a rollback (rolling it back would bring back the
-        release that was just withdrawn). Images that are gone or no longer validated are refused
-        by reviewed_fence, which reads each one before anything changes."""
-        active = self.load(self.env["RELEASE_PARAMETER"], True)
-        need(not str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX),
-             "the live release is a rollback; it is not rolled back again")
-        previous = active.get("previous")
-        need(isinstance(previous, dict) and previous.get("version") == 1 and type(previous.get("generation")) is int
-             and SHA.fullmatch(str(previous.get("source_sha", ""))),
-             "the live release has no previous release to roll back to")
-        region = self.env["COMPUTE_REGION"]
-        images, live = {}, {}
-        for kind in ("host", "tile"):
-            images[kind] = (previous.get(kind + "_amis") or {}).get(region, {}).get("x86_64")
-            live[kind] = active[kind + "_amis"][region]["x86_64"]
-        need(all(IMAGE.fullmatch(str(image)) for image in images.values()),
-             "the previous release names no image pair")
-        need(images["host"] != live["host"], "the previous release's host image is the live one")
-        host_only = images["tile"] == live["tile"]
-        config = self.reviewed_pair({"source_sha": previous["source_sha"], "images": images, "expected": active},
-                                    host_only=host_only)
-        return config, host_only
-
-    def run_rollback_to_previous(self):
-        config, host_only = self.rollback_to_previous()
-        return self.run_reviewed(config, self.ROLLBACK_PREFIX.rstrip(":"), host_only=host_only)
+    @staticmethod
+    def gate_receipt(release):
+        return {key: release.get(key) for key in ("generation", "build_id")}
 
     def gate_record(self):
         try:
@@ -748,66 +722,161 @@ class Publisher:
                 return {}
             raise
 
-    def fleet_images(self, release):
-        """Count the fleet's live hosts and tiles by whether they run the release's image: a smoke
-        can verify a release only on machines booted from it (a routine publication leaves running
-        machines on the image they booted)."""
+    def fleet_placement(self, release):
+        """Read the EC2 placements; never infer a booted image from the current template default."""
         region = self.env["COMPUTE_REGION"]
-        want = {"fcvm-fleet-" + kind: release[kind + "_amis"][region]["x86_64"] for kind in ("host", "tile")}
-        counts = {"release_hosts": 0, "other": 0}
-        arguments = {"Filters": [{"Name": "tag:Purpose", "Values": sorted(want)},
+        want = {kind: release[kind + "_amis"][region]["x86_64"] for kind in ("host", "tile")}
+        templates = {item["id"]: item["kind"] for item in self.templates}
+        instances = {}
+        current, settled = True, True
+        matches = {"host": [], "tile": []}
+        host_count = 0
+        now = self.clock()
+        # Query by AWS's immutable template tag. A missing or changed mutable Purpose tag
+        # must make the inventory unobservable instead of making a live instance disappear.
+        arguments = {"Filters": [{"Name": "tag:aws:ec2launchtemplate:id", "Values": sorted(templates)},
                                  {"Name": "instance-state-name", "Values": ["pending", "running"]}]}
         for _ in range(20):
             page = self.client("ec2", True).describe_instances(**arguments)
             for reservation in page["Reservations"]:
                 for item in reservation["Instances"]:
-                    purpose = {t["Key"]: t["Value"] for t in item.get("Tags", [])}.get("Purpose")
-                    if item.get("ImageId") != want.get(purpose):
-                        counts["other"] += 1
-                    elif purpose == "fcvm-fleet-host":
-                        counts["release_hosts"] += 1
+                    tags = {t["Key"]: t["Value"] for t in item.get("Tags", [])}
+                    kind = templates.get(tags.get("aws:ec2launchtemplate:id"))
+                    instance = item.get("InstanceId", "")
+                    image = item.get("ImageId", "")
+                    state = item.get("State", {}).get("Name")
+                    boot = item.get("LaunchTime")
+                    need(reservation.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+                         and kind in want and tags.get("Purpose") == "fcvm-fleet-" + kind
+                         and re.fullmatch(r"i-[0-9a-f]{17}", instance) and IMAGE.fullmatch(image)
+                         and state in {"pending", "running"}
+                         and isinstance(boot, datetime.datetime) and boot.utcoffset() is not None
+                         and instance not in instances,
+                         "Fleet placement includes an unobservable or unowned instance")
+                    boot = boot.timestamp()
+                    instances[instance] = (kind, image, state, boot)
+                    need(len(instances) <= 64, "Fleet placement exceeds its fixed bound")
+                    host_count += kind == "host"
+                    current = current and image == want[kind]
+                    # Pending tiles cannot have served a viewer either; they make a verdict
+                    # inconclusive even when the host is old enough and all AMIs match.
+                    settled = settled and state == "running" and boot <= now
+                    if kind == "host":
+                        settled = settled and now - boot >= self.GATE_HOST_SETTLE_SECONDS
+                    if image == want[kind] and state == "running":
+                        matches[kind].append(instance)
             if not page.get("NextToken"):
-                return counts
+                placement = {"current": current, "settled": settled, "release_hosts": sorted(matches["host"]),
+                             "release_tiles": sorted(matches["tile"]),
+                             "digest": digest(encoded({"region": region, "images": want, "instances": instances}))}
+                return placement, host_count
             arguments["NextToken"] = page["NextToken"]
-        raise Refused("Fleet inventory exceeds its fixed bound")
+        raise Refused("Fleet placement exceeds its fixed bound")
+
+    @staticmethod
+    def gate_evidence(event):
+        evidence = event.get("evidence")
+        need(isinstance(evidence, dict) and set(evidence) == {"kind", "family", "hosts", "instances"}
+             and evidence["kind"] == "image_failure" and evidence["family"] in ("v4", "v6"),
+             "rollback requires an image-attributed failed viewer probe")
+        for key in ("hosts", "instances"):
+            ids = evidence[key]
+            need(isinstance(ids, list) and len(ids) <= 64
+                 and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in ids),
+                 "rollback probe attribution is invalid")
+        need(evidence["hosts"] or evidence["instances"], "rollback probe lacks instance attribution")
+        return evidence
+
+    def require_gate_placement(self, active, expected_digest, evidence=None):
+        placement, _ = self.fleet_placement(active)
+        need(placement["current"] and placement["settled"] and placement["release_hosts"]
+             and placement["digest"] == expected_digest,
+             "the release placement has changed or is not observable, current and settled")
+        if evidence is not None:
+            for key, report in (("release_hosts", "hosts"), ("release_tiles", "instances")):
+                known = {digest("fcvm-release-gate\0" + instance) for instance in placement[key]}
+                need(set(evidence[report]) <= known, "the failed probe was not served by the release's images")
+
+    def rollback_to_previous(self, active):
+        """Build a reviewed transition from the checked live receipt to its own previous images."""
+        need(not active["build_id"].startswith(self.ROLLBACK_PREFIX),
+             "the live release is a rollback; it is not rolled back again")
+        previous = active.get("previous")
+        need(isinstance(previous, dict) and previous.get("version") == 1
+             and type(previous.get("generation")) is int
+             and previous["generation"] == active["generation"] - 1
+             and SHA.fullmatch(str(previous.get("source_sha", ""))),
+             "the live release has no previous release to roll back to")
+        region = self.env["COMPUTE_REGION"]
+        images = {kind: (previous.get(kind + "_amis") or {}).get(region, {}).get("x86_64")
+                  for kind in ("host", "tile")}
+        need(all(IMAGE.fullmatch(str(image)) for image in images.values()),
+             "the previous release names no image pair")
+        need(images["host"] != active["host_amis"][region]["x86_64"],
+             "the previous release's host image is the live one")
+        host_only = images["tile"] == active["tile_amis"][region]["x86_64"]
+        config = self.reviewed_pair({"source_sha": previous["source_sha"], "images": images, "expected": active},
+                                    host_only=host_only)
+        return config, host_only
+
+    def gate_rollback_answer(self, active):
+        # The workflow prints this answer in public. Report counts only, not instance IDs.
+        # An inventory read failure after committing cannot undo the pointer change.
+        try:
+            placement, total = self.fleet_placement(active)
+            matching = len(placement["release_hosts"])
+            hosts = {"release": matching, "other": total - matching}
+        except Exception:
+            hosts = {"observation": "unavailable"}
+        return {"status": "rolled_back", "pointer": self.gate_receipt(active), "hosts": hosts}
 
     def gate(self, event):
-        """The release gate the staging viewer smoke drives (ejc3/fcvm fleet/ami/release_gate.py).
-
-        status: the live generation, whether the gate has verified it, and whether every live host and
-        tile runs its images. verify N: the smoke passed on generation N, on hosts booted from it. rollback N: the smoke failed on generation N; the live release goes back
-        to its `previous` unless the gate already verified N. A rollback's own receipt is recorded
-        as verified, so the next smoke cannot roll it back to the release it withdrew."""
-        need(isinstance(event, dict) and event.get("action") in {"status", "verify", "rollback"}
-             and set(event) == ({"action"} if event.get("action") == "status" else {"action", "generation"})
-             and (event.get("action") == "status" or type(event.get("generation")) is int),
-             "the release gate takes status, verify or rollback of one generation")
-        active = self.load(self.env["RELEASE_PARAMETER"], True)
-        gate = self.gate_record()
-        rolled_back = str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX)
-        if event["action"] == "status":
-            # current: no live host or tile runs another image, so a smoke now exercises this release
-            # (with nothing running, the smoke wakes the fleet from the templates, which name it).
-            return {"generation": active.get("generation"), "source_sha": active.get("source_sha"),
-                    "verified": gate.get("verified_generation") == active.get("generation"), "rollback": rolled_back,
-                    "current": self.fleet_images(active)["other"] == 0}
-        n = event["generation"]
-        if event["action"] == "verify":
-            need(active.get("generation") == n, "the live release is not that generation")
-            images = self.fleet_images(active)
-            need(images["other"] == 0 and images["release_hosts"] > 0,
-                 "the smoke did not run on hosts booted from this release")
-            self.save(self.env["STATE_PREFIX"] + "/gate", {"verified_generation": n, "build_id": active.get("build_id")})
-            return {"status": "verified", "generation": n}
-        if rolled_back and (active.get("previous") or {}).get("generation") == n:
-            return {"status": "rolled_back", "generation": active["generation"]}
-        need(active.get("generation") == n, "the live release is not that generation")
-        need(gate.get("verified_generation") != n, "the gate verified this generation; it is not rolled back")
-        result = self.run_rollback_to_previous()
-        need(result.get("status") == "promoted", "the rollback did not complete")
-        after = self.load(self.env["RELEASE_PARAMETER"], True)
-        self.save(self.env["STATE_PREFIX"] + "/gate", {"verified_generation": after["generation"], "build_id": after["build_id"]})
-        return {"status": "rolled_back", "generation": result["generation"]}
+        """The protected staging workflow supplies smoke verdicts for one receipt and placement."""
+        actions = ("status", "verify", "rollback")
+        keys = {"status": {"action"}, "verify": {"action", "receipt", "placement"},
+                "rollback": {"action", "receipt", "placement", "evidence"}}
+        need(isinstance(event, dict) and event.get("action") in actions and set(event) == keys[event["action"]],
+             "the release gate takes status, or verify/rollback of an exact receipt and placement")
+        action = event["action"]
+        if action == "status":
+            active = self.load(self.env["RELEASE_PARAMETER"], True)
+            receipt = self.gate_receipt(active)
+            rolled_back = str(receipt["build_id"]).startswith(self.ROLLBACK_PREFIX)
+            placement, _ = self.fleet_placement(active)
+            return {**receipt, "verified": rolled_back or receipt == self.gate_record(),
+                    "rollback": rolled_back, "placement": placement}
+        evidence = self.gate_evidence(event) if action == "rollback" else None
+        receipt, expected = event["receipt"], event["placement"]
+        need(isinstance(receipt, dict) and set(receipt) == {"generation", "build_id"}
+             and type(receipt["generation"]) is int and receipt["generation"] > 0
+             and isinstance(receipt["build_id"], str) and 0 < len(receipt["build_id"]) <= 200
+             and isinstance(expected, str) and DIGEST.fullmatch(expected),
+             "a gate verdict requires an exact release receipt and placement digest")
+        # The separate publisher Lambda and Terraform use this same lock. Revalidate placement
+        # and receipt under it, and keep it through selecting and recording the rollback.
+        self.build_id = f"release-gate-{action}:" + digest(encoded(receipt))
+        with self.publication_lock():
+            active = self.load(self.env["RELEASE_PARAMETER"], True)
+            live_receipt = self.gate_receipt(active)
+            rolled_back = active["build_id"].startswith(self.ROLLBACK_PREFIX)
+            if action == "rollback" and rolled_back and self.gate_receipt(active.get("previous") or {}) == receipt:
+                return self.gate_rollback_answer(active)
+            need(live_receipt == receipt, "the live release is not that exact receipt")
+            need(not rolled_back, "the live release is a rollback; it is not rolled back again")
+            self.require_gate_placement(active, expected, evidence)
+            if action == "verify":
+                self.save(self.env["STATE_PREFIX"] + "/gate", live_receipt)
+                return {"status": "verified", **live_receipt}
+            need(self.gate_record() != live_receipt, "the gate verified this release; it is not rolled back")
+            config, host_only = self.rollback_to_previous(active)
+            result = self.run_reviewed(config, self.ROLLBACK_PREFIX.rstrip(":"), host_only=host_only,
+                                       locked=True, placement_fence=lambda: self.require_gate_placement(active, expected, evidence))
+            need(result.get("status") == "promoted", "the rollback did not complete")
+            after = self.load(self.env["RELEASE_PARAMETER"], True)
+            rollback_receipt = {"generation": result["generation"], "build_id": self.build_id}
+            need(self.gate_receipt(after) == rollback_receipt, "the committed rollback receipt changed")
+            self.save(self.env["STATE_PREFIX"] + "/gate", rollback_receipt)
+            return self.gate_rollback_answer(after)
 
     def run_generation_eleven_rollback(self, event):
         need(event == {"action": "activate-reviewed-generation-eleven-rollback"},
@@ -835,7 +904,7 @@ class Publisher:
                                  host_only=True, release_images={**config["images"], "host": copied})
 
     def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False,
-                     release_images=None):
+                     release_images=None, locked=False, placement_fence=None):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
         if release_images is not None:
@@ -845,6 +914,8 @@ class Publisher:
 
         def fence():
             self.reviewed_fence(config)
+            if placement_fence is not None:
+                placement_fence()
             if host_user_data is not None:
                 # Bootstrap-bound transitions require the signed source to
                 # descend directly from the exact published predecessor.
@@ -852,7 +923,8 @@ class Publisher:
             elif check_ancestry:
                 self.source_fence(config["source_sha"], tile_source)
 
-        with self.publication_lock():
+        need(not locked or self.lock_info is not None, "reviewed transition requires the publication lock")
+        with nullcontext() if locked else self.publication_lock():
             active = self.load(self.env["RELEASE_PARAMETER"], True)
             if active.get("build_id") == self.build_id:
                 need(active.get("generation") == generation and active.get("source_sha") == config["source_sha"]
@@ -1294,12 +1366,13 @@ class Publisher:
         templates = self.templates
         versions = {}
         prepared_host = None
-        if host_user_data is not None:
+        host = next(t for t in self.templates if t["kind"] == "host")
+        if host_only or host_user_data is not None:
             retained = self.retained_tiles(before)
-            host = next(t for t in self.templates if t["kind"] == "host")
             if host_only:
                 versions = retained
                 templates = [host]
+        if host_user_data is not None:
             prepared_host = self.current(host["id"])
             key = host["region"] + "/" + host["id"]
             data = prepared_host["LaunchTemplateData"]
@@ -1336,8 +1409,9 @@ class Publisher:
             self.factory_fence(source, input_sha)
         else:
             fence()
-        if host_user_data is not None:
+        if host_only or host_user_data is not None:
             self.retained_tiles(before if host_only else after)
+        if host_user_data is not None:
             self.check_reviewed_host_default(after, host_user_data)
         try:
             self.save(name, after, True)
@@ -1679,8 +1753,6 @@ class Publisher:
             return self.run_ipv4_host_release(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-generation-eleven-rollback":
             return self.run_generation_eleven_rollback(event)
-        if event == {"action": "rollback-to-previous"}:
-            return self.run_rollback_to_previous()
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ena-host-release":
             return self.run_ena_host_release(event)
         # A factory build that was already running when the factory was paused

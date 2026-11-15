@@ -787,12 +787,9 @@ resource "aws_lambda_function" "fcvm_ami_publish" {
   }
 }
 
-# The release gate: the publisher's code behind a handler that takes only status, verify and
-# rollback of one generation (publish.py gate_handler). ejc3/fcvm's staging viewer smoke
-# (.github/workflows/fleet-release-gate.yml) asks it for the live generation, smokes it once,
-# and records it verified or rolls it back to the live receipt's own previous release, so a
-# release that fails the smoke on either address family withdraws itself with no Terraform
-# step. The dev servers may invoke it too, for a rollback by hand.
+# The protected staging CI workflow reports an exact, observed release receipt and placement.
+# The release gate uses the publisher's transaction and lock to verify or withdraw that receipt
+# only. Dev servers cannot call it: a compromised dev server could fabricate a smoke verdict.
 resource "aws_cloudwatch_log_group" "fcvm_ami_release_gate" {
   name              = "/aws/lambda/fcvm-fleet-ami-release-gate"
   retention_in_days = 14
@@ -812,15 +809,6 @@ resource "aws_lambda_function" "fcvm_ami_release_gate" {
     # The publisher's own environment: the gate runs the same code against the same state.
     variables = aws_lambda_function.fcvm_ami_publish.environment[0].variables
   }
-}
-
-# A dev server may ask the gate for the live generation or roll a failed one back by hand.
-resource "aws_iam_role_policy" "dev_server_fcvm_ami_release_gate" {
-  name = "fcvm-fleet-ami-release-gate"
-  role = aws_iam_role.dev_server.id
-  policy = jsonencode({ Version = "2012-10-17", Statement = [
-    { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_release_gate.arn }
-  ] })
 }
 
 resource "aws_cloudwatch_event_rule" "fcvm_ami_success" {
