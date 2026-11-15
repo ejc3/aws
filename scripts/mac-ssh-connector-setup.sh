@@ -111,14 +111,18 @@ case "$ALIAS" in
     ;;
   *) usage ;;
 esac
-# fcvm-arm is needed only for a fcvm client's key (and the two-hop route); found on first use.
+# fcvm-arm is needed for the two-hop route and for a fcvm client's key: found up front then, so a missing address stops
+# the run before anything is touched. A --lan run with no fcvm client (skevh-mac) does without it.
 FCVM=""
+if [ -z "$LAN" ] || [[ " $CLIENTS" == *" fcvm:"* ]]; then
+  FCVM=$(fcvm_host)
+fi
 
 MAC_SSH="$ALIAS"
 if [ -n "$BOOTSTRAP_PORT" ]; then
   MAC_SSH="-o ProxyCommand=none -o HostName=127.0.0.1 -o Port=$BOOTSTRAP_PORT $ALIAS"
 fi
-on_fcvm() { [ -n "$FCVM" ] || FCVM=$(fcvm_host); ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "$@"; }
+on_fcvm() { ssh -o BatchMode=yes -o ConnectTimeout=10 -i "$KEY" "ubuntu@$FCVM" "$@"; }
 # Run something on the Mac: jumpbox -> fcvm-arm -> the Mac, or with --lan straight to it. stdin is passed through. The
 # callers quote for the two-hop form, whose middle shell strips one level of quotes; `eval` strips the same level on
 # the one hop.
