@@ -1602,11 +1602,12 @@ Kept so the next machine goes faster.
   `removed`, `import` with `for_each`); 1.10.3 can, but the `ejc3/cloudflare` provider fork has no `darwin_arm64`
   build, so `terraform validate` runs only on Linux (CI's `drift.yml`). `scripts/test-mac-ssh-client.py` fails ten
   installer tests on macOS on `main` too: the installer uses GNU `sed -i`.
-- **The mini's LAN address changed under a running session.** It came up on 192.168.4.188 through a USB Ethernet
-  adapter; when that adapter moved to another machine, that machine kept .188 and the mini answered on .194. ssh
-  refused the new key at .188 ("REMOTE HOST IDENTIFICATION HAS CHANGED"), which is how it was caught, and the Xcode
-  copy running at the time stopped part-way. Reach the mini by its Bonjour name with a `HostKeyAlias` (above), and
-  check a long copy's exit status: zsh has no `PIPESTATUS`, so `cmd | tee log; echo ${PIPESTATUS[0]}` prints nothing.
+- **The mini's LAN address changed under a running session.** It first answered on the address of a USB Ethernet
+  adapter; when that adapter moved to another machine, the other machine kept that address and the mini came back on
+  another one. ssh refused the new key at the old address ("REMOTE HOST IDENTIFICATION HAS CHANGED"), which is how it
+  was caught, and the Xcode copy running at the time stopped part-way. Reach the mini by its Bonjour name with a
+  `HostKeyAlias` (above), and check a long copy's exit status: zsh has no `PIPESTATUS`, so
+  `cmd | tee log; echo ${PIPESTATUS[0]}` prints nothing.
 - **Every clone of the base image has the same SSH host keys.** ghcr.io/cirruslabs/macos-tahoe-base ships them baked
   in (dated 2026-08-18), private halves included, so `skevh` and `ci` came up with identical keys and anyone with the
   public image holds them: pinning one would identify nothing. `mac-vm-setup.sh` now makes each guest its own once
@@ -1618,7 +1619,8 @@ Kept so the next machine goes faster.
   It now says so; running the script again finishes it (the disk went from 41 to 93 GB on skevh).
 - **`gh auth refresh` in a terminal tab stopped at "Authenticate Git with your GitHub credentials? (Y/n)"**, which an
   agent cannot answer there. `GH_PROMPT_DISABLED=1 gh auth refresh ...` skips the prompt and prints the device code.
-  Approving it in the browser also offered single sign-on for an unrelated org (par-msl): "Continue" skips it.
+  Approving it in the browser can first offer single sign-on for another org the account belongs to: "Continue"
+  skips it.
 - **The runners registered but could serve nothing at first**: the org's Default runner group lists repositories
   ("selected") and its list was empty (above).
 - **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
