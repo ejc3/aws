@@ -1539,9 +1539,13 @@ runners at the `dolphin-labs-hq` organization (owner, 2026-11-14), named `mini-<
 `kidsports-ios` and `mini`, so any idle one takes a self-hosted macOS job from dolphin-labs, dolphin-films or
 kid-sports-highlights. They are in the org's Default runner group, which serves private repositories only. The VM is
 provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
-run on the mini. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the MacBook's
-`gww-ci` and `kidsports-ci` VMs serve the same labels, jobs split between the two Macs; a job that must build on the
-mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
+run on the mini. The MacBook's two CI VMs joined the same pool on 2026-11-15 (owner), each keeping the one label it was
+provisioned for: `macbook-gww-1` and `macbook-gww-2` in `gww-ci` (`gww-ios`, `macbook`), `macbook-kidsports-1` in
+`kidsports-ci` (`kidsports-ios`, `macbook`); their repository registrations were removed. GitHub cannot rank runners:
+a job goes to whichever matching runner is idle, so the MacBook is a peer of the mini, not a fallback, and a job running
+there fails if the MacBook sleeps or leaves the network. A job that must build on one Mac asks for `mini` or `macbook`
+too. `ci-vm.sh runners` (the MacBook VMs' own script) registers at a repository, so re-registering them by hand means
+`config.sh --url https://github.com/dolphin-labs-hq --runnergroup Default` with those names and labels. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
 dropped again right after (`gh auth refresh -r admin:org -s read:org`), because GitHub applies the scope to every org
 the login reaches, not just dolphin-labs-hq. The Default group's visibility is "selected": a repository can use its
 runners only once it is on the group's list, which was empty. dolphin-labs, dolphin-films and kid-sports-highlights were
