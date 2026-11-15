@@ -151,4 +151,4 @@ recorder.append_record(Path(directory), {"sequence": int(sequence)})
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)
