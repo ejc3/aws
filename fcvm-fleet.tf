@@ -483,13 +483,25 @@ module "fcvm_fleet_east1" {
   # Only images that remove the unauthenticated Windows bridge /still route (ejc3/fcvm#1839)
   # may start Windows on the shared public viewer ports. A rollback to the 853eb034 or
   # 0e910245 host images keeps the other modes but must not start a Windows bridge.
-  windows_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids)
+  # ami-089b83ada9f380d5e: the image factory's host from ejc3/fcvm c5e8fc89 (release generation 15),
+  # which contains #1839 (merge 594dbbaa); its bridge answers /still with 404 in fleet mode.
+  windows_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids, ["ami-089b83ada9f380d5e"])
   # Minecraft mode (?mode=minecraft, ejc3/fcvm docs/fleet/minecraft.md): a host booted from the publisher's copy of the
   # 853eb034 host, the first with fcvm's --minecraft and the tile image (ejc3/fcvm#1757 to #1762), runs four Pumpkin
   # servers (--minecraft 4), CPU-only fcvm VMs restored from a gold snapshot the agent makes of the tile image, each at
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image. The
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
-  minecraft_host_amis       = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
+  minecraft_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
+  # Gen14 carries #1844's host limits and the reviewed Pumpkin login timeout. So does the image
+  # factory's generation fifteen (ami-089b83ada9f380d5e, ejc3/fcvm c5e8fc89: #1844, #1866 and
+  # PUMPKIN_COMMIT 1aa35ecc are in its ancestry; its live host installs FCVM-MC-JOIN at connlimit 4
+  # and 12/min burst 6 per /64). The verified public join is IPv6-only; the host independently
+  # checks the AMI and game slots.
+  minecraft_java_access = {
+    host_amis   = ["ami-0c3ea14848ddbeb93", "ami-089b83ada9f380d5e"]
+    gpu_slots   = local.fcvm_fleet_host_gpu_slots
+    source_cidr = "::/0"
+  }
   slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -999,6 +1011,36 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
     ]
   })
+}
+
+# The existing coordinator role is near its aggregate inline policy limit.
+# Keep the Java grant separate. CreateFleet authorizes template resources via
+# RunInstances; the group must come from the Virginia x86 template, not an override.
+resource "aws_iam_policy" "fcvm_fleet_coordinator_java" {
+  provider    = aws.fcvm_fleet
+  count       = length(module.fcvm_fleet_east1.host_minecraft_java_security_group_arns)
+  name        = "fcvm-fleet-coordinator-java"
+  description = "Allow the Fleet coordinator to use the Virginia host template's Java ingress group."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"
+      Effect   = "Allow"
+      Action   = "ec2:RunInstances"
+      Resource = module.fcvm_fleet_east1.host_minecraft_java_security_group_arns[count.index]
+      Condition = {
+        ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }
+        Bool      = { "ec2:IsLaunchTemplateResource" = "true" }
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java" {
+  provider   = aws.fcvm_fleet
+  count      = length(aws_iam_policy.fcvm_fleet_coordinator_java)
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn
 }
 
 resource "aws_security_group" "fcvm_fleet_coordinator" {

@@ -1,0 +1,18 @@
+[Unit]
+Description=Record shared Next.js host memory pressure
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/nextjs-memory-history
+TimeoutStartSec=20s
+LogsDirectory=nextjs-memory
+LogsDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX

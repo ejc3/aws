@@ -38,6 +38,12 @@ REAL = os.environ.get("NEXTJS_CT_REAL_IMDS", "http://169.254.169.254")
 AWS = os.environ.get("NEXTJS_CT_AWS", "aws")
 ROLE_NAME = "nextjs-dev-role"
 REFRESH_BEFORE = 15 * 60
+# A new session is an `aws sts assume-role` run, over a second, and the CLI and SDKs give the metadata service one
+# second and one try by default: a request that has to wait for one fails with NoCredentials (a member's first
+# `ssh skevh-mac` after an idle hour did, 2026-11-15). So a background thread issues every container's session at
+# start and renews it with PREFETCH_BEFORE left, before a request would have to (REFRESH_BEFORE).
+PREFETCH_BEFORE = REFRESH_BEFORE + 5 * 60
+REFRESH_EVERY = float(os.environ.get("NEXTJS_CT_IMDS_REFRESH_EVERY", "60"))
 PASSTHROUGH = (
     "placement/region", "placement/availability-zone", "instance-id", "instance-type", "ami-id",
     "local-hostname", "hostname", "mac", "iam/info",
@@ -92,21 +98,33 @@ class State:
         return bool(entry) and entry[0] == user and entry[1] > time.time()
 
     # ---- credentials
-    def credentials(self, user):
+    def entitled(self, user):
+        """The inline policy is everyone's; a member's session also carries that member's managed policy
+        (nextjs-ct-member-<user>), which names their own boxes. Only the owner flag makes a session without one: a
+        member whose policy is missing from the config gets no credentials, never the owner's session."""
+        owner = self.config.get("users", {}).get(user, {}).get("owner") is True
+        return owner or bool(self.config.get("session_policy_arns", {}).get(user, []))
+
+    def cached(self, user, before):
+        with self.lock:
+            entry = self.creds.get(user)
+        return entry[0] if entry and entry[1] - time.time() > before else None
+
+    def credentials(self, user, before=REFRESH_BEFORE):
+        # A session with more than `before` left is answered at once, even while the refresher renews it.
+        doc = self.cached(user, before)
+        if doc:
+            return doc
         with self.lock:
             ulock = self.user_locks.setdefault(user, threading.Lock())
         with ulock:
-            cached = self.creds.get(user)
-            if cached and cached[1] - time.time() > REFRESH_BEFORE:
-                return cached[0]
-            # The inline policy is everyone's; a member's session also carries that member's managed policy
-            # (nextjs-ct-member-<user>), which names their own boxes. Only the owner flag makes a session without
-            # one: a member whose policy is missing from the config gets no credentials, never the owner's session.
-            owner = self.config.get("users", {}).get(user, {}).get("owner") is True
-            arns = self.config.get("session_policy_arns", {}).get(user, [])
-            if not owner and not arns:
+            doc = self.cached(user, before)
+            if doc:
+                return doc
+            if not self.entitled(user):
                 print(f"nextjs-ct-imds: refusing {user}: a member with no session policy ARN in the config", file=sys.stderr)
                 return None
+            arns = self.config.get("session_policy_arns", {}).get(user, [])
             cmd = [AWS, "sts", "assume-role", "--role-arn", self.config["role_arn"],
                    "--role-session-name", f"ct-{user}", "--duration-seconds", "3600",
                    "--policy", json.dumps(self.config["session_policy"], separators=(",", ":")), "--output", "json"]
@@ -128,9 +146,23 @@ class State:
                 "Token": c["SessionToken"],
                 "Expiration": datetime.fromtimestamp(expiry, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
-            self.creds[user] = (doc, expiry)
+            with self.lock:
+                self.creds[user] = (doc, expiry)
             print(f"nextjs-ct-imds: issued a session for {user} until {doc['Expiration']}", file=sys.stderr)
             return doc
+
+    def refresh_forever(self):
+        """Issue every entitled container's session now, then renew each with PREFETCH_BEFORE left. A failed renewal
+        is logged and retried next round; requests keep the cached session while it lasts."""
+        while True:
+            for user in sorted(set(self.by_gateway.values())):
+                if not self.entitled(user):
+                    continue
+                try:
+                    self.credentials(user, PREFETCH_BEFORE)
+                except Exception as exc:  # noqa: BLE001 -- one account's failure must not stop the others'
+                    print(f"nextjs-ct-imds: renewing {user}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            time.sleep(REFRESH_EVERY)
 
     # ---- the real metadata service, for the harmless facts
     def real(self, path):
@@ -283,6 +315,7 @@ def main():
     server = BoundedServer(("0.0.0.0", PORT), Handler)
     server.daemon_threads = True
     server.state = State(CONFIG)
+    threading.Thread(target=server.state.refresh_forever, name="session-refresher", daemon=True).start()
     print(f"nextjs-ct-imds: serving {len(server.state.by_gateway)} containers on port {PORT}", file=sys.stderr)
     server.serve_forever()
 

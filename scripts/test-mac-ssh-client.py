@@ -23,6 +23,7 @@ COLIN_PC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++R
 CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
 REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
 COLTON_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHwu+CCNChdYQcpAVyCXMIkwoSP75e159hJk1a/tpOkO"
+MINI_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYdgKiKL4C1d0sQT23eySkjw4xE9dTgmqpyIV7MQ7jY"
 
 
 def mac_map():
@@ -268,9 +269,9 @@ class MacSshClient(unittest.TestCase):
 
 
 class Wiring(unittest.TestCase):
-    def test_the_map_pins_both_macs_and_colins_pc(self):
+    def test_the_map_pins_the_macs_the_mini_its_vms_and_colins_pc(self):
         macs = mac_map()
-        self.assertEqual(sorted(macs), ["colin-pc", "colton-mac", "mac"])
+        self.assertEqual(sorted(macs), ["ci-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
         self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
                                        "host_key_alias": "ejs-macbook-pro-via-fcvm",
                                        "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
@@ -281,6 +282,14 @@ class Wiring(unittest.TestCase):
         self.assertEqual(macs["colin-pc"], {"hostname": "colin-pc-ssh.cc-games.dev", "user": "colin",
                                             "host_key_alias": "colin-pc", "host_key": COLIN_PC_HOST_KEY, "make_key": True})
         self.assertIn('colin_pc_ssh_hostname = "colin-pc-ssh.cc-games.dev"', COLIN_PC)
+        self.assertEqual(macs["mini"], {"hostname": "mini-ssh.cc-games.dev", "user": "ejcampbell", "host_key_alias": "mini",
+                                        "host_key": MINI_HOST_KEY, "make_key": True})
+        self.assertIn('mini_ssh_hostname = "mini-ssh.cc-games.dev"', (ROOT / "mini-ssh.tf").read_text())
+        # The mini's VMs log in as the guest's admin, through their own SSH routes (mac-vms.tf: "<vm>-mac-ssh.cc-games.dev").
+        for vm in ("ci", "skevh"):
+            self.assertEqual({k: macs[f"{vm}-mac"][k] for k in ("hostname", "user", "host_key_alias", "make_key")},
+                             {"hostname": f"{vm}-mac-ssh.cc-games.dev", "user": "admin", "host_key_alias": f"{vm}-mac", "make_key": True})
+            self.assertRegex(macs[f"{vm}-mac"]["host_key"], r"^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$")
         self.assertIn('mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} '
                       '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n"])', SOURCE)
 
@@ -293,7 +302,9 @@ class Wiring(unittest.TestCase):
         self.assertEqual(snippet, "${local.pc_bootstrap_account}\nMAC_USER=ubuntu\n${local.mac_cloudflared_install}\n"
                                   "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
-                                  "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
+                                  "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=mini\nMAC_SECRET=mini-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "MAC_ALIAS=ci-mac\nMAC_SECRET=mac-vm-ci-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
 
     def test_a_daily_association_converges_the_running_fcvm_arm(self):
         assoc = SOURCE[SOURCE.index('resource "aws_ssm_association" "fcvm_mac_ssh_clients"'):]
@@ -319,7 +330,9 @@ class Wiring(unittest.TestCase):
     def test_the_connector_reads_the_nextjs_keys_from_the_containerized_box(self):
         # The containers' homes are on nextjs-ct, found by a tag it keeps through the cutover (its Name changes then).
         self.assertIn('Box = "nextjs-ct"', (ROOT / "nextjs-ct.tf").read_text())
-        self.assertIn("--filters Name=tag:Box,Values=nextjs-ct Name=instance-state-name,Values=running", CONNECTOR.read_text())
+        text = CONNECTOR.read_text()
+        self.assertIn('--filters "Name=tag:$1,Values=$2" Name=instance-state-name,Values=running', text)
+        self.assertIn("running_instance Box nextjs-ct", text)
         self.assertNotIn("tag:Name,Values=nextjs-dev", CONNECTOR.read_text())
 
     def test_the_containers_snippet_sets_user_alias_and_secret_per_call(self):
@@ -448,7 +461,7 @@ class ConnectorScript(unittest.TestCase):
         self.nosudo = root / "nosudo"
         bin_sum = re.search(r"^CFD_SHA256_DARWIN_ARM64_BIN=(\S+)$", CONNECTOR.read_text(), re.M).group(1)
         self.stub("ssh", f"""#!/usr/bin/env python3
-import os, subprocess, sys
+import os, re, subprocess, sys
 with open({str(self.argv_log)!r}, "a") as log:
     log.write(repr(sys.argv[1:]) + "\\n")
 args = sys.argv[1:]
@@ -461,15 +474,22 @@ while args[i].startswith("-"):
     i += 2 if args[i] in ("-o", "-i", "-p") else 1
 data = sys.stdin.buffer.read()
 data = data.replace(b"export PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"export PATH={self.stubs}:/usr/bin:/bin")
+# The reload runs detached and can outlive the test, whose temp dir (and the stub with it) is gone by then; a bare
+# `launchctl` would then fall through to the real one on a Mac and boot out the real connector of the same label (this
+# unloaded the MacBook's own on 2026-11-14). Pinned to the stub's path, a late reload fails instead.
+data = re.sub(rb"(?<![/\\w])launchctl ", b"{self.stubs}/launchctl ", data)  # each hop runs this stub again
 sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).returncode)
 """)
         self.stub("aws", f"""#!/bin/sh
 echo "$*" >> {self.argv_log}
 case "$1 $2" in
-  "ec2 describe-instances") case "$*" in *"Name=tag:Box,Values=nextjs-ct "*) echo i-0123456789abcdef0 ;; *) echo None ;; esac ;;
-  "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
+  "ec2 describe-instances") case "$*" in *"Name=tag:Box,Values=nextjs-ct "*) echo i-0123456789abcdef0 ;;
+    *"Name=tag:Name,Values=fcvm-metal-arm "*) echo i-0fcfcfcfcfcfcfcf0 ;; *) echo None ;; esac ;;
+  "ssm send-command") echo "cmd-$(echo "$*" | sed 's|.*--instance-ids ||; s| .*||')-$(echo "$*" | sed 's|.*cat /home/||; s|/.*||')" ;;
   "ssm wait") ;;
-  "ssm get-command-invocation") u=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); cat "{self.nextjs}/$u.pub" ;;
+  "ssm get-command-invocation") c=$(echo "$*" | sed 's|.*--command-id cmd-||; s| .*||'); u=${{c#*-*-}}
+    # fcvm-arm's ubuntu keeps its key in the shared test home; each nextjs-ct account has its own file.
+    case "$c" in i-0fcfcfcfcfcfcfcf0-ubuntu) cat "{self.home}/.ssh/to-colton-mac.pub" 2>/dev/null ;; *) cat "{self.nextjs}/$u.pub" ;; esac ;;
   "secretsmanager get-secret-value") echo "{self.TOKEN}" ;;
   *) echo "unexpected aws $*" >&2; exit 1 ;;
 esac
@@ -587,7 +607,8 @@ esac
         self.assertIn("nextjs-ct colton has no single valid", result.stderr)
         log = self.argv_log.read_text()
         self.assertIn("cat /home/colton/.ssh/to-colton-mac.pub", log)
-        self.assertEqual(log.count("ssm send-command"), 1, "each account is read by its own command; colton's failed first")
+        self.assertEqual(log.count("cat /home/"), 2, "each account is read by its own command: fcvm-arm's, then colton's, "
+                         "which failed before ejc3's was read")
 
     def test_bad_arguments(self):
         for args in [(), ("nobody-mac",), ("colton-mac", "--bootstrap-port"), ("colton-mac", "--bootstrap-port", "x"), ("colton-mac", "extra")]:

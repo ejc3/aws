@@ -528,6 +528,14 @@ an installed Fleet agent that accepts the matching option. Windows sandboxes sti
 require an explicitly reviewed boot AMI ID: older Windows bridges can carry the
 same assets while exposing an unauthenticated `/still` endpoint.
 
+Virginia's live Minecraft tiles expose the hostname for each launch. Use that
+hostname from Minecraft Java Edition on an IPv6 connection; the game listens on
+TCP/25565. The separate group attaches only to reviewed GPU hosts in Virginia.
+On each agent start the host checks its actual boot AMI, delegated prefix and
+guest layout before admitting Java traffic to the four game slots. Older or
+unverified AMIs and unexpected boot metadata leave Java closed; existing browser
+viewer ports continue to work independently.
+
 The factory builds and verifies in us-west-2 (`fcvm_ami_build_region`), so its g4dn.metal
 builders never take the staging fleet's us-east-1 G quota. The publisher copies each verified
 pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatcher redrives
@@ -992,6 +1000,9 @@ or ask the jumpbox to execute a command. A stopped or missing Mac is reported, n
 silently allocated or restarted by a status, SSH, or workspace command.
 Installing the CLI does not grant a member account the owner's dev-hop key; an account
 without an authorized SSH identity can still inspect status and pricing.
+SSH is admitted only from the managed IPv4 addresses of those five AWS hosts;
+Next.js containers use their host address. From a personal device, use an
+existing SSH route to one of the AWS clients and run `macpbox ssh` there.
 
 Every **new** lease needs the owner's direct approval in the current conversation, after
 showing the quote and minimum charge. The current Oregon M4 Pro host price is **$1.97/hour,
@@ -1485,46 +1496,150 @@ alone lets it reconnect.
    pcboot existed: its key is a line in fcvm-arm `ubuntu`'s `~/.ssh/authorized_keys` (comment `windows-pc-BLD`, no
    expiry), to be deleted there by hand once its Cloudflare route works (ejc3/aws #557).
 
-### macOS VMs on the MacBook (ejc3, skevh)
+### The Mac mini: `ssh mini`, Steve's VM and the CI VM
 
-The MacBook runs two [Tart](https://tart.run) macOS VMs, `ejc3` for EJ and `skevh` for
-Steve, cloned from `ghcr.io/cirruslabs/macos-tahoe-base`. Each signs its `admin` account
-in at boot, so it always has a desktop, and runs its own `cloudflared` connector for its
-own tunnel (`mac-vms.tf`). Per VM there are two TCP routes:
+EJ's Mac mini (Apple M5 Pro, 15 cores, 64 GB, 1.8 TB, macOS 27; on the home LAN, set up 2026-11-14) is reachable only
+through Cloudflare, like Colton's Mac: nothing listens on the internet, and nothing in AWS reaches it but these routes.
 
-| VM | Screen Sharing | SSH | Access |
+| what | route | who | Terraform |
 |---|---|---|---|
-| `ejc3` | `ejc3-mac.cc-games.dev` | `ejc3-mac-ssh.cc-games.dev` | EJ only (Google or one-time PIN) |
-| `skevh` | `skevh-mac.cc-games.dev` | `skevh-mac-ssh.cc-games.dev` | GitHub members of `dolphin-labs-hq` |
+| the host, account `ejcampbell` | `mini-ssh.cc-games.dev` (SSH) | EJ in a browser; `ssh mini` as fcvm-arm `ubuntu` and nextjs-ct `ejc3` | `mini-ssh.tf` |
+| VM `skevh` (Steve's) | `skevh-mac.cc-games.dev` (Screen Sharing), `skevh-mac-ssh.cc-games.dev` | dolphin-labs-hq GitHub members; `ssh skevh-mac` as nextjs-ct `skevh` | `mac-vms.tf` |
+| VM `ci` | `ci-mac.cc-games.dev`, `ci-mac-ssh.cc-games.dev` | EJ in a browser; `ssh ci-mac` as fcvm-arm `ubuntu` and nextjs-ct `ejc3` | `mac-vms.tf` |
+
+Each EC2 client has its own Access service token (`mini-ssh-access-*`, `mac-vm-<vm>-ssh-access-*`) and its own key
+(`~/.ssh/to-<alias>`, made on the box by `mac-ssh-client.tf`); the mini and each guest authorize those keys in a managed
+block. Holding `ssh mini` is holding both VMs as well (`tart exec <vm> ...` from the host).
+
+From a person's own machine, as for the MacBook's old VMs:
 
 ```bash
 cloudflared access tcp --hostname skevh-mac.cc-games.dev --url localhost:5901
-open vnc://localhost:5901   # sign in as admin; password: secret mac-vm-<vm>-admin-password
+open vnc://localhost:5901   # sign in as admin
 ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.cc-games.dev
 ```
 
-SSH accepts keys only: the MacBook's `ejcampbell` key plus ejc3's keys from
-`nextjs_user_keys` (minus the fleet hop key) in `ejc3`, and Steve's keys from
-`nextjs_user_keys` in `skevh`. The `admin` password is used only for Screen Sharing; SSH never
-uses it. It is the generated secret `mac-vm-<vm>-admin-password`: both running guests accept it
-and reject the image's `admin`/`admin` (checked 2026-09-26 with `dscl . -authonly admin ...`
-through `tart exec -i <vm>`, reading the password from stdin). Terraform only STORES the value.
-Nothing applies it inside a guest, so a VM created or rebuilt from the Tart image starts with
-the image default until someone sets the secret by hand on the MacBook and re-runs that check.
-Access is the real gate: both hostnames sit behind Cloudflare Access with origin enforcement.
-Inside each VM, the connector is a launchd daemon that
-reads its token from a root-only file (`/etc/cloudflared/tunnel.token`), never from argv.
+**What runs on the mini**, all as `ejcampbell`'s LaunchAgents (no root service):
 
-On the MacBook, `~/Library/LaunchAgents/com.ejcampbell.tart.<vm>.plist` runs
-`tart run --no-graphics <vm>` with KeepAlive while `ejcampbell` is logged in; Tart needs an
-unlocked login keychain, so the VMs start after that login, and after a reboot only once
-FileVault is unlocked at the machine. Local admin from the MacBook:
+- `com.ejcampbell.caffeinate` (`caffeinate -ims`): the mini's default is sleep after one minute, which would take every
+  route down as soon as nobody watches its screen.
+- `com.ccgames.mini-ssh.cloudflared`: the host's connector.
+- `com.ejcampbell.tart.skevh` and `com.ejcampbell.tart.ci`: `tart run --no-graphics <vm>` (Tart 2.38.0 in
+  `~/Applications/tart.app`, linked at `~/.local/bin/tart`). `ci` also mounts the mini's `~/Applications/Xcode.app`
+  read-only. A Mac runs at most two macOS VMs at once, so the mini is full: ci has 9 cores / 36 GB / 200 GB, skevh 4 /
+  16 / 100.
+- Inside each VM, its own connector as the guest's `admin` (`com.ccgames.mac-vm-<vm>.cloudflared`), keys-only sshd.
+
+**FileVault is on**, so the mini cannot log itself in: after a power cut or a reboot nothing above runs until someone
+signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
+unlock once.
+
+**The CI VM's runners** (`scripts/mac-vm-setup.sh ci --lan mini-lan --runners`): one pool of four GitHub Actions
+runners at the `dolphin-labs-hq` organization (owner, 2026-11-14), named `mini-<n>` and labelled `gww-ios`,
+`kidsports-ios` and `mini`, so any idle one takes a self-hosted macOS job from dolphin-labs, dolphin-films or
+kid-sports-highlights. They are in the org's Default runner group, which serves private repositories only. The VM is
+provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
+run on the mini. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the MacBook's
+`gww-ci` and `kidsports-ci` VMs serve the same labels, jobs split between the two Macs; a job that must build on the
+mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
+dropped again right after (`gh auth refresh -r admin:org -s read:org`), because GitHub applies the scope to every org
+the login reaches, not just dolphin-labs-hq. The Default group's visibility is "selected": a repository can use its
+runners only once it is on the group's list, which was empty. dolphin-labs, dolphin-films and kid-sports-highlights were
+added on 2026-11-14 (`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo id>`); a new
+repository needs the same before its jobs can run here. Nothing in Terraform manages the org's runner groups.
+
+**Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (below),
+an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an org admin of dolphin-labs-hq
+(`admin:org` scope):
+
+```sshconfig
+Host mini-lan
+    HostName EJs-Mac-Mini.local     # its Bonjour name: its LAN address has already changed once
+    User ejcampbell
+    IdentityFile ~/.ssh/to-mini     # authorized on the mini by hand at setup
+    IdentitiesOnly yes
+    HostKeyAlias mini-lan           # the host key is checked under this name, whatever the address
+    StrictHostKeyChecking yes
+```
 
 ```bash
-tart list
-tart exec <vm> <command>      # through the guest agent, no network needed
-tart run --vnc <vm>            # watch the screen (stop the LaunchAgent first)
+scripts/mac-vm-setup.sh skevh --lan mini-lan                  # prints the guest's host key: pin it in mac-ssh-client.tf
+scripts/mac-vm-setup.sh ci --lan mini-lan
+scripts/mac-ssh-connector-setup.sh mini --lan mini-lan        # the host's connector and clients' keys
+scripts/mac-ssh-connector-setup.sh skevh-mac --lan mini-lan   # inside the VM, through tart exec
+scripts/mac-ssh-connector-setup.sh ci-mac --lan mini-lan
+scripts/mac-vm-setup.sh ci --lan mini-lan --runners
 ```
+
+The host's keys-only Remote Login drop-in needs sudo, which needs the mini's password: the connector script stops
+and prints the one command to type at the mini. Everything else needs no password.
+
+#### Mac mini: what bit during setup (2026-11-14)
+
+Kept so the next machine goes faster.
+
+- **Driving a Mac over Screen Sharing from an agent.** No desktop computer-use tools were in the session; Peekaboo's
+  CLI (`~/.local/bin/peekaboo`, 4.9.5) did it. `peekaboo list` is gone in v4 (`peekaboo window list --app "Screen
+  Sharing" --json` gives window ids). `peekaboo see` failed with "ScreenCaptureKit is quarantined";
+  `screencapture -x -o -l <window_id> out.png` works.
+- **Clicks went to the wrong app.** `peekaboo click` hits whatever is frontmost: the first clicks landed in the Claude
+  app, not the mini. Bring Screen Sharing forward first (`osascript -e 'tell application "Screen Sharing" to activate'`;
+  `peekaboo app switch` refuses without consent, and System Events' AXRaise needs assistive access), then
+  `peekaboo click --foreground --global --at X,Y`, where X,Y is the window's origin plus the screenshot's pixel
+  position halved (Retina).
+- **`peekaboo type` reports "did not return an accepted outcome" even when the text arrived.** Check with a screenshot.
+- **Shift does not survive Screen Sharing.** Typed into the mini, `~` arrived as a backtick, `&&` as `77`, `>>` as
+  `..`, capitals as lower case. Type only unshifted characters: the mini's key went in as `curl -so k.sh
+  <this Mac's LAN address>/k.sh; sh k.sh`, served for a minute by `python3 -m http.server 80 --bind 0.0.0.0` (port 80
+  on one address needs root on macOS; on 0.0.0.0 it does not).
+- **Turning on Remote Login also turned on "Allow full disk access for remote users".** Left on: the VMs and their
+  launchd agents are managed over SSH.
+- **The README was stale about the MacBook.** Its `ejc3` and `skevh` VMs no longer existed (`tart list` showed only
+  `gww-ci`, plus `kidsports-ci` under `TART_HOME=/Volumes/Scratch/.tart-kidsports`); those two CI VMs come from
+  `ci-vm.sh` in dolphin-labs and kid-sports-highlights. The `ejc3` VM's routes in `mac-vms.tf`, with no VM behind
+  them, were removed on 2026-11-15.
+- **Checking the change on a Mac.** Homebrew's Terraform is 1.5.7 and cannot parse this configuration (`ephemeral`,
+  `removed`, `import` with `for_each`); 1.10.3 can, but the `ejc3/cloudflare` provider fork has no `darwin_arm64`
+  build, so `terraform validate` runs only on Linux (CI's `drift.yml`). `scripts/test-mac-ssh-client.py` fails ten
+  installer tests on macOS on `main` too: the installer uses GNU `sed -i`.
+- **The mini's LAN address changed under a running session.** It first answered on the address of a USB Ethernet
+  adapter; when that adapter moved to another machine, the other machine kept that address and the mini came back on
+  another one. ssh refused the new key at the old address ("REMOTE HOST IDENTIFICATION HAS CHANGED"), which is how it
+  was caught, and the Xcode copy running at the time stopped part-way. Reach the mini by its Bonjour name with a
+  `HostKeyAlias` (above), and check a long copy's exit status: zsh has no `PIPESTATUS`, so
+  `cmd | tee log; echo ${PIPESTATUS[0]}` prints nothing.
+- **Every clone of the base image has the same SSH host keys.** ghcr.io/cirruslabs/macos-tahoe-base ships them baked
+  in (dated 2026-08-18), private halves included, so `skevh` and `ci` came up with identical keys and anyone with the
+  public image holds them: pinning one would identify nothing. `mac-vm-setup.sh` now makes each guest its own once
+  (`ssh-keygen -A`, marker `/etc/ssh/.host-keys-made-by-mac-vm-setup`). The MacBook's `gww-ci` and `kidsports-ci`
+  were cloned from the same image and were not changed.
+- **A fresh Mac has no `python3`**: only Apple's stub, which pops the developer-tools installer on the Mac's screen
+  instead of running. `mac-vm-setup.sh` checks for a VM with `tart get`.
+- **Growing a guest's disk can fail while it is still booting**, and `set -e` then ended the first run with no message.
+  It now says so; running the script again finishes it (the disk went from 41 to 93 GB on skevh).
+- **`gh auth refresh` in a terminal tab stopped at "Authenticate Git with your GitHub credentials? (Y/n)"**, which an
+  agent cannot answer there. `GH_PROMPT_DISABLED=1 gh auth refresh ...` skips the prompt and prints the device code.
+  Approving it in the browser can first offer single sign-on for another org the account belongs to: "Continue"
+  skips it.
+- **The runners registered but could serve nothing at first**: the org's Default runner group lists repositories
+  ("selected") and its list was empty (above).
+- **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
+  administration-only connector tokens.
+- **The base image download is slow**: 27.3 GB compressed from ghcr.io at about 1% a minute. Start `tart pull` first.
+- **The connector script read fcvm-arm's client key over ssh with the jumpbox's `fcvm-ec2` key**, which the MacBook
+  does not have: its only key to fcvm-arm is a security key, and the call sat waiting for a touch. Every client's key
+  is now read through Run Command, as the nextjs-ct ones already were, so a `--lan` run needs only the admin AWS session
+  and no ssh to fcvm-arm.
+- **The first `ssh skevh-mac` from Steve's container after an idle hour failed with `NoCredentials`** in the Access
+  proxy; every retry connected. `nextjs-ct-imds` issued an expired session on request, an `aws sts assume-role` run
+  of over a second, and the CLI waits one second, once: it hung up (the broker logged `BrokenPipeError`) and the next
+  call found the session cached. Any member's first AWS call after an idle hour could fail the same way. The broker now
+  issues every container's session at start and renews it in the background before a request would have to.
+- **Running `scripts/test-mac-ssh-client.py` on the MacBook took `ssh mac` down** (Cloudflare 1033 for the fcvm agents
+  until it was noticed). The connector's reload runs detached; in the test it outlived its temp dir, so its bare
+  `launchctl` fell through to the real one and booted out the real `com.ejcampbell.macbook-ssh.cloudflared`. The test
+  now pins `launchctl` to its stub. If it happens again: `launchctl bootstrap gui/$(id -u)
+  ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`.
 
 ## Start a Codex session
 
@@ -1907,6 +2022,16 @@ upstream default branch or a verified GitHub merge of the exact worktree head.
 `sudo nextjs-worktree-prune` previews the job without removing anything. The
 dedicated SSM association installs the timer without rerunning Next.js setup
 or starting cleanup during installation.
+
+**Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
+every 30 seconds. The recorder keeps bounded, root-only files in
+`/var/log/nextjs-memory`, on the host's EBS volume. These put memory, swap and
+pressure alongside container cgroup usage and the largest processes. They
+record process names and counters; they do not read command lines, environment
+variables or process contents. Inspect the files after an incident to see which
+workloads were growing before the box became unreachable. The separate SSM
+association follows replacement hosts and installs only the recorder and its
+timer. It does not rerun Next.js provisioning or restart any existing service.
 
 **The zone follows the account, not a flag.** `colton` and `connor` publish to
 `https://<name>.cc-games.dev`; `ejc3` and `skevh` publish to `https://<name>.dolphin-labs.dev`.

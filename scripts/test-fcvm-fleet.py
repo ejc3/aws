@@ -54,6 +54,44 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("from_port        = 443", coord)
         self.assertIn("to_port          = 443", coord)
 
+    def test_public_java_join_is_virginia_host_only_and_ipv6_only(self):
+        for region in ("east2", "west2"):
+            self.assertNotIn("minecraft_java_access", block('module "fcvm_fleet_%s"' % region))
+        east = block('module "fcvm_fleet_east1"')
+        # Gen14 (reviewed) and the factory's generation fifteen (ejc3/fcvm c5e8fc89, which carries #1844's
+        # host limits and Pumpkin 1aa35ecc's login timeout).
+        self.assertIn('host_amis   = ["ami-0c3ea14848ddbeb93", "ami-089b83ada9f380d5e"]', east)
+        self.assertIn('source_cidr = "::/0"', east)
+        guard = block('resource "aws_vpc_security_group_ingress_rule" "minecraft_java"', MOD)
+        self.assertRegex(guard, r"cidr_ipv6\s*=\s*var\.minecraft_java_access\.source_cidr")
+        for field in ("from_port", "to_port"):
+            self.assertRegex(guard, rf"{field}\s*=\s*25565")
+        self.assertNotIn("cidr_ipv4", guard)
+        host = block('resource "aws_launch_template" "host"', MOD)
+        # Every Virginia host gets the group; the boot guard opens 25565 only on a listed image or
+        # one that says it carries the join limits.
+        self.assertIn('each.key == "x86_64" && var.minecraft_java_access != null', host)
+        self.assertIn("aws_security_group.minecraft_java[*].id", host)
+        for template in ("tile", "tile_on_demand", "tile_pool"):
+            self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
+        self.assertNotIn("minecraft_java", block('resource "aws_security_group" "fleet"', MOD))
+        self.assertEqual(TF.count("host_minecraft_java_security_group_arns"), 2)
+        inline = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        self.assertNotIn("host_minecraft_java", inline, "Keep the new grant outside the nearly-full inline policy")
+        dedicated = block('resource "aws_iam_policy" "fcvm_fleet_coordinator_java"')
+        self.assertIn('Sid      = "LaunchVirginiaHostWithTemplateJavaGroup"', dedicated)
+        self.assertIn('Action   = "ec2:RunInstances"', dedicated)
+        self.assertIn('Resource = module.fcvm_fleet_east1.host_minecraft_java_security_group_arns[count.index]', dedicated)
+        self.assertNotIn('"ec2:CreateFleet"', dedicated)
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java"')
+        self.assertIn('role       = aws_iam_role.fcvm_fleet_coordinator_task.name', attachment)
+        self.assertIn('policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn', attachment)
+        self.assertIn('ArnEquals = { "ec2:LaunchTemplate" = module.fcvm_fleet_east1.host_minecraft_java_template_arn }', dedicated)
+        self.assertIn('Bool      = { "ec2:IsLaunchTemplateResource" = "true" }', dedicated)
+        self.assertNotIn('IfExists', dedicated)
+        source_template = block('output "host_minecraft_java_template_arn"', MOD)
+        self.assertIn('aws_launch_template.host["x86_64"].arn', source_template)
+
     def test_ipv4_opening_requires_all_supplied_images_to_have_the_private_reviewed_guard(self):
         self.assertIn('data "aws_ami" "guarded"', MOD, "Public IPv4 requires AMI guard admission first")
         admitted = block('data "aws_ami" "guarded"', MOD)
@@ -90,6 +128,186 @@ class NetworkTests(unittest.TestCase):
 
 
 class HostTests(unittest.TestCase):
+    def test_java_guard_runs_before_agent_on_every_start_and_uses_the_booted_image(self):
+        user_data = MOD.split("user_data = base64encode(<<-EOT", 1)[1].split("\n  EOT", 1)[0]
+        before_env, after_env = user_data.split("printf 'FLEET_AGENT_ARGS", 1)
+        self.assertIn("/etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf", before_env)
+        # Closed before the agent starts; opened by its own unit after the agent has installed
+        # the join limits and the guard has read them back.
+        self.assertIn("ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard close\n", before_env)
+        self.assertIn("ExecStartPost=/bin/systemctl --no-block restart fcvm-minecraft-java-open.service\n", before_env)
+        opener = before_env.split("cat > /etc/systemd/system/fcvm-minecraft-java-open.service <<'MINECRAFT_OPEN'\n", 1)[1].split("MINECRAFT_OPEN", 1)[0]
+        for line in ("After=fcvm-fleet-agent.service", "PartOf=fcvm-fleet-agent.service", "Type=oneshot",
+                     "EnvironmentFile=/etc/fcvm-fleet/agent.env", "EnvironmentFile=-/etc/fcvm-fleet/windows.env",
+                     "ExecStart=/usr/local/libexec/fcvm-minecraft-java-guard open "):
+            with self.subTest(line=line):
+                self.assertIn(line, opener)
+        self.assertIn("systemctl daemon-reload", before_env)
+        self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", after_env)
+        guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
+        image = "ami-0c3ea14848ddbeb93"
+        second = "ami-089b83ada9f380d5e"
+        approved_list = image + "," + second
+        with tempfile.TemporaryDirectory() as temp:
+            curl = Path(temp) / "curl"
+            curl.write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                set -eu
+                case "${!#}" in
+                  */api/token) test "$BOOT_AMI" != no-token; printf fixture-token;;
+                  */meta-data/ami-id|*/meta-data/mac|*/network/interfaces/macs/00:01:02:03:04:05/ipv6-prefix)
+                    test "$(cat)" = 'X-aws-ec2-metadata-token: fixture-token'
+                    case "${!#}" in
+                      *ami-id) test "$BOOT_AMI" != no-image; printf "%s" "$BOOT_AMI";;
+                      *ipv6-prefix) printf "%s" "$PREFIX";;
+                      *mac) printf 00:01:02:03:04:05;;
+                    esac;;
+                  *) exit 90;;
+                esac
+            """).lstrip())
+            curl.chmod(0o700)
+            nft = Path(temp) / "nft"
+            nft.write_text('#!/bin/bash\ncat\nexit "$NFT_STATUS"\n')
+            nft.chmod(0o700)
+            pci = Path(temp) / "pci"
+            (pci / "drivers/vfio-pci").mkdir(parents=True)
+            for i in range(8):
+                name = f"0000:{i:02d}:00.0"
+                dev = pci / "devices" / name
+                dev.mkdir(parents=True)
+                (dev / "vendor").write_text("0x10de\n")
+                (dev / "class").write_text("0x030200\n")
+                (pci / "drivers/vfio-pci" / name).symlink_to(dev)
+            limits_env = Path(temp) / "minecraft.env"
+            ip6tables = Path(temp) / "ip6tables"
+            ip6tables.write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                set -eu
+                test "$1" = -S
+                case "$2" in
+                  FCVM-MC-JOIN) test -n "${IP6_JOIN:-}" || exit 1; printf "%s\n" "$IP6_JOIN";;
+                  FORWARD) printf "%s\n" "$IP6_FORWARD";;
+                  *) exit 2;;
+                esac
+            """).lstrip())
+            ip6tables.chmod(0o700)
+            script = (guard.replace("/usr/bin/curl", str(curl)).replace("/usr/sbin/nft", str(nft))
+                      .replace("/sys/bus/pci", str(pci)).replace("/etc/fcvm-fleet/minecraft.env", str(limits_env))
+                      .replace("/usr/sbin/ip6tables", str(ip6tables)))
+            # ip6tables -S as the agent's chain prints on a host (ejc3/fcvm src/fleet/agent/joinguard.rs).
+            syn = "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN"
+            live_join = "\n".join([
+                "-N FCVM-MC-JOIN",
+                f"-A FCVM-MC-JOIN {syn} -m connlimit --connlimit-above 4 --connlimit-mask 64 --connlimit-saddr "
+                "-j REJECT --reject-with tcp-reset",
+                f"-A FCVM-MC-JOIN {syn} -m hashlimit --hashlimit-above 12/min --hashlimit-burst 6 --hashlimit-mode srcip "
+                "--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 -j REJECT --reject-with tcp-reset"])
+            live_forward = "\n".join(["-P FORWARD ACCEPT",
+                                      "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN",
+                                      "-A FORWARD -i veth0 -j ACCEPT"])
+            approved_prefix = "2001:db8:1:2:3::/80"
+            agent_args = "--windows 4 --minecraft 4"
+            cases = [(image, approved_prefix, agent_args, "8", "0", True),
+                     (second, approved_prefix, agent_args, "8", "0", True),
+                     ("ami-0bbbbbbbbbbbbbbbb", approved_prefix, agent_args, "8", "0", False),
+                     ("no-token", approved_prefix, agent_args, "8", "0", False),
+                     ("no-image", approved_prefix, agent_args, "8", "0", False),
+                     (image, "2001:db8:1:2::/64", agent_args, "8", "0", False),
+                     (image, approved_prefix + "\n" + approved_prefix, agent_args, "8", "0", False),
+                     (image, approved_prefix, "--minecraft 4", "8", "0", False),
+                     (image, approved_prefix, agent_args, "7", "0", False),
+                     (image, approved_prefix, agent_args, "8", "1", True)]
+            cases = [case + ("", live_join, live_forward) for case in cases]
+            # An image off the list opens only when its build said its servers carry the join limits
+            # (ejc3/fcvm#1915: MINECRAFT_JOIN_LIMITS=enforced in /etc/fcvm-fleet/minecraft.env), and
+            # still only with the layout checks.
+            unlisted = "ami-0ccccccccccccccc1"
+            enforced = "MINECRAFT_JOIN_LIMITS=enforced\n"
+            cases += [(unlisted, approved_prefix, agent_args, "8", "0", True, enforced, live_join, live_forward),
+                      (unlisted, approved_prefix, agent_args, "8", "0", False, "MINECRAFT_JOIN_LIMITS=enforced # x\n",
+                       live_join, live_forward),
+                      (unlisted, approved_prefix, "--minecraft 4", "8", "0", False, enforced, live_join, live_forward),
+                      (unlisted, "2001:db8:1:2::/64", agent_args, "8", "0", False, enforced, live_join, live_forward),
+                      ("no-image", approved_prefix, agent_args, "8", "0", False, enforced, live_join, live_forward)]
+            # The marker is a precondition, not the proof: the live chain decides, for a listed image
+            # as for a marked one.
+            unhooked = "\n".join(["-P FORWARD ACCEPT", "-A FORWARD -i veth0 -j ACCEPT"])
+            accept_first = "\n".join(["-P FORWARD ACCEPT", "-A FORWARD -i veth0 -j ACCEPT",
+                                       "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"])
+            for actual, marker in ((unlisted, enforced), (image, "")):
+                cases += [(actual, approved_prefix, agent_args, "8", "0", False, marker, "", live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker, live_join, unhooked),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker, live_join, accept_first),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace("--connlimit-above 4 ", "--connlimit-above 40 "), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace("--hashlimit-burst 6 ", "--hashlimit-burst 60 "), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           live_join.replace(" -j REJECT --reject-with tcp-reset", " -j ACCEPT"), live_forward),
+                          (actual, approved_prefix, agent_args, "8", "0", False, marker,
+                           "\n".join(live_join.splitlines()[:2]), live_forward)]
+            # Rules that pass a substring check but bypass or narrow the limits, as Ubuntu noble's
+            # ip6tables 1.8.10 (nf_tables) prints them. Each keeps Java closed.
+            connlimit, hashlimit = live_join.splitlines()[1:]
+            jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
+            bypasses = {
+                "earlier RETURN": (live_join, "\n".join(["-P FORWARD ACCEPT",
+                                                          "-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", jump])),
+                "earlier jump elsewhere": (live_join, "\n".join(["-P FORWARD ACCEPT",
+                                                                  "-A FORWARD -i br0 -j FCVM-OTHER", jump])),
+                "connlimit on marked packets only": (live_join.replace(
+                    connlimit, connlimit.replace(" -m connlimit ", " -m mark --mark 0x1 -m connlimit ")), live_forward),
+                "connlimit keyed by destination": (live_join.replace(
+                    connlimit, connlimit.replace("--connlimit-saddr", "--connlimit-daddr")), live_forward),
+                "hashlimit on marked packets only": (live_join.replace(
+                    hashlimit, hashlimit.replace(" -m hashlimit ", " -m mark --mark 0x1 -m hashlimit ")), live_forward),
+                "hashlimit keyed by destination": (live_join.replace(hashlimit, hashlimit.replace(
+                    "--hashlimit-mode srcip", "--hashlimit-mode dstip").replace(
+                    "--hashlimit-srcmask 64", "--hashlimit-dstmask 64")), live_forward),
+            }
+            for label, (join, forward) in bypasses.items():
+                for actual, marker in ((unlisted, enforced), (image, "")):
+                    cases.append((actual, approved_prefix, agent_args, "8", "0", False, marker, join, forward))
+            allow = ("forward ip6 daddr { 2001:db8:1:2:3::e, 2001:db8:1:2:3::f, "
+                     "2001:db8:1:2:3::10, 2001:db8:1:2:3::11 } tcp dport 25565 return")
+            labels = {rules: label for label, rules in bypasses.items()}
+            for actual, prefix, args, gpu_count, status, forward_allowed, limits, join, forward in cases:
+                with self.subTest(labels.get((join, forward), ""), actual=actual, prefix=prefix, args=args,
+                                  gpu_count=gpu_count, status=status, limits=limits, join=join, forward=forward):
+                    limits_env.write_text(limits)
+                    result = subprocess.run(
+                        ["/bin/bash", "-x", "-c", script, "--", "open", approved_list, gpu_count, "4", "4"],
+                        env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status, IP6_JOIN=join,
+                                 IP6_FORWARD=forward, FCVM_JAVA_GUARD_WAIT="0",
+                                 FLEET_AGENT_ARGS=args, WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
+                        capture_output=True,
+                        text=True, check=False, timeout=5,
+                    )
+                    self.assertEqual(result.returncode, int(status))
+                    self.assertIn("hook input priority -130", result.stdout)
+                    self.assertIn("hook forward priority -130", result.stdout)
+                    self.assertIn("input tcp dport 25565 drop", result.stdout)
+                    self.assertEqual(allow in result.stdout, forward_allowed)
+                    self.assertEqual("forward ip6 daddr" in result.stdout, forward_allowed)
+                    self.assertIn("forward tcp dport 25565 drop", result.stdout)
+                    if forward_allowed:
+                        self.assertLess(result.stdout.index(allow), result.stdout.index("forward tcp dport 25565 drop"))
+                    self.assertNotIn("fixture-token", result.stderr)
+                    self.assertNotIn("flush ruleset", result.stdout)
+
+    def test_java_guard_closes_before_the_agent_starts_whatever_the_host_holds(self):
+        guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
+        with tempfile.TemporaryDirectory() as temp:
+            nft = Path(temp) / "nft"
+            nft.write_text('#!/bin/bash\ncat\n')
+            nft.chmod(0o700)
+            result = subprocess.run(["/bin/bash", "-c", guard.replace("/usr/sbin/nft", str(nft)), "--", "close"],
+                                    capture_output=True, text=True, check=True, timeout=5)
+        self.assertIn("flush table ip6 fcvm_minecraft_java", result.stdout)
+        self.assertIn("input tcp dport 25565 drop", result.stdout)
+        self.assertIn("forward tcp dport 25565 drop", result.stdout)
+        self.assertNotIn("return", result.stdout)
+
     def test_potato_argument_tracks_the_actual_boot_image_not_the_template_history(self):
         # The publisher reuses user data when it switches image IDs. Exercise
         # the same bootstrap with the candidate, current host, every rollback and failed IMDS.
@@ -109,7 +327,8 @@ class HostTests(unittest.TestCase):
         legacy_windows = ("ami-0bbbbbbbbbbbbbbb", "ami-0eeeeeeeeeeeeeee")  # 853eb034 and 0e910245
         self.assertEqual(re.search(r'windows_host_amis\s*=\s*(.+)', east)[1],
                          'concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids, '
-                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids)')
+                         'data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/c12ad070"].ids, '
+                         '["ami-089b83ada9f380d5e"])')
         # Legacy copies still carry Minecraft and potato, but the widened public ports
         # must never expose their unauthenticated Windows /still endpoint on rollback.
         self.assertNotIn('"--minecraft', TF)
@@ -195,21 +414,35 @@ exit 1
             shell = (textwrap.dedent(fallback).replace('/usr/local/bin/fcvm', str(fcvm))
                      .replace('/usr/bin/podman', str(podman))
                      .replace('/etc/fcvm-fleet/windows.env', str(windows_env))
-                     .replace('${var.minecraft_count}', '3'))
+                     .replace('${var.minecraft_count}', '3')
+                     .replace('${var.windows_count}', '2'))
             potato_image = 'localhost/fcvm-potato:fleet'
             minecraft_image = 'localhost/fcvm-minecraft:fleet'
             both_images = f'{potato_image} {minecraft_image}'
             both_flags = '--potato-players --minecraft --windows'
-            for name, before, images, help_text, suffix in (
-                ('factory host with both', '', both_images, both_flags, ' --potato-players 96 --minecraft 3'),
-                ('only Minecraft image', '', minecraft_image, both_flags, ' --minecraft 3'),
-                ('only potato flag', '', both_images, '--potato-players --minecraft-image --windows', ' --potato-players 96'),
-                ('neither image; legacy Windows config present', '', '', both_flags, ''),
-                ('old agent with both images', '', both_images, '--potato-image --minecraft-image --windows', ''),
-                ('help probe failure', '', both_images, 'fails', ''),
-                ('reviewed image keeps existing arguments once', ' --windows 4 --potato-players 96 --minecraft=3', both_images, both_flags, ''),
+            legacy = 'WINDOWS_AGENT_ARGS=--windows-image /legacy-image\n'
+            # The image's build writes this line only when its bridge refuses /still on the public
+            # ports (ejc3/fcvm#1839, fleet/ami/host/build.sh).
+            refusing = legacy + 'WINDOWS_BRIDGE_STILL=refused\n'
+            for name, before, images, help_text, suffix, windows in (
+                ('factory host whose bridge refuses /still', '', both_images, both_flags,
+                 ' --potato-players 96 --minecraft 3 --windows 2', refusing),
+                ('refusing bridge, old agent without --windows', '', both_images, '--potato-players --minecraft',
+                 ' --potato-players 96 --minecraft 3', refusing),
+                ('refusing bridge and no mode images', '', '', both_flags, ' --windows 2', refusing),
+                ('a marker with anything else on its line is not the marker', '', '', both_flags, '',
+                 legacy + 'WINDOWS_BRIDGE_STILL=refused # comment\n'),
+                ('reviewed Windows image is not given --windows twice', ' --windows 4', '', both_flags, '', refusing),
+                ('factory host with both', '', both_images, both_flags, ' --potato-players 96 --minecraft 3', legacy),
+                ('only Minecraft image', '', minecraft_image, both_flags, ' --minecraft 3', legacy),
+                ('only potato flag', '', both_images, '--potato-players --minecraft-image --windows', ' --potato-players 96', legacy),
+                ('neither image; legacy Windows config present', '', '', both_flags, '', legacy),
+                ('old agent with both images', '', both_images, '--potato-image --minecraft-image --windows', '', legacy),
+                ('help probe failure', '', both_images, 'fails', '', legacy),
+                ('reviewed image keeps existing arguments once', ' --windows 4 --potato-players 96 --minecraft=3', both_images, both_flags, '', legacy),
             ):
                 with self.subTest(name=name):
+                    windows_env.write_text(windows)
                     result = subprocess.run(
                         ['/bin/bash', '-eu', '-c', f"agent_args='--phones 2{before}'\n" + shell + '\nprintf "%s" "$agent_args"'],
                         env=dict(os.environ, IMAGES=images, HELP=help_text), capture_output=True, text=True, check=True, timeout=5,

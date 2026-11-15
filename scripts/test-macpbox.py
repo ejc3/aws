@@ -28,6 +28,25 @@ DATA = {"version": 1, "region": mac.REGION, "type": mac.TYPE, "name": "macpbox",
         "admin_identity_file": "~/.ssh/fcvm-ec2", "dev_identity_file": "~/.ssh/dev_hop"}
 
 
+class NetworkBoundaryTests(unittest.TestCase):
+    def test_ssh_cidrs_follow_only_the_hosts_with_the_macpbox_client(self):
+        terraform = (ROOT / "mac-dev.tf").read_text()
+        group = re.search(r'^resource "aws_security_group" "macpbox" \{\n(.*?)^\}', terraform, re.M | re.S)[1]
+        ingress = re.findall(r"^  ingress \{\n(.*?)^  \}", group, re.M | re.S)
+        self.assertEqual(len(ingress), 1)
+        self.assertNotIn("0.0.0.0/0", ingress[0])
+        self.assertNotIn("ipv6_cidr_blocks", ingress[0])
+        self.assertRegex(ingress[0], r"from_port\s*= 22\b")
+        self.assertRegex(ingress[0], r"to_port\s*= 22\b")
+        self.assertRegex(ingress[0], r'protocol\s*= "tcp"')
+        self.assertRegex(ingress[0], r"cidr_blocks\s*= local\.macpbox_ssh_cidrs\b")
+        sources = re.search(r"(?ms)^  macpbox_ssh_cidrs = (.*?)^  \]\)\)", terraform)[1]
+        self.assertRegex(sources, r'(?s)ip in concat\(.*?\) : "\$\{ip\}/32"')
+        self.assertEqual(set(re.findall(r"aws_eip\.(\w+)\[\*\]\.public_ip", sources)), {
+            "jumpbox", "jumpbox_2", "firecracker_dev_next", "x86_dev", "nextjs_dev",
+        })
+
+
 class Cloud:
     def __init__(self):
         self.calls, self.hosts, self.instances = [], [], []

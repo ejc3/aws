@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample shared Next.js host memory usage every 30 seconds
+
+[Timer]
+OnBootSec=15s
+OnUnitActiveSec=30s
+AccuracySec=2s
+
+[Install]
+WantedBy=timers.target

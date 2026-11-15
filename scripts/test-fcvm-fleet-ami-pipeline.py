@@ -317,6 +317,10 @@ class FactoryTests(unittest.TestCase):
         self.assertRegex(publisher, r"PIPELINE_REGION\s*=\s*local\.fcvm_fleet_home_region")
 
     def setUp(self):
+        # Delivery may recheck a queued timeout after the request helper's fake has exited.
+        github = patch.object(mod, "public_github", return_value=None)
+        self.addCleanup(github.stop)
+        github.start()
         self.time = NOW
         self.env = {"ENABLED": "true", "STATE_PREFIX": "/factory", "PROJECT_NAME": "factory", "CONTROL_REGION": "us-west-1",
             "COMPUTE_REGION": "us-east-1", "FLEET_ACCOUNT": "123456789012", "BUILDER_PROFILE": "arn:aws:iam::123456789012:instance-profile/factory",
@@ -374,9 +378,17 @@ class FactoryTests(unittest.TestCase):
         def response(path):
             if path == "git/ref/heads/main":
                 return {"object": {"sha": source_sha}}
-            if path == "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha:
+            base = "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + source_sha
+            if path in (base, base + "?per_page=1&page=2"):
                 if isinstance(comparison, Exception):
                     raise comparison
+                # GitHub puts every changed file's patch on the first page of a comparison: over a
+                # long history that page passes public_github's 2 MiB bound (2.24 MB for the
+                # extended-timeout source...20fc62c4 on 2026-11-14), and only page two is small.
+                if isinstance(comparison, dict) and comparison.get("oversized"):
+                    if path == base:
+                        raise mod.Refused("trusted CI metadata exceeds its fixed bound")
+                    return {k: v for k, v in comparison.items() if k != "oversized"}
                 return comparison
             return {"workflow_runs": [self.ci_run(head_sha=source_sha)]}
         with patch.object(mod, "public_github", side_effect=response):
@@ -419,6 +431,19 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(len(self.ec2.launches), 1)
         self.launch("tile-build")
         self.assertEqual(self.ec2.launches[-1]["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 32)
+
+    def test_the_host_image_root_has_room_for_the_store_and_a_host_kernel(self):
+        # The host image keeps its packed store (about 28 GB) on the root disk as the S3
+        # restore's fallback. With 64 GB the root of a gpubox from the cad0ddad image had 416 MB
+        # free, and installing a 7.3.3 host kernel there failed ("No space left on device"). The
+        # host builder's root, which every host booted from the image inherits, is 96 GB, and
+        # the role allows exactly that.
+        self.launch()
+        self.assertEqual(self.ec2.launches[0]["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 96)
+        tf = (Path(__file__).resolve().parent.parent / "fcvm-fleet-ami-pipeline.tf").read_text()
+        cap = re.search(r'Sid = "FixedRoot".*?NumericLessThanEquals = \{ "ec2:VolumeSize" = (\d+) \}', tf, re.S)
+        self.assertIsNotNone(cap, "no root volume size cap in the builder role")
+        self.assertEqual(int(cap.group(1)), max(mod.VOLUMES.values()))
 
     def test_definite_capacity_rejection_frees_queue_without_retrying_slot(self):
         def rejected(**kwargs):
@@ -914,12 +939,69 @@ class FactoryTests(unittest.TestCase):
             ("2" * 40, {**proof, "status": "behind"}, 240),
             ("3" * 40, {**proof, "merge_base_commit": {"sha": "9" * 40}}, 240),
             ("4" * 40, OSError("GitHub unavailable"), 240),
+            # A long history whose first comparison page is over the response bound (generation
+            # fifteen's request expired at 240 minutes on 2026-11-14 for this reason).
+            ("5" * 40, {**proof, "oversized": True}, 360),
         ):
             with self.subTest(source=source):
                 self.setUp()
                 result = self.request("critical", source_sha=source, comparison=compare)
                 self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], expected)
                 self.assertEqual(result["deadline_unix"], NOW + expected * 60)
+
+    def test_queued_legacy_timeout_is_extended_at_first_start_when_source_is_proven(self):
+        result = self.request()
+        # The live pre-upgrade request already recorded an explicit four-hour timeout.
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["build_timeout_minutes"], 240)
+        self.assertEqual(self.cb.starts, [])
+        self.time = result["not_before"]
+        expected = "compare/" + mod.EXTENDED_TIMEOUT_SOURCE + "..." + SOURCE_SHA + "?per_page=1&page=2"
+
+        def compare(path):
+            # Bound the comparison to this one queued source; never hold the Terraform lock across HTTP.
+            self.assertEqual(path, expected)
+            self.assertFalse(self.ddb.held)
+            return {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": mod.EXTENDED_TIMEOUT_SOURCE}}
+
+        with patch.object(mod, "public_github", side_effect=compare) as github:
+            self.factory.reconcile()
+        self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], 360)
+        record = self.factory.request_record(INPUT_SHA)
+        self.assertEqual(record["build_timeout_minutes"], 360)
+        self.assertEqual(record["start_attempted"], self.time)
+        self.assertEqual(record["deadline_unix"], self.time + 21600)
+        github.assert_called_once_with(expected)
+
+    def test_timeout_proof_cannot_fence_a_replacement_queued_source(self):
+        result = self.request()
+        self.time = result["not_before"]
+        new_input, new_source = "3" * 64, "4" * 40
+
+        def compare(_path):
+            self.assertFalse(self.ddb.held)
+            current = self.factory.request_record(INPUT_SHA)
+            self.store.values["/factory/requests/" + new_input] = dict(
+                current, request_id=new_input, source_sha=new_source, input_sha256=new_input)
+            self.store.values["/factory/control"]["pending"] = new_input
+            return {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": mod.EXTENDED_TIMEOUT_SOURCE}}
+
+        with patch.object(mod, "public_github", side_effect=compare):
+            self.factory.reconcile()
+        self.assertEqual(self.cb.starts, [])
+        self.assertNotIn("start_attempted", self.factory.request_record(new_input))
+        self.factory.reconcile()
+        self.assertEqual(self.cb.starts[0]["sourceVersion"], new_source)
+        self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], 240)
+
+    def test_admitted_extended_timeout_is_not_downgraded_when_github_is_unavailable(self):
+        proof = {"status": "ahead", "behind_by": 0, "merge_base_commit": {"sha": mod.EXTENDED_TIMEOUT_SOURCE}}
+        result = self.request(comparison=proof)
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["build_timeout_minutes"], 360)
+        self.time = result["not_before"]
+        with patch.object(mod, "public_github", side_effect=OSError("GitHub unavailable")) as github:
+            self.factory.reconcile()
+        self.assertEqual(self.cb.starts[0]["timeoutInMinutesOverride"], 360)
+        github.assert_not_called()
 
     def test_request_queued_before_upgrade_keeps_legacy_project_timeout(self):
         result = self.request(source_sha=mod.EXTENDED_TIMEOUT_SOURCE)
@@ -1639,12 +1721,12 @@ class FactoryTests(unittest.TestCase):
                          (before, [], [], []))
 
     def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
-        # 2026-11-14: generation twelve broke staging; the factory is paused until the boot fix
-        # and the launch-path gate are in. The pause reaches the dispatcher as ENABLED=false,
-        # which starts nothing, while the launch templates still follow the release pointer.
+        # The pause reaches the dispatcher as ENABLED=false, which starts nothing, while the launch
+        # templates still follow the release pointer. It was on from generation twelve (#823) until
+        # ejc3/fcvm had the boot fix and the launch-path gate; it is off again.
         source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
-        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertRegex(variable, r"default\s*=\s*false")
         self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
         self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
         # what ENABLED=false does with a queued normal request whose window has opened

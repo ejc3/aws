@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
-VOLUMES = {"host": 64, "tile": 32}
+VOLUMES = {"host": 96, "tile": 32}
 LEGACY_TIMEOUT_MINUTES = 240
 EXTENDED_TIMEOUT_MINUTES = 360
 # First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
@@ -99,7 +99,10 @@ def execution_timeout_minutes(source):
     if source == EXTENDED_TIMEOUT_SOURCE:
         return EXTENDED_TIMEOUT_MINUTES
     try:
-        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source)
+        # Ancestry only, from page two: page one carries every changed file's patch, and over the
+        # long history since EXTENDED_TIMEOUT_SOURCE it passes public_github's 2 MiB bound, which
+        # gave generation fifteen's build the 240-minute limit and expired it mid-validation.
+        comparison = public_github("compare/" + EXTENDED_TIMEOUT_SOURCE + "..." + source + "?per_page=1&page=2")
     except (OSError, ValueError, Refused):
         # Missing ancestry proof is not permission to extend the legacy bound.
         return LEGACY_TIMEOUT_MINUTES
@@ -537,7 +540,7 @@ class Factory:
         control["pending"] = request_id
         control["last_source"] = source
         self.save("/control", control)
-        self.reconcile()
+        self.reconcile(checked_timeout=(request_id, source, record["build_timeout_minutes"]))
         return public_record(self.request_record(request_id))
 
     @contextmanager
@@ -658,10 +661,10 @@ class Factory:
         self.save("/requests/" + record["request_id"], record)
         self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
 
-    def reconcile(self):
+    def reconcile(self, checked_timeout=None):
         self.failures = []
         try:
-            publication = self.reconcile_control()
+            publication = self.reconcile_control(checked_timeout)
         finally:
             # In the order they were recorded, so the parameter ends on the newest.
             failures, self.failures = self.failures, []
@@ -674,10 +677,31 @@ class Factory:
             if response.get("StatusCode") != 202:
                 raise Refused("publication retry was not accepted")
 
-    def reconcile_control(self):
+    def request_window_open(self, control, request):
+        if request["priority"] != "normal":
+            return True
+        now = self.now()
+        today = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date().isoformat()
+        return now >= request["not_before"] and control.get("last_normal_day") != today
+
+    @staticmethod
+    def legacy_timeout_to_recheck(request):
+        return (request["status"] == "queued" and request.get("build_timeout_minutes") == LEGACY_TIMEOUT_MINUTES
+                and not request.get("start_attempted") and not request.get("build_id")
+                and request["source_sha"] != RETIRED_SOURCE_SHA)
+
+    def reconcile_control(self, checked_timeout=None):
         control = self.load("/control", {})
         if not control.get("active") and not control.get("pending"):
             return
+        # A queued request may have received the legacy limit when the ancestry lookup failed.
+        # Recheck outside the backend mutex, and bind the proof to the exact request under it.
+        if control.get("pending") and self.env.get("ENABLED") == "true":
+            pending = self.request_record(control["pending"])
+            if self.legacy_timeout_to_recheck(pending) and self.request_window_open(control, pending):
+                identity = (pending["request_id"], pending["source_sha"])
+                if checked_timeout is None or checked_timeout[:2] != identity:
+                    checked_timeout = (*identity, execution_timeout_minutes(pending["source_sha"]))
         start_record = None
         is_new = False
         with self.control_lock() as acquired:
@@ -778,13 +802,19 @@ class Factory:
                     control["pending"] = None
                     self.save("/control", control)
                     return
-                today = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
-                if pending["priority"] == "normal" and (self.now() < pending["not_before"] or control.get("last_normal_day") == today):
+                if not self.request_window_open(control, pending):
                     return
                 # Invalidate old publication before leaving the mutex for StartBuild.
                 start_record = pending
                 is_new = not start_record.get("start_attempted")
                 if is_new:
+                    if start_record["status"] != "queued" or start_record.get("build_id"):
+                        return  # Never fence a record that ceased to be an unstarted request.
+                    if self.legacy_timeout_to_recheck(start_record):
+                        if checked_timeout is None or checked_timeout[:2] != (start_record["request_id"], start_record["source_sha"]):
+                            return  # The eligible request changed; reconcile it on the next tick.
+                        if checked_timeout[2] == EXTENDED_TIMEOUT_MINUTES:
+                            start_record["build_timeout_minutes"] = EXTENDED_TIMEOUT_MINUTES
                     start_record["start_attempted"] = int(self.now())
                     self.save("/requests/" + start_record["request_id"], start_record)
                 control["active"] = {"intent": start_record["request_id"]}

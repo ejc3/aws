@@ -90,8 +90,7 @@ locals {
     "systemctl enable \"cloudflared@${z}\" >/dev/null 2>&1 || true\nsystemctl is-active --quiet \"cloudflared@${z}\" || systemctl start \"cloudflared@${z}\" || echo \"WARNING: cloudflared@${z} did not start\""
   ])
 
-  # Unix accounts. Each gets the fcvm key initially so you can get in as them and help;
-  # they can add their own keys to ~/.ssh/authorized_keys afterwards.
+  # Unix accounts. People may also add their own keys to ~/.ssh/authorized_keys.
   # `ej` was replaced by `ejc3`, matching the GitHub login so the account name, the git
   # identity and the repos all read the same. Created FRESH rather than renamed: the old
   # home held only tooling (zsh/atuin/fzf) with no credentials and no repos, and building
@@ -104,9 +103,12 @@ locals {
   # folder shows up in their Codex app. Deliberately not everyone: skevh is left out.
   nextjs_codex_seed_users = ["colton", "connor", "colin", "ejc3"]
 
-  # Keys the account owner logs in with, on top of the shared fcvm key above. Declared
-  # here rather than pasted into the box so a rebuild does not lose someone's access --
-  # the fcvm key is for US getting in to help, this is for THEM getting in at all.
+  # The owner uses the instance key pair from the phone to reach these three accounts.
+  # Member entries disable forwarding of the owner’s local SSH agent.
+  nextjs_owner_phone_ssh_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2"
+
+  # Declare each account's keys so a rebuild preserves access. People may also
+  # keep their own keys in their home directories.
   # Public keys only; nothing secret lives in this file.
   # A LIST per user, not a single string. ejc3 legitimately carries several keys (a personal
   # one plus service keys like the instinct bot), and the old map(string) could hold exactly
@@ -115,6 +117,10 @@ locals {
   nextjs_user_keys = {
     colton = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMkDiSjc5h8pkS6huofWCwpFwa0kY6UaWUH2JYkT7K6i colton",
+      "no-agent-forwarding ${local.nextjs_owner_phone_ssh_key}",
+    ]
+    connor = [
+      "no-agent-forwarding ${local.nextjs_owner_phone_ssh_key}",
     ]
     skevh = [
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEdvVbYeu8+3tHPYk/A/67qa5yoTaagVSaW+iQQncUVA stevekrutzler@Steves-iMac.local",
@@ -143,11 +149,7 @@ locals {
       # so unlike the keys above this is a new grant rather than an adoption of something the
       # instance already authorized: SHA256:tsfGYA0b848cRjsAWRAIG59lR7593BA06LaSncfyQOA.
       "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIM3U+Or6AG9kj/94JubpeKkNz7Jo872Piljcom/Gyj2P dolphin",
-      # The owner's own key (the instance key pair, which the owner's phone SSH app uses), declared 2026-10-20.
-      # nextjs-dev's setup put it in every account; nextjs-ct-machine removes it from any account that does not
-      # declare it, so after the cutover the phone could no longer log in to this account. Declared for ejc3
-      # only; the members' accounts stay without it.
-      "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINwtXjjTCVgT9OR3qrnz3zDkV2GveuCBlWFXSOBG2joe fcvm-ec2",
+      local.nextjs_owner_phone_ssh_key,
     ]
   }
 
