@@ -136,7 +136,7 @@ variable "minecraft_host_amis" {
 variable "minecraft_java_access" {
   description = "Exact reviewed IPv6 Java host AMI and permitted IPv6 source; null leaves the region closed."
   type = object({
-    host_ami    = string
+    host_amis   = list(string)
     source_cidr = string
     gpu_slots   = number
   })
@@ -144,13 +144,14 @@ variable "minecraft_java_access" {
 
   validation {
     condition = var.minecraft_java_access == null ? true : (
-      can(regex("^ami-[a-f0-9]{17}$", var.minecraft_java_access.host_ami)) &&
+      length(var.minecraft_java_access.host_amis) > 0 &&
+      alltrue([for ami in var.minecraft_java_access.host_amis : can(regex("^ami-[a-f0-9]{17}$", ami))]) &&
       (var.minecraft_java_access.source_cidr == "::/0" ||
         (strcontains(var.minecraft_java_access.source_cidr, ":") &&
           endswith(var.minecraft_java_access.source_cidr, "/128") &&
       can(cidrhost(var.minecraft_java_access.source_cidr, 0))))
     )
-    error_message = "Minecraft Java needs one exact AMI ID and only IPv6 /128 proof sources or ::/0."
+    error_message = "Minecraft Java needs exact AMI IDs and only IPv6 /128 proof sources or ::/0."
   }
 }
 
@@ -278,7 +279,7 @@ locals {
     MINECRAFT_GUARD
     cat > /etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf <<'MINECRAFT_UNIT'
     [Service]
-    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard ${var.minecraft_java_access.host_ami} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
+    ExecStartPre=/usr/local/libexec/fcvm-minecraft-java-guard ${join(",", var.minecraft_java_access.host_amis)} ${var.minecraft_java_access.gpu_slots} ${var.windows_count} ${var.minecraft_count}
     MINECRAFT_UNIT
     systemctl daemon-reload
     %{endif~}
@@ -499,7 +500,7 @@ resource "aws_launch_template" "host" {
     # New Terraform defaults attach the extra group only to the reviewed
     # image. Image-only publisher copies retain the bootstrap gate as well.
     security_groups = concat([aws_security_group.fleet.id],
-      each.key == "x86_64" && var.gpu_amis[each.key] == try(var.minecraft_java_access.host_ami, "")
+      each.key == "x86_64" && contains(try(var.minecraft_java_access.host_amis, []), var.gpu_amis[each.key])
       ? aws_security_group.minecraft_java[*].id : []
     )
     associate_public_ip_address = true

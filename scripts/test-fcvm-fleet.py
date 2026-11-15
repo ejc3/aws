@@ -58,7 +58,9 @@ class NetworkTests(unittest.TestCase):
         for region in ("east2", "west2"):
             self.assertNotIn("minecraft_java_access", block('module "fcvm_fleet_%s"' % region))
         east = block('module "fcvm_fleet_east1"')
-        self.assertIn('host_ami    = "ami-0c3ea14848ddbeb93"', east)
+        # Gen14 (reviewed) and the factory's generation fifteen (ejc3/fcvm c5e8fc89, which carries #1844's
+        # host limits and Pumpkin 1aa35ecc's login timeout).
+        self.assertIn('host_amis   = ["ami-0c3ea14848ddbeb93", "ami-089b83ada9f380d5e"]', east)
         self.assertIn('source_cidr = "::/0"', east)
         guard = block('resource "aws_vpc_security_group_ingress_rule" "minecraft_java"', MOD)
         self.assertRegex(guard, r"cidr_ipv6\s*=\s*var\.minecraft_java_access\.source_cidr")
@@ -66,7 +68,7 @@ class NetworkTests(unittest.TestCase):
             self.assertRegex(guard, rf"{field}\s*=\s*25565")
         self.assertNotIn("cidr_ipv4", guard)
         host = block('resource "aws_launch_template" "host"', MOD)
-        self.assertIn('var.gpu_amis[each.key] == try(var.minecraft_java_access.host_ami, "")', host)
+        self.assertIn('contains(try(var.minecraft_java_access.host_amis, []), var.gpu_amis[each.key])', host)
         self.assertIn("aws_security_group.minecraft_java[*].id", host)
         for template in ("tile", "tile_on_demand", "tile_pool"):
             self.assertNotIn("minecraft_java", block('resource "aws_launch_template" "%s"' % template, MOD))
@@ -133,6 +135,8 @@ class HostTests(unittest.TestCase):
         self.assertIn("systemctl start --no-block fcvm-fleet-agent.service", after_env)
         guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
         image = "ami-0c3ea14848ddbeb93"
+        second = "ami-089b83ada9f380d5e"
+        approved_list = image + "," + second
         with tempfile.TemporaryDirectory() as temp:
             curl = Path(temp) / "curl"
             curl.write_text(textwrap.dedent(r"""
@@ -168,6 +172,7 @@ class HostTests(unittest.TestCase):
             approved_prefix = "2001:db8:1:2:3::/80"
             agent_args = "--windows 4 --minecraft 4"
             cases = [(image, approved_prefix, agent_args, "8", "0", True),
+                     (second, approved_prefix, agent_args, "8", "0", True),
                      ("ami-0bbbbbbbbbbbbbbbb", approved_prefix, agent_args, "8", "0", False),
                      ("no-token", approved_prefix, agent_args, "8", "0", False),
                      ("no-image", approved_prefix, agent_args, "8", "0", False),
@@ -181,7 +186,7 @@ class HostTests(unittest.TestCase):
             for actual, prefix, args, gpu_count, status, forward_allowed in cases:
                 with self.subTest(actual=actual, prefix=prefix, args=args, gpu_count=gpu_count, status=status):
                     result = subprocess.run(
-                        ["/bin/bash", "-x", "-c", script, "--", image, gpu_count, "4", "4"],
+                        ["/bin/bash", "-x", "-c", script, "--", approved_list, gpu_count, "4", "4"],
                         env=dict(os.environ, BOOT_AMI=actual, PREFIX=prefix, NFT_STATUS=status,
                                  FLEET_AGENT_ARGS=args, WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
                         capture_output=True,

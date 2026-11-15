@@ -492,10 +492,13 @@ module "fcvm_fleet_east1" {
   # its own IPv6 address. Older images' agents have no --minecraft, so the argument follows the boot image. The
   # 0e910245 host (generation ten) carries ejc3/fcvm#1824, with which a restored server keeps its bots connected.
   minecraft_host_amis = concat(data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/853eb034"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/0e910245"].ids, data.aws_ami_ids.fcvm_ami_build_region_copies["host/x86_64/cad0ddad"].ids)
-  # Gen14 carries #1844's host limits and the reviewed Pumpkin login timeout.
-  # The verified public join is IPv6-only; the host independently checks the AMI and game slots.
+  # Gen14 carries #1844's host limits and the reviewed Pumpkin login timeout. So does the image
+  # factory's generation fifteen (ami-089b83ada9f380d5e, ejc3/fcvm c5e8fc89: #1844, #1866 and
+  # PUMPKIN_COMMIT 1aa35ecc are in its ancestry; its live host installs FCVM-MC-JOIN at connlimit 4
+  # and 12/min burst 6 per /64). The verified public join is IPv6-only; the host independently
+  # checks the AMI and game slots.
   minecraft_java_access = {
-    host_ami    = "ami-0c3ea14848ddbeb93"
+    host_amis   = ["ami-0c3ea14848ddbeb93", "ami-089b83ada9f380d5e"]
     gpu_slots   = local.fcvm_fleet_host_gpu_slots
     source_cidr = "::/0"
   }
