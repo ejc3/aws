@@ -732,6 +732,25 @@ class Factory:
                 expired = build["buildStatus"] in ("IN_PROGRESS", "QUEUED") and self.now() >= journal["deadline_unix"]
                 failed = build["buildStatus"] in ("FAILED", "FAULT", "STOPPED", "TIMED_OUT")
                 publication_expired = False
+                if succeeded:
+                    publication = self.load("/publications/" + digest(active), {})
+                    if publication.get("build_id") == active and publication.get("status") == "withdrawn":
+                        release = json.loads(self.release_ssm().get_parameter(
+                            Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+                        current = release.get("build_id")
+                        if isinstance(current, str) and current and current != active:
+                            # The publisher records intent before the pointer commits. Only a
+                            # moved pointer under this same mutex makes the withdrawal terminal.
+                            # The request key can now name another retry: never overwrite it.
+                            if record.get("build_id") == active and record["status"] not in ("failed", "promoted", "superseded"):
+                                record.update(status="failed", message="publication rolled back; automatic replay refused")
+                                self.save("/requests/" + record["request_id"], record)
+                                self.queue_failure(record, journal, build)
+                            self.cleanup(journal)
+                            if self.gone(suffix, journal):
+                                control["active"] = None
+                                self.save("/control", control)
+                            return
                 if succeeded and record["status"] != "failed":
                     if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
                         raise Refused("successful build has no final execution receipt")

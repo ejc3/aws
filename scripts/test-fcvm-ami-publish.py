@@ -2,6 +2,7 @@
 """Credential-free publisher transactions against strict in-memory AWS fakes."""
 import base64
 import copy
+import inspect
 import re
 import datetime
 import hashlib
@@ -1833,6 +1834,445 @@ class PublisherTests(unittest.TestCase):
             publisher.run(ena)
         self.assertEqual(self.fleet_ssm.values, before)
         self.assertEqual(self.ec2.selected, [])
+
+    def generation_eleven_live(self):
+        """Generation eleven live (the cad0ddad host, released after generation ten): a receipt whose
+        previous names generation ten's pair."""
+        event, ten = self.reviewed_ipv4_host_fixture()
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, ten, self.IPV4_SOURCE)
+        self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(ten)
+        return ten, copy.deepcopy(self.fleet_ssm.values["/release"])
+
+    def gate_factory_live(self):
+        build_region = self.env["BUILD_REGION"]
+        candidates = {image: copy.deepcopy(self.ec2.images[image]) for image in self.new.values()}
+        snapshots = {block["Ebs"]["SnapshotId"]: copy.deepcopy(self.ec2.snapshots[block["Ebs"]["SnapshotId"]])
+                     for image in candidates.values() for block in image["BlockDeviceMappings"]}
+        _, previous = self.generation_eleven_live()
+        self.env["BUILD_REGION"] = build_region
+        # Retention prunes the initial fixture's unvalidated build during publication of the
+        # predecessor. In production the factory builds these new candidates afterwards.
+        self.ec2.images.update(candidates)
+        self.ec2.snapshots.update(snapshots)
+        # The prior host and tile passed before this full, independently built factory pair.
+        prior_host = self.gate_instance(previous, number=900)
+        self.publisher().gate(self.gate_event("verify"))
+        self.ec2.instances[prior_host]["State"]["Name"] = "terminated"
+        with mock.patch.object(MODULE.Publisher, "source_fence"):
+            result = self.publisher().run(self.event)
+        self.assertEqual(result, {"status": "promoted", "generation": previous["generation"] + 1})
+        active = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(active["build_id"], self.build)
+        self.assertEqual(self.publisher().gate_changed_kinds(active), ["host", "tile"])
+        self.gate_instance(active)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return previous, active
+
+    def gate_instance(self, release, *, kind="host", number=200, state="running", image=None, age=600):
+        name = "i-" + format(number, "017x")
+        self.ec2.instances[name] = {
+            "InstanceId": name, "ImageId": image or release[kind + "_amis"]["us-east-1"]["x86_64"],
+            "LaunchTime": datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=age),
+            "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-" + kind},
+                     {"Key": "aws:ec2launchtemplate:id", "Value": self.ids[0 if kind == "host" else 1]}],
+            "State": {"Name": state},
+        }
+        return name
+
+    def gate_event(self, action, *, status=None, evidence=None):
+        status = self.publisher().gate({"action": "status"}) if status is None else status
+        event = {"action": action, "receipt": {key: status[key] for key in ("generation", "build_id")},
+                 "placement": status["placement"]["digest"]}
+        if action == "rollback":
+            event["evidence"] = evidence if evidence is not None else {
+                "kind": "image_failure", "family": "v6",
+                "hosts": [MODULE.digest("fcvm-release-gate\0" + i) for i in status["placement"]["release_hosts"][:1]],
+                "instances": [],
+            }
+        return event
+
+    def test_the_gate_rolls_an_attributed_failed_release_back_to_its_previous(self):
+        ten, eleven = self.generation_eleven_live()
+        host, *tiles = self.ids
+        instance = self.gate_instance(eleven)
+        before = copy.deepcopy(self.ec2.templates)
+        status = self.publisher().gate({"action": "status"})
+        self.assertEqual({key: status[key] for key in ("generation", "build_id", "verified", "rollback")},
+                         {"generation": 11, "build_id": eleven["build_id"], "verified": False, "rollback": False})
+        self.assertEqual(status["placement"],
+                         {"current": True, "settled": True, "release_hosts": [instance], "release_tiles": [],
+                          "changed_kinds": ["host"], "digest": status["placement"]["digest"]})
+        self.assertRegex(status["placement"]["digest"], r"^[0-9a-f]{64}$")
+        event = self.gate_event("rollback", status=status)
+        answer = self.publisher().gate(event)
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["source_sha"]), (12, ten["source_sha"]))
+        self.assertTrue(after["build_id"].startswith("rollback-to-previous:"))
+        self.assertEqual((after["host_amis"], after["tile_amis"]), (ten["host_amis"], ten["tile_amis"]))
+        self.assertEqual(after["previous"], {k: v for k, v in eleven.items() if k != "previous"})
+        self.assertEqual(answer, {"status": "rolled_back",
+                                  "pointer": {"generation": 12, "build_id": after["build_id"]},
+                                  "hosts": {"release": 0, "other": 1}})
+        self.assertNotIn(instance, json.dumps(answer))
+        table = self.ec2.templates[host]
+        current = table["versions"][table["default"]]["LaunchTemplateData"]
+        self.assertEqual(current["ImageId"], ten["host_amis"]["us-east-1"]["x86_64"])
+        self.assertEqual(MODULE.without_image(current),
+                         MODULE.without_image(before[host]["versions"][before[host]["default"]]["LaunchTemplateData"]))
+        self.assertEqual([self.ec2.templates[tile] for tile in tiles], [before[tile] for tile in tiles])
+        self.assertEqual(self.main_ssm.values["/factory/gate"], answer["pointer"])
+        self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+        created = list(self.ec2.created)
+        self.assertEqual(self.publisher().gate(event), answer)
+        self.assertEqual(self.ec2.created, created)
+        self.assertIsNone(self.ddb.item)
+
+    def test_the_gate_refuses_a_rollback_with_no_previous_release(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        orphan = dict(eleven, previous=None)
+        self.fleet_ssm.values["/release"] = copy.deepcopy(orphan)
+        with self.assertRaisesRegex(MODULE.Refused, "no previous release to roll back to"):
+            self.publisher().gate(self.gate_event("rollback"))
+        self.assertEqual(self.fleet_ssm.values["/release"], orphan)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_refuses_a_rollback_whose_previous_image_is_gone(self):
+        ten, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        del self.ec2.images[ten["host_amis"]["us-east-1"]["x86_64"]]
+        before = copy.deepcopy(self.fleet_ssm.values)
+        # EC2 answers a missing image with an SDK error (the fake raises KeyError).
+        with self.assertRaises(KeyError):
+            self.publisher().gate(self.gate_event("rollback"))
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_never_rolls_back_a_verified_receipt(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        event = self.gate_event("verify")
+        self.assertEqual(self.publisher().gate(event), {"status": "verified", **event["receipt"]})
+        with self.assertRaisesRegex(MODULE.Refused, "the gate verified this release"):
+            self.publisher().gate(self.gate_event("rollback"))
+        with self.assertRaisesRegex(MODULE.Refused, "the live release is not that exact receipt"):
+            self.publisher().gate(dict(event, receipt=dict(event["receipt"], build_id="other-build")))
+        self.assertEqual(self.fleet_ssm.values["/release"], eleven)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_reports_exact_stable_placement_and_rejects_old_mixed_or_unready_instances(self):
+        old, eleven = self.generation_eleven_live()
+        self.assertTrue(self.publisher().gate({"action": "status"})["placement"]["current"])
+        with self.assertRaisesRegex(MODULE.Refused, "placement has changed or"):
+            self.publisher().gate(self.gate_event("verify"))
+        host = self.gate_instance(eleven, age=60)
+        self.assertFalse(self.publisher().gate({"action": "status"})["placement"]["settled"])
+        with self.assertRaisesRegex(MODULE.Refused, "placement has changed or"):
+            self.publisher().gate(self.gate_event("verify"))
+        self.ec2.instances[host]["LaunchTime"] -= datetime.timedelta(minutes=10)
+        tile = self.gate_instance(eleven, kind="tile", number=202, state="pending")
+        self.assertFalse(self.publisher().gate({"action": "status"})["placement"]["settled"])
+        self.ec2.instances[tile]["State"]["Name"] = "running"
+        other = self.gate_instance(old, number=203)
+        self.assertFalse(self.publisher().gate({"action": "status"})["placement"]["current"])
+        with self.assertRaisesRegex(MODULE.Refused, "placement has changed or"):
+            self.publisher().gate(self.gate_event("rollback"))
+        self.ec2.instances[other]["State"]["Name"] = "terminated"
+        status = self.publisher().gate({"action": "status"})
+        self.assertEqual(status["placement"]["release_hosts"], [host])
+        self.assertEqual(status["placement"]["release_tiles"], [tile])
+        self.assertEqual(self.publisher().gate(self.gate_event("verify", status=status))["status"], "verified")
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_refuses_synthetic_or_unobservable_placements(self):
+        _, eleven = self.generation_eleven_live()
+        i = self.gate_instance(eleven)
+        original = copy.deepcopy(self.ec2.instances[i])
+        for instance in (dict(original, LaunchTime=None), dict(original, Tags=original["Tags"][1:])):
+            with self.subTest(instance=instance):
+                self.ec2.instances[i] = instance
+                with self.assertRaisesRegex(MODULE.Refused, "unobservable or unowned"):
+                    self.publisher().gate({"action": "status"})
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_refuses_unattributed_or_wrong_image_failures(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        tile = self.gate_instance(eleven, kind="tile", number=201)
+        status = self.publisher().gate({"action": "status"})
+        valid = self.gate_event("rollback", status=status)["evidence"]
+        for evidence in (dict(valid, kind="transport"), dict(valid, hosts=[]), dict(valid, family="v5"),
+                         dict(valid, hosts=[tile]), dict(valid, hosts=[MODULE.digest("wrong host")]),
+                         dict(valid, hosts=[MODULE.digest("fcvm-release-gate\0" + tile)])):
+            with self.subTest(evidence=evidence):
+                with self.assertRaises(MODULE.Refused):
+                    self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
+        self.assertEqual(self.ec2.selected, [])
+        # A standalone tile that did not change cannot block or undo a host-only rollout.
+        evidence = dict(valid, hosts=[], instances=[MODULE.digest("fcvm-release-gate\0" + tile)])
+        with self.assertRaisesRegex(MODULE.Refused, "image did not change"):
+            self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
+        with self.assertRaisesRegex(MODULE.Refused, "exactly one direct instance"):
+            self.publisher().gate(self.gate_event("rollback", status=status, evidence=dict(evidence, hosts=valid["hosts"])))
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_allows_a_failed_ec2_tile_only_when_that_image_changed(self):
+        _, active = self.gate_factory_live()
+        tile = self.gate_instance(active, kind="tile", number=901)
+        evidence = {"kind": "image_failure", "family": "v6", "hosts": [],
+                    "instances": [MODULE.digest("fcvm-release-gate\0" + tile)]}
+        event = self.gate_event("rollback", evidence=evidence)
+        self.assertEqual(self.publisher().gate(event)["status"], "rolled_back")
+
+    def test_the_gate_never_rolls_back_to_a_predecessor_without_its_exact_verification(self):
+        previous, active = self.generation_eleven_live()
+        self.gate_instance(active)
+        verdict = self.gate_event("rollback")
+        for verified in (None, dict(generation=previous["generation"], build_id="different-build"),
+                         dict(generation=previous["generation"] - 1, build_id="earlier-verified-build")):
+            with self.subTest(verified=verified):
+                self.main_ssm.values.pop("/factory/gate", None)
+                if verified is not None:
+                    self.main_ssm.values["/factory/gate"] = verified
+                with self.assertRaisesRegex(MODULE.Refused, "previous release was not verified"):
+                    self.publisher().gate(verdict)
+        self.assertEqual(self.fleet_ssm.values["/release"], active)
+        self.assertEqual(self.ec2.selected, [])
+        # Positive verification still works on the first rollout and enables safe later rollbacks.
+        self.main_ssm.values.pop("/factory/gate", None)
+        event = self.gate_event("verify")
+        self.assertEqual(self.publisher().gate(event), {"status": "verified", **event["receipt"]})
+
+    def test_the_gate_rejects_a_changed_placement_before_moving_templates(self):
+        _, eleven = self.generation_eleven_live()
+        host = self.gate_instance(eleven)
+        event = self.gate_event("rollback")
+        self.ec2.instances[host]["LaunchTime"] -= datetime.timedelta(seconds=1)
+        with self.assertRaisesRegex(MODULE.Refused, "placement has changed or"):
+            self.publisher().gate(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], eleven)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_rechecks_moving_placement_before_committing_the_pointer(self):
+        previous, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        verdict = self.gate_event("rollback")
+        host = self.ids[0]
+        template = self.ec2.templates[host]
+        default = copy.deepcopy(template["versions"][template["default"]]["LaunchTemplateData"])
+        choose = self.ec2.modify_launch_template
+
+        def changed_at_selection(**kwargs):
+            self.gate_instance(eleven, number=201)
+            return choose(**kwargs)
+
+        with mock.patch.object(self.ec2, "modify_launch_template", side_effect=changed_at_selection):
+            with self.assertRaisesRegex(MODULE.Refused, "placement has changed or"):
+                self.publisher().gate(verdict)
+        self.assertEqual(self.fleet_ssm.values["/release"], eleven)
+        self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"], default)
+        self.assertEqual(self.main_ssm.values["/factory/gate"], self.publisher().gate_receipt(previous))
+
+    def test_the_gate_cannot_roll_back_a_release_published_before_it_gets_the_lock(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        verdict = self.gate_event("rollback")
+        newer = dict(eleven, generation=12, build_id="another-build")
+        publisher = self.publisher()
+        acquire = publisher.acquire
+
+        def published_first():
+            self.fleet_ssm.values["/release"] = newer
+            return acquire()
+
+        with mock.patch.object(publisher, "acquire", side_effect=published_first):
+            with self.assertRaisesRegex(MODULE.Refused, "the live release is not that exact receipt"):
+                publisher.gate(verdict)
+        self.assertEqual(self.fleet_ssm.values["/release"], newer)
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_marks_only_its_completed_rollback_before_unlocking(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        release = publisher.release
+        newer = dict(eleven, generation=13, build_id="another-build")
+
+        def next_promotion():
+            self.assertIsNotNone(self.ddb.item)
+            recorded = self.main_ssm.values["/factory/gate"]
+            self.assertEqual(recorded, publisher.gate_receipt(self.fleet_ssm.values["/release"]))
+            self.assertEqual(recorded["generation"], 12)
+            release()
+            self.fleet_ssm.values["/release"] = newer
+
+        with mock.patch.object(publisher, "release", side_effect=next_promotion):
+            response = publisher.gate(verdict)
+        self.assertEqual(response["pointer"], self.main_ssm.values["/factory/gate"])
+        self.assertEqual(self.fleet_ssm.values["/release"], newer)
+        self.assertFalse(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_the_gate_reports_its_committed_pointer_when_later_host_observation_fails(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven)
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        observe = publisher.fleet_placement
+
+        def skip_post_commit(release):
+            if publisher.committed:
+                raise RuntimeError("EC2 inventory unavailable")
+            return observe(release)
+
+        with mock.patch.object(publisher, "fleet_placement", side_effect=skip_post_commit):
+            answer = publisher.gate(verdict)
+        self.assertEqual(answer, {"status": "rolled_back", "pointer": publisher.gate_receipt(self.fleet_ssm.values["/release"]),
+                                  "hosts": {"observation": "unavailable"}})
+        self.assertEqual(answer["pointer"]["generation"], 12)
+        self.assertIsNone(self.ddb.item)
+
+    def test_factory_success_event_never_republishes_its_withdrawn_images(self):
+        self.gate_factory_live()
+        publisher = self.publisher()
+        # While it is still live, a duplicate must finish idempotently despite its committed journal.
+        self.assertEqual(publisher.run(self.event), {"status": "promoted", "generation": 12})
+        self.assertEqual(self.ec2.created, [])
+        self.publisher().gate(self.gate_event("rollback"))
+        pointer = copy.deepcopy(self.fleet_ssm.values["/release"])
+        before = copy.deepcopy(self.ec2.templates)
+        retry = self.main_ssm.values["/factory/requests/" + self.input]
+        retry["build_id"] = "other-retry-of-the-same-input"
+        request_snapshot = copy.deepcopy(retry)
+        self.assertEqual(self.publisher().run(self.event),
+                         {"status": "superseded", "reason": "committed_release_is_no_longer_live"})
+        self.assertEqual(self.fleet_ssm.values["/release"], pointer)
+        self.assertEqual(self.ec2.templates, before)
+        self.assertEqual(self.main_ssm.values["/factory/requests/" + self.input], request_snapshot)
+
+    def test_the_gate_quarantines_a_failed_factory_build_before_changing_the_pointer(self):
+        _, active = self.gate_factory_live()
+        key = "/factory/publications/" + MODULE.digest(self.build)
+        self.main_ssm.values[key]["status"] = "preparing"  # A failed final journal write after publishing.
+        verdict = self.gate_event("rollback")
+        save = self.fleet_ssm.put_parameter
+
+        def before_commit(**kwargs):
+            if kwargs["Name"] == "/release":
+                self.assertIsNotNone(self.ddb.item)
+                self.assertEqual(self.main_ssm.values[key]["status"], "withdrawn")
+            return save(**kwargs)
+
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=before_commit):
+            self.publisher().gate(verdict)
+        rolled_back = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # A later receipt no longer directly mentions the withdrawn factory build.
+        later = dict(rolled_back, generation=rolled_back["generation"] + 1, build_id="another-reviewed-release",
+                     previous={k: v for k, v in rolled_back.items() if k != "previous"})
+        self.fleet_ssm.values["/release"] = later
+        created = copy.deepcopy(self.ec2.created)
+        self.assertEqual(self.publisher().run(self.event)["status"], "superseded")
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(self.fleet_ssm.values["/release"], later)
+        self.assertEqual(self.main_ssm.values[key]["build_id"], active["build_id"])
+
+    def test_factory_event_waiting_for_its_live_receipt_cannot_republish_after_a_gate_rollback(self):
+        self.gate_factory_live()
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        acquire = publisher.acquire
+        changes = {}
+
+        def gate_locked_first():
+            self.publisher().gate(verdict)
+            changes["created"] = list(self.ec2.created)
+            changes["pointer"] = copy.deepcopy(self.fleet_ssm.values["/release"])
+            return acquire()
+
+        with mock.patch.object(publisher, "acquire", side_effect=gate_locked_first):
+            self.assertEqual(publisher.run(self.event),
+                             {"status": "superseded", "reason": "committed_release_is_no_longer_live"})
+        self.assertEqual(self.ec2.created, changes["created"])
+        self.assertEqual(self.fleet_ssm.values["/release"], changes["pointer"])
+
+    def gate_rollback_with_lost_verify_write(self):
+        _, active = self.generation_eleven_live()
+        old_host = self.gate_instance(active)
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        save = publisher.save
+
+        def fail_final_verification(name, value, fleet=False):
+            if name == "/factory/gate":
+                self.assertIsNotNone(self.ddb.item)
+                self.assertEqual(publisher.gate_receipt(self.fleet_ssm.values["/release"]), value)
+                raise RuntimeError("verification unavailable after pointer committed")
+            return save(name, value, fleet)
+
+        with mock.patch.object(publisher, "save", side_effect=fail_final_verification):
+            with self.assertRaisesRegex(RuntimeError, "verification unavailable"):
+                publisher.gate(verdict)
+        status = self.publisher().gate({"action": "status"})
+        self.assertTrue(status["rollback"])
+        self.assertFalse(status["verified"])
+        return verdict, old_host, copy.deepcopy(self.fleet_ssm.values["/release"])
+
+    def test_exact_rollback_replay_repairs_interrupted_verification_under_lock(self):
+        verdict, _, active = self.gate_rollback_with_lost_verify_write()
+        created = list(self.ec2.created)
+        publisher = self.publisher()
+        save = publisher.save
+
+        def check_locked(name, value, fleet=False):
+            self.assertEqual(name, "/factory/gate")
+            self.assertEqual(value, publisher.gate_receipt(active))
+            self.assertIsNotNone(self.ddb.item)
+            return save(name, value, fleet)
+
+        with mock.patch.object(publisher, "save", side_effect=check_locked):
+            self.assertEqual(publisher.gate(verdict)["status"], "rolled_back")
+        self.assertEqual(self.ec2.created, created)
+        self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_a_new_smoke_can_verify_rollback_if_the_original_request_was_lost(self):
+        _, old_host, active = self.gate_rollback_with_lost_verify_write()
+        self.ec2.instances[old_host]["State"]["Name"] = "terminated"
+        self.gate_instance(active, number=884)
+        with self.assertRaisesRegex(MODULE.Refused, "not rolled back again"):
+            self.publisher().gate(self.gate_event("rollback"))
+        event = self.gate_event("verify")
+        self.assertEqual(self.publisher().gate(event), {"status": "verified", **event["receipt"]})
+        self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_the_gate_handler_takes_only_its_three_requests(self):
+        for event in ({"action": "rollback"}, {"action": "rollback", "generation": "11"},
+                      {"action": "rollback", "receipt": {"generation": 11, "build_id": "x"}, "placement": "a" * 64},
+                      {"action": "activate-reviewed-seed"}, {"action": "status", "generation": 1}, []):
+            with mock.patch.object(MODULE.Publisher, "__init__", lambda this, *a, **k: None):
+                self.assertEqual(MODULE.gate_handler(event, None)["status"], "refused", event)
+
+    def test_the_release_gate_is_its_own_function_invoked_by_staging_ci_only(self):
+        root = SOURCE.parents[1]
+        pipeline = (root / "fcvm-fleet-ami-pipeline.tf").read_text()
+        gate = re.search(r'resource "aws_lambda_function" "fcvm_ami_release_gate" \{\n(.*?)\n\}', pipeline, re.S).group(1)
+        self.assertIn('handler                        = "publish.gate_handler"', gate)
+        self.assertIn("role                           = aws_iam_role.fcvm_ami_publish.arn", gate)
+        self.assertIn("variables = aws_lambda_function.fcvm_ami_publish.environment[0].variables", gate)
+        self.assertIn("reserved_concurrent_executions = 1", gate)
+        self.assertNotIn("aws_lambda_function.fcvm_ami_release_gate.arn", pipeline)
+        self.assertNotIn('"rollback-to-previous"', inspect.getsource(MODULE.Publisher.run))
+        ci = (root / "fcvm-fleet-ci.tf").read_text()
+        stage = re.search(r'resource "aws_iam_role_policy" "fcvm_stage_ci" \{\n(.*?)\n\}', ci, re.S).group(1)
+        self.assertEqual(re.findall(r'Action = "lambda:InvokeFunction", Resource = ([^ }]+)', stage),
+                         ["aws_lambda_function.fcvm_coordinator_release.arn", "aws_lambda_function.fcvm_ami_release_gate.arn"])
+        self.assertIn("RELEASE_GATE        = aws_lambda_function.fcvm_ami_release_gate.function_name", ci)
+        handler = inspect.getsource(MODULE.gate_handler)
+        self.assertIn("Publisher().gate(event)", handler)
+        self.assertNotIn(".run(", handler)
 
     def test_native_client_factory_separates_staging_from_control_and_compute_regions(self):
         sdk = types.SimpleNamespace(client=mock.Mock(side_effect=lambda *_args, **_kwargs: object()))
