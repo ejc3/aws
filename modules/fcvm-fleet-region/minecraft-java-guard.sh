@@ -4,8 +4,9 @@
 set -euo pipefail
 set +x
 
-approved=${1:?missing approved host image}
-[[ "$approved" =~ ^ami-[a-f0-9]{17}$ ]]
+# A comma-separated list of the reviewed host images that carry the join limits.
+approved=${1:?missing approved host images}
+[[ "$approved" =~ ^ami-[a-f0-9]{17}(,ami-[a-f0-9]{17})*$ ]]
 imds=http://169.254.169.254/latest
 destinations=
 read_imds() {
@@ -19,7 +20,7 @@ read_imds() {
 if token=$(/usr/bin/curl --noproxy '*' -fsS --max-time 2 -X PUT \
     -H 'X-aws-ec2-metadata-token-ttl-seconds: 60' "$imds/api/token" 2>/dev/null) &&
     [[ -n "$token" ]] &&
-    active=$(read_imds ami-id 2>/dev/null) && [[ "$active" == "$approved" ]] &&
+    active=$(read_imds ami-id 2>/dev/null) && [[ ",$approved," == *",$active,"* ]] &&
     mac=$(read_imds mac 2>/dev/null) && [[ "$mac" =~ ^([a-f0-9]{2}:){5}[a-f0-9]{2}$ ]] &&
     prefix=$(read_imds "network/interfaces/macs/$mac/ipv6-prefix" 2>/dev/null); then
   destinations=$(/usr/bin/python3 - "$prefix" "$2" "$3" "$4" <<'PYTHON'
