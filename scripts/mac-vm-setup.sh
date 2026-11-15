@@ -245,8 +245,11 @@ for i in $(seq 1 "$CI_COUNT"); do
     echo "   $name: already registered"
     continue
   fi
-  # A token per runner (they last an hour), on stdin end to end: gh -> ssh -> tart exec -> config.sh.
-  gh api -X POST "orgs/$CI_ORG/actions/runners/registration-token" --jq .token |
+  # A token per runner (they last an hour), on stdin from here on: ssh -> tart exec -> config.sh. Minted first, so a
+  # refusal (no admin:org) stops here instead of handing config.sh an empty token.
+  token=$(gh api -X POST "orgs/$CI_ORG/actions/runners/registration-token" --jq .token) && [ -n "$token" ] ||
+    { echo "no registration token for $CI_ORG: gh needs the admin:org scope (gh auth refresh -h github.com -s admin:org)" >&2; exit 1; }
+  printf '%s' "$token" |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
       set -e
       token=\$(cat)
@@ -256,5 +259,6 @@ for i in $(seq 1 "$CI_COUNT"); do
       ./svc.sh install >/dev/null
       ./svc.sh start >/dev/null
     ")"
+  unset token
   echo "   $name: registered at $CI_ORG ($CI_LABELS,mini)"
 done
