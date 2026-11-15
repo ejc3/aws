@@ -732,6 +732,39 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values["/release"], {"build_id": BUILD})
         self.assertEqual(len(self.publisher.calls), 1)
 
+    def test_withdrawal_intent_never_stops_a_factory_build_still_live(self):
+        self.succeed()
+        self.store.values["/factory/publications/" + mod.digest(BUILD)] = {"build_id": BUILD, "status": "withdrawn"}
+        self.fleet_ssm.values["/release"] = {"build_id": BUILD}
+        self.factory.reconcile()
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "awaiting-publish")
+        self.assertEqual(self.store.values["/factory/control"]["active"], BUILD)
+        self.assertEqual(len(self.publisher.calls), 1)
+
+    def test_completed_withdrawal_clears_the_exact_factory_request_without_redrive(self):
+        for replaced in (False, True):
+            with self.subTest(replaced=replaced):
+                case = FactoryTests()
+                case.setUp()
+                try:
+                    case.succeed()
+                    case.store.values["/factory/publications/" + mod.digest(BUILD)] = {"build_id": BUILD, "status": "withdrawn"}
+                    case.fleet_ssm.values["/release"] = {"build_id": "rollback-to-previous:done"}
+                    key = "/factory/requests/" + INPUT_SHA
+                    if replaced:
+                        case.store.values[key]["build_id"] = "a-different-retry-for-the-same-input"
+                    before = copy.deepcopy(case.store.values[key])
+                    case.factory.reconcile()
+                    self.assertIsNone(case.store.values["/factory/control"]["active"])
+                    self.assertEqual(case.publisher.calls, [])
+                    if replaced:
+                        self.assertEqual(case.store.values[key], before)
+                    else:
+                        self.assertEqual(case.store.values[key]["status"], "failed")
+                        self.assertEqual(case.store.values[key]["message"], "publication rolled back; automatic replay refused")
+                finally:
+                    case.doCleanups()
+
     def test_uncommitted_publication_lease_expires_without_a_new_build_or_pointer_write(self):
         ended = self.succeed()
         self.time = ended + 86400 + 1

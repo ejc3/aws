@@ -562,14 +562,15 @@ class Publisher:
         need(len(raw.encode()) <= 4000, "publication metadata exceeds its fixed bound")
         self.client("ssm", fleet).put_parameter(Name=name, Type="String", Value=raw, Overwrite=True)
 
-    def prior_transaction(self):
+    def prior_transaction(self, build_id=None):
+        build_id = self.build_id if build_id is None else build_id
         try:
-            value = self.load(self.env["STATE_PREFIX"] + "/publications/" + digest(self.build_id))
+            value = self.load(self.env["STATE_PREFIX"] + "/publications/" + digest(build_id))
         except Exception as error:
             if getattr(error, "response", {}).get("Error", {}).get("Code") == "ParameterNotFound":
                 return None
             raise
-        need(value.get("build_id") == self.build_id, "publication receipt identity changed")
+        need(value.get("build_id") == build_id, "publication receipt identity changed")
         return value
 
     def acquire(self):
@@ -722,6 +723,18 @@ class Publisher:
                 return {}
             raise
 
+    def gate_changed_kinds(self, release):
+        previous = release.get("previous")
+        if not isinstance(previous, dict):
+            return []
+        region = self.env["COMPUTE_REGION"]
+        changed = []
+        for kind in ("host", "tile"):
+            old = (previous.get(kind + "_amis") or {}).get(region, {}).get("x86_64")
+            if isinstance(old, str) and IMAGE.fullmatch(old) and old != release[kind + "_amis"][region]["x86_64"]:
+                changed.append(kind)
+        return changed
+
     def fleet_placement(self, release):
         """Read the EC2 placements; never infer a booted image from the current template default."""
         region = self.env["COMPUTE_REGION"]
@@ -767,7 +780,7 @@ class Publisher:
                         matches[kind].append(instance)
             if not page.get("NextToken"):
                 placement = {"current": current, "settled": settled, "release_hosts": sorted(matches["host"]),
-                             "release_tiles": sorted(matches["tile"]),
+                             "release_tiles": sorted(matches["tile"]), "changed_kinds": self.gate_changed_kinds(release),
                              "digest": digest(encoded({"region": region, "images": want, "instances": instances}))}
                 return placement, host_count
             arguments["NextToken"] = page["NextToken"]
@@ -784,7 +797,8 @@ class Publisher:
             need(isinstance(ids, list) and len(ids) <= 64
                  and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in ids),
                  "rollback probe attribution is invalid")
-        need(evidence["hosts"] or evidence["instances"], "rollback probe lacks instance attribution")
+        need(len(evidence["hosts"]) + len(evidence["instances"]) == 1,
+             "rollback probe does not identify exactly one direct instance")
         return evidence
 
     def require_gate_placement(self, active, expected_digest, evidence=None):
@@ -793,11 +807,12 @@ class Publisher:
              and placement["digest"] == expected_digest,
              "the release placement has changed or is not observable, current and settled")
         if evidence is not None:
-            for key, report in (("release_hosts", "hosts"), ("release_tiles", "instances")):
-                known = {digest("fcvm-release-gate\0" + instance) for instance in placement[key]}
-                need(set(evidence[report]) <= known, "the failed probe was not served by the release's images")
+            kind, report = ("host", "hosts") if evidence["hosts"] else ("tile", "instances")
+            need(kind in placement["changed_kinds"], "the failed probe's image did not change in this release")
+            known = {digest("fcvm-release-gate\0" + instance) for instance in placement[f"release_{kind}s"]}
+            need(evidence[report][0] in known, "the failed probe was not served by the release's images")
 
-    def rollback_to_previous(self, active):
+    def rollback_to_previous(self, active, verified):
         """Build a reviewed transition from the checked live receipt to its own previous images."""
         need(not active["build_id"].startswith(self.ROLLBACK_PREFIX),
              "the live release is a rollback; it is not rolled back again")
@@ -807,6 +822,8 @@ class Publisher:
              and previous["generation"] == active["generation"] - 1
              and SHA.fullmatch(str(previous.get("source_sha", ""))),
              "the live release has no previous release to roll back to")
+        need(self.gate_receipt(previous) == verified,
+             "the previous release was not verified by the gate; automatic rollback is refused")
         region = self.env["COMPUTE_REGION"]
         images = {kind: (previous.get(kind + "_amis") or {}).get(region, {}).get("x86_64")
                   for kind in ("host", "tile")}
@@ -818,6 +835,18 @@ class Publisher:
         config = self.reviewed_pair({"source_sha": previous["source_sha"], "images": images, "expected": active},
                                     host_only=host_only)
         return config, host_only
+
+    def quarantine_factory_release(self, active):
+        build_id = active["build_id"]
+        if not re.fullmatch(re.escape(self.env["PROJECT_NAME"]) + r":[0-9a-f-]{36}", build_id):
+            return
+        prior = self.prior_transaction(build_id) or {"build_id": build_id}
+        if prior.get("status") != "withdrawn":
+            # Journal the exact rejected build under the publication lock before changing its
+            # pointer. If that fails, refuse the rollback. If the pointer update fails, the
+            # same live receipt can still finish idempotently; it cannot publish a second time.
+            prior["status"] = "withdrawn"
+            self.save(self.env["STATE_PREFIX"] + "/publications/" + digest(build_id), prior)
 
     def gate_rollback_answer(self, active):
         # The workflow prints this answer in public. Report counts only, not instance IDs.
@@ -863,14 +892,20 @@ class Publisher:
                 return self.gate_rollback_answer(active)
             need(live_receipt == receipt, "the live release is not that exact receipt")
             need(not rolled_back, "the live release is a rollback; it is not rolled back again")
-            self.require_gate_placement(active, expected, evidence)
             if action == "verify":
+                self.require_gate_placement(active, expected)
                 self.save(self.env["STATE_PREFIX"] + "/gate", live_receipt)
                 return {"status": "verified", **live_receipt}
-            need(self.gate_record() != live_receipt, "the gate verified this release; it is not rolled back")
-            config, host_only = self.rollback_to_previous(active)
+            verified = self.gate_record()
+            need(verified != live_receipt, "the gate verified this release; it is not rolled back")
+            config, host_only = self.rollback_to_previous(active, verified)
+
+            def gate_fence():
+                self.require_gate_placement(active, expected, evidence)
+                self.quarantine_factory_release(active)
+
             result = self.run_reviewed(config, self.ROLLBACK_PREFIX.rstrip(":"), host_only=host_only,
-                                       locked=True, placement_fence=lambda: self.require_gate_placement(active, expected, evidence))
+                                       locked=True, placement_fence=gate_fence)
             need(result.get("status") == "promoted", "the rollback did not complete")
             after = self.load(self.env["RELEASE_PARAMETER"], True)
             rollback_receipt = {"generation": result["generation"], "build_id": self.build_id}
@@ -1726,6 +1761,15 @@ class Publisher:
         self.retain(result, record)
         return {"status": "promoted", "generation": result["generation"]}
 
+    def factory_replay_superseded(self, active, prior):
+        # A duplicate success event can arrive while dispatch still names this build active.
+        # A completed publication may finish idempotently while it is the live receipt,
+        # but there is never a second publication of that build after a move or withdrawal.
+        previous = active.get("previous") or {}
+        return ((prior is not None and prior.get("status") in {"committed", "withdrawn"})
+                or (str(active.get("build_id", "")).startswith(self.ROLLBACK_PREFIX)
+                    and previous.get("build_id") == self.build_id))
+
     def run(self, event):
         if isinstance(event, dict) and event.get("action") == "replicate-active-release":
             return self.run_replicate(event)
@@ -1765,6 +1809,8 @@ class Publisher:
         resources = None
         if active.get("build_id") != self.build_id:
             prior = self.prior_transaction()
+            if self.factory_replay_superseded(active, prior):
+                return {"status": "superseded", "reason": "committed_release_is_no_longer_live"}
             if prior and prior.get("status") == "rolled_back":
                 name, request = self.request(source, input_sha)
                 request.update(status="failed", message="publication rolled back; automatic replay refused")
@@ -1784,6 +1830,10 @@ class Publisher:
             if active.get("build_id") == self.build_id:
                 self.committed = True
                 return self.finish(active, source, input_sha)
+            # An event that observed the same live receipt on entry did not prepare an image
+            # pair and cannot start another publication if that receipt moves while it waits.
+            if manifest is None or self.factory_replay_superseded(active, self.prior_transaction()):
+                return {"status": "superseded", "reason": "committed_release_is_no_longer_live"}
             self.request(source, input_sha)
             self.factory_fence(source, input_sha)
             need(self.proof(build, source, input_sha) == manifest,

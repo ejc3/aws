@@ -1843,7 +1843,34 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(publisher.run(event), {"status": "promoted", "generation": 11})
         self.ec2.created.clear()
         self.ec2.selected.clear()
+        self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(ten)
         return ten, copy.deepcopy(self.fleet_ssm.values["/release"])
+
+    def gate_factory_live(self):
+        build_region = self.env["BUILD_REGION"]
+        candidates = {image: copy.deepcopy(self.ec2.images[image]) for image in self.new.values()}
+        snapshots = {block["Ebs"]["SnapshotId"]: copy.deepcopy(self.ec2.snapshots[block["Ebs"]["SnapshotId"]])
+                     for image in candidates.values() for block in image["BlockDeviceMappings"]}
+        _, previous = self.generation_eleven_live()
+        self.env["BUILD_REGION"] = build_region
+        # Retention prunes the initial fixture's unvalidated build during publication of the
+        # predecessor. In production the factory builds these new candidates afterwards.
+        self.ec2.images.update(candidates)
+        self.ec2.snapshots.update(snapshots)
+        # The prior host and tile passed before this full, independently built factory pair.
+        prior_host = self.gate_instance(previous, number=900)
+        self.publisher().gate(self.gate_event("verify"))
+        self.ec2.instances[prior_host]["State"]["Name"] = "terminated"
+        with mock.patch.object(MODULE.Publisher, "source_fence"):
+            result = self.publisher().run(self.event)
+        self.assertEqual(result, {"status": "promoted", "generation": previous["generation"] + 1})
+        active = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(active["build_id"], self.build)
+        self.assertEqual(self.publisher().gate_changed_kinds(active), ["host", "tile"])
+        self.gate_instance(active)
+        self.ec2.created.clear()
+        self.ec2.selected.clear()
+        return previous, active
 
     def gate_instance(self, release, *, kind="host", number=200, state="running", image=None, age=600):
         name = "i-" + format(number, "017x")
@@ -1863,7 +1890,7 @@ class PublisherTests(unittest.TestCase):
         if action == "rollback":
             event["evidence"] = evidence if evidence is not None else {
                 "kind": "image_failure", "family": "v6",
-                "hosts": [MODULE.digest("fcvm-release-gate\0" + i) for i in status["placement"]["release_hosts"]],
+                "hosts": [MODULE.digest("fcvm-release-gate\0" + i) for i in status["placement"]["release_hosts"][:1]],
                 "instances": [],
             }
         return event
@@ -1878,7 +1905,7 @@ class PublisherTests(unittest.TestCase):
                          {"generation": 11, "build_id": eleven["build_id"], "verified": False, "rollback": False})
         self.assertEqual(status["placement"],
                          {"current": True, "settled": True, "release_hosts": [instance], "release_tiles": [],
-                          "digest": status["placement"]["digest"]})
+                          "changed_kinds": ["host"], "digest": status["placement"]["digest"]})
         self.assertRegex(status["placement"]["digest"], r"^[0-9a-f]{64}$")
         event = self.gate_event("rollback", status=status)
         answer = self.publisher().gate(event)
@@ -1985,10 +2012,40 @@ class PublisherTests(unittest.TestCase):
                 with self.assertRaises(MODULE.Refused):
                     self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
         self.assertEqual(self.ec2.selected, [])
-        # A failed standalone EC2 tile can attest by its own identity, not by claiming to be a host.
+        # A standalone tile that did not change cannot block or undo a host-only rollout.
         evidence = dict(valid, hosts=[], instances=[MODULE.digest("fcvm-release-gate\0" + tile)])
-        self.assertEqual(self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))["status"],
-                         "rolled_back")
+        with self.assertRaisesRegex(MODULE.Refused, "image did not change"):
+            self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
+        with self.assertRaisesRegex(MODULE.Refused, "exactly one direct instance"):
+            self.publisher().gate(self.gate_event("rollback", status=status, evidence=dict(evidence, hosts=valid["hosts"])))
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_allows_a_failed_ec2_tile_only_when_that_image_changed(self):
+        _, active = self.gate_factory_live()
+        tile = self.gate_instance(active, kind="tile", number=901)
+        evidence = {"kind": "image_failure", "family": "v6", "hosts": [],
+                    "instances": [MODULE.digest("fcvm-release-gate\0" + tile)]}
+        event = self.gate_event("rollback", evidence=evidence)
+        self.assertEqual(self.publisher().gate(event)["status"], "rolled_back")
+
+    def test_the_gate_never_rolls_back_to_a_predecessor_without_its_exact_verification(self):
+        previous, active = self.generation_eleven_live()
+        self.gate_instance(active)
+        verdict = self.gate_event("rollback")
+        for verified in (None, dict(generation=previous["generation"], build_id="different-build"),
+                         dict(generation=previous["generation"] - 1, build_id="earlier-verified-build")):
+            with self.subTest(verified=verified):
+                self.main_ssm.values.pop("/factory/gate", None)
+                if verified is not None:
+                    self.main_ssm.values["/factory/gate"] = verified
+                with self.assertRaisesRegex(MODULE.Refused, "previous release was not verified"):
+                    self.publisher().gate(verdict)
+        self.assertEqual(self.fleet_ssm.values["/release"], active)
+        self.assertEqual(self.ec2.selected, [])
+        # Positive verification still works on the first rollout and enables safe later rollbacks.
+        self.main_ssm.values.pop("/factory/gate", None)
+        event = self.gate_event("verify")
+        self.assertEqual(self.publisher().gate(event), {"status": "verified", **event["receipt"]})
 
     def test_the_gate_rejects_a_changed_placement_before_moving_templates(self):
         _, eleven = self.generation_eleven_live()
@@ -2001,7 +2058,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.selected, [])
 
     def test_the_gate_rechecks_moving_placement_before_committing_the_pointer(self):
-        _, eleven = self.generation_eleven_live()
+        previous, eleven = self.generation_eleven_live()
         self.gate_instance(eleven)
         verdict = self.gate_event("rollback")
         host = self.ids[0]
@@ -2018,7 +2075,7 @@ class PublisherTests(unittest.TestCase):
                 self.publisher().gate(verdict)
         self.assertEqual(self.fleet_ssm.values["/release"], eleven)
         self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"], default)
-        self.assertNotIn("/factory/gate", self.main_ssm.values)
+        self.assertEqual(self.main_ssm.values["/factory/gate"], self.publisher().gate_receipt(previous))
 
     def test_the_gate_cannot_roll_back_a_release_published_before_it_gets_the_lock(self):
         _, eleven = self.generation_eleven_live()
@@ -2078,6 +2135,69 @@ class PublisherTests(unittest.TestCase):
                                   "hosts": {"observation": "unavailable"}})
         self.assertEqual(answer["pointer"]["generation"], 12)
         self.assertIsNone(self.ddb.item)
+
+    def test_factory_success_event_never_republishes_its_withdrawn_images(self):
+        self.gate_factory_live()
+        publisher = self.publisher()
+        # While it is still live, a duplicate must finish idempotently despite its committed journal.
+        self.assertEqual(publisher.run(self.event), {"status": "promoted", "generation": 12})
+        self.assertEqual(self.ec2.created, [])
+        self.publisher().gate(self.gate_event("rollback"))
+        pointer = copy.deepcopy(self.fleet_ssm.values["/release"])
+        before = copy.deepcopy(self.ec2.templates)
+        retry = self.main_ssm.values["/factory/requests/" + self.input]
+        retry["build_id"] = "other-retry-of-the-same-input"
+        request_snapshot = copy.deepcopy(retry)
+        self.assertEqual(self.publisher().run(self.event),
+                         {"status": "superseded", "reason": "committed_release_is_no_longer_live"})
+        self.assertEqual(self.fleet_ssm.values["/release"], pointer)
+        self.assertEqual(self.ec2.templates, before)
+        self.assertEqual(self.main_ssm.values["/factory/requests/" + self.input], request_snapshot)
+
+    def test_the_gate_quarantines_a_failed_factory_build_before_changing_the_pointer(self):
+        _, active = self.gate_factory_live()
+        key = "/factory/publications/" + MODULE.digest(self.build)
+        self.main_ssm.values[key]["status"] = "preparing"  # A failed final journal write after publishing.
+        verdict = self.gate_event("rollback")
+        save = self.fleet_ssm.put_parameter
+
+        def before_commit(**kwargs):
+            if kwargs["Name"] == "/release":
+                self.assertIsNotNone(self.ddb.item)
+                self.assertEqual(self.main_ssm.values[key]["status"], "withdrawn")
+            return save(**kwargs)
+
+        with mock.patch.object(self.fleet_ssm, "put_parameter", side_effect=before_commit):
+            self.publisher().gate(verdict)
+        rolled_back = copy.deepcopy(self.fleet_ssm.values["/release"])
+        # A later receipt no longer directly mentions the withdrawn factory build.
+        later = dict(rolled_back, generation=rolled_back["generation"] + 1, build_id="another-reviewed-release",
+                     previous={k: v for k, v in rolled_back.items() if k != "previous"})
+        self.fleet_ssm.values["/release"] = later
+        created = copy.deepcopy(self.ec2.created)
+        self.assertEqual(self.publisher().run(self.event)["status"], "superseded")
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(self.fleet_ssm.values["/release"], later)
+        self.assertEqual(self.main_ssm.values[key]["build_id"], active["build_id"])
+
+    def test_factory_event_waiting_for_its_live_receipt_cannot_republish_after_a_gate_rollback(self):
+        self.gate_factory_live()
+        verdict = self.gate_event("rollback")
+        publisher = self.publisher()
+        acquire = publisher.acquire
+        changes = {}
+
+        def gate_locked_first():
+            self.publisher().gate(verdict)
+            changes["created"] = list(self.ec2.created)
+            changes["pointer"] = copy.deepcopy(self.fleet_ssm.values["/release"])
+            return acquire()
+
+        with mock.patch.object(publisher, "acquire", side_effect=gate_locked_first):
+            self.assertEqual(publisher.run(self.event),
+                             {"status": "superseded", "reason": "committed_release_is_no_longer_live"})
+        self.assertEqual(self.ec2.created, changes["created"])
+        self.assertEqual(self.fleet_ssm.values["/release"], changes["pointer"])
 
     def test_the_gate_handler_takes_only_its_three_requests(self):
         for event in ({"action": "rollback"}, {"action": "rollback", "generation": "11"},
