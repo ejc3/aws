@@ -20,6 +20,8 @@ fail() { echo "applied-status: $*" >&2; exit 1; }
 
 # A credentialed Mac can write the parameter, but it cannot publish through this
 # script. Require the real local EC2 identity and the same EC2 session in STS.
+# A traced caller would otherwise log the token assignment and the header.
+set +x
 metadata=http://169.254.169.254/latest
 token=$(curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 -X PUT \
   -H 'X-aws-ec2-metadata-token-ttl-seconds: 30' "$metadata/api/token" 2>/dev/null) ||
@@ -28,6 +30,7 @@ identity=$(printf '%s\n' "X-aws-ec2-metadata-token: $token" |
   curl -fsS --noproxy '*' --connect-timeout 1 --max-time 2 -H @- \
     "$metadata/dynamic/instance-identity/document" 2>/dev/null) ||
   skip "could not verify the local EC2 instance"
+unset token
 instance=$(jq -er '.instanceId | select(test("^i-[0-9a-f]{8}([0-9a-f]{9})?$"))' <<<"$identity" 2>/dev/null) ||
   skip "invalid local EC2 instance ID"
 account=$(jq -er '.accountId | select(test("^[0-9]{12}$"))' <<<"$identity" 2>/dev/null) ||
@@ -73,6 +76,13 @@ chmod 0700 -- "$state_dir" || fail "could not protect the diagnostic directory"
 plan_log=$(mktemp "$state_dir/.plan.XXXXXX") || fail "could not open a private plan log"
 diag_tmp=""
 trap 'rm -f -- "$plan_log" ${diag_tmp:+"$diag_tmp"}' EXIT
+# A direct Terraform invocation or a surviving provider can still use this
+# host's resources after the wrapper lock is free. Linux comm truncates the
+# provider names to "terraform-provi". The wrapper and backend still lock.
+if pgrep -x 'terraform|terraform-provi' >/dev/null; then
+  skip "Terraform or a provider is already running on this jumpbox"
+fi
+
 # A full plan usually takes 10–15 minutes. Leave time for a 10-minute
 # backend-lock wait in explicit mode and for Terraform to unwind cancellation.
 timeout --signal=TERM 29m "$terraform" plan -detailed-exitcode -lock=true \

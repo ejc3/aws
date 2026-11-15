@@ -44,6 +44,15 @@ fi
 cat "$FAKE_PLAN_LOG"
 exit "$FAKE_PLAN_EXIT"
 TF
+cat > "$tmp/bin/pgrep" <<'PGREP'
+#!/usr/bin/env bash
+[ "$1" = -x ] || exit 1
+if [[ "${FAKE_ACTIVE_TF:-none}" =~ ^($2)$ ]]; then
+  echo 1234
+else
+  exit 1
+fi
+PGREP
 chmod +x "$tmp/bin/"*
 export PATH="$tmp/bin:$PATH" FAKE_AWS_OUT="$tmp/published" FAKE_PLAN_CALL="$tmp/terraform-call"
 export XDG_STATE_HOME="$tmp/state"
@@ -92,6 +101,10 @@ TF_CLI_ARGS='-refresh=false' TF_CLI_ARGS_plan='-target=aws_vpc.wrong' TF_WORKSPA
   fail "explicit plan did not lock and refresh the entire default workspace"
 [ "$(stat -c %a "$diagnostic")" = 600 ] || fail "diagnostic is not private"
 
+# A traced caller must not expose the IMDS token when it is fetched or sent.
+bash -x "$pub" >"$tmp/traced-result" 2>"$tmp/traced-output"
+! grep -Fq 'test-imds-token' "$tmp/traced-output" || fail "IMDS token escaped into the shell trace"
+
 cat > "$tmp/pending.log" <<'LOG'
 Note: Objects have changed outside of Terraform
   # aws_instance.unrelated will be destroyed
@@ -122,6 +135,12 @@ PY
 # Neither a local wrapper collision nor a held shared backend lock invalidates
 # the prior result. A permission/network error while acquiring a lock does.
 cp "$diagnostic" "$tmp/previous-diagnostic"
+FAKE_ACTIVE_TF=terraform run 75 0 "$tmp/clean.log" --if-idle
+not_planned "a direct Terraform invocation without the wrapper"
+not_published "a direct Terraform invocation without the wrapper"
+FAKE_ACTIVE_TF=terraform-provi run 75 0 "$tmp/clean.log"
+not_planned "a provider surviving its Terraform parent"
+not_published "a provider surviving its Terraform parent"
 run 75 75 "$tmp/clean.log" --if-idle
 not_published "local lock collision"
 cat > "$tmp/remote-lock.log" <<'LOG'
