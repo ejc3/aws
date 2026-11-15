@@ -204,6 +204,7 @@ class HostTests(unittest.TestCase):
                 "--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 -j REJECT --reject-with tcp-reset"])
             live_forward = "\n".join(["-P FORWARD ACCEPT",
                                       "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN",
+                                      '-A FORWARD -m comment --comment "netavark firewall plugin rules" -j NETAVARK_FORWARD',
                                       "-A FORWARD -i veth0 -j ACCEPT"])
             approved_prefix = "2001:db8:1:2:3::/80"
             agent_args = "--windows 4 --minecraft 4"
@@ -294,6 +295,129 @@ class HostTests(unittest.TestCase):
                         self.assertLess(result.stdout.index(allow), result.stdout.index("forward tcp dport 25565 drop"))
                     self.assertNotIn("fixture-token", result.stderr)
                     self.assertNotIn("flush ruleset", result.stdout)
+
+    def test_java_guard_moves_the_java_jump_above_netavarks_while_java_is_closed(self):
+        # On a staging host (2026-11-15) podman's netavark inserts its FORWARD jump at position 1
+        # after the agent inserted the Java jump there, when the renderer containers start. The
+        # guard then moves the agent's jump back to position 1, with Java closed throughout, and
+        # opens only once it reads the jump first. An earlier rule of any other kind still keeps
+        # Java closed and is never moved past.
+        guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
+        image = "ami-0c3ea14848ddbeb93"
+        syn = "-p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN"
+        join = "\n".join([
+            "-N FCVM-MC-JOIN",
+            f"-A FCVM-MC-JOIN {syn} -m connlimit --connlimit-above 4 --connlimit-mask 64 --connlimit-saddr "
+            "-j REJECT --reject-with tcp-reset",
+            f"-A FCVM-MC-JOIN {syn} -m hashlimit --hashlimit-above 12/min --hashlimit-burst 6 --hashlimit-mode srcip "
+            "--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 -j REJECT --reject-with tcp-reset"])
+        jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
+        netavark = '-A FORWARD -m comment --comment "netavark firewall plugin rules" -j NETAVARK_FORWARD'
+        cases = {
+            # (FORWARD before, opens, FORWARD after)
+            "netavark first": ([netavark, jump], True, [jump, netavark]),
+            "jump already first": ([jump, netavark], True, [jump, netavark]),
+            "Java first before netavark starts": ([jump], False, [jump]),
+            "nft close fails": ([netavark, jump], False, [netavark, jump]),
+            "netavark and a RETURN first": ([netavark, "-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", jump],
+                                            False, None),
+            "a RETURN first": (["-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", netavark, jump], False, None),
+            "netavark with another comment": (
+                ['-A FORWARD -m comment --comment "other" -j NETAVARK_FORWARD', jump], False, None),
+            "netavark and no jump": ([netavark], False, [netavark]),
+            "two jumps": ([jump, netavark, jump], False, None),
+        }
+        with tempfile.TemporaryDirectory() as temp:
+            t = Path(temp)
+            log = t / "events"
+            (t / "curl").write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                set -eu
+                case "${!#}" in
+                  */api/token) printf fixture-token;;
+                  */meta-data/ami-id) cat >/dev/null; printf "%s" "$BOOT_AMI";;
+                  */meta-data/mac) cat >/dev/null; printf 00:01:02:03:04:05;;
+                  */ipv6-prefix) cat >/dev/null; printf 2001:db8:1:2:3::/80;;
+                  *) exit 90;;
+                esac
+            """).lstrip())
+            # nft logs whether it was handed an opened or a closed table.
+            (t / "nft").write_text(textwrap.dedent(r"""
+                #!/bin/bash
+                if grep -q 'ip6 daddr'; then
+                  echo "nft open" >> "$EVENTS"
+                elif [[ "${FAIL_CLOSE:-}" == 1 ]]; then
+                  echo "nft close failed" >> "$EVENTS"
+                  exit 1
+                else
+                  echo "nft closed" >> "$EVENTS"
+                fi
+            """).lstrip())
+            # ip6tables keeps FORWARD in a file and supports the two edits the guard may make.
+            (t / "ip6tables").write_text(textwrap.dedent(r"""
+                #!/usr/bin/env python3
+                import os, sys
+                args, state = sys.argv[1:], os.environ["FORWARD_FILE"]
+                rules = [l for l in open(state).read().splitlines() if l]
+                spec = ["-p", "tcp", "--dport", "25565", "-j", "FCVM-MC-JOIN"]
+                jump = "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN"
+                if args == ["-S", "FCVM-MC-JOIN"]:
+                    print(os.environ["IP6_JOIN"]); sys.exit(0)
+                if args == ["-S", "FORWARD"]:
+                    print("-P FORWARD ACCEPT"); print("\n".join(rules)); sys.exit(0)
+                open(os.environ["EVENTS"], "a").write("ip6tables " + " ".join(args) + "\n")
+                if args == ["-D", "FORWARD"] + spec and jump in rules:
+                    rules.remove(jump)
+                elif args == ["-I", "FORWARD", "1"] + spec:
+                    rules.insert(0, jump)
+                else:
+                    sys.exit(1)
+                open(state, "w").write("\n".join(rules) + "\n")
+            """).lstrip())
+            for name in ("curl", "nft", "ip6tables"):
+                (t / name).chmod(0o700)
+            pci = t / "pci"
+            (pci / "drivers/vfio-pci").mkdir(parents=True)
+            for i in range(8):
+                dev = pci / "devices" / f"0000:{i:02d}:00.0"
+                dev.mkdir(parents=True)
+                (dev / "vendor").write_text("0x10de\n")
+                (dev / "class").write_text("0x030200\n")
+                (pci / "drivers/vfio-pci" / dev.name).symlink_to(dev)
+            script = (guard.replace("/usr/bin/curl", str(t / "curl")).replace("/usr/sbin/nft", str(t / "nft"))
+                      .replace("/sys/bus/pci", str(pci)).replace("/etc/fcvm-fleet/minecraft.env", str(t / "mc.env"))
+                      .replace("/usr/sbin/ip6tables", str(t / "ip6tables")))
+            (t / "mc.env").write_text("")
+            for label, (before, opens, after) in cases.items():
+                with self.subTest(label):
+                    (t / "forward").write_text("\n".join(before) + "\n")
+                    log.write_text("")
+                    result = subprocess.run(
+                        ["/bin/bash", "-c", script, "--", "open", image, "8", "4", "4"],
+                        env=dict(os.environ, BOOT_AMI=image, IP6_JOIN=join, FORWARD_FILE=str(t / "forward"),
+                                 EVENTS=str(log), FCVM_JAVA_GUARD_WAIT="0", FLEET_AGENT_ARGS="--windows 4 --minecraft 4",
+                                 FAIL_CLOSE="1" if label == "nft close fails" else "0",
+                                 WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
+                        capture_output=True, text=True, check=False, timeout=10)
+                    events = log.read_text().splitlines()
+                    if label == "nft close fails":
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(events, ["nft close failed"])
+                        self.assertEqual((t / "forward").read_text().splitlines(), before)
+                        continue
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(events[-1], "nft open" if opens else "nft closed", events)
+                    moved = [e for e in events if e.startswith("ip6tables ")]
+                    if moved:
+                        # The jump moves only while Java is closed: a closed table goes in first and no
+                        # opened one before the move is done.
+                        first = events.index(moved[0])
+                        self.assertIn("nft closed", events[:first], events)
+                        self.assertNotIn("nft open", events[:events.index(moved[-1])], events)
+                    if after is not None:
+                        self.assertEqual((t / "forward").read_text().split("\n")[:-1], after)
+                    else:
+                        self.assertEqual(moved, [], "an earlier rule other than netavark's is never moved past")
 
     def test_java_guard_closes_before_the_agent_starts_whatever_the_host_holds(self):
         guard = (ROOT / "modules/fcvm-fleet-region/minecraft-java-guard.sh").read_text()
