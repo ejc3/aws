@@ -204,6 +204,7 @@ class HostTests(unittest.TestCase):
                 "--hashlimit-name fcvm-mc-join --hashlimit-srcmask 64 -j REJECT --reject-with tcp-reset"])
             live_forward = "\n".join(["-P FORWARD ACCEPT",
                                       "-A FORWARD -p tcp -m tcp --dport 25565 -j FCVM-MC-JOIN",
+                                      '-A FORWARD -m comment --comment "netavark firewall plugin rules" -j NETAVARK_FORWARD',
                                       "-A FORWARD -i veth0 -j ACCEPT"])
             approved_prefix = "2001:db8:1:2:3::/80"
             agent_args = "--windows 4 --minecraft 4"
@@ -316,6 +317,8 @@ class HostTests(unittest.TestCase):
             # (FORWARD before, opens, FORWARD after)
             "netavark first": ([netavark, jump], True, [jump, netavark]),
             "jump already first": ([jump, netavark], True, [jump, netavark]),
+            "Java first before netavark starts": ([jump], False, [jump]),
+            "nft close fails": ([netavark, jump], False, [netavark, jump]),
             "netavark and a RETURN first": ([netavark, "-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", jump],
                                             False, None),
             "a RETURN first": (["-A FORWARD -p tcp -m tcp --dport 25565 -j RETURN", netavark, jump], False, None),
@@ -341,7 +344,14 @@ class HostTests(unittest.TestCase):
             # nft logs whether it was handed an opened or a closed table.
             (t / "nft").write_text(textwrap.dedent(r"""
                 #!/bin/bash
-                if grep -q 'ip6 daddr' ; then echo "nft open" >> "$EVENTS"; else echo "nft closed" >> "$EVENTS"; fi
+                if grep -q 'ip6 daddr'; then
+                  echo "nft open" >> "$EVENTS"
+                elif [[ "${FAIL_CLOSE:-}" == 1 ]]; then
+                  echo "nft close failed" >> "$EVENTS"
+                  exit 1
+                else
+                  echo "nft closed" >> "$EVENTS"
+                fi
             """).lstrip())
             # ip6tables keeps FORWARD in a file and supports the two edits the guard may make.
             (t / "ip6tables").write_text(textwrap.dedent(r"""
@@ -386,10 +396,16 @@ class HostTests(unittest.TestCase):
                         ["/bin/bash", "-c", script, "--", "open", image, "8", "4", "4"],
                         env=dict(os.environ, BOOT_AMI=image, IP6_JOIN=join, FORWARD_FILE=str(t / "forward"),
                                  EVENTS=str(log), FCVM_JAVA_GUARD_WAIT="0", FLEET_AGENT_ARGS="--windows 4 --minecraft 4",
+                                 FAIL_CLOSE="1" if label == "nft close fails" else "0",
                                  WINDOWS_AGENT_ARGS="--windows-image /fixture/windows"),
                         capture_output=True, text=True, check=False, timeout=10)
-                    self.assertEqual(result.returncode, 0, result.stderr)
                     events = log.read_text().splitlines()
+                    if label == "nft close fails":
+                        self.assertNotEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(events, ["nft close failed"])
+                        self.assertEqual((t / "forward").read_text().splitlines(), before)
+                        continue
+                    self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertEqual(events[-1], "nft open" if opens else "nft closed", events)
                     moved = [e for e in events if e.startswith("ip6tables ")]
                     if moved:
