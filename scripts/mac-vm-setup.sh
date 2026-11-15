@@ -7,8 +7,8 @@
 #   scripts/mac-vm-setup.sh skevh --lan mini-lan
 #   scripts/mac-vm-setup.sh ci    --lan mini-lan --runners    then: Xcode and the build tools in ci, and its runners
 #
-# --runners (ci only) runs dolphin-labs' own apps/native/scripts/ci-vm.sh `provision` on the mini against ci (Xcode
-# copied in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
+# --runners (ci only) provisions ci the way dolphin-labs' apps/native/scripts/ci-vm.sh `provision` does (Xcode copied
+# in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
 # pool of GitHub Actions runners in the VM at the dolphin-labs-hq ORGANIZATION (owner, 2026-11-14), so any idle one
 # takes any repository's job: named mini-<n>, labelled with every label those repositories' macOS jobs ask for
 # (CI_LABELS below) and `mini`. They join the org's Default runner group, which serves private repositories only.
@@ -181,10 +181,55 @@ on_host "\$HOME/.local/bin/tart exec $VM cat /etc/ssh/ssh_host_ed25519_key.pub" 
 
 [ -n "$RUNNERS" ] || exit 0
 
-echo "runners 1/2 provision (dolphin-labs apps/native/scripts/ci-vm.sh, on the mini)"
-gh api repos/dolphin-labs-hq/dolphin-labs/contents/apps/native/scripts/ci-vm.sh -H 'Accept: application/vnd.github.raw' |
-  on_host "cat > \$HOME/.local/bin/ci-vm.sh && chmod 755 \$HOME/.local/bin/ci-vm.sh"
-on_host "PATH=\$HOME/.local/bin:\$PATH GWW_CI_VM=$VM GWW_CI_XCODE=\$HOME/Applications/Xcode.app ci-vm.sh provision"
+echo "runners 1/2 provision: Xcode, build tools and the signing keychain in $VM (the steps of dolphin-labs' ci-vm.sh)"
+# dolphin-labs' apps/native/scripts/ci-vm.sh `provision` does this on the MacBook, but it needs python3 on the host,
+# and a fresh mini has only Apple's stub (Xcode's own python3 is refused until `sudo xcodebuild -license`). The same
+# steps, with nothing run as root on the host.
+in_ci() { on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "$1")"; }
+# Xcode, the mini's copy, streamed in as a tar through tart exec (the share's virtiofs mount breaks an app bundle's
+# symlinks), whole only once its marker is written after the tar ended well; again only when the mini's is another
+# version or build.
+want=$(on_host 'p=$HOME/Applications/Xcode.app/Contents; /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" $p/Info.plist; /usr/libexec/PlistBuddy -c "Print :ProductBuildVersion" $p/version.plist' | paste -sd' ' -)
+[[ $want =~ ^[0-9][0-9.]*\ [0-9A-Za-z]+$ ]] || { echo "no Xcode version on the mini ($want)" >&2; exit 1; }
+have=$(in_ci "cat /Applications/Xcode.app/.ci-vm-copied 2>/dev/null || true")
+if [ "$have" != "$want" ]; then
+  echo "   copying Xcode $want in"
+  in_ci "sudo rm -rf /Applications/.xcode-incoming && sudo mkdir /Applications/.xcode-incoming"
+  on_host "tar -C \$HOME/Applications -cf - Xcode.app | \$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc 'sudo tar -C /Applications/.xcode-incoming -xf -'"
+  in_ci "set -e; sudo rm -rf /Applications/Xcode.app; sudo mv /Applications/.xcode-incoming/Xcode.app /Applications/Xcode.app; sudo rmdir /Applications/.xcode-incoming; echo '$want' | sudo tee /Applications/Xcode.app/.ci-vm-copied >/dev/null"
+fi
+in_ci "
+  set -e
+  sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+  sudo xcodebuild -license accept
+  sudo xcodebuild -runFirstLaunch >/dev/null
+  echo \"   \$(xcodebuild -version | head -1)\"
+"
+# The rest from Homebrew, which the base image carries; Node 22 ahead of any other in every login shell (the runners'
+# services take their PATH from one).
+in_ci "
+  set -e
+  brew update >/dev/null 2>&1 || true
+  brew install node@22 python@3.12 xcodegen cocoapods awscli gh >/dev/null
+  grep -q 'node@22/bin' ~/.zprofile 2>/dev/null || echo 'export PATH=\"/opt/homebrew/opt/node@22/bin:\$PATH\"' >> ~/.zprofile
+  export PATH=\"/opt/homebrew/opt/node@22/bin:\$PATH\"
+  echo \"   node \$(node --version), \$(python3.12 --version), xcodegen \$(xcodegen --version | tail -1), pod \$(pod --version)\"
+"
+# A keychain of the builds' own: the runners run without a login session's unlocked keychain, so signing would ask a
+# person ("User interaction is not allowed"). Its password is made here and kept only in the VM.
+in_ci "
+  set -e
+  kc=\$HOME/Library/Keychains/ci.keychain-db
+  if [ ! -f \$kc ]; then
+    umask 077
+    openssl rand -hex 24 > \$HOME/.ci-keychain-password
+    security create-keychain -p \"\$(cat \$HOME/.ci-keychain-password)\" ci.keychain
+  fi
+  security set-keychain-settings -lut 21600 \$kc
+  security list-keychains -d user -s \$kc \$(security list-keychains -d user | tr -d '\"' | grep -v ci.keychain)
+  security default-keychain -d user -s \$kc
+  echo '   signing keychain ready'
+"
 
 echo "runners 2/2 registrations"
 on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
