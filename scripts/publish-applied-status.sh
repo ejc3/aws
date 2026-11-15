@@ -83,9 +83,10 @@ if pgrep -x 'terraform|terraform-provi' >/dev/null; then
   skip "Terraform or a provider is already running on this jumpbox"
 fi
 
-# A full plan usually takes 10–15 minutes. Leave time for a 10-minute
-# backend-lock wait in explicit mode and for Terraform to unwind cancellation.
-timeout --signal=TERM 29m "$terraform" plan -detailed-exitcode -lock=true \
+# Reserve up to two minutes for the wrapper lock, ten for the backend lock,
+# and the usual 10–15 minutes for the plan. The wrapper's default wait alone
+# would outlive this timeout and turn ordinary contention into a plan error.
+TF_RUN_LOCK_WAIT=120 timeout --signal=TERM 29m "$terraform" plan -detailed-exitcode -lock=true \
   -lock-timeout="$wait" -input=false -no-color >"$plan_log" 2>&1
 rc=$?
 if [ "$rc" -eq 75 ]; then

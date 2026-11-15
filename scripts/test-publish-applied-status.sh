@@ -36,8 +36,8 @@ CURL
 cat > "$tmp/bin/terraform" <<'TF'
 #!/usr/bin/env bash
     # TERRAFORM-RUN-LOCK-WRAPPER mock
-printf 'idle=%s workspace=%s global=%s per_command=%s args=%s\n' \
-  "${TF_RUN_LOCK_NOWAIT:-}" "${TF_WORKSPACE:-}" "${TF_CLI_ARGS:-}" "${TF_CLI_ARGS_plan:-}" "$*" >"$FAKE_PLAN_CALL"
+printf 'idle=%s host_wait=%s workspace=%s global=%s per_command=%s args=%s\n' \
+  "${TF_RUN_LOCK_NOWAIT:-}" "${TF_RUN_LOCK_WAIT:-}" "${TF_WORKSPACE:-}" "${TF_CLI_ARGS:-}" "${TF_CLI_ARGS_plan:-}" "$*" >"$FAKE_PLAN_CALL"
 if [ -n "${FAKE_MOVE_MAIN:-}" ]; then
   git --git-dir="$FAKE_MOVE_MAIN" update-ref refs/heads/main refs/heads/later
 fi
@@ -92,12 +92,12 @@ field() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[sys.ar
 diagnostic="$XDG_STATE_HOME/aws-applied-status/last-plan.log"
 
 printf 'No changes. Your infrastructure matches the configuration.\n' > "$tmp/clean.log"
-TF_CLI_ARGS='-refresh=false' TF_CLI_ARGS_plan='-target=aws_vpc.wrong' TF_WORKSPACE=other run 0 0 "$tmp/clean.log"
+TF_RUN_LOCK_WAIT=86400 TF_CLI_ARGS='-refresh=false' TF_CLI_ARGS_plan='-target=aws_vpc.wrong' TF_WORKSPACE=other run 0 0 "$tmp/clean.log"
 [ "$(field plan)" = clean ] || fail "clean plan not published as clean"
 [ "$(field pending_count)" = 0 ] || fail "clean plan has pending items"
 [ "$(field main)" = "$(git rev-parse HEAD)" ] || fail "wrong main sha"
 [ "$(field subject)" = "Merge the thing (#42)" ] || fail "wrong subject"
-[ "$(cat "$FAKE_PLAN_CALL")" = 'idle= workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=10m -input=false -no-color' ] ||
+[ "$(cat "$FAKE_PLAN_CALL")" = 'idle= host_wait=120 workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=10m -input=false -no-color' ] ||
   fail "explicit plan did not lock and refresh the entire default workspace"
 [ "$(stat -c %a "$diagnostic")" = 600 ] || fail "diagnostic is not private"
 
@@ -120,7 +120,7 @@ LOG
 run 2 2 "$tmp/pending.log" --if-idle
 [ "$(field plan)" = pending ] || fail "pending plan not published as pending"
 [ "$(field pending_count)" = 4 ] || fail "expected four managed-resource actions"
-[ "$(cat "$FAKE_PLAN_CALL")" = 'idle=1 workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=0s -input=false -no-color' ] ||
+[ "$(cat "$FAKE_PLAN_CALL")" = 'idle=1 host_wait=120 workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=0s -input=false -no-color' ] ||
   fail "Stop hook would wait instead of using both nonblocking locks"
 python3 - "$FAKE_AWS_OUT" <<'PY' || fail "pending list is wrong"
 import json, sys
@@ -141,8 +141,18 @@ not_published "a direct Terraform invocation without the wrapper"
 FAKE_ACTIVE_TF=terraform-provi run 75 0 "$tmp/clean.log"
 not_planned "a provider surviving its Terraform parent"
 not_published "a provider surviving its Terraform parent"
-run 75 75 "$tmp/clean.log" --if-idle
-not_published "local lock collision"
+TF_RUN_LOCK_WAIT=86400 run 75 75 "$tmp/clean.log"
+not_published "local lock collision in explicit mode"
+case "$(cat "$FAKE_PLAN_CALL")" in
+  'idle= host_wait=120 '*) ;;
+  *) fail "local lock wait can outlive the publisher";;
+esac
+TF_RUN_LOCK_WAIT=86400 run 75 75 "$tmp/clean.log" --if-idle
+not_published "local lock collision in idle mode"
+case "$(cat "$FAKE_PLAN_CALL")" in
+  'idle=1 host_wait=120 '*) ;;
+  *) fail "idle plan would wait on the host lock";;
+esac
 cat > "$tmp/remote-lock.log" <<'LOG'
 Error: Error acquiring the state lock
 Error message: operation error DynamoDB: PutItem, api error ConditionalCheckFailedException: The conditional request failed
