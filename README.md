@@ -1602,6 +1602,15 @@ Kept so the next machine goes faster.
   refused the new key at .188 ("REMOTE HOST IDENTIFICATION HAS CHANGED"), which is how it was caught, and the Xcode
   copy running at the time stopped part-way. Reach the mini by its Bonjour name with a `HostKeyAlias` (above), and
   check a long copy's exit status: zsh has no `PIPESTATUS`, so `cmd | tee log; echo ${PIPESTATUS[0]}` prints nothing.
+- **Every clone of the base image has the same SSH host keys.** ghcr.io/cirruslabs/macos-tahoe-base ships them baked
+  in (dated 2026-08-18), private halves included, so `skevh` and `ci` came up with identical keys and anyone with the
+  public image holds them: pinning one would identify nothing. `mac-vm-setup.sh` now makes each guest its own once
+  (`ssh-keygen -A`, marker `/etc/ssh/.host-keys-made-by-mac-vm-setup`). The MacBook's `gww-ci` and `kidsports-ci`
+  were cloned from the same image and were not changed.
+- **A fresh Mac has no `python3`**: only Apple's stub, which pops the developer-tools installer on the Mac's screen
+  instead of running. `mac-vm-setup.sh` checks for a VM with `tart get`.
+- **Growing a guest's disk can fail while it is still booting**, and `set -e` then ended the first run with no message.
+  It now says so; running the script again finishes it (the disk went from 41 to 93 GB on skevh).
 - **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
   administration-only connector tokens.
 - **The base image download is slow**: 27.3 GB compressed from ghcr.io at about 1% a minute. Start `tart pull` first.

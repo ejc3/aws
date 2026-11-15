@@ -21,8 +21,9 @@
 #     existing VM is kept as it is: this never deletes or re-clones one.
 #   * the LaunchAgent com.ejcampbell.tart.<vm>: `tart run --no-graphics <vm>` at login, restarted by launchd. ci also
 #     gets the host's ~/Applications/Xcode.app read-only at /Volumes/My Shared Files/xcode.
-#   * waits for the guest agent, then for skevh authorizes Steve's own keys (nextjs_user_keys.skevh in
-#     nextjs-user-data.tf) for the guest's admin, in a managed block.
+#   * waits for the guest agent, grows the guest's disk, replaces the image's shared SSH host keys with the guest's
+#     own (once), and for skevh authorizes Steve's own keys (nextjs_user_keys.skevh in nextjs-user-data.tf) for the
+#     guest's admin, in a managed block.
 #   * prints the guest's SSH host key, which mac-ssh-client.tf pins for `ssh <vm>-mac`.
 # Re-running is safe: nothing that is already right is changed, and the VM is restarted only when its LaunchAgent changed.
 set -euo pipefail
@@ -81,7 +82,8 @@ on_host bash -s <<REMOTE
 set -euo pipefail
 export PATH=\$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 command -v tart >/dev/null || { echo "no tart in ~/.local/bin on the mini (README 'The Mac mini')" >&2; exit 1; }
-if tart list --format json | python3 -c "import json,sys; sys.exit(0 if any(v['Name']=='$VM' for v in json.load(sys.stdin)) else 1)"; then
+# No python3 here: a fresh Mac has only Apple's stub, which pops up the developer-tools installer instead of running.
+if tart get "$VM" >/dev/null 2>&1; then
   echo "$VM exists; kept as it is"
 else
   [ "$VM" != ci ] || [ -d "\$HOME/Applications/Xcode.app" ] || { echo "ci needs ~/Applications/Xcode.app on the mini" >&2; exit 1; }
@@ -142,6 +144,19 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/bash -c $(printf '%q' '
   yes | sudo diskutil repairDisk ${store%s*} >/dev/null 2>&1 || true
   out=$(sudo diskutil apfs resizeContainer $store 0 2>&1) || echo "$out" | grep -q "must be different"
   echo "   disk: $(df -h / | tail -1 | awk "{print \$2}")"
+')" || { echo "growing $VM's disk failed (it can, while the guest is still booting): run this again" >&2; exit 1; }
+
+# The image's sshd host keys are baked into ghcr.io/cirruslabs/macos-tahoe-base: every clone shares them, private
+# halves included, so a pinned key would identify nothing. Each guest makes its own once (marker in /etc/ssh).
+echo "   $VM's own SSH host keys"
+on_host "\$HOME/.local/bin/tart exec $VM /bin/bash -c $(printf '%q' '
+  set -e
+  m=/etc/ssh/.host-keys-made-by-mac-vm-setup
+  if [ -e $m ]; then echo "   already its own"; exit 0; fi
+  sudo rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
+  sudo ssh-keygen -A >/dev/null
+  sudo touch $m
+  echo "   made"
 ')"
 
 if [ -n "$OWNER_KEYS" ]; then

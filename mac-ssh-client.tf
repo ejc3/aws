@@ -48,20 +48,21 @@ locals {
       host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDYdgKiKL4C1d0sQT23eySkjw4xE9dTgmqpyIV7MQ7jY"
       make_key       = true
     }
-    # The mini's VMs (mac-vms.tf): each guest's own /etc/ssh/ssh_host_ed25519_key.pub, read through `tart exec` on the
-    # mini. A VM rebuilt from the image has a new one.
+    # The mini's VMs (mac-vms.tf): each guest's own /etc/ssh/ssh_host_ed25519_key.pub, made in the guest by
+    # scripts/mac-vm-setup.sh (the image's baked-in keys are shared by every clone) and read 2026-11-14. A VM rebuilt
+    # from the image has a new one.
     ci-mac = {
       hostname       = "ci-mac-ssh.cc-games.dev"
       user           = "admin"
       host_key_alias = "ci-mac"
-      host_key       = "@CI_MAC_HOST_KEY@"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ5yhWc4NoEZVpMhrW3aq20AZLOfTQbPjjJJk7PbibRL"
       make_key       = true
     }
     skevh-mac = {
       hostname       = "skevh-mac-ssh.cc-games.dev"
       user           = "admin"
       host_key_alias = "skevh-mac"
-      host_key       = "@SKEVH_MAC_HOST_KEY@"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBljGktqmAak5c1kul5ELE+4jUXZTvArNfpOW+ja7yNB"
       make_key       = true
     }
     # Colin's Windows PC: OpenSSH Server's host key (C:\ProgramData\ssh\ssh_host_ed25519_key.pub, read on the PC).
