@@ -274,9 +274,11 @@ locals {
     %{if var.minecraft_java_access != null~}
     install -d -m 0755 /usr/local/libexec /etc/systemd/system/fcvm-fleet-agent.service.d
     install -m 0755 /dev/null /usr/local/libexec/fcvm-minecraft-java-guard
-    cat > /usr/local/libexec/fcvm-minecraft-java-guard <<'MINECRAFT_GUARD'
-    ${file("${path.module}/minecraft-java-guard.sh")}
-    MINECRAFT_GUARD
+    # Compress only the embedded helper to leave room under EC2's 16 KiB
+    # user-data cap while keeping the outer bash bootstrap unchanged.
+    (set -o pipefail
+      printf '%s' '${base64gzip(file("${path.module}/minecraft-java-guard.sh"))}' | /usr/bin/base64 -d | /usr/bin/gzip -d
+    ) > /usr/local/libexec/fcvm-minecraft-java-guard
     # Closed before every agent start. Opened by its own unit once the agent (the one owner of
     # the FCVM-MC-JOIN rules) has installed them and the guard has read them back live.
     cat > /etc/systemd/system/fcvm-fleet-agent.service.d/30-minecraft-java-guard.conf <<'MINECRAFT_UNIT'
@@ -543,6 +545,12 @@ resource "aws_launch_template" "host" {
 
   lifecycle {
     ignore_changes = [description]
+
+    # EC2 counts decoded bytes, not the base64 length or Unicode characters.
+    precondition {
+      condition     = length(local.user_data) * 3 / 4 - length(regex("=*$", local.user_data)) <= 16384
+      error_message = "The Fleet host startup script exceeds EC2's 16 KiB user-data limit."
+    }
   }
 }
 
