@@ -1632,6 +1632,11 @@ Kept so the next machine goes faster.
   and no ssh to fcvm-arm.
 - **The first `ssh skevh-mac` from Steve's container failed with `NoCredentials`** in the Access proxy (its container's
   first AWS call); the next two connected. Retry once before debugging the route.
+- **Running `scripts/test-mac-ssh-client.py` on the MacBook took `ssh mac` down** (Cloudflare 1033 for the fcvm agents
+  until it was noticed). The connector's reload runs detached; in the test it outlived its temp dir, so its bare
+  `launchctl` fell through to the real one and booted out the real `com.ejcampbell.macbook-ssh.cloudflared`. The test
+  now pins `launchctl` to its stub. If it happens again: `launchctl bootstrap gui/$(id -u)
+  ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`.
 
 ## Start a Codex session
 

@@ -461,7 +461,7 @@ class ConnectorScript(unittest.TestCase):
         self.nosudo = root / "nosudo"
         bin_sum = re.search(r"^CFD_SHA256_DARWIN_ARM64_BIN=(\S+)$", CONNECTOR.read_text(), re.M).group(1)
         self.stub("ssh", f"""#!/usr/bin/env python3
-import os, subprocess, sys
+import os, re, subprocess, sys
 with open({str(self.argv_log)!r}, "a") as log:
     log.write(repr(sys.argv[1:]) + "\\n")
 args = sys.argv[1:]
@@ -474,6 +474,10 @@ while args[i].startswith("-"):
     i += 2 if args[i] in ("-o", "-i", "-p") else 1
 data = sys.stdin.buffer.read()
 data = data.replace(b"export PATH=/usr/bin:/bin:/usr/sbin:/sbin", b"export PATH={self.stubs}:/usr/bin:/bin")
+# The reload runs detached and can outlive the test, whose temp dir (and the stub with it) is gone by then; a bare
+# `launchctl` would then fall through to the real one on a Mac and boot out the real connector of the same label (this
+# unloaded the MacBook's own on 2026-11-14). Pinned to the stub's path, a late reload fails instead.
+data = re.sub(rb"(?<![/\\w])launchctl ", b"{self.stubs}/launchctl ", data)  # each hop runs this stub again
 sys.exit(subprocess.run(["bash", "-c", " ".join(args[i + 1:])], input=data).returncode)
 """)
         self.stub("aws", f"""#!/bin/sh
