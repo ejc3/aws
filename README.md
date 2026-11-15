@@ -1543,9 +1543,19 @@ run on the mini. GitHub cannot rank runners: a job goes to whichever matching ru
 `gww-ci` and `kidsports-ci` VMs serve the same labels, jobs split between the two Macs; a job that must build on the
 mini asks for `mini` too. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`).
 
-**Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (the mini's LAN address, key `~/.ssh/to-mini`),
+**Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (below),
 an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an org admin of dolphin-labs-hq
 (`admin:org` scope):
+
+```sshconfig
+Host mini-lan
+    HostName EJs-Mac-Mini.local     # its Bonjour name: its LAN address has already changed once
+    User ejcampbell
+    IdentityFile ~/.ssh/to-mini     # authorized on the mini by hand at setup
+    IdentitiesOnly yes
+    HostKeyAlias mini-lan           # the host key is checked under this name, whatever the address
+    StrictHostKeyChecking yes
+```
 
 ```bash
 scripts/mac-vm-setup.sh skevh --lan mini-lan                  # prints the guest's host key: pin it in mac-ssh-client.tf
@@ -1587,6 +1597,11 @@ Kept so the next machine goes faster.
   `removed`, `import` with `for_each`); 1.10.3 can, but the `ejc3/cloudflare` provider fork has no `darwin_arm64`
   build, so `terraform validate` runs only on Linux (CI's `drift.yml`). `scripts/test-mac-ssh-client.py` fails ten
   installer tests on macOS on `main` too: the installer uses GNU `sed -i`.
+- **The mini's LAN address changed under a running session.** It came up on 192.168.4.188 through a USB Ethernet
+  adapter; when that adapter moved to another machine, that machine kept .188 and the mini answered on .194. ssh
+  refused the new key at .188 ("REMOTE HOST IDENTIFICATION HAS CHANGED"), which is how it was caught, and the Xcode
+  copy running at the time stopped part-way. Reach the mini by its Bonjour name with a `HostKeyAlias` (above), and
+  check a long copy's exit status: zsh has no `PIPESTATUS`, so `cmd | tee log; echo ${PIPESTATUS[0]}` prints nothing.
 - **The MacBook's AWS SSO session had expired**: `aws sso login` before the `--lan` installs, which read the
   administration-only connector tokens.
 - **The base image download is slow**: 27.3 GB compressed from ghcr.io at about 1% a minute. Start `tart pull` first.
