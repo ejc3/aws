@@ -441,8 +441,10 @@ for what changed. On 2026-09-28 an agent spent 15+ minutes re-running a full 48-
 
 **Dev boxes and Terraform state**: dev boxes cannot read state or its lock table, on
 purpose: state holds credentials. To check from a dev box whether main is applied, read
-`/infra/applied-status` (see `applied-status.tf`). The jumpbox's Stop hook publishes it
-after every plan of a clean origin/main.
+`/infra/applied-status` (see `applied-status.tf`). On a jumpbox, run
+`bash scripts/publish-applied-status.sh` from an initialized fresh origin/main worktree
+for a full plan that publishes its result. The Stop hook uses the same command when idle.
+A targeted plan does not establish that main is applied.
 
 **Credential ownership**: Personal Codex, Claude, GitHub, and Vercel device logins belong
 to one Unix user. Never seed them from Terraform, copy them between users, or overwrite a

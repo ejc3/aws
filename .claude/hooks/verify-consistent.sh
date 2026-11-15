@@ -24,7 +24,9 @@ root="${CLAUDE_PROJECT_DIR:-}"
 if [ -z "$root" ]; then
   root=$(printf '%s' "$input" | jq -r '.cwd // empty')
 fi
-[ -n "$root" ] && cd "$root" 2>/dev/null
+if [ -n "$root" ]; then
+  cd "$root" 2>/dev/null || exit 0
+fi
 root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 cd "$root" || exit 0
 
@@ -46,7 +48,7 @@ if git rev-parse --abbrev-ref "@{u}" >/dev/null 2>&1; then
   if [ "${ahead:-0}" -gt 0 ]; then
     problems+=("$ahead local commit(s) not pushed. Run: git push origin $branch")
   fi
-else
+elif [ "$branch" != HEAD ]; then
   problems+=("Branch '$branch' has no upstream. Push it: git push -u origin $branch")
 fi
 
@@ -54,37 +56,19 @@ fi
 # a checkout of origin/main is compared with live AWS. Any other branch predates or differs
 # from what is applied, and planning it reports the difference as "drift" that must not be
 # "fixed" (a review branch built on an old base did exactly that).
-git fetch -q origin main 2>/dev/null || true
-at_main=0
-[ "$(git rev-parse HEAD 2>/dev/null)" = "$(git rev-parse origin/main 2>/dev/null)" ] && at_main=1
-if [ "$branch" = main ] && [ "$at_main" = 0 ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)" -gt 0 ]; then
-  problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
-fi
-# One Terraform run at a time (#408): on the jumpboxes `terraform` is the run-lock wrapper (terraform-run-lock.tf),
-# which makes this plan share one host lock with every other plan and apply. TF_RUN_LOCK_NOWAIT makes it give up at
-# once (exit 75) instead of queueing behind a long apply. The process check also skips while a run that bypassed the
-# wrapper (a full path, another box's checkout) is alive. Git checks still apply either way.
-terraform_check_available() {
-  if pgrep -x 'terraform|terraform-provi' >/dev/null; then
-    printf '%s\n' 'Skipping Terraform drift check: Terraform is already running.' >&2
-    return 1
-  fi
-}
-
-if [ "$at_main" = 1 ] && command -v terraform >/dev/null 2>&1 && terraform_check_available; then
-  tflog="/tmp/stop-hook-tfplan.log"
-  TF_RUN_LOCK_NOWAIT=1 terraform plan -detailed-exitcode -lock=false -input=false -no-color >"$tflog" 2>&1
-  rc=$?
-  if [ "$rc" -eq 75 ]; then
-    printf '%s\n' 'Skipping Terraform drift check: another Terraform run holds the run lock.' >&2
-  else
-    # Dev boxes cannot read state; tell them what this plan found (applied-status.tf).
-    # Publishes only from a clean origin/main checkout and never blocks the stop.
-    bash scripts/publish-applied-status.sh "$rc" "$tflog" >/dev/null 2>&1 || true
+if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; then
+  if [ "$branch" = main ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null)" -gt 0 ]; then
+    problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
+  elif [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && [ -z "$(git status --porcelain)" ]; then
+    # This command independently verifies the jumpbox and latest origin/main.
+    # Busy locks and ineligible hosts skip. Results and raw logs stay distinct.
+    bash scripts/publish-applied-status.sh --if-idle >&2
+    rc=$?
+    tflog="${XDG_STATE_HOME:-$HOME/.local/state}/aws-applied-status/last-plan.log"
     if [ "$rc" -eq 2 ]; then
-      problems+=("Terraform drift: live AWS does not match config (terraform plan shows changes). Review $tflog and either 'terraform apply' the intended change or reconcile config to match live BEFORE stopping, so nothing is lost.")
-    elif [ "$rc" -ne 0 ]; then
-      problems+=("terraform plan failed (exit $rc). See $tflog -- resolve before stopping.")
+      problems+=("Terraform drift: live AWS does not match config. Review $tflog and apply or reconcile the intended change.")
+    elif [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ]; then
+      problems+=("Terraform status check failed (exit $rc). Look for the latest run in $tflog or see the command diagnostic.")
     fi
   fi
 fi
