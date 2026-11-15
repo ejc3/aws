@@ -126,14 +126,23 @@ run 75 75 "$tmp/clean.log" --if-idle
 not_published "local lock collision"
 cat > "$tmp/remote-lock.log" <<'LOG'
 Error: Error acquiring the state lock
-Error message: ConditionalCheckFailedException: The conditional request failed
+Error message: operation error DynamoDB: PutItem, api error ConditionalCheckFailedException: The conditional request failed
 Lock Info:
   ID: previous
 LOG
 run 75 1 "$tmp/remote-lock.log" --if-idle
 not_published "backend lock collision"
+# The prior owner can release before Terraform looks up who held the lock.
+cat > "$tmp/released-lock.log" <<'LOG'
+Error: Error acquiring the state lock
+Error message: operation error DynamoDB: PutItem, api error
+ConditionalCheckFailedException: The conditional request failed
+Unable to retrieve item from the DynamoDB table
+LOG
+run 75 1 "$tmp/released-lock.log" --if-idle
+not_published "backend lock released before Terraform read Lock Info"
 cmp "$diagnostic" "$tmp/previous-diagnostic" || fail "lock contention hid the prior diagnostic"
-printf 'Error: Error acquiring the state lock\nAccessDeniedException: should-stay-private\n' > "$tmp/denied.log"
+printf 'Error: Error acquiring the state lock\noperation error DynamoDB: PutItem, api error AccessDeniedException: should-stay-private\n' > "$tmp/denied.log"
 run 1 1 "$tmp/denied.log"
 [ "$(field plan)" = error ] || fail "failed plan not published as error"
 ! grep -q 'should-stay-private' "$FAKE_AWS_OUT" || fail "private error leaked"
@@ -145,12 +154,12 @@ run 124 124 "$tmp/denied.log"
 {
   printf 'Terraform will perform the following actions:\n'
   for i in $(seq 1 400); do printf '  # aws_ssm_parameter.item_%s will be created\n' "$i"; done
-  head -c 1100000 /dev/zero | tr '\0' x
+  head -c 4300000 /dev/zero | tr '\0' x
 } > "$tmp/big.log"
 run 2 2 "$tmp/big.log"
 [ "$(wc -c < "$FAKE_AWS_OUT")" -le 4096 ] || fail "published value exceeds 4 KB"
 [ "$(field pending_count)" = 400 ] || fail "big plan lost its full count"
-[ "$(wc -c < "$diagnostic")" -le 1048800 ] || fail "retained diagnostic is oversized"
+[ "$(wc -c < "$diagnostic")" -le 4194500 ] || fail "retained diagnostic is oversized"
 
 FAKE_IMDS_DISABLED=1 run 75 0 "$tmp/clean.log"
 not_published "Mac with copied EC2 credentials"

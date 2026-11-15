@@ -81,10 +81,12 @@ rc=$?
 if [ "$rc" -eq 75 ]; then
   skip "another Terraform run holds this jumpbox's run lock"
 fi
+# DynamoDB's conditional Put proves contention even if the previous owner
+# released the state lock before Terraform could read out its details.
 if [ "$rc" -eq 1 ] &&
    grep -q '^Error: Error acquiring the state lock' "$plan_log" &&
-   grep -q 'ConditionalCheckFailedException' "$plan_log" &&
-   grep -q '^Lock Info:' "$plan_log"; then
+   grep -q 'operation error DynamoDB: PutItem' "$plan_log" &&
+   grep -q 'ConditionalCheckFailedException:' "$plan_log"; then
   skip "another Terraform run holds the shared backend lock"
 fi
 
@@ -95,7 +97,7 @@ diagnostic="$state_dir/last-plan.log"
 diag_tmp=$(mktemp "$state_dir/.last.XXXXXX") || fail "could not open the local diagnostic"
 {
   printf 'main=%s checked_at=%s terraform_exit=%s\n' "$head_sha" "$checked_at" "$rc"
-  tail -c 1048576 -- "$plan_log"
+  tail -c 4194304 -- "$plan_log"
 } >"$diag_tmp" || fail "could not save the local diagnostic"
 mv -f -- "$diag_tmp" "$diagnostic" || fail "could not save the local diagnostic"
 echo "applied-status: Terraform exit $rc; local diagnostic: $diagnostic" >&2
