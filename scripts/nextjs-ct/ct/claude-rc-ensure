@@ -25,21 +25,35 @@ set -uo pipefail
 WHO="${1:?usage: claude-rc-ensure <user>}"
 H="/home/$WHO"
 tm() { sudo -u "$WHO" -H env HOME="$H" tmux "$@" 2>/dev/null; }
-# EVERY window, not just the first (fixed 2026-09-25 by Claude): agents-start can launch more
-# than one managed claude per user (~/.config/agent-extra-dirs), and the first-window-only
-# version never looked at the others. Each window is judged on its own screen and rate-limited
-# on its own, so a repair in one never blocks or triggers another.
-pgrep -u "$WHO" -x claude >/dev/null 2>&1 || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
+# Native Claude Code uses the version basename as its Linux process name. The
+# claw-master wrapper does not prove that Claude itself started. Keep recognizing
+# older "claude" processes, and check the executable of version-named candidates
+# from this user's process list against the native install path.
+claude_pids() {
+  local pid comm exe version
+  ps -u "$WHO" -o pid=,comm= 2>/dev/null | while read -r pid comm; do
+    case "$comm" in
+      claude) printf '%s\n' "$pid" ;;
+      [0-9]*)
+        exe=$(readlink -- "/proc/$pid/exe") || continue
+        exe=${exe%" (deleted)"}
+        version=${exe##*/}
+        if [[ "$exe" == "$H/.local/share/claude/versions/$version" &&
+              "$version" =~ ^[0-9]+[.][0-9]+[.][0-9]+([+-][0-9A-Za-z.+-]+)?$ ]]; then
+          printf '%s\n' "$pid"
+        fi
+        ;;
+    esac
+  done
+}
+pids=$(claude_pids)
+[ -n "$pids" ] || { echo "claude-rc-ensure: $WHO has no claude"; exit 0; }
 
-# Only a window that IS a claude is ever judged, let alone typed into: t-claude must have keyed
-# it (@tclaude_path) AND a claude process of this user must sit below its pane. Without this, a
-# shell that merely PRINTS the reconnect error (a log tail, this script's own output) would
-# match the failure string below and be sent "/remote-control" plus Enter as if it were a
-# prompt. pane_current_command cannot answer this: t-claude runs claude under a python3
-# wrapper, so a live claude pane reads "python3" (zsh -> python3 -> claude).
+# A keyed t-claude window must still have a Claude process of this user below
+# its pane. A shell that merely prints an error must never receive repair input.
 runs_claude() {
   local pid
-  for pid in $(pgrep -u "$WHO" -x claude); do
+  for pid in $pids; do
     while [ -n "$pid" ] && [ "$pid" -gt 1 ]; do
       [ "$pid" = "$1" ] && return 0
       pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
@@ -47,30 +61,63 @@ runs_claude() {
   done
   return 1
 }
-# -a lists a window once per session that shows it (t-claude's grouped views share windows), so
-# de-duplicate by line or one window would be judged -- and repaired -- several times.
-wins=$(tm list-windows -a -F '#{window_id} #{pane_pid} #{@tclaude_path}' | sort -u \
-  | while read -r wid panepid keyed; do
-      [ -n "$keyed" ] && runs_claude "$panepid" && echo "$wid"
-    done)
-[ -n "$wins" ] || { echo "claude-rc-ensure: $WHO has no claude window"; exit 0; }
+# Inspect every managed window, once even when grouped sessions share it. Use
+# the specific pane ID throughout: a window ID could follow a focus change.
+panes=$(tm list-windows -a -F '#{pane_id} #{pane_pid} #{@tclaude_path}' | sort -u |
+  while read -r paneid panepid keyed; do
+    [ -n "$keyed" ] && runs_claude "$panepid" && echo "$paneid"
+  done)
+[ -n "$panes" ] || { echo "claude-rc-ensure: $WHO has no claude window"; exit 0; }
 
 STATEDIR=/var/lib/claude-rc-ensure
 mkdir -p "$STATEDIR"
 
-repair_window() {
-  local win="$1" label key STAMP now last P
-  label=$(tm display-message -p -t "$win" '#{session_name}:#{window_name}')
+# Require a known empty Claude composer after the error. Unknown screens are
+# safe to leave alone, as are drafts, background work, and a newer RC success.
+idle_stale_prompt() {
+  local screen="$1" line stale=0 prompt=none input='^[[:space:]]*[❯›](.*)$'
+  case "${screen,,}" in
+    *"esc to interrupt"*|*"escape to interrupt"*|*"esc to cancel"*|*"esc to stop"*) return 1 ;;
+  esac
+  while IFS= read -r line; do
+    case "$line" in
+      *"Couldn't reconnect to your Remote Control session"*) stale=1; prompt=none; continue ;;
+      *"Remote Control active"*|*"Remote Control connected"*|*"Remote Control enabled"*) stale=0 ;;
+      *"Remote Control is active"*|*"Remote Control is connected"*|*"Remote Control is enabled"*) stale=0 ;;
+    esac
+    if [[ "$line" =~ $input ]]; then
+      if [[ "${BASH_REMATCH[1]}" =~ ^[[:space:]]*$ ]]; then
+        prompt=empty
+      else
+        prompt=draft
+      fi
+    elif [[ "$prompt" == empty ]]; then
+      if [[ "$line" =~ ^[[:space:]─━-]+$ && "$line" == *"────"* ]]; then
+        prompt=confirmed
+      elif [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
+        prompt=draft
+      fi
+    elif [[ "$prompt" == confirmed && "$line" =~ (^|[[:space:]])/rc([[:space:]]|$) ]]; then
+      # /rc in the current status footer means the binding is back.
+      stale=0
+    fi
+  done <<< "$screen"
+  [ "$stale" = 1 ] && [ "$prompt" = confirmed ]
+}
+
+repair_pane() {
+  local target="$1" label key STAMP now last P
+  label=$(tm display-message -p -t "$target" '#{session_name}:#{window_name}')
   # Rate-limit key: the folder t-claude stamped on the window (stable across tmux restarts);
   # the window name, then its id, when it has none.
-  key=$(tm display-message -p -t "$win" '#{@tclaude_path}')
+  key=$(tm display-message -p -t "$target" '#{@tclaude_path}')
   [ -n "$key" ] || key="$label"
-  [ -n "$key" ] || key="$win"
+  [ -n "$key" ] || key="$target"
   STAMP="$STATEDIR/$WHO-$(printf '%s' "$key" | cksum | awk '{print $1}')"
 
   # Only the CURRENT screen. Reading the whole scrollback means text left by an earlier
   # repair re-triggers the repair, forever.
-  pane() { tm capture-pane -p -S -25 -t "$win"; }
+  pane() { tm capture-pane -p -t "$target"; }
   P="$(pane)"
 
   # The one fault this fixes: a stale binding on a resumed conversation, whose reconnect
@@ -93,34 +140,42 @@ repair_window() {
     echo "claude-rc-ensure: $WHO $label repaired within the last hour, backing off"
     return 0
   fi
+  # Recheck the same pane and its process just before typing. The failure may have cleared,
+  # or the person may have started typing while we were inspecting the pane.
+  pids=$(claude_pids)
+  if ! runs_claude "$(tm display-message -p -t "$target" '#{pane_pid}')" ||
+     ! idle_stale_prompt "$(pane)"; then
+    echo "claude-rc-ensure: $WHO $label has no idle stale prompt; leaving alone"
+    return 0
+  fi
   echo "$now" > "$STAMP"
 
   echo "claude-rc-ensure: $WHO $label reconnect is dead -- dropping the stale binding"
-  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  tm send-keys -t "$target" '/remote-control' Enter; sleep 8
   case "$(pane)" in
     *"Disconnect this session"*)
-      tm send-keys -t "$win" Up; tm send-keys -t "$win" Up; tm send-keys -t "$win" Enter; sleep 6
+      tm send-keys -t "$target" Up; tm send-keys -t "$target" Up; tm send-keys -t "$target" Enter; sleep 6
       ;;
     *)
       echo "claude-rc-ensure: $WHO $label disconnect menu never appeared; leaving the session alone" >&2
-      tm send-keys -t "$win" Escape
+      tm send-keys -t "$target" Escape
       return 0
       ;;
   esac
 
-  tm send-keys -t "$win" '/remote-control' Enter; sleep 8
+  tm send-keys -t "$target" '/remote-control' Enter; sleep 8
   case "$(pane)" in
     *"Enable Remote Control"*)
-      tm send-keys -t "$win" '1'; sleep 1; tm send-keys -t "$win" Enter; sleep 8
+      tm send-keys -t "$target" '1'; sleep 1; tm send-keys -t "$target" Enter; sleep 8
       echo "claude-rc-ensure: $WHO $label re-enabled"
       ;;
     *)
       echo "claude-rc-ensure: $WHO $label enable menu never appeared; leaving the session alone" >&2
-      tm send-keys -t "$win" Escape
+      tm send-keys -t "$target" Escape
       return 0
       ;;
   esac
 }
 
-for w in $wins; do repair_window "$w"; done
+for p in $panes; do repair_pane "$p"; done
 exit 0

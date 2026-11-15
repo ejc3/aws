@@ -8,7 +8,9 @@ from pathlib import Path
 import http.client
 import json
 import os
+import pwd
 import re
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -1358,6 +1360,161 @@ else:raise AssertionError(operation)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(calls, [])
                 self.assertNotIn("completed", result.stdout)
+
+
+
+class ClaudeRemoteControlWatchdogTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.home = self.root / "home"
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        account = pwd.getpwuid(os.getuid()).pw_name
+        self.log = self.root / "keys"
+        self.log.touch()
+        user_file = self.root / "user"
+        user_file.write_text(account + "\n")
+        ensure = self.bin / "claude-rc-ensure"
+        ensure.write_text((CT / ensure.name).read_text().replace('H="/home/$WHO"', f'H="{self.home}"')
+                          .replace("STATEDIR=/var/lib/claude-rc-ensure", f'STATEDIR="{self.root / "state"}"'))
+        ensure.chmod(0o755)
+        self.watchdog = self.root / "watchdog"
+        self.watchdog.write_text((CT / "claude-rc-watchdog").read_text()
+                                 .replace("/etc/nextjs-ct/user", str(user_file))
+                                 .replace("/usr/local/bin/claude-rc-ensure", str(ensure)))
+        fake(self.bin, "sudo", '[[ "$1 $2 $3" == "-u $RC_ACCOUNT -H" ]] || exit 1\nshift 3\nexec "$@"\n')
+        fake(self.bin, "sleep", "exit 0\n")
+        fake(self.bin, "tmux", r"""
+count=$(( $(wc -l < "$RC_LOG") - RC_KEYS_BEFORE ))
+case "$1" in
+  list-windows)
+    [[ "$*" == *'#{pane_id} #{pane_pid} #{@tclaude_path}'* ]] || exit 1
+    printf '%%72 %s %s\n' "$RC_PANE_PID" "$RC_MARKER"
+    ;;
+  display-message)
+    [[ "$4" == %72 ]] || exit 1
+    if [[ "$5" == '#{pane_pid}' ]]; then
+      if [[ "$RC_SCREEN" == ended ]]; then echo 1; else echo "$RC_PANE_PID"; fi
+    else
+      echo /example/repo
+    fi
+    ;;
+  capture-pane)
+    [[ "${*: -1}" == %72 ]] || exit 1
+    case "$count" in
+      0)
+        if [[ "$RC_SCREEN" != healthy || "$*" == *" -S "* ]]; then
+          echo "Couldn't reconnect to your Remote Control session"
+        fi
+        case "$RC_SCREEN" in
+          overloaded) echo "Session creation failed" ;;
+          busy) echo "Esc to interrupt" ;;
+        esac
+        echo '────────────────'
+        if [[ "$RC_SCREEN" == draft ]]; then
+          echo '❯ do not submit me'
+        else
+          echo '❯'
+        fi
+        [[ "$RC_SCREEN" == multiline ]] && echo '  continuation of draft'
+        [[ "$RC_SCREEN" != ambiguous ]] && echo '────────────────'
+        case "$RC_SCREEN" in
+          healthy|recovered) echo '  ? for shortcuts · /rc' ;;
+          connected) echo "Remote Control is connected" ;;
+        esac
+        ;;
+      1) echo "Disconnect this session" ;;
+      *) echo "Enable Remote Control" ;;
+    esac
+    ;;
+  send-keys) printf '%s\n' "$*" >> "$RC_LOG" ;;
+esac
+""")
+        self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', RC_ACCOUNT=account, RC_LOG=str(self.log))
+
+    def process_tree(self, name, native):
+        parent = self.home / ".local/share/claude/versions" if native else self.root / "unrelated"
+        parent.mkdir(parents=True, exist_ok=True)
+        exe = parent / name
+        shutil.copy2(shutil.which("sleep"), exe)
+        # A real native executable: Linux names this process after the file,
+        # not "claude" (or its own original name, "sleep"). Keep an independent
+        # shell as the pane so the test also exercises the ancestry check.
+        tree = subprocess.Popen(
+            ["/bin/bash", "-c", r'''
+"$1" 60 &
+child=$!
+trap 'kill "$child" 2>/dev/null; wait "$child"; exit 0' TERM
+printf '%s\n' "$child"
+wait "$child"
+''', "pane", str(exe)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+
+        def cleanup():
+            if tree.poll() is None:
+                tree.terminate()
+            tree.communicate(timeout=3)
+
+        self.addCleanup(cleanup)
+        child = int(tree.stdout.readline())
+        deadline = time.monotonic() + 3
+        while os.readlink(f"/proc/{child}/exe") != str(exe):
+            self.assertLess(time.monotonic(), deadline, "child never executed its versioned file")
+            time.sleep(0.005)
+        return tree.pid
+
+    def check_watchdog(self, pane, screen, marker="/example/repo"):
+        env = dict(self.env, RC_PANE_PID=str(pane), RC_SCREEN=screen, RC_MARKER=marker,
+                   RC_KEYS_BEFORE=str(len(self.log.read_text().splitlines())))
+        return subprocess.run(["bash", str(self.watchdog)], env=env, check=True, text=True,
+                              capture_output=True, timeout=10).stdout
+
+    def test_native_claude_repairs_only_the_verified_pane(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.assertIn("re-enabled", self.check_watchdog(pane, "stale"))
+        self.assertEqual(self.log.read_text().splitlines(), [
+            "send-keys -t %72 /remote-control Enter",
+            "send-keys -t %72 Up",
+            "send-keys -t %72 Up",
+            "send-keys -t %72 Enter",
+            "send-keys -t %72 /remote-control Enter",
+            "send-keys -t %72 1",
+            "send-keys -t %72 Enter",
+        ])
+        self.assertIn("backing off", self.check_watchdog(pane, "stale"))
+        self.assertEqual(len(self.log.read_text().splitlines()), 7)
+
+    def test_healthy_native_claude_ignores_stale_error_in_scrollback(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.assertIn("nothing to repair", self.check_watchdog(pane, "healthy"))
+        self.assertFalse(self.log.read_text())
+
+    def test_managed_pane_needs_its_own_claude_and_an_explicit_failure(self):
+        pane = self.process_tree("2.1.325", native=True)
+        self.check_watchdog(1, "stale")
+        self.check_watchdog(pane, "stale", marker="")
+        self.assertIn("upstream 503", self.check_watchdog(pane, "overloaded"))
+        self.assertFalse(self.log.read_text())
+
+    def test_visible_error_does_not_interrupt_a_draft_busy_or_recovered_session(self):
+        pane = self.process_tree("2.1.325", native=True)
+        for screen in ("draft", "multiline", "busy", "recovered", "connected", "ambiguous", "ended"):
+            with self.subTest(screen=screen):
+                self.assertIn("has no idle stale prompt", self.check_watchdog(pane, screen))
+                self.assertFalse(self.log.read_text())
+
+    def test_legacy_claude_process_is_still_recognized(self):
+        pane = self.process_tree("claude", native=False)
+        self.assertIn("nothing to repair", self.check_watchdog(pane, "healthy"))
+        self.assertFalse(self.log.read_text())
+
+    def test_same_version_name_outside_the_install_path_is_not_claude(self):
+        pane = self.process_tree("2.1.325", native=False)
+        self.check_watchdog(pane, "stale")
+        self.assertFalse(self.log.read_text())
 
 
 if __name__ == "__main__":
