@@ -10,6 +10,7 @@ import json
 import os
 import pwd
 import re
+import select
 import shutil
 import socket
 import subprocess
@@ -1374,6 +1375,7 @@ class ClaudeRemoteControlWatchdogTests(unittest.TestCase):
         account = pwd.getpwuid(os.getuid()).pw_name
         self.log = self.root / "keys"
         self.log.touch()
+        recheck = self.root / "recheck"
         user_file = self.root / "user"
         user_file.write_text(account + "\n")
         ensure = self.bin / "claude-rc-ensure"
@@ -1396,6 +1398,7 @@ case "$1" in
   display-message)
     [[ "$4" == %72 ]] || exit 1
     if [[ "$5" == '#{pane_pid}' ]]; then
+      touch "$RC_RECHECK"
       if [[ "$RC_SCREEN" == ended ]]; then echo 1; else echo "$RC_PANE_PID"; fi
     else
       echo /example/repo
@@ -1410,6 +1413,7 @@ case "$1" in
         fi
         case "$RC_SCREEN" in
           overloaded) echo "Session creation failed" ;;
+          late_overload) [[ -e "$RC_RECHECK" ]] && echo "Session creation failed" ;;
           busy) echo "Esc to interrupt" ;;
         esac
         echo '────────────────'
@@ -1432,25 +1436,26 @@ case "$1" in
   send-keys) printf '%s\n' "$*" >> "$RC_LOG" ;;
 esac
 """)
-        self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', RC_ACCOUNT=account, RC_LOG=str(self.log))
+        self.env = dict(os.environ, PATH=f'{self.bin}:{os.environ["PATH"]}', RC_ACCOUNT=account, RC_LOG=str(self.log),
+                        RC_RECHECK=str(recheck))
 
     def process_tree(self, name, native):
         parent = self.home / ".local/share/claude/versions" if native else self.root / "unrelated"
         parent.mkdir(parents=True, exist_ok=True)
         exe = parent / name
-        shutil.copy2(shutil.which("sleep"), exe)
-        # A real native executable: Linux names this process after the file,
-        # not "claude" (or its own original name, "sleep"). Keep an independent
-        # shell as the pane so the test also exercises the ancestry check.
+        shutil.copy2("/bin/bash", exe)
+        # Have the renamed native executable report its own PID after exec,
+        # then block in its own read builtin. A parent's $! is visible before
+        # /proc/<pid>/exe can reliably describe the child that started.
         tree = subprocess.Popen(
             ["/bin/bash", "-c", r'''
-"$1" 60 &
+exec 3<&0
+"$1" --noprofile --norc -c 'printf "%s\n" "$$"; read -r _' <&3 &
 child=$!
 trap 'kill "$child" 2>/dev/null; wait "$child"; exit 0' TERM
-printf '%s\n' "$child"
 wait "$child"
 ''', "pane", str(exe)],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
 
         def cleanup():
@@ -1459,14 +1464,15 @@ wait "$child"
             tree.communicate(timeout=3)
 
         self.addCleanup(cleanup)
-        child = int(tree.stdout.readline())
-        deadline = time.monotonic() + 3
-        while os.readlink(f"/proc/{child}/exe") != str(exe):
-            self.assertLess(time.monotonic(), deadline, "child never executed its versioned file")
-            time.sleep(0.005)
+        self.assertTrue(select.select([tree.stdout], [], [], 3)[0], "versioned fixture did not start")
+        ready = tree.stdout.readline().strip()
+        if not ready:
+            self.fail(f"versioned fixture exited before its ready signal: {tree.communicate(timeout=3)[1]}")
+        self.assertEqual(os.readlink(f"/proc/{int(ready)}/exe"), str(exe))
         return tree.pid
 
     def check_watchdog(self, pane, screen, marker="/example/repo"):
+        Path(self.env["RC_RECHECK"]).unlink(missing_ok=True)
         env = dict(self.env, RC_PANE_PID=str(pane), RC_SCREEN=screen, RC_MARKER=marker,
                    RC_KEYS_BEFORE=str(len(self.log.read_text().splitlines())))
         return subprocess.run(["bash", str(self.watchdog)], env=env, check=True, text=True,
@@ -1501,7 +1507,7 @@ wait "$child"
 
     def test_visible_error_does_not_interrupt_a_draft_busy_or_recovered_session(self):
         pane = self.process_tree("2.1.325", native=True)
-        for screen in ("draft", "multiline", "busy", "recovered", "connected", "ambiguous", "ended"):
+        for screen in ("draft", "multiline", "busy", "recovered", "connected", "ambiguous", "ended", "late_overload"):
             with self.subTest(screen=screen):
                 self.assertIn("has no idle stale prompt", self.check_watchdog(pane, screen))
                 self.assertFalse(self.log.read_text())

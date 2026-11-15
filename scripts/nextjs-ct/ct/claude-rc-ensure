@@ -77,7 +77,7 @@ mkdir -p "$STATEDIR"
 idle_stale_prompt() {
   local screen="$1" line stale=0 prompt=none input='^[[:space:]]*[❯›](.*)$'
   case "${screen,,}" in
-    *"esc to interrupt"*|*"escape to interrupt"*|*"esc to cancel"*|*"esc to stop"*) return 1 ;;
+    *"session creation failed"*|*"esc to interrupt"*|*"escape to interrupt"*|*"esc to cancel"*|*"esc to stop"*) return 1 ;;
   esac
   while IFS= read -r line; do
     case "$line" in
