@@ -1,10 +1,10 @@
 # macOS VMs, each reachable through Cloudflare on its own tunnel.
 #
-#   ejc3   EJ's MacBook Pro (route kept; the VM itself no longer exists there, checked 2026-11-14)
 #   skevh  Steve's, on the Mac mini (moved from the MacBook 2026-11-14)
 #   ci     CI's, on the Mac mini: GitHub Actions runners (scripts/mac-vm-setup.sh)
 #
-# A Mac runs at most two macOS VMs at once (Virtualization.framework's limit), so the mini is full with skevh and ci.
+# The MacBook's ejc3 VM and its routes were retired 2026-11-15 (the VM was already gone). A Mac runs at most two macOS
+# VMs at once (Virtualization.framework's limit), so the mini is full with skevh and ci.
 #
 # Each VM is a Tart clone of ghcr.io/cirruslabs/macos-tahoe-base. It signs its own `admin`
 # account in at boot, so it always has a desktop, and runs its OWN cloudflared connector for
@@ -21,8 +21,8 @@
 #   ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@<vm>-mac-ssh.cc-games.dev
 #
 # Who gets in, in a browser or with cloudflared on a person's machine:
-#   ejc3, ci -- EJ only (the browser-manager owner policy: Google or one-time PIN)
-#   skevh    -- GitHub members of dolphin-labs-hq, like *.dolphin-labs.dev
+#   ci     -- EJ only (the browser-manager owner policy: Google or one-time PIN)
+#   skevh  -- GitHub members of dolphin-labs-hq, like *.dolphin-labs.dev
 # and, on the SSH route only, the EC2 accounts in mac_vm_ssh_clients, each with its own service token (the colton-mac
 # pattern; their `ssh <vm>-mac` comes from mac-ssh-client.tf):
 #   ci     fcvm-arm ubuntu, nextjs-ct ejc3
@@ -44,8 +44,7 @@ locals {
 
   mac_vms = merge(
     {
-      ejc3 = local.mac_vm_owner
-      ci   = local.mac_vm_owner
+      ci = local.mac_vm_owner
     },
     # skevh rides on the dolphin GitHub identity provider, so it exists only with that zone.
     local.dolphin_enabled ? {
