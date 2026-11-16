@@ -1139,7 +1139,7 @@ class BootstrapTests(unittest.TestCase):
         # Before the controller writes the parameter there is no tag for the role's condition to
         # match, so SSM answers AccessDenied. That must mean "not yet", not "give up".
         text = BOOTSTRAP.read_text()
-        poll = text.split("REG_TOKEN=$(python3 - \"$INSTANCE_ID\" <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        poll = text.split("BOOTSTRAP_CREDENTIAL=$(python3 - \"$INSTANCE_ID\" <<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         tmp = Path(tempfile.mkdtemp(prefix="poll."))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
         (tmp / "botocore").mkdir()
@@ -1184,8 +1184,9 @@ class BootstrapTests(unittest.TestCase):
         # given another repository's job (ejc3/fcvm's included, though both have one owner).
         app, *_ = load_app()
         rendered = app.user_data(IMAGINE, "imagine,l")
-        start = rendered.index("printf '%s' \"$REG_TOKEN\" | sudo -u runner")
-        step = rendered[start:rendered.index("unset REG_TOKEN", start)]
+        self.assertIn("REGISTRATION='repository'", rendered)
+        start = rendered.index("printf '%s' \"$BOOTSTRAP_CREDENTIAL\" | sudo -u runner")
+        step = rendered[start:rendered.index("unset BOOTSTRAP_CREDENTIAL", start)]
         tmp = Path(tempfile.mkdtemp(prefix="register."))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
         (tmp / "bin").mkdir()
@@ -1194,7 +1195,7 @@ class BootstrapTests(unittest.TestCase):
         for f in (tmp / "bin" / "sudo", tmp / "config.sh"):
             f.chmod(0o755)
         script = ("REPO=$(sed -n \"s/^REPO='\\(.*\\)'$/\\1/p\" user-data); LABELS=$(sed -n \"s/^LABELS='\\(.*\\)'$/\\1/p\" user-data)\n"
-                  "INSTANCE_ID=i-0abc WORK=/home/runner/work REG_TOKEN=REGTOKEN\n" + step)
+                  "INSTANCE_ID=i-0abc WORK=/home/runner/work BOOTSTRAP_CREDENTIAL=REGTOKEN\n" + step)
         (tmp / "user-data").write_text(rendered)
         out = subprocess.run(["bash", "-c", script], cwd=tmp, capture_output=True, text=True, timeout=30,
                              env={"PATH": f"{tmp / 'bin'}:/usr/bin:/bin"})
@@ -1227,7 +1228,7 @@ class BootstrapTests(unittest.TestCase):
         text = BOOTSTRAP.read_text()
         self.assertIn("WORK=/home/runner/work\n", text)
         self.assertIn('install -d -o runner -g runner "$WORK"', text)
-        self.assertIn('--work "$4"\' \\\n  _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"\n', text)
+        self.assertIn('--work "$4"\' \\\n    _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"\n', text)
         self.assertNotIn("--work _work", text)
         self.assertLess(text.index('install -d -o runner -g runner "$WORK"'), text.index("exec ./config.sh"))
 
@@ -1594,9 +1595,10 @@ class WiringTests(unittest.TestCase):
             self.assertFalse([n for n in names if "metal" in n], size)
 
     def test_served_repos_match_their_tokens_and_the_front(self):
-        served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
-        tokens = re.findall(r'"([^"]+/[^"]+)"', re.search(r"runner_extra_repos = \[([^\]]+)\]", REPOS_TF).group(1))
-        self.assertEqual(sorted(served), sorted(tokens))
+        served = set(re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M))
+        tokens = set(re.findall(r'"([^"]+/[^"]+)"', re.search(r"runner_extra_repos = \[([^\]]+)\]", REPOS_TF).group(1)))
+        self.assertEqual(served - tokens, {"dolphin-labs-hq/dolphin-business", "dolphin-labs-hq/dolphin-cloud"})
+        self.assertLessEqual(tokens, served)
         # The front forwards only what the controller serves: a repo whose token gate is off is out of both.
         self.assertIn("APP_REPOS           = jsonencode(keys(local.runner_app_config))", FRONT_TF)
 
@@ -1653,6 +1655,13 @@ class WiringTests(unittest.TestCase):
         # provider alias fails at apply, and without a hook the repo waits for the reconcile.
         served = re.findall(r'^\s+"([^"]+/[^"]+)"\s*=\s*\{ label', APP_TF, re.M)
         hooks = re.findall(r'resource "github_repository_webhook" "\w+" \{.*?\n\}', APP_TF, re.S)
+        expansion = next(h for h in hooks if '"runner_app_dolphin_pool_expansion"' in h)
+        self.assertIn('toset(keys(local.dolphin_runner_pool_expansion_active))', expansion)
+        self.assertIn('provider   = github.dolphin_labs', expansion)
+        self.assertIn('repository = split("/", each.key)[1]', expansion)
+        self.assertIn('events     = ["workflow_job"]', expansion)
+        hooks.remove(expansion)
+        served = [r for r in served if r not in ("dolphin-labs-hq/dolphin-business", "dolphin-labs-hq/dolphin-cloud")]
         self.assertEqual(len(hooks), len(served))
         for repo in served:
             owner, name = repo.split("/")
@@ -1897,7 +1906,7 @@ class VcpuCapTerraformTests(unittest.TestCase):
     def test_a_host_may_be_tagged_with_its_vcpus_at_launch(self):
         policy = re.search(r'resource "aws_iam_role_policy" "runner_app_lambda" \{.*?\n\}', APP_TF, re.S).group()
         keys = re.findall(r'"([^"]+)"', re.search(r'"aws:TagKeys" = \[([^\]]+)\]', policy).group(1))
-        self.assertEqual(keys, ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion"])
+        self.assertEqual(keys, ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion", "RunnerGroup"])
 
     def test_each_vcpu_capped_repo_alarms_above_its_vcpu_cap(self):
         self.assertIn("runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.peak_max_vcpus != null }", APP_TF)
@@ -1979,6 +1988,149 @@ def aged(repo, sizes, minutes, state="running", first=0):
     for host in out:
         host["LaunchTime"], host["State"] = NOW - timedelta(minutes=minutes), {"Name": state}
     return out
+
+
+class DolphinOrganizationPoolTests(unittest.TestCase):
+    group_id = 123
+
+    def load(self):
+        app, ec2 = load_budget_app()
+        patcher = mock.patch.dict(os.environ, {
+            "DOLPHIN_POOL_GROUP_ID": str(self.group_id),
+            "DOLPHIN_POOL_REPOS": json.dumps([DOLPHIN, FILMS]),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return app, ec2
+
+    def test_job_brokers_one_jit_credential_and_does_not_register_a_repo_runner(self):
+        app, ec2 = self.load()
+        original = app.github
+        calls = []
+        blob = "ABCD" * 1300
+
+        def github(method, path, token, body=None):
+            if path.endswith("/generate-jitconfig"):
+                calls.append((method, path, token, body))
+                self.assertEqual(len(ec2.launched), 1, "do not create a runner before EC2 accepted the host")
+                return {"runner": {"name": body["name"]}, "encoded_jit_config": blob}
+            return original(method, path, token, body)
+
+        job = {"repo": DOLPHIN, "action": "queued", "workflow_job": {"id": 7, "labels": ["self-hosted", "dolphin", "l"]}}
+        with mock.patch.object(app, "github", side_effect=github), mock.patch.object(app, "org_pool_token", return_value="ORG"):
+            self.assertEqual(app.handler(job, None)["outcome"], "launched")
+            self.assertEqual(app.handler(job, None)["outcome"], "exists")
+        host = ec2.instances[0]["InstanceId"]
+        self.assertEqual(calls, [("POST", "/orgs/dolphin-labs-hq/actions/runners/generate-jitconfig", "ORG", {
+            "name": host, "runner_group_id": self.group_id,
+            "labels": ["self-hosted", "Linux", "X64", "dolphin", "l"], "work_folder": "/home/runner/work",
+        })])
+        (put,) = app.ssm._fake.put
+        self.assertEqual(put["Name"], f"/github-runner/bootstrap/{host}")
+        self.assertEqual(put["Value"], blob)
+        self.assertEqual(put["Tier"], "Advanced")
+        self.assertNotIn(blob, ec2.launched[0]["UserData"])
+        self.assertIn("REGISTRATION='jit'", ec2.launched[0]["UserData"])
+        self.assertNotIn("registration-token", str(original.calls))
+        self.assertEqual(app.tag(ec2.instances[0], "RunnerGroup"), str(self.group_id))
+
+    def test_org_token_requires_exact_private_group_and_narrows_its_permissions(self):
+        app, _ = self.load()
+        cfg = app.config()[0][DOLPHIN]
+        path = app.org_group_path(cfg)
+        group = {"id": self.group_id, "name": "dolphin-linux", "visibility": "selected",
+                 "allows_public_repositories": False, "default": False, "inherited": False,
+                 "restricted_to_workflows": False}
+        members = [{"full_name": r, "private": True} for r in [DOLPHIN, FILMS]]
+        expiration = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        for extra, public in ((True, False), (False, True), (False, False)):
+            with self.subTest(extra=extra, public=public), \
+                    mock.patch.object(app, "app_credentials", return_value=(456, "JWT")), \
+                    mock.patch.object(app, "github", side_effect=[
+                        {"token": "ghs_test", "expires_at": expiration},
+                        dict(group, allows_public_repositories=public),
+                        {"total_count": 2 + extra, "repositories": members},
+                    ]) as api:
+                if extra or public:
+                    with self.assertRaisesRegex(RuntimeError, "policy|allowlist"):
+                        app.org_pool_token(cfg)
+                else:
+                    self.assertEqual(app.org_pool_token(cfg), "ghs_test")
+                    self.assertEqual(api.call_args_list[-1].args, ("GET", f"{path}/repositories?per_page=100", "ghs_test"))
+                api.assert_any_call("POST", "/app/installations/456/access_tokens", "JWT",
+                                    body={"permissions": {"organization_self_hosted_runners": "write"}})
+
+    def test_shared_burst_limits_include_cross_repo_hosts_and_unseen_claims(self):
+        for sizes, new_size in [(["s"] * 24, "s"), (["xl"] * 12, "s")]:
+            with self.subTest(sizes=sizes):
+                app, ec2 = self.load()
+                ec2.instances = aged(FILMS, sizes[:-1], 0)
+                self.assertTrue(app.claim(FILMS, "not-visible", VCPUS[sizes[-1]]))
+                cfg = app.config()[0][DOLPHIN]
+                with mock.patch.object(app, "org_pool_token") as token:
+                    self.assertEqual(app.ensure_runner(DOLPHIN, cfg, SUBNETS, "PAT", "1", new_size, [])[0], "cap")
+                    token.assert_not_called()
+
+    def test_cross_repo_spot_attribution_and_cleanup_remain_inside_the_group(self):
+        app, ec2 = self.load()
+        host = instance("i-12345678", FILMS, "1", 0)
+        ec2.instances = [host]
+        self.assertIsNone(app.our_host(DOLPHIN, host["InstanceId"]), "legacy hosts belong to one repo")
+        host["Tags"].append({"Key": "RunnerGroup", "Value": str(self.group_id)})
+        self.assertEqual(app.our_host(DOLPHIN, host["InstanceId"]), host)
+        self.assertIsNone(app.our_host(IMAGINE, host["InstanceId"]))
+        cfg = app.config()[0][DOLPHIN]
+        names = {"i-12345678": 17, "i-34567890": 18, "i-56789012": 19}
+        runners = {n: {"id": i, "status": "offline", "labels": [{"name": "dolphin"}]} for n, i in names.items()}
+        app.reap(DOLPHIN, cfg, "ORG", [], runners, pooled_dead={"i-34567890"})
+        self.assertEqual(app.github.calls, [("DELETE", "/orgs/dolphin-labs-hq/actions/runners/18", "ORG")])
+
+    def test_no_org_grant_keeps_ec2_unchanged_and_releases_launch_claim(self):
+        app, ec2 = self.load()
+        cfg = app.config()[0][DOLPHIN]
+        with mock.patch.object(app, "org_pool_token", side_effect=RuntimeError("no org grant")):
+            with self.assertRaisesRegex(RuntimeError, "no org grant"):
+                app.ensure_runner(DOLPHIN, cfg, SUBNETS, "PAT", "7", "l", [])
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(app.active_claims(DOLPHIN), {})
+
+    def test_a_busy_runner_covers_its_sponsor_until_a_sibling_assignment_is_confirmed(self):
+        app, ec2 = self.load()
+        name = "i-12345678"
+        host = instance(name, DOLPHIN, "7", 2, "s")
+        host["Tags"].append({"Key": "RunnerGroup", "Value": str(self.group_id)})
+        ec2.instances.append(host)
+        cfg = app.config()[0][DOLPHIN]
+        original = app.github
+        original.runs[DOLPHIN, "queued"] = [24]
+        original.jobs[24] = [{"id": 7, "status": "queued", "labels": ["self-hosted", "dolphin", "s"]}]
+
+        def github(method, path, token, body=None):
+            if path.startswith(f"{app.org_group_path(cfg)}/runners?"):
+                return {"runners": [{"name": name, "status": "online", "busy": True}]}
+            if path.endswith("/generate-jitconfig"):
+                return {"runner": {"name": body["name"]}, "encoded_jit_config": "a2V5"}
+            return original(method, path, token, body)
+
+        with mock.patch.object(app, "github", side_effect=github), mock.patch.object(app, "org_pool_token", return_value="ORG"):
+            result = app.reconcile(DOLPHIN, cfg, SUBNETS)
+            self.assertEqual(result["outcomes"], {"exists": 1})
+            self.assertEqual(ec2.launched, [])
+            original.runs[FILMS, "in_progress"] = [25]
+            original.jobs[25] = [{"id": 8, "status": "in_progress", "runner_name": name}]
+            result = app.reconcile(DOLPHIN, cfg, SUBNETS)
+            self.assertEqual(result["outcomes"], {"launched": 1})
+            self.assertEqual(len(ec2.launched), 1)
+            self.assertEqual(app.tag(ec2.instances[-1], "JobId"), "7")
+
+    def test_rollback_does_not_reap_an_active_pool_runner_missing_from_the_repo_listing(self):
+        app, ec2 = load_budget_app()
+        host = instance("i-12345678", DOLPHIN, "7", 30)
+        host["Tags"].append({"Key": "RunnerGroup", "Value": str(self.group_id)})
+        ec2.instances = [host]
+        result = app.reconcile(DOLPHIN, BUDGET_REPOS[DOLPHIN], SUBNETS)
+        self.assertEqual(host["State"]["Name"], "running")
+        self.assertEqual(result["live"], 1)
 
 
 class BudgetArithmeticTests(unittest.TestCase):
@@ -2318,8 +2470,10 @@ class BudgetTerraformTests(unittest.TestCase):
     def test_two_50_dollar_buckets_two_days_deep_imagine_alone_and_the_dolphin_repos_together(self):
         groups = re.search(r"runner_budget_groups = \{(.*?)\n  \}", APP_TF, re.S).group(1)
         self.assertIn('imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }', groups)
-        self.assertIn('dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", '
-                      '"dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }', groups)
+        self.assertRegex(groups, r'dolphin = \{\s+daily_usd = 50\s+repos\s+= concat\(local.dolphin_runner_pool_repos, '
+                                 r'\["dolphin-labs-hq/dolphin-family"\]\)')
+        pool = re.search(r"dolphin_runner_pool_repos = concat\(\[(.*?)\], keys\(local.dolphin_runner_pool_expansion_active\)\)", APP_TF, re.S)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', pool.group(1))), {DOLPHIN, FILMS, "dolphin-labs-hq/dolphin-maps"})
         self.assertNotIn(COLTON, groups)
         defaults = dict(re.findall(r"^\s+(\w+)\s+= ([\d.]+)", re.search(r"runner_budget_defaults = \{(.*?)\n  \}", APP_TF, re.S).group(1), re.M))
         self.assertEqual(defaults, {"capacity_days": "2", "burst_max": "64", "burst_max_vcpus": "512", "lookahead_hours": "2",
@@ -2571,7 +2725,7 @@ class RunnersAppTokenTests(unittest.TestCase):
         both = json.dumps({"app_id": 9, "private_key": open(self.pkcs1).read(),
                            "installations": {"dolphin-labs-hq": 777, "ejc3": 888}})
         app, calls, _ = self.app_with(both, scopes=scopes)
-        listed = re.findall(r'"([^"]+)"', re.search(r"runner_app_github_app_repos = \[(.*?)\]", APP_TF).group(1))
+        listed = re.findall(r'"([^"]+)"', re.search(r"runner_app_github_app_repos = concat\(\s*\[(.*?)\]", APP_TF).group(1))
         os.environ["APP_INSTALLATION_REPOS"] = json.dumps(listed)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
@@ -2691,14 +2845,18 @@ class RunnersAppTokenTests(unittest.TestCase):
 class RunnersAppTerraformTests(unittest.TestCase):
     TF = (ROOT / "runner-app.tf").read_text()
 
-    def test_exactly_the_dolphin_repos_imagine_and_constellation_take_app_tokens_and_colton_keeps_its_pat(self):
-        m = re.search(r"runner_app_github_app_repos = \[(.*?)\]", self.TF)
+    def test_only_named_repos_may_take_app_tokens_and_expansion_has_no_pat(self):
+        m = re.search(r"runner_app_github_app_repos = concat\(\s*\[(.*?)\],\s*keys\(local.dolphin_runner_pool_expansion\),\s*\)", self.TF)
         repos = re.findall(r'"([^"]+)"', m.group(1))
         self.assertEqual(sorted(repos), ["dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-maps",
                                          "ejc3/constellation", "ejc3/imagine"])
-        self.assertNotIn(COLTON, repos)
+        expansion = set(re.findall(r'^\s+"([^"]+)"\s*=', re.search(
+            r"dolphin_runner_pool_expansion = \{(.*?)\n  \}", self.TF, re.S).group(1), re.M))
+        self.assertEqual(expansion, {"dolphin-labs-hq/dolphin-business", "dolphin-labs-hq/dolphin-cloud"})
+        self.assertTrue(all(repo not in REPOS_TF for repo in expansion), "no expansion PAT containers")
         self.assertIn('app_repo = contains(local.runner_app_github_app_repos, repo) ? repo : ""', self.TF)
-        self.assertIn('pat_secret = "github-runner/repo-pat/${repo}"', self.TF, "every repo keeps its PAT as the fallback")
+        self.assertRegex(self.TF, r'pat_secret\s+= contains\(keys\(local.dolphin_runner_pool_expansion\), repo\) '
+                                  r'\? "" : "github-runner/repo-pat/\$\{repo\}"')
 
     def test_a_refused_installation_alarms(self):
         flt = self.TF[self.TF.index('resource "aws_cloudwatch_log_metric_filter" "runner_app_installation_refused"'):]
@@ -2911,7 +3069,8 @@ class BootstrapOnAPrebuiltImageTests(unittest.TestCase):
 
     def test_a_prebuilt_images_tool_directories_go_first_on_the_jobs_path(self):
         text = BOOTSTRAP.read_text()
-        block = text[text.index("if [ -s /etc/github-app-runner/path ]"):text.index("sudo -u runner -H ./run.sh")]
+        start = text.index("if [ -s /etc/github-app-runner/path ]")
+        block = text[start:text.index("\nfi\n", start) + len("\nfi\n")]
         tmp = Path(tempfile.mkdtemp(prefix="path."))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(tmp)])
         (tmp / "path").write_text("/home/runner/.cargo/bin\n/opt/node/bin\n")
@@ -2932,7 +3091,7 @@ class BootstrapOnAPrebuiltImageTests(unittest.TestCase):
         text = BOOTSTRAP.read_text()
         stop = text.index('if [ "$PREPARE_ONLY" = 1 ]; then')
         self.assertLess(text.index('install -d -o runner -g runner "$WORK"'), stop)
-        self.assertLess(stop, text.index("REG_TOKEN=$(python3"))
+        self.assertLess(stop, text.index("BOOTSTRAP_CREDENTIAL=$(python3"))
         self.assertIn("exit 0", text[stop:text.index("fi", stop)])
         self.assertIn("PREPARE_ONLY=${GITHUB_APP_RUNNER_PREPARE_ONLY:-0}", text)
         trap = text.index("trap 'sync; shutdown -h now' EXIT")

@@ -9,8 +9,9 @@ correct:
     id; a redelivered event finds the tag and launches nothing. The runner registers
     --ephemeral, takes one job (not necessarily that one; the count is what matters), and
     powers off, and InstanceInitiatedShutdownBehavior=terminate deletes it.
-  * NO reuse, ever, and nothing shared between repos: each repo has its own label, cap, PAT
-    and Repo tag, and a host never outlives its job. The cap is a number of hosts (`max`) and,
+  * NO reuse, ever. Repository runners serve one repo; the Dolphin organization pool can
+    serve any admitted repo. The Repo tag always identifies the job that sponsored the
+    launch, not the job GitHub ultimately assigns. The cap is a number of hosts (`max`) and,
     where a repo sets one, a number of vCPUs (`max_vcpus`) as well: see ensure_runner(). A repo in a budget group
     (ejc3/imagine; the dolphin repos together) takes its caps from that group's leaky bucket of dollars: high ceilings
     while the bucket is healthy, its old caps once it would clip. See "budget buckets" below.
@@ -52,6 +53,12 @@ from botocore.config import Config
 
 REGION = 'us-west-1'
 ROLE = 'github-app-runner'
+DOLPHIN_ORG = 'dolphin-labs-hq'
+DOLPHIN_GROUP_NAME = 'dolphin-linux'
+DOLPHIN_GROUP_MAX_HOSTS = 24
+DOLPHIN_GROUP_MAX_VCPUS = 768
+ORG_GROUP_TAG = 'RunnerGroup'
+ORG_RUNNERS_PATH = f'/orgs/{DOLPHIN_ORG}/actions/runners'
 CANONICAL_AMI_PARAM = '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
 # The tag runner-app-image.tf's pipeline puts on every image it builds, and the only own-account images the launch policy
 # admits (runner-app.tf, LaunchPrebuiltRunnerImages).
@@ -124,9 +131,18 @@ def config():
     folded into each repo's config, so Lambda's 4 KB environment does not carry a copy per repo."""
     repos = json.loads(os.environ['REPOS'])
     shared = json.loads(os.environ.get('REPO_SHARED') or '{}')
-    for cfg in repos.values():
+    group_id = int(os.environ.get('DOLPHIN_POOL_GROUP_ID') or '0')
+    members = set(json.loads(os.environ.get('DOLPHIN_POOL_REPOS') or '[]'))
+    if group_id and (group_id < 1 or not members or not members <= repos.keys() or
+                     any(not repo.startswith(DOLPHIN_ORG + '/') or repos[repo]['label'] != 'dolphin' or
+                         repos[repo].get('budget_group') != 'dolphin' for repo in members)):
+        raise RuntimeError('invalid Dolphin organization runner pool configuration')
+    for repo, cfg in repos.items():
         for key, value in shared.items():
             cfg.setdefault(key, value)
+        if group_id and repo in members:
+            cfg['org_group'] = group_id
+            cfg['org_members'] = members
     return repos, json.loads(os.environ['LAUNCH_SUBNETS'])
 
 
@@ -156,6 +172,7 @@ APP_TOKEN_PERMISSIONS = {'administration': 'write', 'actions': 'read', 'metadata
 RERUN_TOKEN_PERMISSIONS = {'actions': 'write', 'metadata': 'read'}
 _APP_TOKENS = {}  # (repo, permissions) -> (token, expiry epoch seconds), reused while a warm Lambda keeps the module
 _APP_SCOPE_OK = {}  # (installation id, owner) -> (expiry epoch seconds, refusal message or None) of its last scope check
+_ORG_TOKENS = {}  # (group id, members) -> (token, expiry epoch sec, group policy checked until)
 APP_SCOPE_PASS_SECONDS = 2700
 _SHA256_DIGEST_INFO = bytes.fromhex('3031300d060960864801650304020105000420')
 
@@ -206,13 +223,7 @@ def app_jwt(app_id, pem, at=None):
     return f'{head}.{body}.{_b64url(rs256(f"{head}.{body}".encode(), pem))}'
 
 
-def app_token(repo, permissions=None):
-    """An installation token for `repo` from the runners app, or None when the app is not set up for it."""
-    permissions = permissions or APP_TOKEN_PERMISSIONS
-    key = (repo, tuple(sorted(permissions.items())))
-    cached = _APP_TOKENS.get(key)
-    if cached and cached[1] - time.time() > 600:
-        return cached[0]
+def app_credentials(owner):
     try:
         value = secrets.get_secret_value(SecretId=RUNNER_APP_SECRET)['SecretString']
     except Exception as error:
@@ -220,12 +231,26 @@ def app_token(repo, permissions=None):
             return None
         raise
     creds = json.loads(value) if value.strip() else {}
-    owner, name = repo.split('/', 1)
     installation = (creds.get('installations') or {}).get(owner)
     if not (creds.get('app_id') and creds.get('private_key') and installation):
         return None
     jwt = app_jwt(creds['app_id'], creds['private_key'])
     check_installation_scope(installation, owner, jwt)
+    return installation, jwt
+
+
+def app_token(repo, permissions=None):
+    """An installation token for `repo` from the runners app, or None when the app is not set up for it."""
+    permissions = permissions or APP_TOKEN_PERMISSIONS
+    key = (repo, tuple(sorted(permissions.items())))
+    cached = _APP_TOKENS.get(key)
+    if cached and cached[1] - time.time() > 600:
+        return cached[0]
+    owner, name = repo.split('/', 1)
+    pair = app_credentials(owner)
+    if pair is None:
+        return None
+    installation, jwt = pair
     out = github('POST', f'/app/installations/{installation}/access_tokens', jwt,
                  body={'repositories': [name], 'permissions': permissions})
     token = out.get('token')
@@ -237,6 +262,61 @@ def app_token(repo, permissions=None):
         expires = time.time() + 3000
     _APP_TOKENS[key] = (token, expires)
     return token
+
+
+def org_group_path(cfg):
+    return f"/orgs/{DOLPHIN_ORG}/actions/runner-groups/{cfg['org_group']}"
+
+
+def org_pool_token(cfg):
+    """The runtime app's runner-only token. Never substitute a repo PAT or use the admin app."""
+    key = (cfg['org_group'], frozenset(cfg['org_members']))
+    ts = time.time()
+    token, expires, checked_until = _ORG_TOKENS.get(key, ('', 0, 0))
+    if expires - ts <= 600:
+        pair = app_credentials(DOLPHIN_ORG)
+        if pair is None:
+            raise RuntimeError('Dolphin organization runner app is not configured')
+        installation, jwt = pair
+        out = github('POST', f'/app/installations/{installation}/access_tokens', jwt,
+                     body={'permissions': {'organization_self_hosted_runners': 'write'}})
+        token = out.get('token')
+        if not isinstance(token, str) or not token.startswith('ghs_'):
+            raise RuntimeError('Dolphin runner app returned no organization installation token')
+        expires = datetime.fromisoformat(out['expires_at'].replace('Z', '+00:00')).timestamp()
+        checked_until = 0
+    if ts >= checked_until:
+        path = org_group_path(cfg)
+        group = github('GET', path, token)
+        if (group.get('id') != cfg['org_group'] or group.get('name') != DOLPHIN_GROUP_NAME or
+                group.get('visibility') != 'selected' or group.get('allows_public_repositories') is not False or
+                group.get('default') is not False or group.get('inherited') is not False or
+                group.get('restricted_to_workflows') is not False):
+            raise RuntimeError('Dolphin Linux runner group does not match its private selected-repository policy')
+        listing = github('GET', f'{path}/repositories?per_page=100', token)
+        selected = listing.get('repositories') or []
+        names = {r.get('full_name') for r in selected if r.get('private') is True and not r.get('archived')}
+        if listing.get('total_count') != len(selected) or len(names) != len(selected) or names != cfg['org_members']:
+            raise RuntimeError('Dolphin Linux runner group repository access differs from the controller allowlist')
+        checked_until = ts + 300
+    _ORG_TOKENS[key] = (token, expires, checked_until)
+    return token
+
+
+def org_jit_config(cfg, token, instance_id, size):
+    out = github('POST', f'{ORG_RUNNERS_PATH}/generate-jitconfig', token, body={
+        'name': instance_id, 'runner_group_id': cfg['org_group'],
+        'labels': ['self-hosted', 'Linux', 'X64', cfg['label'], size],
+        'work_folder': '/home/runner/work',
+    })
+    blob = out.get('encoded_jit_config')
+    runner = out.get('runner') or {}
+    if (runner.get('name') != instance_id or not isinstance(blob, str) or
+            not re.fullmatch(r'[A-Za-z0-9+/]+={0,2}', blob) or len(blob) > 8192):
+        raise RuntimeError('GitHub returned no usable single-runner JIT configuration')
+    # JIT has no expires_at field. The host consumes this once; the parameter reaper has a
+    # short upper bound for undelivered credentials, independent of GitHub's validity window.
+    return blob, now() + BOOT_GRACE
 
 
 def check_installation_scope(installation, owner, jwt):
@@ -310,6 +390,8 @@ def repo_pat(cfg, permissions=None):
             raise
         except Exception as error:
             print(f"{cfg['app_repo']}: runners app token failed ({type(error).__name__}: {str(error)[:160]}); using the repo's own token")
+    if not cfg.get('pat_secret'):
+        return None
     try:
         value = secrets.get_secret_value(SecretId=cfg['pat_secret'])['SecretString']
     except Exception as error:
@@ -689,15 +771,50 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     return found
 
 
-def list_runners(repo, pat):
+def pool_assignments(repo, cfg, candidates):
+    """Find positive evidence of a sibling repo using a sponsor's busy runner."""
+    if not candidates:
+        return set()
+    repos = config()[0]
+    budget, assigned = [20], set()
+    for sibling in rotated(sorted(cfg['org_members'] - {repo}), int(time.time() // 120)):
+        if budget[0] <= 0 or out_of_time() or assigned == candidates:
+            break
+        try:
+            token = repo_pat(repos[sibling], {'actions': 'read', 'metadata': 'read'})
+        except OutOfTime:
+            break
+        except Exception as error:
+            # A sibling's unavailable credentials are not evidence that its runner is free.
+            print(f'{repo}: could not read the pool assignment credential for {sibling} ({type(error).__name__})')
+            continue
+        if not token:
+            continue
+        try:
+            for run in runs_oldest_first(sibling, 'in_progress', token, budget):
+                for job in pages(sibling, f"/repos/{sibling}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', token, budget):
+                    name = job.get('runner_name')
+                    if job.get('status') == 'in_progress' and name in candidates:
+                        assigned.add(name)
+                        if assigned == candidates:
+                            return assigned
+        except OutOfTime:
+            break
+        except (OSError, ValueError) as error:
+            print(f'{repo}: could not confirm pool assignments in {sibling} ({type(error).__name__})')
+    return assigned
+
+
+def list_runners(repo, pat, path=None):
     """({runner name: runner record}, complete) for this repo's self-hosted runners. `complete` is
     False when the listing stopped early -- at the repo's deadline, or past 500 runners -- and a
     host's absence from it then proves nothing."""
+    path = path or f'/repos/{repo}/actions/runners'
     out = {}
     for page in range(1, 6):
         if out_of_time():
             return out, False
-        body = github('GET', f'/repos/{repo}/actions/runners?per_page=100&page={page}', pat)
+        body = github('GET', f'{path}?per_page=100&page={page}', pat)
         runners = body.get('runners') or []
         for runner in runners:
             out[runner.get('name')] = runner
@@ -706,9 +823,10 @@ def list_runners(repo, pat):
     return out, False
 
 
-def registered_now(repo, name, pat):
+def registered_now(repo, name, pat, path=None):
     """True if a runner called `name` is registered right now (GitHub filters by exact name)."""
-    body = github('GET', f'/repos/{repo}/actions/runners?name={urllib.parse.quote(name)}', pat)
+    path = path or f'/repos/{repo}/actions/runners'
+    body = github('GET', f'{path}?name={urllib.parse.quote(name)}', pat)
     return any(r.get('name') == name for r in body.get('runners') or [])
 
 
@@ -745,18 +863,20 @@ def app_instances(repo):
     return [i for page in pages for r in page['Reservations'] for i in r['Instances']]
 
 
-def user_data(repo, labels):
+def user_data(repo, labels, jit=False):
     with open(os.path.join(HERE, 'bootstrap.sh')) as f:
         script = f.read()
-    return script.replace('@@REPO@@', repo).replace('@@LABELS@@', labels)
+    return (script.replace('@@REPO@@', repo).replace('@@LABELS@@', labels)
+            .replace('@@REGISTRATION@@', 'jit' if jit else 'repository'))
 
 
 def broker(instance_id, token, expires):
     account = os.environ['RUNNER_ACCOUNT_ID']
     ssm.put_parameter(
         Name=f'/github-runner/bootstrap/{instance_id}',
-        Description='One-host GitHub registration credential; expires at GitHub after one hour',
+        Description='One-host GitHub Actions bootstrap credential',
         Type='SecureString', Value=token, Overwrite=False,
+        **({'Tier': 'Advanced'} if len(token) > 4096 else {}),
         Tags=[
             # Role=github-runner so fcvm's cleanup also sweeps this parameter once it expires.
             {'Key': 'Role', 'Value': 'github-runner'},
@@ -808,7 +928,8 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
     """One spot VM for `size`, trying each subnet and instance type in order."""
     ami, root_device = runner_image(repo, cfg)
     labels = f"{cfg['label']},{size}"
-    data = user_data(repo, labels)
+    org_group = cfg.get('org_group')
+    data = user_data(repo, labels, jit=bool(org_group))
     vcpus = known_vcpus(cfg, size)
     last_error, attempt = None, 0
     # Only these mean EC2 created nothing, so another pool is safe to try. Anything else -- a
@@ -853,7 +974,8 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
                             {'Key': 'Size', 'Value': size},
                             {'Key': 'JobId', 'Value': job_id},
                             {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
-                        ] + ([{'Key': 'Vcpus', 'Value': str(vcpus)}] if vcpus is not None else [])},
+                        ] + ([{'Key': 'Vcpus', 'Value': str(vcpus)}] if vcpus is not None else [])
+                          + ([{'Key': ORG_GROUP_TAG, 'Value': str(org_group)}] if org_group else [])},
                         {'ResourceType': 'volume', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                         {'ResourceType': 'network-interface', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
                     ])
@@ -884,7 +1006,7 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
 def settle(repo, instance_id, instance_type, subnet, job_id, labels, token):
     """After EC2 accepted a launch: hand the host its credential, or terminate it."""
     try:
-        broker(instance_id, *token)
+        broker(instance_id, *(token(instance_id) if callable(token) else token))
     except Exception as error:
         # EC2 accepted it; without its credential it can only idle. Never launch another
         # type for the same job: the reconcile retries once this one is gone.
@@ -902,6 +1024,8 @@ def settle(repo, instance_id, instance_type, subnet, job_id, labels, token):
                 ssm.delete_parameter(Name=f'/github-runner/bootstrap/{instance_id}')
             except Exception:
                 pass
+        if callable(token):
+            raise RuntimeError(f'{repo}: could not provision a JIT runner for {instance_id}') from None
         return None, True
     print(f"{repo}: launched {instance_id} ({instance_type}, {subnet['availability_zone']}) for job {job_id} [{labels}]")
     return instance_id, False
@@ -1002,7 +1126,7 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
-    if any(tag(i, 'JobId') == job_id for i in listed + live) and not still_waiting(repo, job_id, pat):
+    if (cfg.get('org_group') or any(tag(i, 'JobId') == job_id for i in listed + live)) and not still_waiting(repo, job_id, pat):
         return 'not queued', token
     max_hosts, max_vcpus, mode = int(cfg['max']), cfg.get('max_vcpus'), ''
     if budget:
@@ -1038,20 +1162,26 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             print(f"{repo}: at its cap of {max_vcpus} vCPUs ({used} in use, an {size} runner needs {need}); "
                   f"job {job_id} waits{mode}")
             return 'cap', token
-    if budget and state['throttled']:
-        outcome = throttled_group_check(repo, cfg, budget, repos, group_listed, running, unseen, claimed, size, job_id, mode)
+    if budget and (state['throttled'] or cfg.get('org_group')):
+        outcome = group_capacity_check(repo, cfg, budget, repos, group_listed, running,
+                                       unseen, claimed, size, job_id, mode, state['throttled'])
         if outcome:
             return outcome, token
     nonce = claim(repo, job_id, need)
     if not nonce:
         return 'claimed', token
     try:
-        token = token or registration_token(repo, pat)
-        instance_id, definite = launch(repo, cfg, subnets, size, job_id, token, nonce)
+        if cfg.get('org_group'):
+            org_token = org_pool_token(cfg)
+            bootstrap = lambda instance_id: org_jit_config(cfg, org_token, instance_id, size)
+        else:
+            token = token or registration_token(repo, pat)
+            bootstrap = token
+        instance_id, definite = launch(repo, cfg, subnets, size, job_id, bootstrap, nonce)
     except Exception:
-        # Anything raised here launched nothing: a failure before RunInstances (the token, the
-        # AMI lookup) or a definite RunInstances refusal (LaunchRefused). Free the job for the
-        # next round rather than holding it for CLAIM_SECONDS, and let the error reach the alarm.
+        # Prelaunch/refusal errors did not create a host. A JIT handoff error reaches here only
+        # after EC2 accepted termination; ambiguous creation or termination keeps the claim.
+        # Free the job for the next round and let the error reach the alarm.
         release(repo, job_id)
         raise
     if instance_id:
@@ -1074,13 +1204,13 @@ def still_waiting(repo, job_id, pat):
     return False
 
 
-def throttled_group_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode):
-    """'cap' when a throttled group's repos together would pass its throttled_vcpus with this job's host, else None.
+def group_capacity_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode, throttled):
+    """Count all sponsors' hosts and unseen claims before enforcing the group's shared limit.
 
     Counted like the per-repo vCPU cap, across the group: every live host of every member (each once, by its own
     vCPUs), this repo's launches not listed yet (by their claims) and the other members' too. A group holding nothing
     may launch one host of any size, so a job larger than the cap still runs, alone."""
-    cap = int(budget_groups()[group]['throttled_vcpus'])
+    cap = int(budget_groups()[group]['throttled_vcpus']) if throttled else DOLPHIN_GROUP_MAX_VCPUS
     hosts = {i['InstanceId']: i for i in group_listed if i.get('State', {}).get('Name') in LIVE_STATES}
     hosts.update({i['InstanceId']: i for i in running})
     # A claim is backed once its own host is listed in ANY state, as release() judges it: one whose host already ended
@@ -1097,21 +1227,28 @@ def throttled_group_check(repo, cfg, group, repos, group_listed, running, unseen
                 used += vcpus if vcpus is not None else largest_vcpus(cfg)
                 others += 1
     need = size_vcpus(cfg, size)
+    if cfg.get('org_group') and len(hosts) + len(unseen) + others >= DOLPHIN_GROUP_MAX_HOSTS:
+        print(f"{repo}: at its shared pool cap of {DOLPHIN_GROUP_MAX_HOSTS} hosts; job {job_id} waits{mode}")
+        return 'cap'
     if not hosts and not unseen and not others:
         return None   # the group holds nothing: one host of any size
     if used + need > cap:
-        print(f"{repo}: at its group's throttled cap of {cap} vCPUs ({used} in use across budget {group}, an {size} "
+        limit = 'throttled cap' if throttled else 'shared pool cap'
+        print(f"{repo}: at its group's {limit} of {cap} vCPUs ({used} in use across budget {group}, an {size} "
               f"runner needs {need}); job {job_id} waits{mode}")
         return 'cap'
     return None
 
 
-def reap(repo, cfg, pat, live, runners, complete=True):
+def reap(repo, cfg, pat, live, runners, complete=True, pooled_dead=None, sweep_offline=True):
     """Terminate hosts that never registered, sat idle or outlived any job; return survivors.
 
     Each terminate or DELETE is a request, so none starts after the repo's deadline: the rest
     wait for the next round and count as live until then. "Never registered" is judged only
     from a complete runner listing, or a busy host missing from a partial one would be killed."""
+    # An offline JIT record can be created before EC2 listings show the new host.
+    # Delete group records only when EC2 positively identifies that group host as dead.
+    path = ORG_RUNNERS_PATH if pooled_dead is not None else f'/repos/{repo}/actions/runners'
     keep, t = [], now()
     for index, instance in enumerate(live):
         if out_of_time():
@@ -1124,7 +1261,7 @@ def reap(repo, cfg, pat, live, runners, complete=True):
         reason, idle = None, False
         if age > MAX_LIFETIME:
             reason = f'older than {MAX_LIFETIME}'
-        elif runner is None and complete and age > BOOT_GRACE and not registered_now(repo, instance_id, pat):
+        elif runner is None and complete and age > BOOT_GRACE and not registered_now(repo, instance_id, pat, path):
             # The listing is from the start of the round: a slow boot may have registered since,
             # and could be starting a job. Recheck this one name before killing it.
             reason = f'not registered after {BOOT_GRACE}'
@@ -1136,7 +1273,7 @@ def reap(repo, cfg, pat, live, runners, complete=True):
             # GitHub refuses to remove a runner that is running a job -- and terminate only
             # once that succeeded. (Pattern B uses the same order, for the same reason.)
             try:
-                github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
+                github('DELETE', f"{path}/{runner['id']}", pat)
             except urllib.error.HTTPError as error:
                 print(f'{repo}: keeping {instance_id}: GitHub refused to deregister its runner ({error.code})')
                 keep.append(instance)
@@ -1149,20 +1286,23 @@ def reap(repo, cfg, pat, live, runners, complete=True):
             # offline-runner sweep below removes it.
             if runner is not None and not out_of_time():
                 try:
-                    github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
+                    github('DELETE', f"{path}/{runner['id']}", pat)
                 except urllib.error.HTTPError as error:
                     print(f'{repo}: could not remove runner {instance_id}: {error.code}')
         else:
             keep.append(instance)
+    if not sweep_offline:
+        return keep
     live_ids = {i['InstanceId'] for i in keep}
     for name, runner in runners.items():
         ours = cfg['label'].lower() in {str(l.get('name', '')).lower() for l in runner.get('labels') or []}
-        if ours and str(name).startswith('i-') and name not in live_ids and runner.get('status') == 'offline':
+        dead = name not in live_ids if pooled_dead is None else name in pooled_dead
+        if ours and str(name).startswith('i-') and dead and runner.get('status') == 'offline':
             if out_of_time():
                 break
             print(f'{repo}: removing offline runner {name} (its host is gone)')
             try:
-                github('DELETE', f"/repos/{repo}/actions/runners/{runner['id']}", pat)
+                github('DELETE', f"{path}/{runner['id']}", pat)
             except urllib.error.HTTPError as error:
                 print(f'{repo}: could not remove runner {name}: {error.code}')
     return keep
@@ -1190,7 +1330,30 @@ def reconcile_repo(repo, cfg, subnets, result):
     if out_of_time():
         print(f'{repo}: reconcile stopped after the runner listing; its time share is spent')
         return {'repo': repo, 'skipped': 'no time left'}
-    live = reap(repo, cfg, pat, app_instances(repo), runners, complete)
+    live = app_instances(repo)
+    if cfg.get('org_group'):
+        org_token = org_pool_token(cfg)
+        pooled_runners, pooled_complete = list_runners(repo, org_token, path=f'{org_group_path(cfg)}/runners')
+        pooled_hosts = {i['InstanceId']: i for i in group_listing('dolphin', config()[0])
+                        if tag(i, ORG_GROUP_TAG) == str(cfg['org_group'])}
+        pooled_dead = {i for i, host in pooled_hosts.items()
+                       if host.get('State', {}).get('Name') in ('terminated', 'stopped')}
+        pool = [i for i in live if tag(i, ORG_GROUP_TAG) == str(cfg['org_group'])]
+        legacy = [i for i in live if not tag(i, ORG_GROUP_TAG)]
+        # GitHub may include group runners in the repository listing. Never reap those there.
+        runners = {name: r for name, r in runners.items() if not r.get('runner_group_id') and
+                   name not in pooled_hosts and name not in pooled_runners}
+        live = (reap(repo, cfg, pat, legacy, runners, complete and pooled_complete, sweep_offline=False) +
+                reap(repo, cfg, org_token, pool, pooled_runners, pooled_complete, pooled_dead=pooled_dead))
+        runners.update(pooled_runners)
+    else:
+        # If the launch gate was shut with pooled jobs still running, a repository listing
+        # cannot prove their registrations are absent. Leave those hosts to finish normally.
+        pooled = [i for i in live if tag(i, ORG_GROUP_TAG)]
+        pooled_names = {i['InstanceId'] for i in pooled}
+        legacy_runners = {name: r for name, r in runners.items()
+                          if name not in pooled_names and not r.get('runner_group_id')}
+        live = reap(repo, cfg, pat, [i for i in live if not tag(i, ORG_GROUP_TAG)], legacy_runners, complete) + pooled
     outcomes, token = {}, None
     # From here on, a stop at the deadline still reports these (live grows with each launch).
     result['outcomes'] = outcomes
@@ -1206,6 +1369,13 @@ def reconcile_repo(repo, cfg, subnets, result):
     running_on = set()
     try:
         jobs = queued_jobs(repo, cfg, pat, running_on=running_on)
+        if cfg.get('org_group') and jobs:
+            queued_ids = {job_id for job_id, _ in jobs}
+            candidates = {host['InstanceId'] for host in pool
+                          if tag(host, 'JobId') in queued_ids and
+                          runners.get(host['InstanceId'], {}).get('busy') and
+                          host['InstanceId'] not in running_on}
+            running_on.update(pool_assignments(repo, cfg, candidates))
     finally:
         DEADLINE[0] = share_end
     # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
@@ -1353,7 +1523,7 @@ def spot_verdict(instance, completed_at):
 
 
 def our_host(repo, instance_id):
-    """The host EC2 lists as `instance_id` when it is one of this repo's runners, else None."""
+    """The EC2 host is sponsored by this repo or belongs to its explicitly admitted pool."""
     if not re.fullmatch(r'i-[0-9a-f]{8,17}', instance_id or ''):
         return None
     try:
@@ -1366,9 +1536,16 @@ def our_host(repo, instance_id):
         raise
     for reservation in listed.get('Reservations') or []:
         for instance in reservation.get('Instances') or []:
-            if (instance.get('InstanceId') == instance_id and tag(instance, 'Role') == ROLE
-                    and tag(instance, 'Repo') == repo):
+            if instance.get('InstanceId') != instance_id or tag(instance, 'Role') != ROLE:
+                continue
+            sponsor = tag(instance, 'Repo')
+            if sponsor == repo:
                 return instance
+            group = tag(instance, ORG_GROUP_TAG)
+            if group:
+                cfg = config()[0].get(repo, {})
+                if group == str(cfg.get('org_group')) and sponsor in cfg.get('org_members', ()):
+                    return instance
     return None
 
 

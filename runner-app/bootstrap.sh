@@ -1,6 +1,6 @@
 #!/bin/bash
 # github-app-runner bootstrap. User data for one ephemeral x86 runner, rendered per launch by
-# runner-app/app_runner.py (it fills in the repo and labels; nothing secret is in here).
+# runner-app/app_runner.py (it fills in the repo, labels and registration mode; nothing secret is in here).
 #
 # Canonical's Ubuntu 24.04: no NVMe, no fcvm. The repos' workflows install their own Node/Python
 # (setup-node, setup-python) and browsers (`playwright install --with-deps`, which uses apt
@@ -10,6 +10,7 @@
 # (runner-app-image.tf), whose builder ran this same file's install steps (PREPARE_ONLY, below).
 # Each install step skips what is already there, so such a host goes straight to registration;
 # whatever is missing, or older than this file's pins, is installed as on Canonical's image.
+set +x
 set -euo pipefail
 exec >>/var/log/github-app-runner.log 2>&1
 
@@ -26,6 +27,7 @@ fi
 
 REPO='@@REPO@@'
 LABELS='@@LABELS@@'
+REGISTRATION='@@REGISTRATION@@'
 RUNNER_VERSION='2.337.0'
 RUNNER_SHA256='70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613'
 export AWS_DEFAULT_REGION=us-west-1 DEBIAN_FRONTEND=noninteractive
@@ -91,10 +93,15 @@ if [ "$PREPARE_ONLY" = 1 ]; then
   exit 0
 fi
 
-# This host's one-time registration token. The controller writes it only after EC2 accepted
-# the launch, tagged with this instance's ARN, which is the only parameter this role can read;
-# it is deleted as soon as it is read.
-REG_TOKEN=$(python3 - "$INSTANCE_ID" <<'PY'
+case "$REGISTRATION" in
+  jit|repository) ;;
+  *) echo "github-app-runner: invalid registration mode" >&2; exit 1 ;;
+esac
+
+# The controller writes the repo registration token or the organization's runner-specific
+# JIT configuration only after EC2 accepted the launch. The parameter is readable by this
+# instance alone, and must be deleted successfully before a job can start.
+BOOTSTRAP_CREDENTIAL=$(python3 - "$INSTANCE_ID" <<'PY'
 import sys
 import time
 
@@ -123,24 +130,28 @@ print(value)
 PY
 )
 
-# The token reaches config.sh as ACTIONS_RUNNER_INPUT_TOKEN, never as an argument: argv is
-# readable by every local process through /proc/<pid>/cmdline, and the token is live until
-# registration completes. Same as fcvm's bootstrap (runner-autoscale.tf).
 cd "$DIR"
-printf '%s' "$REG_TOKEN" | sudo -u runner -H bash -c \
-  'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work "$4"' \
-  _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"
-unset REG_TOKEN
+if [ "$REGISTRATION" = repository ]; then
+  # Pass the token through stdin to config.sh's environment. Command arguments are readable
+  # in /proc/<pid>/cmdline, and the token is live until registration completes.
+  printf '%s' "$BOOTSTRAP_CREDENTIAL" | sudo -u runner -H bash -c \
+    'ACTIONS_RUNNER_INPUT_TOKEN=$(cat) exec ./config.sh --unattended --url "https://github.com/$1" --name "$2" --labels "$3" --ephemeral --disableupdate --work "$4"' \
+    _ "$REPO" "$INSTANCE_ID" "$LABELS" "$WORK"
+  unset BOOTSTRAP_CREDENTIAL
+else
+  # JIT skips config.sh, which normally initializes .env and captures the runner's PATH.
+  sudo -u runner -H bash ./env.sh
+fi
 
-# .env is read by the runner's listener, which run.sh starts, and its variables reach every job:
+# .env is read by the runner's listener, and its variables reach every job:
 # AGENT_TOOLSDIRECTORY for the setup-* actions, RUNNER_TOOL_CACHE for the runner's own
 # ${{ runner.tool_cache }}.
 printf 'AGENT_TOOLSDIRECTORY=%s\nRUNNER_TOOL_CACHE=%s\n' "$TOOL_CACHE" "$TOOL_CACHE" >> "$DIR/.env"
 
 # A prebuilt image lists the directories its toolchains live in (runner-app/images/), one per
 # line, so a job's setup finds them already installed; Canonical's image has no such file. They
-# go first on the PATH config.sh saw (sudo's secure_path, in .path), and that PATH goes into
-# .env: the listener run.sh starts reads .env, not .path (only the service script runsvc.sh,
+# go first on the PATH env.sh captured (sudo's secure_path, in .path), and that PATH goes into
+# .env: the listener reads .env, not .path (only the service script runsvc.sh,
 # which these hosts do not use, reads .path), so a PATH in .path alone never reached a job.
 if [ -s /etc/github-app-runner/path ]; then
   EXTRA_PATH=$(paste -sd: /etc/github-app-runner/path)
@@ -149,5 +160,13 @@ if [ -s /etc/github-app-runner/path ]; then
   printf 'PATH=%s:%s\n' "$EXTRA_PATH" "$JOB_PATH" >> "$DIR/.env"
 fi
 
-sudo -u runner -H ./run.sh
+if [ "$REGISTRATION" = jit ]; then
+  # Runner.Listener consumes and removes ACTIONS_RUNNER_INPUT_JITCONFIG on startup. Pass it
+  # directly so a supervising shell does not keep the credential or reuse it on a restart.
+  printf '%s' "$BOOTSTRAP_CREDENTIAL" | sudo -u runner -H bash -c \
+    'umask 077; ACTIONS_RUNNER_INPUT_JITCONFIG=$(cat) exec ./bin/Runner.Listener run'
+  unset BOOTSTRAP_CREDENTIAL
+else
+  sudo -u runner -H ./run.sh
+fi
 echo "github-app-runner: job finished at $(date -Is); powering off"

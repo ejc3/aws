@@ -41,13 +41,9 @@ locals {
   # without `max_vcpus` is capped by hosts alone. No repo sets it now: the budgeted repos' vCPU caps come from their
   # group (burst_max_vcpus per repo, throttled_vcpus for the whole group), and are counted the same way.
   #
-  # dolphin-films (a downstream of dolphin-labs, dolphin-films.tf) asks for the same `dolphin`
-  # label as its upstream. Runners register per repo and hosts are counted by their Repo tag,
-  # so sharing the label shares no runner, host or cap: its caps (throttled 2) are its own and it can never take one of
-  # dolphin-labs' hosts. What the dolphin repos do share is one budget bucket (runner_budget_groups). `alarm` names its
-  # per-repo alarm, which would otherwise collide with dolphin-labs' (both are named after the label). dolphin-maps
-  # (another dolphin-labs-hq project) is the same shape: the `dolphin` label, its own caps, its own alarm; so is
-  # dolphin-family.
+  # The dolphin repos share the `dolphin` selector and one budget bucket (runner_budget_groups). The first three
+  # share a runner group after activation; other Dolphin repos still register per repo. `alarm` keeps their existing
+  # per-repo diagnostics distinct even though they share a workflow label.
   #
   # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
   # register to https://github.com/ejc3/imagine only (a repository-level runner is never given
@@ -63,7 +59,7 @@ locals {
   # throttled, when the group's repos together are also held to the group's throttled_vcpus. While the group is in
   # burst it gets the group's burst ceilings instead. `max` (and `max_vcpus`, where set) stay a hard backstop in both modes, and setting `max = 0`
   # still stops a repo outright. For these repos `max` is the burst host ceiling, 64.
-  runner_app_repos = {
+  runner_app_repos = merge({
     "CoderColton/colton-games"      = { label = "cc-games", max = 8, image = "colton-games-runner" }
     "dolphin-labs-hq/dolphin-labs"  = { label = "dolphin", max = 64, throttled_max = 8, image = "dolphin-labs-runner" }
     "dolphin-labs-hq/dolphin-films" = { label = "dolphin", max = 64, throttled_max = 2, image = "dolphin-films-runner", alarm = "dolphin-films" }
@@ -77,7 +73,7 @@ locals {
     # other jobs for `l` or `s`; throttled, 4 hosts, which its group's 74 vCPUs fill before then with `l` and `xl` jobs.
     # Canonical's image: its jobs bring their toolchains through setup actions (GITHUB-RUNNERS.md, "ejc3/constellation").
     "ejc3/constellation" = { label = "constellation", max = 64, throttled_max = 4 }
-  }
+  }, local.dolphin_runner_pool_expansion_active)
 
   # BUDGET. Each group is a leaky bucket of dollars (runner-app/app_runner.py, "budget buckets"; GITHUB-RUNNERS.md,
   # "Budget buckets"). It refills at daily_usd a day, continuously (daily_usd / 86400 a second), and holds at most
@@ -111,7 +107,10 @@ locals {
   }
   runner_budget_groups = {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
-    dolphin = { daily_usd = 50, repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "dolphin-labs-hq/dolphin-family"] }
+    dolphin = {
+      daily_usd = 50
+      repos     = concat(local.dolphin_runner_pool_repos, ["dolphin-labs-hq/dolphin-family"])
+    }
 
     # Its own bucket once constellation_token_ready is on (no bucket, metric or alarm before: runner_budget_served).
     constellation = { daily_usd = 50, repos = ["ejc3/constellation"] }
@@ -151,7 +150,7 @@ locals {
       max        = c.max
       max_vcpus  = try(c.max_vcpus, null) # null: no vCPU cap, hosts alone
       image      = try(c.image, "")       # "": Canonical's image
-      pat_secret = "github-runner/repo-pat/${repo}"
+      pat_secret = contains(keys(local.dolphin_runner_pool_expansion), repo) ? "" : "github-runner/repo-pat/${repo}"
       sizes      = local.runner_app_sizes
       vcpus      = local.runner_app_size_vcpus
       # Every entry carries app_repo so the map stays one type; empty means "no app, use the PAT".
@@ -178,7 +177,12 @@ locals {
   # The runners app (dolphin-labs-runners) is private to dolphin-labs-hq today, so it has no ejc3 installation and both
   # use their PATs (GITHUB-RUNNERS.md, "Controller tokens from a GitHub App").
   # dolphin-family is not here: it uses its own controller token until the runners app's installation is widened to it.
-  runner_app_github_app_repos = ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "ejc3/constellation"]
+  # Permit the two named additions in the installation scope before turning on their pool service, so adding them
+  # in GitHub settings cannot temporarily invalidate the existing repos' installation tokens.
+  runner_app_github_app_repos = concat(
+    ["dolphin-labs-hq/dolphin-labs", "dolphin-labs-hq/dolphin-films", "dolphin-labs-hq/dolphin-maps", "ejc3/imagine", "ejc3/constellation"],
+    keys(local.dolphin_runner_pool_expansion),
+  )
   # Only the repos actually served (runner_app_config is gated): a repo whose token gate is still false adds no hosts, so
   # counting its cap would loosen the combined alarm before it serves anything. Each repo counts the most hosts it may
   # hold in any mode (peak_max): a budgeted repo's burst ceiling of 64, which is exactly the most hosts its 512 vCPUs can
@@ -442,7 +446,7 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
         Resource = [for kind in ["instance", "volume", "network-interface"] : "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:${kind}/*"]
         Condition = {
           StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestTag/Role" = "github-app-runner" }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion"] }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Role", "Repo", "Size", "Vcpus", "JobId", "InspectorEc2Exclusion", "RunnerGroup"] }
         }
       },
       {
@@ -571,6 +575,9 @@ resource "aws_lambda_function" "runner_app" {
 
       # Every repo the runners app is meant to cover, token gates or not: what an installation may select.
       APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)
+      # Group creation does not change registration. Activate only once the runtime app has the org permission.
+      DOLPHIN_POOL_GROUP_ID = local.dolphin_runner_group && var.enable_dolphin_runner_pool ? github_actions_runner_group.dolphin_linux[0].id : "0"
+      DOLPHIN_POOL_REPOS    = jsonencode(local.dolphin_runner_pool_repos)
 
       # The budget buckets (locals above): one item per group in BUDGET_TABLE.
       BUDGET_TABLE = aws_dynamodb_table.runner_app_budget[0].name
@@ -587,6 +594,12 @@ resource "aws_lambda_function" "runner_app" {
   tags = { Name = "github-app-runner" }
 
   lifecycle {
+    precondition {
+      condition = !var.enable_dolphin_runner_pool || (local.dolphin_runner_group && alltrue([
+        for repo in local.dolphin_runner_pool_repos : try(local.runner_app_config[repo].label == "dolphin" && local.runner_app_config[repo].app_repo == repo, false)
+      ]))
+      error_message = "The Dolphin runner pool needs its GitHub group and each pool repository enabled on the runners app."
+    }
     precondition {
       # The vCPU caps count a host by its size, so every type listed under a size must have that size's vCPUs. These
       # pools are all 4 vCPUs per "xlarge" (c6a/c6i/c7a/c7i/c8i): an N-xlarge type has 4N.
@@ -982,6 +995,23 @@ variable "enable_runner_app_webhooks" {
   default     = true
 }
 
+variable "enable_dolphin_runner_pool" {
+  description = "Switch the initial Dolphin Linux repositories to organization registration after approving the runners App's organization permission"
+  type        = bool
+  default     = false
+}
+
+variable "enable_dolphin_runner_pool_expansion" {
+  description = "Add Dolphin Business and Cloud to the organization Linux runner pool after selecting both in the runners App installation"
+  type        = bool
+  default     = false
+
+  validation {
+    condition     = !var.enable_dolphin_runner_pool_expansion || (var.enable_dolphin_runner_pool && var.enable_github_runner && var.enable_runner_app_webhooks)
+    error_message = "Enable the Dolphin Linux runner pool and runner webhooks before expanding its membership."
+  }
+}
+
 # A per-repo gate for dolphin-films, whose controller token has to be minted by the org owner (a fine-grained token cannot be
 # created by API) and put by hand. Reading a secret that has no value fails EVERY plan of this repository, so until the value
 # exists this stays false and the repo's webhook is neither planned nor its token read. Set the default to true in a commit
@@ -1023,6 +1053,20 @@ variable "constellation_token_ready" {
 
 locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
+
+  # Share the existing admin App provider only for group management. The controller keeps the separate runners App.
+  dolphin_runner_group = local.runner_app_webhooks
+  dolphin_runner_pool_repos = concat([
+    "dolphin-labs-hq/dolphin-films",
+    "dolphin-labs-hq/dolphin-labs",
+    "dolphin-labs-hq/dolphin-maps",
+  ], keys(local.dolphin_runner_pool_expansion_active))
+  # These repos already select the shared `dolphin` label and do not need their own images or PATs.
+  dolphin_runner_pool_expansion = {
+    "dolphin-labs-hq/dolphin-business" = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-business" }
+    "dolphin-labs-hq/dolphin-cloud"    = { label = "dolphin", max = 64, throttled_max = 2, alarm = "dolphin-cloud" }
+  }
+  dolphin_runner_pool_expansion_active = var.enable_dolphin_runner_pool_expansion ? local.dolphin_runner_pool_expansion : {}
 
   # A repo with a hand-minted token: its webhook and token read need its gate as well as the global one. A repo not
   # listed here needs only the global gate.
@@ -1089,6 +1133,28 @@ provider "github" {
       id              = tostring(local.github_app_admin.app_id)
       installation_id = tostring(local.github_app_admin.installations["dolphin-labs-hq"])
       pem_file        = local.github_app_admin.private_key
+    }
+  }
+}
+
+data "github_repository" "dolphin_runner_pool" {
+  for_each  = local.dolphin_runner_group ? toset(local.dolphin_runner_pool_repos) : toset([])
+  provider  = github.dolphin_labs
+  full_name = each.key
+}
+
+resource "github_actions_runner_group" "dolphin_linux" {
+  count                      = local.dolphin_runner_group ? 1 : 0
+  provider                   = github.dolphin_labs
+  name                       = "dolphin-linux"
+  visibility                 = "selected"
+  allows_public_repositories = false
+  selected_repository_ids    = [for repo in local.dolphin_runner_pool_repos : data.github_repository.dolphin_runner_pool[repo].repo_id]
+
+  lifecycle {
+    precondition {
+      condition     = alltrue([for repo in values(data.github_repository.dolphin_runner_pool) : repo.visibility == "private" && !repo.archived])
+      error_message = "Only selected private, unarchived repositories may use the Dolphin Linux runner group."
     }
   }
 }
@@ -1206,6 +1272,23 @@ resource "github_repository_webhook" "runner_app_dolphin_family" {
   count      = local.dolphin_family_webhook ? 1 : 0
   provider   = github.dolphin_labs
   repository = "dolphin-family"
+  events     = ["workflow_job"]
+  active     = true
+
+  configuration {
+    url          = "${aws_apigatewayv2_api.runner_webhook[0].api_endpoint}/webhook"
+    content_type = "json"
+    insecure_ssl = false
+    secret       = random_password.github_webhook[0].result
+  }
+
+  depends_on = [aws_lambda_function.runner_app, aws_lambda_function.runner_webhook_front]
+}
+
+resource "github_repository_webhook" "runner_app_dolphin_pool_expansion" {
+  for_each   = local.runner_app_webhooks ? toset(keys(local.dolphin_runner_pool_expansion_active)) : toset([])
+  provider   = github.dolphin_labs
+  repository = split("/", each.key)[1]
   events     = ["workflow_job"]
   active     = true
 
