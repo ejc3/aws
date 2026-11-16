@@ -912,12 +912,6 @@ class Publisher:
             return {**receipt, "verified": receipt == self.gate_record(),
                     "rollback": rolled_back, "placement": placement}
         evidence = self.gate_evidence(event) if action == "rollback" else None
-        if evidence is not None and evidence["kind"] == "no_agent":
-            # Fresh at the gate's entry only: the placement fence repeats the other checks
-            # through a rollback, which may take longer than this window.
-            now = self.clock()
-            need(now - self.GATE_NO_AGENT_FRESH_SECONDS <= evidence["observed_at"] / 1000
-                 <= now + self.GATE_CLOCK_SKEW_SECONDS, "the agents were not read just now")
         receipt, expected = event["receipt"], event["placement"]
         need(isinstance(receipt, dict) and set(receipt) == {"generation", "build_id"}
              and type(receipt["generation"]) is int and receipt["generation"] > 0
@@ -946,6 +940,12 @@ class Publisher:
             need(not rolled_back, "the live release is a rollback; it is not rolled back again")
             verified = self.gate_record()
             need(verified != live_receipt, "the gate verified this release; it is not rolled back")
+            if evidence["kind"] == "no_agent":
+                # Only a fresh observation may start a rollback. The exact committed replay
+                # above can repair its verification record even if the rollback outlasted it.
+                now = self.clock()
+                need(now - self.GATE_NO_AGENT_FRESH_SECONDS <= evidence["observed_at"] / 1000
+                     <= now + self.GATE_CLOCK_SKEW_SECONDS, "the agents were not read just now")
             config, host_only = self.rollback_to_previous(active, verified)
 
             def gate_fence():

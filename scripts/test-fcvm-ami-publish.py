@@ -2272,10 +2272,14 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.created, changes["created"])
         self.assertEqual(self.fleet_ssm.values["/release"], changes["pointer"])
 
-    def gate_rollback_with_lost_verify_write(self):
+    def gate_rollback_with_lost_verify_write(self, *, no_agent=False):
         _, active = self.generation_eleven_live()
-        old_host = self.gate_instance(active)
-        verdict = self.gate_event("rollback")
+        if no_agent:
+            old_host = self.gate_instance(active, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 60)
+            verdict = self.no_agent_event(self.publisher().gate({"action": "status"}))
+        else:
+            old_host = self.gate_instance(active)
+            verdict = self.gate_event("rollback")
         publisher = self.publisher()
         save = publisher.save
 
@@ -2310,6 +2314,16 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(publisher.gate(verdict)["status"], "rolled_back")
         self.assertEqual(self.ec2.created, created)
         self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_the_gate_replays_a_committed_no_agent_rollback_after_the_observation_expires(self):
+        verdict, _, active = self.gate_rollback_with_lost_verify_write(no_agent=True)
+        created = list(self.ec2.created)
+        publisher = self.publisher()
+        publisher.clock = lambda: verdict["evidence"]["observed_at"] / 1000 + publisher.GATE_NO_AGENT_FRESH_SECONDS + 60
+        self.assertEqual(publisher.gate(verdict)["pointer"], publisher.gate_receipt(active))
+        self.assertEqual(self.fleet_ssm.values["/release"], active)
+        self.assertEqual(self.ec2.created, created)
+        self.assertTrue(publisher.gate({"action": "status"})["verified"])
 
     def test_a_new_smoke_can_verify_rollback_if_the_original_request_was_lost(self):
         _, old_host, active = self.gate_rollback_with_lost_verify_write()
