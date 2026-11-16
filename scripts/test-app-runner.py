@@ -2094,6 +2094,35 @@ class DolphinOrganizationPoolTests(unittest.TestCase):
         self.assertEqual(ec2.launched, [])
         self.assertEqual(app.active_claims(DOLPHIN), {})
 
+    def test_a_busy_runner_covers_its_sponsor_until_a_sibling_assignment_is_confirmed(self):
+        app, ec2 = self.load()
+        name = "i-12345678"
+        host = instance(name, DOLPHIN, "7", 2, "s")
+        host["Tags"].append({"Key": "RunnerGroup", "Value": str(self.group_id)})
+        ec2.instances.append(host)
+        cfg = app.config()[0][DOLPHIN]
+        original = app.github
+        original.runs[DOLPHIN, "queued"] = [24]
+        original.jobs[24] = [{"id": 7, "status": "queued", "labels": ["self-hosted", "dolphin", "s"]}]
+
+        def github(method, path, token, body=None):
+            if path.startswith(f"{app.org_group_path(cfg)}/runners?"):
+                return {"runners": [{"name": name, "status": "online", "busy": True}]}
+            if path.endswith("/generate-jitconfig"):
+                return {"runner": {"name": body["name"]}, "encoded_jit_config": "a2V5"}
+            return original(method, path, token, body)
+
+        with mock.patch.object(app, "github", side_effect=github), mock.patch.object(app, "org_pool_token", return_value="ORG"):
+            result = app.reconcile(DOLPHIN, cfg, SUBNETS)
+            self.assertEqual(result["outcomes"], {"exists": 1})
+            self.assertEqual(ec2.launched, [])
+            original.runs[FILMS, "in_progress"] = [25]
+            original.jobs[25] = [{"id": 8, "status": "in_progress", "runner_name": name}]
+            result = app.reconcile(DOLPHIN, cfg, SUBNETS)
+            self.assertEqual(result["outcomes"], {"launched": 1})
+            self.assertEqual(len(ec2.launched), 1)
+            self.assertEqual(app.tag(ec2.instances[-1], "JobId"), "7")
+
     def test_rollback_does_not_reap_an_active_pool_runner_missing_from_the_repo_listing(self):
         app, ec2 = load_budget_app()
         host = instance("i-12345678", DOLPHIN, "7", 30)
@@ -2102,6 +2131,7 @@ class DolphinOrganizationPoolTests(unittest.TestCase):
         result = app.reconcile(DOLPHIN, BUDGET_REPOS[DOLPHIN], SUBNETS)
         self.assertEqual(host["State"]["Name"], "running")
         self.assertEqual(result["live"], 1)
+
 
 class BudgetArithmeticTests(unittest.TestCase):
     """bucket_step(): refill at $50/86,400 s, drain by what the hosts cost, capped at two days' budget."""

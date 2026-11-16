@@ -771,6 +771,40 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     return found
 
 
+def pool_assignments(repo, cfg, candidates):
+    """Find positive evidence of a sibling repo using a sponsor's busy runner."""
+    if not candidates:
+        return set()
+    repos = config()[0]
+    budget, assigned = [20], set()
+    for sibling in rotated(sorted(cfg['org_members'] - {repo}), int(time.time() // 120)):
+        if budget[0] <= 0 or out_of_time() or assigned == candidates:
+            break
+        try:
+            token = repo_pat(repos[sibling], {'actions': 'read', 'metadata': 'read'})
+        except OutOfTime:
+            break
+        except Exception as error:
+            # A sibling's unavailable credentials are not evidence that its runner is free.
+            print(f'{repo}: could not read the pool assignment credential for {sibling} ({type(error).__name__})')
+            continue
+        if not token:
+            continue
+        try:
+            for run in runs_oldest_first(sibling, 'in_progress', token, budget):
+                for job in pages(sibling, f"/repos/{sibling}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', token, budget):
+                    name = job.get('runner_name')
+                    if job.get('status') == 'in_progress' and name in candidates:
+                        assigned.add(name)
+                        if assigned == candidates:
+                            return assigned
+        except OutOfTime:
+            break
+        except (OSError, ValueError) as error:
+            print(f'{repo}: could not confirm pool assignments in {sibling} ({type(error).__name__})')
+    return assigned
+
+
 def list_runners(repo, pat, path=None):
     """({runner name: runner record}, complete) for this repo's self-hosted runners. `complete` is
     False when the listing stopped early -- at the repo's deadline, or past 500 runners -- and a
@@ -1335,6 +1369,13 @@ def reconcile_repo(repo, cfg, subnets, result):
     running_on = set()
     try:
         jobs = queued_jobs(repo, cfg, pat, running_on=running_on)
+        if cfg.get('org_group') and jobs:
+            queued_ids = {job_id for job_id, _ in jobs}
+            candidates = {host['InstanceId'] for host in pool
+                          if tag(host, 'JobId') in queued_ids and
+                          runners.get(host['InstanceId'], {}).get('busy') and
+                          host['InstanceId'] not in running_on}
+            running_on.update(pool_assignments(repo, cfg, candidates))
     finally:
         DEADLINE[0] = share_end
     # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
