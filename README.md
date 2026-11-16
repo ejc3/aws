@@ -1146,7 +1146,8 @@ All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (a manage
 - **`mac-lease`**: the desktop lease, so two sessions' clicks, typing and app relaunches do not interleave. Advisory
   and lightweight: `mac-lease run NAME [--ttl S] [--wait S] -- CMD` holds it for one command; `take NAME` / `release
   NAME` hold it across several `ssh mac` calls (default ttl 600 s, renewable by taking it again); `status` shows the
-  holder. The `peekaboo` wrapper waits (up to `MAC_LEASE_WAIT`, default 120 s) before any click, typing, app, window,
+  holder. A `run`'s lease belongs to that process: another `run` or `take` of the same name waits for it, `release`
+  does not end it, and a `run` inside one's own `take` leaves the take's lease held. The `peekaboo` wrapper waits (up to `MAC_LEASE_WAIT`, default 120 s) before any click, typing, app, window,
   menu or dialog command while another session holds the lease; pass yours as `MAC_LEASE=NAME`. Looking (`see`,
   `image`, `capture`, `permissions`) never waits. Take the lease before anything that relaunches or signs out of an
   app (Chrome above all: a relaunch can sign App Store Connect out).

@@ -161,6 +161,46 @@ class Lease(Base):
     def test_names_are_checked(self):
         self.assertEqual(self.lease("take", "bad name").returncode, 2)
 
+    def run_bg(self, name, *args):
+        return subprocess.Popen([str(BIN / "mac-lease"), "run", name, *args], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_a_second_run_of_the_same_name_waits(self):
+        # Two jobs under one name ran at once: the second run "renewed" the first's lease.
+        first = self.run_bg("job", "--", "sleep", "3")
+        time.sleep(0.6)
+        r = self.lease("run", "job", "--", "true")
+        self.assertEqual(r.returncode, 75, "a live run's lease is not taken again by name")
+        self.assertIn("held by job", r.stderr)
+        start = time.time()
+        self.assertEqual(self.lease("run", "job", "--wait", "15", "--", "true").returncode, 0)
+        self.assertGreater(time.time() - start, 1.5, "it waited for the first run")
+        first.wait(timeout=10)
+
+    def test_killing_a_second_run_leaves_the_first_ones_lease(self):
+        first = self.run_bg("job", "--", "sleep", "30")
+        time.sleep(0.6)
+        second = self.run_bg("job", "--wait", "30", "--", "sleep", "30")
+        time.sleep(0.6)
+        second.kill(); second.wait()
+        self.assertIn("job (", self.lease("status").stdout)
+        self.assertIn("pid %d" % first.pid, self.lease("status").stdout)
+        r = self.lease("release", "job")
+        self.assertEqual(r.returncode, 75, "a run's lease ends with its run, not by name")
+        self.assertIn("pid %d" % first.pid, self.lease("status").stdout)
+        first.kill(); first.wait()
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
+    def test_a_take_lease_is_renewed_and_released_by_name_and_a_run_under_it_leaves_it(self):
+        self.assertEqual(self.lease("take", "mine", "--ttl", "2").returncode, 0)
+        self.assertEqual(self.lease("take", "mine", "--ttl", "60").returncode, 0, "renewed across calls")
+        time.sleep(2.5)
+        self.assertIn("mine (", self.lease("status").stdout, "the renewal's ttl")
+        self.assertEqual(self.lease("run", "mine", "--", "true").returncode, 0, "a run under one's own take")
+        self.assertIn("mine (", self.lease("status").stdout, "the run left the take's lease held")
+        self.assertEqual(self.lease("release", "mine").returncode, 0)
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
 
 class Peekaboo(Base):
     def setUp(self):
