@@ -1855,7 +1855,7 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(drill["tile_amis"], active["tile_amis"])
         self.assertEqual(drill["source_sha"], MODULE.Publisher.DRILL_SOURCE)
         self.assertTrue(drill["build_id"].startswith("reviewed-release-gate-drill:"))
-        receipt = self.main_ssm.values["/factory/drill/" + MODULE.Publisher.DRILL_IMAGE]
+        receipt = self.main_ssm.values["/factory/publications/drill-" + MODULE.Publisher.DRILL_IMAGE]
         self.assertEqual(receipt, {"image": MODULE.Publisher.DRILL_IMAGE, "branch": "drill/unframed-renderer",
                                    "source_sha": MODULE.Publisher.DRILL_SOURCE,
                                    "generation": active["generation"] + 1, "approved": "owner, 2026-11-15"})
@@ -1915,6 +1915,22 @@ class PublisherTests(unittest.TestCase):
         event, active = self.drill_fixture()
         with self.assertRaisesRegex(MODULE.Refused, "no caller configuration"):
             self.windows_publisher(active).run(dict(event, image="ami-0123456789abcdef0"))
+
+    def test_the_publisher_role_may_write_the_drill_receipt(self):
+        # The receipt is written after promotion: a write the role is denied would leave the
+        # drill image live with no receipt, and the predecessor pin refuses a retry.
+        import fnmatch
+        pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        policy = re.search(r'resource "aws_iam_role_policy" "fcvm_ami_publish" \{(.*?)\n\}', pipeline, re.S)
+        self.assertIsNotNone(policy)
+        put = re.search(r'Action = "ssm:PutParameter", Resource = \[(.*?)\] \}', policy.group(1))
+        self.assertIsNotNone(put)
+        granted = re.findall(r'parameter\$\{local\.fcvm_ami_state_prefix\}([^"]*)"', put.group(1))
+        self.assertTrue(granted)
+        publisher = MODULE.Publisher.__new__(MODULE.Publisher)
+        publisher.env = {"STATE_PREFIX": ""}
+        name = publisher.drill_receipt_name()
+        self.assertTrue(any(fnmatch.fnmatchcase(name, pattern) for pattern in granted), (name, granted))
 
     def test_reviewed_ena_host_refuses_a_live_receipt_other_than_the_rollback(self):
         # The live receipt is still the factory's generation twelve: the rollback has not run.

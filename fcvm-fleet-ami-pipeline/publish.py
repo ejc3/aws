@@ -717,7 +717,8 @@ class Publisher:
                          "build_id": "fcvm-fleet-image-factory:48515f0e-16cc-490c-b0d4-9c813e92aa54"}
 
     def drill_receipt_name(self):
-        return self.env["STATE_PREFIX"] + "/drill/" + self.DRILL_IMAGE
+        # Under /publications/, a path the publisher role may already write (fcvm-fleet-ami-pipeline.tf).
+        return self.env["STATE_PREFIX"] + "/publications/drill-" + self.DRILL_IMAGE
 
     def reviewed_release_gate_drill(self):
         """The drill's transition: the live receipt, which must be generation sixteen as the
