@@ -707,9 +707,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin`, `imagine` or `constellation`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
-  `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too. Runners
-  register per repo and hosts are counted by their `Repo` tag, so the shared label shares no
-  runner, cap or token. `ejc3/imagine` asks for `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`;
+  `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too.
+  With the Dolphin organization pool disabled, runners register per repo and hosts are counted by their `Repo` tag;
+  in that mode the shared label shares no runner, cap or token. `ejc3/imagine` asks for
+  `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`;
   `ejc3/constellation` for `[self-hosted, constellation, xl]` (its Rust suite) and `l` or `s`.
 - **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
@@ -916,6 +917,58 @@ a week, so a quiet stretch banks room for a busy day.
   ceilings, lookahead, reserve, resume, the throttled-hours alarm), and apply. The stored level is kept; the refill and
   the capacity change at once, and a level above a lowered capacity is cut to it on the next update. To reset a bucket to
   full, delete its item. To take a repo out of the buckets, remove it from its group; it is then capped by its `max`.
+
+### Dolphin organization Linux pool
+
+When enabled, the `dolphin-labs-hq` pool registers disposable Linux x64 runners in one organization
+runner group, `dolphin-linux`. Repositories in the group can draw on the same Spot capacity. Each VM
+still takes one job and terminates; there is no idle fleet. The Mac runner group and the Linux runners
+belonging to other GitHub owners continue on their existing paths.
+
+**Sizing.** Across 4,032 matched five-minute CloudWatch samples from November 2 to November 16, 2026,
+the existing Dolphin Linux runners used at most **18 hosts and 608 vCPUs**; p95 was **5 hosts and 168
+vCPUs**, and 66% of samples had no hosts. These are live host counts in `GitHubAppRunner`, including
+booting hosts and excluding jobs still queued or using GitHub-hosted runners. Start with a shared
+burst ceiling of **24 hosts and 768 vCPUs** and keep the existing Dolphin budget and throttling.
+Compare queue age and cap refusals with actual concurrency after migration before resizing. GitHub
+can refuse even self-hosted jobs when its organization billing limit trips, as it did in
+[the November outage](https://github.com/dolphin-labs-hq/dolphin-labs/issues/1511); the pool does not
+change that billing control.
+
+**Images.** Keep the labs, films, and maps AMIs as optional setup accelerators. They contain public
+toolchains, browsers, and system packages; they contain no repository checkout, repository credentials
+or private build artifacts. GitHub can give the next matching job to any pooled VM, including one
+that booted a different repository's AMI. A workflow must install or select its declared tool
+versions when they are absent or different. Check Rust and `wasm-bindgen` versions and Playwright
+browser revisions before reusing them. Exercise the workflow once on the stock Ubuntu image before
+switching any job that might rely on a prebuilt tool.
+
+**Rollout.**
+
+1. Terraform creates `dolphin-linux` for selected private repositories, with public repositories
+   disabled. Start with labs, films and maps. Keep the launch gate off until the exact organization,
+   group and permitted membership are verified and the owner approves organization
+   [**Self-hosted runners: write**](https://docs.github.com/en/rest/actions/self-hosted-runners#create-configuration-for-a-just-in-time-runner-for-an-organization)
+   on the dedicated runtime GitHub App (`dolphin-labs-runners`). That permission
+   issues credentials for the selected group and lets the controller reconcile its registrations.
+   Keep repository Actions reads on repository-scoped tokens, and keep reusable App credentials in
+   the controller. A job VM receives only its one-job JIT configuration. Set
+   `enable_dolphin_runner_pool` in a separate reviewed change after verifying the grant.
+2. Existing `runs-on: [self-hosted, dolphin, s]` selectors (also `l` and `xl`) remain compatible.
+   A canary can explicitly select the `dolphin-linux` group with the same labels. Run smoke jobs
+   concurrently from two of the selected repositories at a supported size. Check that
+   both use ephemeral runners from the group, that the jobs tolerate any eligible VM, that a
+   repository outside the group cannot claim one, and that the runners disappear when the
+   queue empties. Only after those checks, add business and cloud as expansion canaries once
+   the runtime App can read their Actions jobs. The separate
+   `enable_dolphin_runner_pool_expansion` gate adds both webhooks and group memberships.
+   Include a job without a repository AMI in that expansion smoke.
+3. To roll back, remove explicit group selectors from canary workflows. At a quiet point verify
+   that no pooled hosts are pending or running before disabling the pool (or removing an expansion
+   repository). Keep the GitHub group and legacy credentials in place while verifying repository
+   jobs resume. If the launch gate must be shut during a job, the legacy reaper leaves pooled hosts
+   alone so active jobs can finish; check and remove any abandoned group registrations or instances
+   after verifying they are idle.
 
 ### `ejc3/imagine`
 

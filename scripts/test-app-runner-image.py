@@ -186,7 +186,8 @@ class BuildTests(unittest.TestCase):
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
         for key, value in VERSIONS.items():
             self.assertIn(f"export {key}='{value}'\n", script)
-        self.assertNotIn("@@", script.replace("'@@REPO@@'", ""), "every placeholder is filled")
+        self.assertNotIn("@@", script.replace("'@@REPO@@'", "").replace("'@@REGISTRATION@@'", ""),
+                         "the prepare-only bootstrap does not need a registration mode")
         bootstrap = (ROOT / "runner-app" / "bootstrap.sh").read_text()
         self.assertIn(bootstrap.replace("@@REPO@@", "ejc3/imagine").replace("@@LABELS@@", "").rstrip("\n"), script,
                       "the image installs exactly what a job host's bootstrap installs, the runner pin included")
