@@ -706,26 +706,26 @@ class Publisher:
     # Release gate drill, approved by the owner on 2026-11-15. One host image built by hand from
     # the ejc3/fcvm branch drill/unframed-renderer: generation sixteen's source (de4bf769) and a
     # renderer that sends every frame without its FCVF magic, so the staging viewer smoke reports
-    # each fcvm wall tile as an image failure on its host. Published once over the gate-verified
-    # generation sixteen, as a normal release; the release gate is expected to roll it back. The
-    # action and these constants are removed once the drill is done.
+    # each fcvm wall tile as an image failure on its host. Published once over the live factory
+    # release once the gate has verified it, as a normal release; the release gate is expected to
+    # roll it back to that release. The action and these constants are removed once the drill is done.
     DRILL_SOURCE = "d23f79dfca61f256f78b6d8ac17994338afdc5d5"
     DRILL_IMAGE = "ami-0909b5ab23ba60377"
     DRILL_NAME = "fcvm-fleet-host-x86_64-d23f79df-202611160518"
     DRILL_BRANCH = "drill/unframed-renderer"
-    DRILL_PREDECESSOR = {"generation": 16, "source_sha": "de4bf769155e5b1717d245219952229098b28f56",
-                         "build_id": "fcvm-fleet-image-factory:48515f0e-16cc-490c-b0d4-9c813e92aa54"}
 
     def drill_receipt_name(self):
         # Under /publications/, a path the publisher role may already write (fcvm-fleet-ami-pipeline.tf).
         return self.env["STATE_PREFIX"] + "/publications/drill-" + self.DRILL_IMAGE
 
     def reviewed_release_gate_drill(self):
-        """The drill's transition: the live receipt, which must be generation sixteen as the
-        factory published it and as the release gate verified it, to the drill host."""
+        """The drill's transition: the live receipt, which must be a release the factory published
+        and the release gate verified, to the drill host. The live release is not pinned to one
+        generation, because the factory publishes from main while the drill waits to run; whatever
+        it replaces is what the gate rolls back to."""
         active = self.load(self.env["RELEASE_PARAMETER"], True)
-        need({key: active.get(key) for key in self.DRILL_PREDECESSOR} == self.DRILL_PREDECESSOR,
-             "the drill replaces only generation sixteen")
+        need(re.fullmatch(re.escape(self.env["PROJECT_NAME"]) + r":[0-9a-f-]{36}", str(active.get("build_id", ""))),
+             "the drill replaces only a factory release")
         need(self.gate_receipt(active) == self.gate_record(),
              "the drill replaces only a release the gate verified")
         tile = active["tile_amis"][self.env["COMPUTE_REGION"]]["x86_64"]
@@ -755,7 +755,8 @@ class Publisher:
         if result.get("status") == "promoted":
             self.save(self.drill_receipt_name(), {
                 "image": self.DRILL_IMAGE, "branch": self.DRILL_BRANCH, "source_sha": self.DRILL_SOURCE,
-                "generation": result["generation"], "approved": "owner, 2026-11-15"})
+                "generation": result["generation"], "replaced": result["generation"] - 1,
+                "approved": "owner, 2026-11-15"})
         return result
 
     def run_ena_host_release(self, event):

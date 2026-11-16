@@ -1820,8 +1820,7 @@ class PublisherTests(unittest.TestCase):
         self.assertIsNone(self.ddb.item)
 
     def drill_fixture(self, *, tags=None):
-        """A factory release live and verified by the gate (the drill's predecessor, generation
-        sixteen in production), and the drill host built by hand in us-west-2 from a drill branch,
+        """A factory release live and verified by the gate (the drill's predecessor), and the drill host built by hand in us-west-2 from a drill branch,
         tagged as a drill and validated."""
         _, active = self.gate_factory_live()
         self.publisher().gate(self.gate_event("verify"))
@@ -1837,10 +1836,6 @@ class PublisherTests(unittest.TestCase):
         image["Tags"] = [t for t in image.get("Tags", []) if not t["Key"].startswith("fcvm-fleet-drill")] + [
             {"Key": key, "Value": value} for key, value in drill_tags.items() if value is not None]
         self.west.images[MODULE.Publisher.DRILL_IMAGE] = image
-        predecessor = {key: active[key] for key in ("generation", "source_sha", "build_id")}
-        patch = mock.patch.object(MODULE.Publisher, "DRILL_PREDECESSOR", predecessor)
-        patch.start()
-        self.addCleanup(patch.stop)
         self.ec2.created.clear()
         self.ec2.selected.clear()
         return {"action": "activate-release-gate-drill"}, active
@@ -1858,7 +1853,8 @@ class PublisherTests(unittest.TestCase):
         receipt = self.main_ssm.values["/factory/publications/drill-" + MODULE.Publisher.DRILL_IMAGE]
         self.assertEqual(receipt, {"image": MODULE.Publisher.DRILL_IMAGE, "branch": "drill/unframed-renderer",
                                    "source_sha": MODULE.Publisher.DRILL_SOURCE,
-                                   "generation": active["generation"] + 1, "approved": "owner, 2026-11-15"})
+                                   "generation": active["generation"] + 1, "replaced": active["generation"],
+                                   "approved": "owner, 2026-11-15"})
         # Single use: a second invocation is refused, and the release is unchanged.
         with self.assertRaisesRegex(MODULE.Refused, "the drill has run"):
             self.windows_publisher(active).run(event)
@@ -1891,7 +1887,7 @@ class PublisherTests(unittest.TestCase):
                 self.assertEqual(self.fleet_ssm.values, before)
                 self.assertEqual(self.ec2.copies, copies)
 
-    def test_the_drill_replaces_only_the_pinned_release_the_gate_verified(self):
+    def test_the_drill_replaces_only_a_factory_release_the_gate_verified(self):
         event, active = self.drill_fixture()
         copies = list(self.ec2.copies)
         # The gate has not verified the live release.
@@ -1899,10 +1895,15 @@ class PublisherTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.Refused, "only a release the gate verified"):
             self.windows_publisher(active).run(event)
         self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(active)
-        # A different live release than the pinned one.
-        with mock.patch.object(MODULE.Publisher, "DRILL_PREDECESSOR", dict(MODULE.Publisher.DRILL_PREDECESSOR, generation=99)):
-            with self.assertRaisesRegex(MODULE.Refused, "replaces only generation sixteen"):
-                self.windows_publisher(active).run(event)
+        # A live release a reviewed action published, not the factory: the gate's receipt matches
+        # it, and the drill still refuses.
+        reviewed = dict(active, build_id="reviewed-ena-host-release:example")
+        self.fleet_ssm.values["/release"] = reviewed
+        self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(reviewed)
+        with self.assertRaisesRegex(MODULE.Refused, "replaces only a factory release"):
+            self.windows_publisher(reviewed).run(event)
+        self.fleet_ssm.values["/release"] = active
+        self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(active)
         # Any other fleet region than the staging fleet's. (A publisher configured for another region
         # also refuses earlier, at its template scope; the action checks for itself.)
         publisher = self.windows_publisher(active)
@@ -1918,7 +1919,7 @@ class PublisherTests(unittest.TestCase):
 
     def test_the_publisher_role_may_write_the_drill_receipt(self):
         # The receipt is written after promotion: a write the role is denied would leave the
-        # drill image live with no receipt, and the predecessor pin refuses a retry.
+        # drill image live with no receipt to mark the drill as run.
         import fnmatch
         pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         policy = re.search(r'resource "aws_iam_role_policy" "fcvm_ami_publish" \{(.*?)\n\}', pipeline, re.S)
