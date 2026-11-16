@@ -10,6 +10,9 @@
 #
 # A lease ends when released, at its expiry (default ttl 600 s), or when the process that took it with
 # `run` exits. `take` fails with 75 while another live lease exists, unless --wait gives it time.
+# Waiters are served first come, first served: one that has to wait leaves a numbered ticket in the
+# queue directory, and a free lease goes only to the oldest ticket whose waiting process still lives.
+# A `take` that does not wait gets a free lease only while nobody is queued. The holder renews at any time.
 # Installed by ejc3/aws scripts/mac-setup.sh; state in ~/.local/state/mac-lease (MAC_STATE_DIR overrides).
 use strict;
 use warnings;
@@ -20,6 +23,8 @@ use POSIX qw(strftime);
 my $dir = ($ENV{MAC_STATE_DIR} // "$ENV{HOME}/.local/state") . "/mac-lease";
 make_path($dir, { mode => 0700 });
 my $file = "$dir/lease";
+my $queue = "$dir/queue";
+make_path($queue, { mode => 0700 });
 
 sub usage { print STDERR "usage: mac-lease take|release|run|check|status ... (see the top of $0)\n"; exit 2 }
 
@@ -75,26 +80,70 @@ sub options {
     return \%o;
 }
 
+# The live tickets, oldest first: [path, name]. A ticket whose waiting process is gone is removed.
+# Called under the lock.
+sub tickets {
+    opendir(my $dh, $queue) or return ();
+    my @t;
+    for my $f (sort grep { /^\d{12}-\d+-/ } readdir $dh) {
+        my ($pid, $name) = $f =~ /^\d{12}-(\d+)-(.+)$/ or next;
+        if (!kill(0, $pid)) { unlink "$queue/$f"; next; }
+        push @t, ["$queue/$f", $name];
+    }
+    closedir $dh;
+    return @t;
+}
+
+# A new ticket for this process, numbered after every earlier one. Called under the lock.
+sub enqueue {
+    my ($name) = @_;
+    my $n = 0;
+    if (open(my $fh, '<', "$dir/seq")) { my $v = <$fh>; close $fh; $n = $1 if defined $v && $v =~ /^(\d+)/; }
+    $n++;
+    open(my $out, '>', "$dir/seq.$$") or die "mac-lease: $dir/seq.$$: $!\n";
+    print $out "$n\n";
+    close $out or die "mac-lease: $dir/seq: $!\n";
+    rename "$dir/seq.$$", "$dir/seq" or die "mac-lease: $dir/seq: $!\n";
+    my $path = sprintf("%s/%012d-%d-%s", $queue, $n, $$, $name);
+    open(my $t, '>', $path) or die "mac-lease: $path: $!\n";
+    close $t;
+    return $path;
+}
+
 sub take {
     my ($name, $o, $pid) = @_;
     my $deadline = time + $o->{wait};
-    my $said;
+    my ($said, $ticket);
+    my $leave = sub { locked { unlink $ticket if $ticket } };
     while (1) {
-        my $holder = locked {
+        my ($holder, $ahead) = locked {
             my $l = read_lease();
-            if (!$l || $l->{name} eq $name) {
-                write_lease($name, $o->{ttl}, $pid, $l ? $l->{since} : time);
-                return undef;
+            if ($l && $l->{name} eq $name) {                      # the holder renews
+                write_lease($name, $o->{ttl}, $pid, $l->{since});
+                unlink $ticket if $ticket;
+                return (undef, 0);
             }
-            return $l;
+            my @q = tickets();
+            if (!$l && (!@q || ($ticket && $q[0][0] eq $ticket))) {   # free, and nobody queued before this one
+                write_lease($name, $o->{ttl}, $pid, time);
+                unlink $ticket if $ticket;
+                return (undef, 0);
+            }
+            $ticket = enqueue($name) if !$ticket && $o->{wait} > 0 && time < $deadline;
+            my $before = grep { !$ticket || $_->[0] lt $ticket } @q;
+            return ($l // { name => $q[0][1], queued => 1 }, $before);
         };
         return 0 unless $holder;
         if (time >= $deadline) {
-            print STDERR "mac-lease: the desktop is held by ", describe($holder), "\n";
+            $leave->();
+            print STDERR $holder->{queued}
+                ? "mac-lease: free, but $ahead queued before you (first: $holder->{name})\n"
+                : "mac-lease: the desktop is held by " . describe($holder) . ($ahead ? ", $ahead queued before you" : "") . "\n";
             return 75;
         }
-        print STDERR "mac-lease: waiting for ", describe($holder), "\n" unless $said++;
-        sleep 2;
+        print STDERR "mac-lease: waiting for ", ($holder->{queued} ? "$holder->{name} (queued first)" : describe($holder)),
+            ($ahead ? ", $ahead queued before you" : ""), "\n" unless $said++;
+        sleep 1;
     }
 }
 

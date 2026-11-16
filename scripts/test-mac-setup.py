@@ -161,6 +161,55 @@ class Lease(Base):
     def test_names_are_checked(self):
         self.assertEqual(self.lease("take", "bad name").returncode, 2)
 
+    def waiter(self, name, wait="30"):
+        return subprocess.Popen([str(BIN / "mac-lease"), "take", name, "--wait", wait, "--ttl", "60"], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_waiters_are_served_first_come_first_served(self):
+        # Polling, whichever waiter looked first after a release won: one that had waited an hour lost to one
+        # that came a second ago. Now the oldest live ticket gets a free lease.
+        for _ in range(3):
+            self.lease("take", "holder")
+            early = self.waiter("early")
+            time.sleep(0.6)
+            late = self.waiter("late")
+            time.sleep(0.6)
+            self.assertEqual(self.lease("release", "holder").returncode, 0)
+            self.assertEqual(early.wait(timeout=10), 0)
+            self.assertIn("early", self.lease("status").stdout)
+            self.assertIsNone(late.poll(), "the later waiter still waits")
+            self.lease("release", "early")
+            self.assertEqual(late.wait(timeout=10), 0)
+            self.lease("release", "late")
+
+    def test_a_take_that_does_not_wait_gets_no_lease_while_others_are_queued(self):
+        self.lease("take", "holder")
+        queued = self.waiter("queued")
+        time.sleep(0.6)
+        r = self.lease("take", "jumper")
+        self.assertEqual(r.returncode, 75)
+        self.assertIn("1 queued before you", r.stderr)
+        self.lease("release", "holder")
+        self.assertEqual(queued.wait(timeout=10), 0)
+        self.lease("release", "queued")
+        self.assertEqual(self.lease("take", "jumper").returncode, 0, "free and nobody queued")
+
+    def test_a_dead_waiters_ticket_does_not_hold_the_queue(self):
+        self.lease("take", "holder")
+        gone = self.waiter("gone")
+        time.sleep(0.6)
+        gone.kill(); gone.wait()
+        self.lease("release", "holder")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+
+    def test_a_waiter_that_gives_up_leaves_the_queue(self):
+        self.lease("take", "holder", "--ttl", "60")
+        r = self.lease("take", "brief", "--wait", "1")
+        self.assertEqual(r.returncode, 75)
+        self.lease("release", "holder")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+        self.assertEqual(os.listdir(self.state / "mac-lease" / "queue"), [])
+
 
 class Peekaboo(Base):
     def setUp(self):
