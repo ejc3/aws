@@ -16,10 +16,13 @@ variable "fcvm_ami_pipeline_enabled" {
 # kernel (ejc3/fcvm#1874) and the launch-path proof in the validator (ejc3/fcvm#1876, #1878),
 # and its request workflow refuses a source without them (ejc3/fcvm#1873). The one request
 # queued from before the fix is retired by the dispatcher (#852).
+# Paused for the release gate drills (publish.py DRILLS, owner-approved 2026-11-15): each drill commit
+# must descend from the live release's source, so the factory must not publish under them. Set back to
+# false by the drill cleanup, which removes the drill actions.
 variable "fcvm_ami_factory_paused" {
   description = "Start no factory build; requests stay queued or are answered disabled"
   type        = bool
-  default     = false
+  default     = true
 }
 
 locals {

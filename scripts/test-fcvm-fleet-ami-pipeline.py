@@ -1757,10 +1757,12 @@ class FactoryTests(unittest.TestCase):
     def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
         # The pause reaches the dispatcher as ENABLED=false, which starts nothing, while the launch
         # templates still follow the release pointer. It was on from generation twelve (#823) until
-        # ejc3/fcvm had the boot fix and the launch-path gate; it is off again.
+        # ejc3/fcvm had the boot fix and the launch-path gate, and is on again for the release gate
+        # drills, which need the live release's source to stay put until their cleanup.
         source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
-        self.assertRegex(variable, r"default\s*=\s*false")
+        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertIn("DRILLS", (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline" / "publish.py").read_text())
         self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
         self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
         # what ENABLED=false does with a queued normal request whose window has opened

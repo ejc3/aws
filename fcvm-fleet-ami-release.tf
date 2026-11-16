@@ -135,10 +135,13 @@ locals {
     "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
     "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
     "host/x86_64/c12ad070" = { image = "ami-0c2656522631215d1", kind = "host", name = "fcvm-fleet-host-x86_64-c12ad070-202611141114" }
-    # RELEASE GATE DRILL (owner-approved 2026-11-15; publish.py run_release_gate_drill): generation sixteen's host
-    # (ejc3/fcvm de4bf769) revised to the drill branch drill/unframed-renderer at d23f79df, whose renderer sends frames
-    # without their FCVF magic. Published once over the live, gate-verified factory release; removed after the drill.
-    "host/x86_64/d23f79df" = { image = "ami-0909b5ab23ba60377", kind = "host", name = "fcvm-fleet-host-x86_64-d23f79df-202611160518" }
+    # RELEASE GATE DRILLS (owner-approved 2026-11-15; publish.py DRILLS): two hosts built from ejc3/fcvm drill/ branches,
+    # each generation seventeen's source (3cace583) merged with one change that fails the gate. 7457a0ff
+    # (drill/unframed-renderer): the renderer sends frames without their FCVF magic. c3831f6c
+    # (drill/agent-never-registers): the fleet agent never dials the coordinator. Each is published once over the live,
+    # gate-verified release; both are removed after the drills.
+    "host/x86_64/7457a0ff" = { image = "ami-0c19d1cb5f3ec0332", kind = "host", name = "fcvm-fleet-host-x86_64-7457a0ff-202611161233" }
+    "host/x86_64/c3831f6c" = { image = "ami-03dad8b8bdb96efe4", kind = "host", name = "fcvm-fleet-host-x86_64-c3831f6c-202611161233" }
   }
 }
 

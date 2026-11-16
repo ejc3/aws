@@ -1819,88 +1819,106 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.publisher().run(event), {"status": "promoted", "generation": 14})
         self.assertIsNone(self.ddb.item)
 
-    def drill_fixture(self, *, tags=None):
-        """A factory release live and verified by the gate (the drill's predecessor), and the drill host built by hand in us-west-2 from a drill branch,
-        tagged as a drill and validated."""
-        _, active = self.gate_factory_live()
-        self.publisher().gate(self.gate_event("verify"))
-        # Built by hand in us-west-2, like every reviewed build-region host.
+    RENDERER_DRILL, NO_AGENT_DRILL = "activate-release-gate-drill", "activate-no-agent-drill"
+
+    def drill_image(self, action, *, tags=None):
+        """The drill host for one action, built by hand in us-west-2 from its drill branch, tagged as
+        a drill and validated."""
+        drill = MODULE.Publisher.DRILLS[action]
         self.env["BUILD_REGION"] = "us-west-2"
         image = copy.deepcopy(self.west.images[self.IPV4_IMAGE])
-        name = MODULE.Publisher.DRILL_NAME
-        image.update(ImageId=MODULE.Publisher.DRILL_IMAGE, Name=name, State="available",
-                     Description="fcvm fleet: " + name, SourceImageId=self.IPV4_IMAGE, SourceImageRegion="us-west-2")
-        drill_tags = {"fcvm-fleet-drill": "release-gate-drill", "fcvm-fleet-drill-branch": "drill/unframed-renderer",
-                      "fcvm-fleet-drill-commit": MODULE.Publisher.DRILL_SOURCE}
+        image.update(ImageId=drill["image"], Name=drill["name"], State="available",
+                     Description="fcvm fleet: " + drill["name"], SourceImageId=self.IPV4_IMAGE, SourceImageRegion="us-west-2")
+        drill_tags = {"fcvm-fleet-drill": "release-gate-drill", "fcvm-fleet-drill-branch": drill["branch"],
+                      "fcvm-fleet-drill-commit": drill["source"]}
         drill_tags.update(tags or {})
         image["Tags"] = [t for t in image.get("Tags", []) if not t["Key"].startswith("fcvm-fleet-drill")] + [
             {"Key": key, "Value": value} for key, value in drill_tags.items() if value is not None]
-        self.west.images[MODULE.Publisher.DRILL_IMAGE] = image
+        self.west.images[drill["image"]] = image
         self.ec2.created.clear()
         self.ec2.selected.clear()
-        return {"action": "activate-release-gate-drill"}, active
+        return {"action": action}
 
-    def test_the_drill_publishes_once_over_the_verified_release_and_the_gate_rolls_it_back(self):
-        event, active = self.drill_fixture()
-        publisher, copied, _ = self.release_through_second_apply(self.windows_publisher, event, active,
-                                                                 MODULE.Publisher.DRILL_SOURCE)
+    def drill_fixture(self, action=RENDERER_DRILL, *, tags=None):
+        """A factory release live and verified by the gate (the first drill's predecessor), and the
+        drill host."""
+        _, active = self.gate_factory_live()
+        self.publisher().gate(self.gate_event("verify"))
+        return self.drill_image(action, tags=tags), active
+
+    def run_drill_and_roll_back(self, event, active, number):
+        """Publish one drill over the verified live release, check its receipt, then let the gate
+        roll it back on an attributed failed probe of its host. Returns the drill and rollback
+        receipts."""
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, copied, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
         self.assertEqual(publisher.run(event), {"status": "promoted", "generation": active["generation"] + 1})
-        drill = self.fleet_ssm.values["/release"]
-        self.assertEqual(drill["host_amis"], {"us-east-1": {"x86_64": copied}})
-        self.assertEqual(drill["tile_amis"], active["tile_amis"])
-        self.assertEqual(drill["source_sha"], MODULE.Publisher.DRILL_SOURCE)
-        self.assertTrue(drill["build_id"].startswith("reviewed-release-gate-drill:"))
-        receipt = self.main_ssm.values["/factory/publications/drill-" + MODULE.Publisher.DRILL_IMAGE]
-        self.assertEqual(receipt, {"image": MODULE.Publisher.DRILL_IMAGE, "branch": "drill/unframed-renderer",
-                                   "source_sha": MODULE.Publisher.DRILL_SOURCE,
-                                   "generation": active["generation"] + 1, "replaced": active["generation"],
-                                   "approved": "owner, 2026-11-15"})
+        promoted = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(promoted["host_amis"], {"us-east-1": {"x86_64": copied}})
+        self.assertEqual(promoted["tile_amis"], active["tile_amis"])
+        self.assertEqual(promoted["source_sha"], drill["source"])
+        self.assertTrue(promoted["build_id"].startswith(drill["identity"] + ":"))
+        self.assertEqual(self.main_ssm.values["/factory/publications/drill-" + drill["image"]],
+                         {"image": drill["image"], "branch": drill["branch"], "source_sha": drill["source"],
+                          "generation": active["generation"] + 1, "replaced": active["generation"],
+                          "approved": "owner, 2026-11-15"})
         # Single use: a second invocation is refused, and the release is unchanged.
         with self.assertRaisesRegex(MODULE.Refused, "the drill has run"):
             self.windows_publisher(active).run(event)
-        self.assertEqual(self.fleet_ssm.values["/release"], drill)
+        self.assertEqual(self.fleet_ssm.values["/release"], promoted)
         # The gate treats it as any release: unverified, and an attributed failed probe on its host
         # rolls it back to the verified predecessor's images.
         for name in list(self.ec2.instances):
             self.ec2.instances[name]["State"]["Name"] = "terminated"
-        self.gate_instance(drill, number=950)
+        self.gate_instance(promoted, number=number)
         status = self.publisher().gate({"action": "status"})
         self.assertEqual((status["generation"], status["verified"], status["rollback"]),
                          (active["generation"] + 1, False, False))
         self.assertIn("host", status["placement"]["changed_kinds"])
-        answer = self.publisher().gate(self.gate_event("rollback", status=status))
-        self.assertEqual(answer["status"], "rolled_back")
-        after = self.fleet_ssm.values["/release"]
+        self.assertEqual(self.publisher().gate(self.gate_event("rollback", status=status))["status"], "rolled_back")
+        after = copy.deepcopy(self.fleet_ssm.values["/release"])
         self.assertEqual((after["host_amis"], after["tile_amis"]), (active["host_amis"], active["tile_amis"]))
         with self.assertRaisesRegex(MODULE.Refused, "the drill has run"):
             self.windows_publisher(after).run(event)
+        return promoted, after
 
-    def test_the_drill_refuses_an_image_not_tagged_as_built_from_a_drill_branch(self):
-        for tags in ({"fcvm-fleet-drill": None}, {"fcvm-fleet-drill-branch": "main"},
-                     {"fcvm-fleet-drill-branch": "drill/other"}, {"fcvm-fleet-drill-commit": "0" * 40}):
-            with self.subTest(tags=tags):
-                self.setUp()
-                event, active = self.drill_fixture(tags=tags)
-                before, copies = copy.deepcopy(self.fleet_ssm.values), list(self.ec2.copies)
-                with self.assertRaisesRegex(MODULE.Refused, "not tagged as built from the drill branch"):
-                    self.windows_publisher(active).run(event)
-                self.assertEqual(self.fleet_ssm.values, before)
-                self.assertEqual(self.ec2.copies, copies)
+    def test_both_drills_publish_once_and_the_gate_rolls_each_back(self):
+        event, active = self.drill_fixture()
+        _, rolled = self.run_drill_and_roll_back(event, active, 950)
+        self.assertTrue(rolled["build_id"].startswith(MODULE.Publisher.ROLLBACK_PREFIX))
+        # The gate records its rollback as verified, so the second drill runs over it, and the
+        # gate rolls the second drill back to that rollback's images.
+        self.assertEqual(self.main_ssm.values["/factory/gate"], self.publisher().gate_receipt(rolled))
+        second = self.drill_image(self.NO_AGENT_DRILL)
+        self.run_drill_and_roll_back(second, rolled, 970)
 
-    def test_the_drill_replaces_only_a_factory_release_the_gate_verified(self):
+    def test_a_drill_refuses_an_image_not_tagged_as_built_from_its_drill_branch(self):
+        for action in MODULE.Publisher.DRILLS:
+            other = next(d for a, d in MODULE.Publisher.DRILLS.items() if a != action)
+            for tags in ({"fcvm-fleet-drill": None}, {"fcvm-fleet-drill-branch": "main"},
+                         {"fcvm-fleet-drill-branch": other["branch"]}, {"fcvm-fleet-drill-commit": other["source"]}):
+                with self.subTest(action=action, tags=tags):
+                    self.setUp()
+                    event, active = self.drill_fixture(action, tags=tags)
+                    before, copies = copy.deepcopy(self.fleet_ssm.values), list(self.ec2.copies)
+                    with self.assertRaisesRegex(MODULE.Refused, "not tagged as built from the drill branch"):
+                        self.windows_publisher(active).run(event)
+                    self.assertEqual(self.fleet_ssm.values, before)
+                    self.assertEqual(self.ec2.copies, copies)
+
+    def test_a_drill_replaces_only_a_verified_factory_release_or_rollback(self):
         event, active = self.drill_fixture()
         copies = list(self.ec2.copies)
         # The gate has not verified the live release.
         self.main_ssm.values["/factory/gate"] = {"generation": 1, "build_id": "other"}
         with self.assertRaisesRegex(MODULE.Refused, "only a release the gate verified"):
             self.windows_publisher(active).run(event)
-        self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(active)
-        # A live release a reviewed action published, not the factory: the gate's receipt matches
-        # it, and the drill still refuses.
+        # A live release a reviewed action published: the gate's receipt matches it, and the drill
+        # still refuses.
         reviewed = dict(active, build_id="reviewed-ena-host-release:example")
         self.fleet_ssm.values["/release"] = reviewed
         self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(reviewed)
-        with self.assertRaisesRegex(MODULE.Refused, "replaces only a factory release"):
+        with self.assertRaisesRegex(MODULE.Refused, "only a factory release or the gate's rollback"):
             self.windows_publisher(reviewed).run(event)
         self.fleet_ssm.values["/release"] = active
         self.main_ssm.values["/factory/gate"] = self.publisher().gate_receipt(active)
@@ -1909,17 +1927,36 @@ class PublisherTests(unittest.TestCase):
         publisher = self.windows_publisher(active)
         publisher.env = dict(publisher.env, COMPUTE_REGION="us-west-2")
         with self.assertRaisesRegex(MODULE.Refused, "only the staging fleet"):
-            publisher.run_release_gate_drill(event)
+            publisher.run_drill(event)
         self.assertEqual(self.ec2.copies, copies)
 
-    def test_the_drill_takes_no_caller_configuration(self):
+    def test_a_drill_source_must_descend_from_the_live_release_source(self):
+        # The source fence binds drills like any reviewed host: a drill commit that does not contain
+        # the live release's source (generation seventeen published while the first drill images,
+        # built on generation sixteen, waited) is refused and the release is unchanged.
         event, active = self.drill_fixture()
-        with self.assertRaisesRegex(MODULE.Refused, "no caller configuration"):
-            self.windows_publisher(active).run(dict(event, image="ami-0123456789abcdef0"))
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        publisher.compare_sources = mock.Mock(return_value={
+            "status": "diverged", "behind_by": 3, "base_commit": {"sha": active["source_sha"]},
+            "merge_base_commit": {"sha": "0" * 40}})
+        before = copy.deepcopy(self.fleet_ssm.values)
+        with self.assertRaisesRegex(MODULE.Refused, "precedes the reviewed or active release"):
+            publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertNotIn("/factory/publications/drill-" + drill["image"], self.main_ssm.values)
 
-    def test_the_publisher_role_may_write_the_drill_receipt(self):
-        # The receipt is written after promotion: a write the role is denied would leave the
-        # drill image live with no receipt to mark the drill as run.
+    def test_a_drill_takes_no_caller_configuration(self):
+        for action in MODULE.Publisher.DRILLS:
+            with self.subTest(action=action):
+                self.setUp()
+                event, active = self.drill_fixture(action)
+                with self.assertRaisesRegex(MODULE.Refused, "no caller configuration"):
+                    self.windows_publisher(active).run(dict(event, image="ami-0123456789abcdef0"))
+
+    def test_the_publisher_role_may_write_the_drill_receipts(self):
+        # A receipt is written after promotion: a write the role is denied would leave the drill
+        # image live with no receipt to mark the drill as run.
         import fnmatch
         pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         policy = re.search(r'resource "aws_iam_role_policy" "fcvm_ami_publish" \{(.*?)\n\}', pipeline, re.S)
@@ -1930,8 +1967,9 @@ class PublisherTests(unittest.TestCase):
         self.assertTrue(granted)
         publisher = MODULE.Publisher.__new__(MODULE.Publisher)
         publisher.env = {"STATE_PREFIX": ""}
-        name = publisher.drill_receipt_name()
-        self.assertTrue(any(fnmatch.fnmatchcase(name, pattern) for pattern in granted), (name, granted))
+        for drill in MODULE.Publisher.DRILLS.values():
+            name = publisher.drill_receipt_name(drill)
+            self.assertTrue(any(fnmatch.fnmatchcase(name, pattern) for pattern in granted), (name, granted))
 
     def test_reviewed_ena_host_refuses_a_live_receipt_other_than_the_rollback(self):
         # The live receipt is still the factory's generation twelve: the rollback has not run.
