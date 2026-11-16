@@ -710,6 +710,13 @@ class Publisher:
 
     ROLLBACK_PREFIX = "rollback-to-previous:"
     GATE_HOST_SETTLE_SECONDS = 300
+    # A healthy host's agent registers within about two minutes of launch (staging, 2026-11-15:
+    # launch to agent start 90 s). A no-agent rollback needs every release host up this long.
+    GATE_NO_AGENT_SECONDS = 900
+    # How old the staging workflow's reading of the coordinator's agents may be, and how far
+    # ahead of this clock.
+    GATE_NO_AGENT_FRESH_SECONDS = 300
+    GATE_CLOCK_SKEW_SECONDS = 60
 
     @staticmethod
     def gate_receipt(release):
@@ -743,6 +750,9 @@ class Publisher:
         instances = {}
         current, settled = True, True
         matches = {"host": [], "tile": []}
+        # The release hosts' launch times, for a no-agent claim. Not part of the placement the
+        # status reports: the workflow prints that in public.
+        boots = self.gate_host_boots = {}
         host_count = 0
         now = self.clock()
         # Query by AWS's immutable template tag. A missing or changed mutable Purpose tag
@@ -778,6 +788,8 @@ class Publisher:
                         settled = settled and now - boot >= self.GATE_HOST_SETTLE_SECONDS
                     if image == want[kind] and state == "running":
                         matches[kind].append(instance)
+                        if kind == "host":
+                            boots[instance] = boot
             if not page.get("NextToken"):
                 placement = {"current": current, "settled": settled, "release_hosts": sorted(matches["host"]),
                              "release_tiles": sorted(matches["tile"]), "changed_kinds": self.gate_changed_kinds(release),
@@ -789,6 +801,19 @@ class Publisher:
     @staticmethod
     def gate_evidence(event):
         evidence = event.get("evidence")
+        if isinstance(evidence, dict) and evidence.get("kind") == "no_agent":
+            # The staging workflow read the coordinator's record of every host whose agent
+            # registered since `coordinator_since`, its start or resume (ejc3/fcvm
+            # stage-smoke.py --agents, /live fleet.agents), and found none of these hosts in it.
+            hosts = evidence.get("hosts")
+            need(set(evidence) == {"kind", "hosts", "observed_at", "coordinator_since"}
+                 and isinstance(hosts, list) and 0 < len(hosts) <= 64
+                 and all(isinstance(value, str) and DIGEST.fullmatch(value) for value in hosts)
+                 and len(set(hosts)) == len(hosts)
+                 and type(evidence["observed_at"]) is int and type(evidence["coordinator_since"]) is int
+                 and 0 < evidence["coordinator_since"] <= evidence["observed_at"],
+                 "a no-agent rollback names its hosts by digest, when the agents were read and since when")
+            return evidence
         need(isinstance(evidence, dict) and set(evidence) == {"kind", "family", "hosts", "instances"}
              and evidence["kind"] == "image_failure" and evidence["family"] in ("v4", "v6"),
              "rollback requires an image-attributed failed viewer probe")
@@ -806,6 +831,18 @@ class Publisher:
         need(placement["current"] and placement["settled"] and placement["release_hosts"]
              and placement["digest"] == expected_digest,
              "the release placement has changed or is not observable, current and settled")
+        if evidence is not None and evidence["kind"] == "no_agent":
+            need("host" in placement["changed_kinds"], "the release's host image did not change")
+            known = {digest("fcvm-release-gate\0" + instance): instance for instance in placement["release_hosts"]}
+            need(set(evidence["hosts"]) == set(known), "a no-agent claim must name exactly the release's hosts")
+            observed, since = evidence["observed_at"] / 1000, evidence["coordinator_since"] / 1000
+            boots = [self.gate_host_boots[instance] for instance in known.values()]
+            # The record began before each host launched, so it covers each host's whole life.
+            need(all(since <= boot for boot in boots),
+                 "the coordinator's registration record began after a release host launched")
+            need(all(observed - boot >= self.GATE_NO_AGENT_SECONDS for boot in boots),
+                 "a release host was not up long enough for its agent to register")
+            return
         if evidence is not None:
             kind, report = ("host", "hosts") if evidence["hosts"] else ("tile", "instances")
             need(kind in placement["changed_kinds"], "the failed probe's image did not change in this release")
@@ -903,6 +940,12 @@ class Publisher:
             need(not rolled_back, "the live release is a rollback; it is not rolled back again")
             verified = self.gate_record()
             need(verified != live_receipt, "the gate verified this release; it is not rolled back")
+            if evidence["kind"] == "no_agent":
+                # Only a fresh observation may start a rollback. The exact committed replay
+                # above can repair its verification record even if the rollback outlasted it.
+                now = self.clock()
+                need(now - self.GATE_NO_AGENT_FRESH_SECONDS <= evidence["observed_at"] / 1000
+                     <= now + self.GATE_CLOCK_SKEW_SECONDS, "the agents were not read just now")
             config, host_only = self.rollback_to_previous(active, verified)
 
             def gate_fence():

@@ -5,6 +5,7 @@ import copy
 import inspect
 import re
 import datetime
+import time
 import hashlib
 import http.client
 import importlib.util
@@ -2028,6 +2029,78 @@ class PublisherTests(unittest.TestCase):
         event = self.gate_event("rollback", evidence=evidence)
         self.assertEqual(self.publisher().gate(event)["status"], "rolled_back")
 
+    def no_agent_event(self, status, *, hosts=None, observed=None, since=None):
+        hosts = status["placement"]["release_hosts"] if hosts is None else hosts
+        observed = time.time() if observed is None else observed
+        # The coordinator has been up since well before the hosts launched (an hour by default).
+        since = observed - 3600 if since is None else since
+        return self.gate_event("rollback", status=status, evidence={
+            "kind": "no_agent", "hosts": sorted(MODULE.digest("fcvm-release-gate\0" + i) for i in hosts),
+            "observed_at": int(observed * 1000), "coordinator_since": int(since * 1000)})
+
+    def test_the_gate_rolls_back_a_release_whose_hosts_registered_no_agent(self):
+        # A host image whose agent never starts gives the viewer smoke no tile to probe. The
+        # protected staging workflow reads the coordinator's agents (ejc3/fcvm stage-smoke.py
+        # --agents); the gate checks the EC2 half: those are all the live release hosts, and
+        # each was up long enough that its agent would have registered.
+        ten, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 120)
+        self.gate_instance(eleven, number=201, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 60)
+        status = self.publisher().gate({"action": "status"})
+        answer = self.publisher().gate(self.no_agent_event(status))
+        self.assertEqual(answer["status"], "rolled_back")
+        after = self.fleet_ssm.values["/release"]
+        self.assertEqual((after["generation"], after["host_amis"]), (12, ten["host_amis"]))
+
+    def test_the_gate_refuses_a_no_agent_claim_it_cannot_lay_on_the_release_hosts(self):
+        _, eleven = self.generation_eleven_live()
+        old = self.gate_instance(eleven, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 120)
+        other = self.gate_instance(eleven, number=202, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 120)
+        status = self.publisher().gate({"action": "status"})
+        now = time.time()
+        stranger = "i-" + format(999, "017x")
+        cases = {
+            "a release host is missing from the claim": (dict(hosts=[old]), "exactly the release's hosts"),
+            "a host outside the release is in it": (dict(hosts=[old, other, stranger]), "exactly the release's hosts"),
+            "the observation is stale": (dict(observed=now - MODULE.Publisher.GATE_NO_AGENT_FRESH_SECONDS - 100),
+                                         "not read just now"),
+            "the observation is in the future": (dict(observed=now + MODULE.Publisher.GATE_CLOCK_SKEW_SECONDS + 120),
+                                                 "not read just now"),
+            # A coordinator that restarted after the hosts launched has a record that does not
+            # cover their first minutes: their agents may have registered before it began.
+            "the record began after a host launched": (dict(since=now - 300), "record began after a release host"),
+        }
+        for label, (kwargs, reason) in cases.items():
+            with self.subTest(label):
+                with self.assertRaisesRegex(MODULE.Refused, reason):
+                    self.publisher().gate(self.no_agent_event(status, **kwargs))
+        ms, since = int(now * 1000), int((now - 3600) * 1000)
+        for evidence in ({"kind": "no_agent", "hosts": [], "observed_at": ms, "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": "now", "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms, "coordinator_since": since,
+                          "family": "v4"},
+                         {"kind": "no_agent", "hosts": ["0" * 64, "0" * 64], "observed_at": ms, "coordinator_since": since},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms},
+                         {"kind": "no_agent", "hosts": ["0" * 64], "observed_at": ms, "coordinator_since": ms + 1}):
+            with self.subTest(evidence=evidence):
+                with self.assertRaisesRegex(MODULE.Refused, "names its hosts by digest"):
+                    self.publisher().gate(self.gate_event("rollback", status=status, evidence=evidence))
+        # A release host that came up too recently for its agent to have registered.
+        self.gate_instance(eleven, number=201, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS - 60)
+        status = self.publisher().gate({"action": "status"})
+        with self.assertRaisesRegex(MODULE.Refused, "not up long enough"):
+            self.publisher().gate(self.no_agent_event(status))
+        self.assertEqual(self.ec2.selected, [])
+
+    def test_the_gate_refuses_no_agent_when_the_release_did_not_change_the_host_image(self):
+        _, eleven = self.generation_eleven_live()
+        self.gate_instance(eleven, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 120)
+        with mock.patch.object(MODULE.Publisher, "gate_changed_kinds", return_value=["tile"]):
+            status = self.publisher().gate({"action": "status"})
+            with self.assertRaisesRegex(MODULE.Refused, "host image did not change"):
+                self.publisher().gate(self.no_agent_event(status))
+        self.assertEqual(self.ec2.selected, [])
+
     def test_the_gate_never_rolls_back_to_a_predecessor_without_its_exact_verification(self):
         previous, active = self.generation_eleven_live()
         self.gate_instance(active)
@@ -2199,10 +2272,14 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.created, changes["created"])
         self.assertEqual(self.fleet_ssm.values["/release"], changes["pointer"])
 
-    def gate_rollback_with_lost_verify_write(self):
+    def gate_rollback_with_lost_verify_write(self, *, no_agent=False):
         _, active = self.generation_eleven_live()
-        old_host = self.gate_instance(active)
-        verdict = self.gate_event("rollback")
+        if no_agent:
+            old_host = self.gate_instance(active, age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 60)
+            verdict = self.no_agent_event(self.publisher().gate({"action": "status"}))
+        else:
+            old_host = self.gate_instance(active)
+            verdict = self.gate_event("rollback")
         publisher = self.publisher()
         save = publisher.save
 
@@ -2237,6 +2314,16 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(publisher.gate(verdict)["status"], "rolled_back")
         self.assertEqual(self.ec2.created, created)
         self.assertTrue(self.publisher().gate({"action": "status"})["verified"])
+
+    def test_the_gate_replays_a_committed_no_agent_rollback_after_the_observation_expires(self):
+        verdict, _, active = self.gate_rollback_with_lost_verify_write(no_agent=True)
+        created = list(self.ec2.created)
+        publisher = self.publisher()
+        publisher.clock = lambda: verdict["evidence"]["observed_at"] / 1000 + publisher.GATE_NO_AGENT_FRESH_SECONDS + 60
+        self.assertEqual(publisher.gate(verdict)["pointer"], publisher.gate_receipt(active))
+        self.assertEqual(self.fleet_ssm.values["/release"], active)
+        self.assertEqual(self.ec2.created, created)
+        self.assertTrue(publisher.gate({"action": "status"})["verified"])
 
     def test_a_new_smoke_can_verify_rollback_if_the_original_request_was_lost(self):
         _, old_host, active = self.gate_rollback_with_lost_verify_write()
