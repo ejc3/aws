@@ -135,6 +135,10 @@ locals {
     "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
     "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
     "host/x86_64/c12ad070" = { image = "ami-0c2656522631215d1", kind = "host", name = "fcvm-fleet-host-x86_64-c12ad070-202611141114" }
+    # RELEASE GATE DRILL (owner-approved 2026-11-15; publish.py run_release_gate_drill): generation sixteen's host
+    # (ejc3/fcvm de4bf769) revised to the drill branch drill/unframed-renderer at d23f79df, whose renderer sends frames
+    # without their FCVF magic. Published once over the verified generation sixteen; removed after the drill.
+    "host/x86_64/d23f79df" = { image = "ami-0909b5ab23ba60377", kind = "host", name = "fcvm-fleet-host-x86_64-d23f79df-202611160518" }
   }
 }
 

@@ -703,6 +703,60 @@ class Publisher:
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
 
+    # Release gate drill, approved by the owner on 2026-11-15. One host image built by hand from
+    # the ejc3/fcvm branch drill/unframed-renderer: generation sixteen's source (de4bf769) and a
+    # renderer that sends every frame without its FCVF magic, so the staging viewer smoke reports
+    # each fcvm wall tile as an image failure on its host. Published once over the gate-verified
+    # generation sixteen, as a normal release; the release gate is expected to roll it back. The
+    # action and these constants are removed once the drill is done.
+    DRILL_SOURCE = "d23f79dfca61f256f78b6d8ac17994338afdc5d5"
+    DRILL_IMAGE = "ami-0909b5ab23ba60377"
+    DRILL_NAME = "fcvm-fleet-host-x86_64-d23f79df-202611160518"
+    DRILL_BRANCH = "drill/unframed-renderer"
+    DRILL_PREDECESSOR = {"generation": 16, "source_sha": "de4bf769155e5b1717d245219952229098b28f56",
+                         "build_id": "fcvm-fleet-image-factory:48515f0e-16cc-490c-b0d4-9c813e92aa54"}
+
+    def drill_receipt_name(self):
+        return self.env["STATE_PREFIX"] + "/drill/" + self.DRILL_IMAGE
+
+    def reviewed_release_gate_drill(self):
+        """The drill's transition: the live receipt, which must be generation sixteen as the
+        factory published it and as the release gate verified it, to the drill host."""
+        active = self.load(self.env["RELEASE_PARAMETER"], True)
+        need({key: active.get(key) for key in self.DRILL_PREDECESSOR} == self.DRILL_PREDECESSOR,
+             "the drill replaces only generation sixteen")
+        need(self.gate_receipt(active) == self.gate_record(),
+             "the drill replaces only a release the gate verified")
+        tile = active["tile_amis"][self.env["COMPUTE_REGION"]]["x86_64"]
+        return self.reviewed_pair({"source_sha": self.DRILL_SOURCE,
+                                   "images": {"host": self.DRILL_IMAGE, "tile": tile},
+                                   "expected": active}, host_only=True)
+
+    def run_release_gate_drill(self, event):
+        need(event == {"action": "activate-release-gate-drill"}, "the drill accepts no caller configuration")
+        # Staging only: the us-east-1 fleet's release pointer, the one pointer this publisher writes.
+        need(self.env["COMPUTE_REGION"] == "us-east-1", "the drill publishes only the staging fleet's release")
+        try:
+            done = self.load(self.drill_receipt_name())
+        except Exception as error:
+            if getattr(error, "response", {}).get("Error", {}).get("Code") != "ParameterNotFound":
+                raise
+            done = None
+        need(done is None, "the drill has run: its image is published once")
+        rows = self.client("ec2", True, self.build_region).describe_images(ImageIds=[self.DRILL_IMAGE])["Images"]
+        need(len(rows) == 1, "the drill image is missing")
+        tags = {item["Key"]: item["Value"] for item in rows[0].get("Tags", [])}
+        need(tags.get("fcvm-fleet-drill") == "release-gate-drill"
+             and tags.get("fcvm-fleet-drill-branch") == self.DRILL_BRANCH and self.DRILL_BRANCH.startswith("drill/")
+             and tags.get("fcvm-fleet-drill-commit") == self.DRILL_SOURCE,
+             "the drill image is not tagged as built from the drill branch")
+        result = self.run_build_region_host_release(self.reviewed_release_gate_drill(), "reviewed-release-gate-drill")
+        if result.get("status") == "promoted":
+            self.save(self.drill_receipt_name(), {
+                "image": self.DRILL_IMAGE, "branch": self.DRILL_BRANCH, "source_sha": self.DRILL_SOURCE,
+                "generation": result["generation"], "approved": "owner, 2026-11-15"})
+        return result
+
     def run_ena_host_release(self, event):
         need(event == {"action": "activate-reviewed-ena-host-release"},
              "reviewed host release accepts no caller configuration")
@@ -1847,6 +1901,8 @@ class Publisher:
             return self.run_generation_eleven_rollback(event)
         if isinstance(event, dict) and event.get("action") == "activate-reviewed-ena-host-release":
             return self.run_ena_host_release(event)
+        if isinstance(event, dict) and event.get("action") == "activate-release-gate-drill":
+            return self.run_release_gate_drill(event)
         # A factory build that was already running when the factory was paused
         # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
         # actions above are how a release is changed while paused.
