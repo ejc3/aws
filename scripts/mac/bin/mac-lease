@@ -148,7 +148,8 @@ sub take {
         my ($holder, $ahead) = locked {
             my $l = read_lease();
             if ($l && $l->{name} eq $name && (!$l->{pid} || $l->{pid} == $pid) && (!$ticket || time < $deadline)) {
-                write_lease($name, $o->{ttl}, $l->{pid}, $l->{since});
+                # A command under a manual lease borrows it without changing its deadline.
+                write_lease($name, $o->{ttl}, $l->{pid}, $l->{since}) unless $pid && !$l->{pid};
                 unlink $ticket if $ticket;
                 return (undef, 0);
             }

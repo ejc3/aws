@@ -257,7 +257,10 @@ class Lease(Base):
         self.assertEqual(self.lease("take", "mine", "--ttl", "60").returncode, 0, "renewed across calls")
         time.sleep(2.5)
         self.assertIn("mine (", self.lease("status").stdout, "the renewal's ttl")
-        self.assertEqual(self.lease("run", "mine", "--", "true").returncode, 0, "a run under one's own take")
+        record = self.state / "mac-lease" / "lease"
+        original = record.read_bytes()
+        self.assertEqual(self.lease("run", "mine", "--ttl", "1", "--", "true").returncode, 0, "a run under one's own take")
+        self.assertEqual(record.read_bytes(), original, "the run did not shorten or extend the manual lease")
         self.assertIn("mine (", self.lease("status").stdout, "the run left the take's lease held")
         self.assertEqual(self.lease("release", "mine").returncode, 0)
         self.assertEqual(self.lease("status").stdout, "free\n")
