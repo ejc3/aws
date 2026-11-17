@@ -29,6 +29,10 @@ class ParameterNotFound(Exception):
     response = {"Error": {"Code": "ParameterNotFound"}}
 
 
+class ParameterAlreadyExists(Exception):
+    response = {"Error": {"Code": "ParameterAlreadyExists"}}
+
+
 class SSM:
     def __init__(self):
         self.values = {}
@@ -40,7 +44,9 @@ class SSM:
         return {"Parameter": {"Value": MODULE.encoded(self.values[Name])}}
 
     def put_parameter(self, Name, Type, Value, Overwrite):
-        assert Type == "String" and Overwrite is True
+        assert Type == "String" and type(Overwrite) is bool
+        if not Overwrite and Name in self.values:
+            raise ParameterAlreadyExists()
         self.values[Name] = json.loads(Value)
         return {"Version": 1}
 
@@ -1848,8 +1854,7 @@ class PublisherTests(unittest.TestCase):
 
     def run_drill_and_roll_back(self, event, active, number):
         """Publish one drill over the verified live release, check its receipt, then let the gate
-        roll it back on an attributed failed probe of its host. Returns the drill and rollback
-        receipts."""
+        roll it back on the drill's actual failure evidence. Returns the drill and rollback receipts."""
         drill = MODULE.Publisher.DRILLS[event["action"]]
         publisher, copied, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
         self.assertEqual(publisher.run(event), {"status": "promoted", "generation": active["generation"] + 1})
@@ -1861,21 +1866,32 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.main_ssm.values["/factory/publications/drill-" + drill["image"]],
                          {"image": drill["image"], "branch": drill["branch"], "source_sha": drill["source"],
                           "generation": active["generation"] + 1, "replaced": active["generation"],
-                          "approved": "owner, 2026-11-15"})
+                          "build_id": promoted["build_id"], "status": "reserved"})
         # Single use: a second invocation is refused, and the release is unchanged.
         with self.assertRaisesRegex(MODULE.Refused, "the drill has run"):
             self.windows_publisher(active).run(event)
         self.assertEqual(self.fleet_ssm.values["/release"], promoted)
-        # The gate treats it as any release: unverified, and an attributed failed probe on its host
-        # rolls it back to the verified predecessor's images.
+        # The renderer fails an image probe; the no-agent drill supplies no probeable tile and
+        # must instead prove that the coordinator observed these hosts' complete lifetime.
         for name in list(self.ec2.instances):
             self.ec2.instances[name]["State"]["Name"] = "terminated"
-        self.gate_instance(promoted, number=number)
+        no_agent = event["action"] == self.NO_AGENT_DRILL
+        self.gate_instance(promoted, number=number,
+                           age=MODULE.Publisher.GATE_NO_AGENT_SECONDS + 60 if no_agent else 600)
         status = self.publisher().gate({"action": "status"})
         self.assertEqual((status["generation"], status["verified"], status["rollback"]),
                          (active["generation"] + 1, False, False))
         self.assertIn("host", status["placement"]["changed_kinds"])
-        self.assertEqual(self.publisher().gate(self.gate_event("rollback", status=status))["status"], "rolled_back")
+        if no_agent:
+            incomplete = self.no_agent_event(status, since=time.time() - 30)
+            with self.assertRaisesRegex(MODULE.Refused, "record began after a release host"):
+                self.publisher().gate(incomplete)
+            self.assertEqual(self.fleet_ssm.values["/release"], promoted)
+            verdict = self.no_agent_event(status)
+            self.assertEqual(verdict["evidence"]["kind"], "no_agent")
+        else:
+            verdict = self.gate_event("rollback", status=status)
+        self.assertEqual(self.publisher().gate(verdict)["status"], "rolled_back")
         after = copy.deepcopy(self.fleet_ssm.values["/release"])
         self.assertEqual((after["host_amis"], after["tile_amis"]), (active["host_amis"], active["tile_amis"]))
         with self.assertRaisesRegex(MODULE.Refused, "the drill has run"):
@@ -1891,6 +1907,124 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.main_ssm.values["/factory/gate"], self.publisher().gate_receipt(rolled))
         second = self.drill_image(self.NO_AGENT_DRILL)
         self.run_drill_and_roll_back(second, rolled, 970)
+
+    def test_a_drill_reserves_its_attempt_under_the_lock_before_changing_templates(self):
+        event, active = self.drill_fixture()
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        name = publisher.drill_receipt_name(drill)
+        saved = self.main_ssm.put_parameter
+        created, selected = list(self.ec2.created), list(self.ec2.selected)
+        witnessed = []
+
+        def reserve(**kwargs):
+            if kwargs["Name"] == name:
+                self.assertIsNotNone(self.ddb.item, "reserve within the infrastructure publication lock")
+                self.assertEqual(kwargs["Overwrite"], False, "one image must never overwrite its attempt")
+                self.assertEqual(self.ec2.created, created, "no candidate may exist before the attempt is reserved")
+                self.assertEqual(self.ec2.selected, selected)
+                self.assertEqual(self.fleet_ssm.values["/release"], active)
+                witnessed.append(kwargs)
+            return saved(**kwargs)
+
+        with mock.patch.object(self.main_ssm, "put_parameter", side_effect=reserve):
+            self.assertEqual(publisher.run(event)["status"], "promoted")
+        self.assertEqual(len(witnessed), 1)
+        self.assertIsNone(self.ddb.item)
+
+    def test_a_refused_drill_reservation_changes_no_template_or_release(self):
+        event, active = self.drill_fixture()
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        name = publisher.drill_receipt_name(drill)
+        saved = self.main_ssm.put_parameter
+        before, created, selected = copy.deepcopy(self.fleet_ssm.values), list(self.ec2.created), list(self.ec2.selected)
+
+        def denied(**kwargs):
+            if kwargs["Name"] == name:
+                raise RuntimeError("reservation denied")
+            return saved(**kwargs)
+
+        with mock.patch.object(self.main_ssm, "put_parameter", side_effect=denied):
+            with self.assertRaisesRegex(RuntimeError, "reservation denied"):
+                publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(self.ec2.selected, selected)
+        self.assertNotIn(name, self.main_ssm.values)
+        self.assertIsNone(self.ddb.item)
+
+    def test_a_lost_drill_reservation_response_cannot_start_or_repeat_the_attempt(self):
+        event, active = self.drill_fixture()
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        name = publisher.drill_receipt_name(drill)
+        saved = self.main_ssm.put_parameter
+        before, created, selected = copy.deepcopy(self.fleet_ssm.values), list(self.ec2.created), list(self.ec2.selected)
+
+        def lost_ack(**kwargs):
+            response = saved(**kwargs)
+            if kwargs["Name"] == name:
+                raise RuntimeError("reservation response lost")
+            return response
+
+        with mock.patch.object(self.main_ssm, "put_parameter", side_effect=lost_ack):
+            with self.assertRaisesRegex(RuntimeError, "reservation response lost"):
+                publisher.run(event)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(self.ec2.selected, selected)
+        self.assertEqual(self.main_ssm.values[name]["status"], "reserved")
+        with self.assertRaisesRegex(MODULE.Refused, "the drill has run or was reserved"):
+            self.windows_publisher(active).run(event)
+        self.assertIsNone(self.ddb.item)
+
+    def test_a_drill_cannot_reserve_twice_even_if_its_read_is_stale(self):
+        event, active = self.drill_fixture()
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        name = publisher.drill_receipt_name(drill)
+        original = {"status": "reserved", "attempt": "earlier"}
+        self.main_ssm.values[name] = original
+        saved = self.main_ssm.get_parameter
+
+        def missing(**kwargs):
+            if kwargs["Name"] == name:
+                raise ParameterNotFound()
+            return saved(**kwargs)
+
+        before, selected = copy.deepcopy(self.fleet_ssm.values), list(self.ec2.selected)
+        with mock.patch.object(self.main_ssm, "get_parameter", side_effect=missing):
+            with self.assertRaises(ParameterAlreadyExists):
+                publisher.run(event)
+        self.assertEqual(self.main_ssm.values[name], original)
+        self.assertEqual(self.fleet_ssm.values, before)
+        self.assertEqual(self.ec2.selected, selected)
+        self.assertIsNone(self.ddb.item)
+
+    def test_a_postcommit_failure_and_rollback_cannot_renew_the_drill_attempt(self):
+        event, active = self.drill_fixture()
+        drill = MODULE.Publisher.DRILLS[event["action"]]
+        publisher, _, _ = self.release_through_second_apply(self.windows_publisher, event, active, drill["source"])
+        with mock.patch.object(publisher, "retain", side_effect=RuntimeError("retention failed after commit")):
+            with self.assertRaisesRegex(RuntimeError, "retention failed after commit"):
+                publisher.run(event)
+        promoted = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(promoted["generation"], active["generation"] + 1)
+        self.assertEqual(self.main_ssm.values[publisher.drill_receipt_name(drill)]["status"], "reserved")
+        self.assertIsNone(self.ddb.item)
+        for instance in self.ec2.instances.values():
+            instance["State"]["Name"] = "terminated"
+        self.gate_instance(promoted, number=990)
+        status = self.publisher().gate({"action": "status"})
+        self.assertEqual(self.publisher().gate(self.gate_event("rollback", status=status))["status"], "rolled_back")
+        restored = copy.deepcopy(self.fleet_ssm.values["/release"])
+        self.assertEqual(restored["host_amis"], active["host_amis"])
+        selected = list(self.ec2.selected)
+        with self.assertRaisesRegex(MODULE.Refused, "the drill has run or was reserved"):
+            self.windows_publisher(restored).run(event)
+        self.assertEqual(self.fleet_ssm.values["/release"], restored)
+        self.assertEqual(self.ec2.selected, selected)
 
     def test_a_drill_refuses_an_image_not_tagged_as_built_from_its_drill_branch(self):
         for action in MODULE.Publisher.DRILLS:
@@ -1955,8 +2089,8 @@ class PublisherTests(unittest.TestCase):
                     self.windows_publisher(active).run(dict(event, image="ami-0123456789abcdef0"))
 
     def test_the_publisher_role_may_write_the_drill_receipts(self):
-        # A receipt is written after promotion: a write the role is denied would leave the drill
-        # image live with no receipt to mark the drill as run.
+        # Attempt reservations must be writable under the same publication-prefix scope as
+        # ordinary transaction receipts.
         import fnmatch
         pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
         policy = re.search(r'resource "aws_iam_role_policy" "fcvm_ami_publish" \{(.*?)\n\}', pipeline, re.S)
@@ -2978,6 +3112,42 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(set(self.copies()), set(self.new.values()))
         self.assertEqual(self.fleet_ssm.values["/release"], before)
         self.assertEqual((self.ec2.created, self.ec2.tagged), ([], []))
+
+    def test_staging_drills_leave_ordinary_gpu_image_copies_on_the_healthy_predecessor(self):
+        for drill in MODULE.Publisher.DRILLS.values():
+            for marker in ("identity", "source"):
+                with self.subTest(drill=drill["identity"], marker=marker):
+                    self.setUp()
+                    self.active_new_pair()
+                    self.publisher().run({"action": "replicate-active-release"})
+                    safe = copy.deepcopy(self.fleet_ssm.values["/release"])
+                    copies = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+                    before_copies = list(self.west.copies)
+                    release = copy.deepcopy(safe)
+                    release.update(generation=safe["generation"] + 1,
+                                   build_id=drill["identity"] + ":example" if marker == "identity" else "unknown:example",
+                                   source_sha=drill["source"] if marker == "source" else "e" * 40,
+                                   previous={k: v for k, v in safe.items() if k != "previous"})
+                    release["host_amis"]["us-east-1"]["x86_64"] = drill["image"]
+                    self.fleet_ssm.values["/release"] = release
+                    self.assertEqual(self.publisher().run({"action": "replicate-active-release"}),
+                                     {"status": "replicated", "generation": safe["generation"]})
+                    self.assertEqual(self.fleet_ssm.values["/release"], release)
+                    self.assertEqual(self.fleet_ssm.values["/release-copies"], copies)
+                    self.assertEqual(self.west.copies, before_copies)
+
+    def test_drill_replication_refuses_a_missing_or_drill_predecessor(self):
+        self.active_new_pair()
+        release = self.fleet_ssm.values["/release"]
+        drill = next(iter(MODULE.Publisher.DRILLS.values()))
+        release.update(build_id=drill["identity"] + ":example")
+        for previous in (None, copy.deepcopy(release), dict(release, generation=5)):
+            with self.subTest(previous=previous):
+                release["previous"] = previous
+                with self.assertRaisesRegex(MODULE.Refused, "no ordinary release to replicate"):
+                    self.publisher().run({"action": "replicate-active-release"})
+                self.assertEqual(self.west.copies, [])
+                self.assertNotIn("/release-copies", self.fleet_ssm.values)
 
     def test_pending_or_failed_copies_preserve_the_previous_available_record(self):
         self.active_new_pair()

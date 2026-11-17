@@ -1754,17 +1754,22 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual((self.store.values, self.store.writes, self.cb.starts, self.cb.stops),
                          (before, [], [], []))
 
-    def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
-        # The pause reaches the dispatcher as ENABLED=false, which starts nothing, while the launch
-        # templates still follow the release pointer. It was on from generation twelve (#823) until
-        # ejc3/fcvm had the boot fix and the launch-path gate, and is on again for the release gate
-        # drills, which need the live release's source to stay put until their cleanup.
+    def test_installing_drill_capability_keeps_critical_factory_updates_enabled(self):
         source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        pipeline = re.search(r'^variable "fcvm_ami_pipeline_enabled" \{\n.*?^\}', source, re.S | re.M).group()
         variable = re.search(r'^variable "fcvm_ami_factory_paused" \{\n.*?^\}', source, re.S | re.M).group()
-        self.assertRegex(variable, r"default\s*=\s*true")
+        self.assertRegex(pipeline, r"default\s*=\s*true")
+        self.assertRegex(variable, r"default\s*=\s*false")
         self.assertIn("DRILLS", (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline" / "publish.py").read_text())
         self.assertIn("ENABLED           = tostring(var.fcvm_ami_pipeline_enabled && !var.fcvm_ami_factory_paused)", source)
         self.assertNotIn("fcvm_ami_factory_paused", (SOURCE.parents[1] / "fcvm-fleet-ami-release.tf").read_text())
+        self.factory.env["ENABLED"] = "true"
+        self.assertEqual(self.request("critical")["status"], "building")
+        self.assertEqual(len(self.cb.starts), 1)
+
+    def test_a_paused_factory_starts_no_build_and_keeps_the_queue(self):
+        # An explicitly paused drill window starts nothing; installing the capability alone
+        # must leave the normal and critical image pipeline enabled.
         # what ENABLED=false does with a queued normal request whose window has opened
         self.store.values.pop("/factory/control", None)
         self.store.values.pop("/factory/requests/" + INPUT_SHA, None)

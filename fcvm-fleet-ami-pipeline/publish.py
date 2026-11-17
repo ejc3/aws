@@ -703,13 +703,13 @@ class Publisher:
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
 
-    # Release gate drills, approved by the owner on 2026-11-15. Each is one host image built by hand
+    # Release gate drills. Each is one host image built by hand
     # from an ejc3/fcvm drill/ branch: generation seventeen's source (3cace583) merged with one change
     # that makes the release fail the gate. Each is published once, as a normal release, over the live
     # release after the gate has verified it, and the gate is expected to roll it back. The factory is
-    # paused for the drills (fcvm_ami_factory_paused): the source fence requires each drill commit to
-    # descend from the live release's source, so the live release must not move under them. The
-    # actions, these constants and the pause are removed once the drills are done.
+    # paused only for a bounded drill window (fcvm_ami_factory_paused): the source fence requires
+    # each drill commit to descend from the live release's source. Stale drill images refuse.
+    # The actions and these constants are removed once the drills are done.
     DRILLS = {
         # The renderer sends every frame without its FCVF magic, so the staging viewer smoke reports
         # each fcvm wall tile as an image failure on its host.
@@ -728,6 +728,21 @@ class Publisher:
     def drill_receipt_name(self, drill):
         # Under /publications/, a path the publisher role may already write (fcvm-fleet-ami-pipeline.tf).
         return self.env["STATE_PREFIX"] + "/publications/drill-" + drill["image"]
+
+    def reserve_drill(self, drill, expected):
+        """Spend one immutable attempt before any launch template or release pointer changes.
+
+        An accepted write whose response is lost still blocks a retry. A later failure may
+        leave the drill unused, but cannot repeat an outage over a recovered predecessor.
+        """
+        need(self.lock_info is not None, "a drill reservation requires the publication lock")
+        receipt = {"image": drill["image"], "branch": drill["branch"], "source_sha": drill["source"],
+                   "generation": expected["generation"] + 1, "replaced": expected["generation"],
+                   "build_id": self.build_id, "status": "reserved"}
+        raw = encoded(receipt)
+        need(len(raw.encode()) <= 4000, "publication metadata exceeds its fixed bound")
+        self.client("ssm").put_parameter(Name=self.drill_receipt_name(drill), Type="String",
+                                         Value=raw, Overwrite=False)
 
     def reviewed_drill(self, drill):
         """A drill's transition: the live receipt, which must be a factory release or the gate's
@@ -757,7 +772,7 @@ class Publisher:
             if getattr(error, "response", {}).get("Error", {}).get("Code") != "ParameterNotFound":
                 raise
             done = None
-        need(done is None, "the drill has run: its image is published once")
+        need(done is None, "the drill has run or was reserved: its image gets one attempt")
         rows = self.client("ec2", True, self.build_region).describe_images(ImageIds=[drill["image"]])["Images"]
         need(len(rows) == 1, "the drill image is missing")
         tags = {item["Key"]: item["Value"] for item in rows[0].get("Tags", [])}
@@ -765,13 +780,9 @@ class Publisher:
              and tags.get("fcvm-fleet-drill-branch") == drill["branch"] and drill["branch"].startswith("drill/")
              and tags.get("fcvm-fleet-drill-commit") == drill["source"],
              "the drill image is not tagged as built from the drill branch")
-        result = self.run_build_region_host_release(self.reviewed_drill(drill), drill["identity"])
-        if result.get("status") == "promoted":
-            self.save(self.drill_receipt_name(drill), {
-                "image": drill["image"], "branch": drill["branch"], "source_sha": drill["source"],
-                "generation": result["generation"], "replaced": result["generation"] - 1,
-                "approved": "owner, 2026-11-15"})
-        return result
+        config = self.reviewed_drill(drill)
+        return self.run_build_region_host_release(
+            config, drill["identity"], before_promote=lambda: self.reserve_drill(drill, config["expected"]))
 
     def run_ena_host_release(self, event):
         need(event == {"action": "activate-reviewed-ena-host-release"},
@@ -1043,7 +1054,7 @@ class Publisher:
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_windows_host_release(), "reviewed-windows-host-release")
 
-    def run_build_region_host_release(self, config, identity):
+    def run_build_region_host_release(self, config, identity, *, before_promote=None):
         host_user_data = self.env["HOST_FIX_BOOT_SHA"]
         need(DIGEST.fullmatch(host_user_data), "invalid reviewed host bootstrap digest")
         # Built in us-west-2 (#807's build region): the release names the publisher's copy.
@@ -1054,10 +1065,11 @@ class Publisher:
         boot = base64.b64decode(self.current(host["id"])["LaunchTemplateData"].get("UserData", "")).decode("utf-8", "replace")
         need(copied in boot, "Terraform's host bootstrap does not name the release-region copy yet")
         return self.run_reviewed(config, identity, host_user_data=host_user_data,
-                                 host_only=True, release_images={**config["images"], "host": copied})
+                                 host_only=True, release_images={**config["images"], "host": copied},
+                                 before_promote=before_promote)
 
     def run_reviewed(self, config, identity, check_ancestry=False, tile_source=None, *, host_user_data=None, host_only=False,
-                     release_images=None, locked=False, placement_fence=None):
+                     release_images=None, locked=False, placement_fence=None, before_promote=None):
         transaction_config = config if tile_source is None else {**config, "tile_source_sha": tile_source}
         self.build_id = identity + ":" + digest(encoded(transaction_config))
         if release_images is not None:
@@ -1108,6 +1120,8 @@ class Publisher:
                     raise Refused("uncertain reviewed version requires administrator reconciliation")
                 raise Refused("interrupted reviewed publication must roll back before terminal replay")
             fence()
+            if before_promote is not None:
+                before_promote()
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
             result = self.promote(manifest, config["source_sha"], None, [], fence=fence,
                                   host_user_data=host_user_data, host_only=host_only)
@@ -1694,6 +1708,15 @@ class Publisher:
         compute = self.env["COMPUTE_REGION"]
         need(release.get("version") == 1 and type(release.get("generation")) is int
              and release.get("guard_sha256") == self.env["GUARD_SHA256"], "active release schema is incompatible")
+        if self.is_drill_release(release):
+            # This parameter is also an input to ordinary developer GPU launches. A staging
+            # exercise never changes their selectable pair, even on an explicit replicate retry.
+            previous = release.get("previous")
+            need(isinstance(previous, dict) and not self.is_drill_release(previous)
+                 and type(previous.get("generation")) is int
+                 and previous["generation"] < release["generation"],
+                 "staging drill has no ordinary release to replicate")
+            return self.replicate(previous)
         sources = {kind: release[kind + "_amis"][compute]["x86_64"] for kind in ("host", "tile")}
         need(all(IMAGE.fullmatch(item) for item in sources.values()) and sources["host"] != sources["tile"],
              "invalid published image identities")
@@ -1735,6 +1758,12 @@ class Publisher:
                 pass
         need(self.load(self.copies_parameter, True) == record, "image copy record was not confirmed")
         return record
+
+    @classmethod
+    def is_drill_release(cls, release):
+        return (release.get("source_sha") in {d["source"] for d in cls.DRILLS.values()}
+                or any(str(release.get("build_id", "")).startswith(d["identity"] + ":")
+                       for d in cls.DRILLS.values()))
 
     def run_replicate(self, event):
         need(event == {"action": "replicate-active-release"}, "image copy accepts no caller configuration")
