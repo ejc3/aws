@@ -104,6 +104,7 @@ sub options {
 # The live tickets, oldest first: [path, name]. A ticket whose waiting process is gone is removed.
 # Called under the lock.
 sub tickets {
+    my ($vacant) = @_;
     opendir(my $dh, $queue) or return ();
     my @t;
     for my $f (sort grep { /^\d{12}-\d+-/ } readdir $dh) {
@@ -116,9 +117,17 @@ sub tickets {
             unlink $path;
             next;
         }
-        push @t, ["$queue/$f", $name];
+        push @t, [$path, $name, $pid];
     }
     closedir $dh;
+    # The kernel still finds an unreaped child by PID. Check the ticket about to get a
+    # free desktop; while a lease is held there is no need to run ps for every waiter.
+    while ($vacant && @t) {
+        my (undef, $state) = process_identity($t[0][2]);
+        last unless defined $state && $state =~ /^Z/;
+        unlink $t[0][0];
+        shift @t;
+    }
     return @t;
 }
 
@@ -153,7 +162,7 @@ sub take {
                 unlink $ticket if $ticket;
                 return (undef, 0);
             }
-            my @q = tickets();
+            my @q = tickets(!$l);
             if (!$l && (!@q || ($ticket && $q[0][0] eq $ticket)) && (!$ticket || time < $deadline)) {   # free, and nobody queued before this one
                 write_lease($name, $o->{ttl}, $pid, time);
                 unlink $ticket if $ticket;

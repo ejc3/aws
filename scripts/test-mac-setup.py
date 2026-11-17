@@ -310,8 +310,17 @@ class Lease(Base):
     def test_a_dead_waiters_ticket_does_not_hold_the_queue(self):
         self.lease("take", "holder")
         gone = self.waiter("gone")
+        self.addCleanup(lambda: (gone.kill(), gone.communicate(timeout=5)))
         time.sleep(0.6)
-        gone.kill(); gone.wait()
+        gone.kill()
+        # Inspect without poll() or wait(): the waiting process has exited but its PID still exists.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = subprocess.check_output(["/bin/ps", "-p", str(gone.pid), "-o", "stat="], text=True)
+            if state.strip().startswith("Z"):
+                break
+            time.sleep(0.02)
+        self.assertTrue(state.strip().startswith("Z"), "the waiter was not reaped")
         self.lease("release", "holder")
         self.assertEqual(self.lease("take", "next").returncode, 0)
 
