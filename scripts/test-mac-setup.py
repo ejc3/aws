@@ -8,6 +8,7 @@ import plistlib
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -145,12 +146,70 @@ class Lease(Base):
         self.assertEqual((r.returncode, r.stdout), (3, "job\n"))
         self.assertEqual(self.lease("status").stdout, "free\n")
 
-    def test_a_dead_runs_lease_is_free(self):
-        p = subprocess.Popen([str(BIN / "mac-lease"), "run", "crashy", "--", "sleep", "30"], env=self.env)
-        time.sleep(0.5)
-        self.assertIn("crashy", self.lease("status").stdout)
-        p.kill(); p.wait()
+    @staticmethod
+    def stop_run_group(wrapper):
+        try:
+            os.killpg(wrapper.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        wrapper.wait(timeout=5)
+
+    def start_leased_command(self, name, ttl="600"):
+        pid_file = self.temp / f"{name}.pid"
+        wrapper = subprocess.Popen([
+            str(BIN / "mac-lease"), "run", name, "--ttl", ttl, "--", "sh", "-c",
+            'printf "%s\\n" "$$" > "$1"; exec sleep 30', "leased", str(pid_file),
+        ], env=self.env, start_new_session=True)
+        self.addCleanup(self.stop_run_group, wrapper)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if pid_file.exists() and (pid := pid_file.read_text().strip()):
+                return wrapper, int(pid)
+            self.assertIsNone(wrapper.poll(), "the run exited before its command started")
+            time.sleep(0.02)
+        self.fail("the leased command did not start")
+
+    def test_a_dead_command_releases_its_run_lease_and_preserves_signal_status(self):
+        wrapper, pid = self.start_leased_command("crashy")
+        self.assertIn(f"while pid {pid} runs", self.lease("status").stdout)
+        os.kill(pid, signal.SIGTERM)
+        self.assertEqual(wrapper.wait(timeout=5), 128 + signal.SIGTERM)
         self.assertEqual(self.lease("status").stdout, "free\n")
+
+    def test_a_runs_lease_outlives_its_ttl_while_the_command_runs(self):
+        # A screen tour can run past the old 600 s ttl without releasing the desktop.
+        wrapper, pid = self.start_leased_command("long", ttl="1")
+        time.sleep(1.2)
+        self.assertIn(f"while pid {pid} runs", self.lease("status").stdout)
+        self.assertEqual(self.lease("take", "other").returncode, 75)
+        os.kill(pid, signal.SIGTERM)
+        self.assertEqual(wrapper.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
+    def test_a_commands_lease_survives_the_wrapper_being_killed(self):
+        wrapper, pid = self.start_leased_command("orphan")
+        wrapper.kill()
+        wrapper.wait(timeout=5)
+        os.kill(pid, 0)
+        self.assertIn(f"while pid {pid} runs", self.lease("status").stdout)
+        self.assertEqual(self.lease("run", "other", "--", "true").returncode, 75)
+
+    def test_an_exited_command_frees_the_lease_even_before_its_wrapper_reaps_it(self):
+        wrapper, pid = self.start_leased_command("unreaped")
+        os.kill(wrapper.pid, signal.SIGSTOP)
+        os.kill(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if self.lease("status").stdout == "free\n":
+                break
+            time.sleep(0.02)
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+
+    def test_a_denied_run_never_starts_its_command(self):
+        self.assertEqual(self.lease("take", "holder").returncode, 0)
+        marker = self.temp / "ran"
+        self.assertEqual(self.lease("run", "other", "--", "touch", marker).returncode, 75)
+        self.assertFalse(marker.exists())
 
     def test_wait_takes_it_once_released(self):
         self.lease("take", "first", "--ttl", "2")
@@ -160,6 +219,138 @@ class Lease(Base):
 
     def test_names_are_checked(self):
         self.assertEqual(self.lease("take", "bad name").returncode, 2)
+
+    def run_bg(self, name, *args):
+        return subprocess.Popen([str(BIN / "mac-lease"), "run", name, *args], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_a_second_run_of_the_same_name_waits(self):
+        # Two jobs under one name ran at once: the second run "renewed" the first's lease.
+        first = self.run_bg("job", "--", "sleep", "3")
+        time.sleep(0.6)
+        r = self.lease("run", "job", "--", "true")
+        self.assertEqual(r.returncode, 75, "a live run's lease is not taken again by name")
+        self.assertIn("held by job", r.stderr)
+        start = time.time()
+        self.assertEqual(self.lease("run", "job", "--wait", "15", "--", "true").returncode, 0)
+        self.assertGreater(time.time() - start, 1.5, "it waited for the first run")
+        first.wait(timeout=10)
+
+    def test_killing_a_second_run_leaves_the_first_ones_lease(self):
+        first, child = self.start_leased_command("job")
+        marker = self.temp / "second-ran"
+        second = self.run_bg("job", "--wait", "30", "--", "touch", marker)
+        time.sleep(0.6)
+        second.kill()
+        second.communicate(timeout=5)
+        self.assertFalse(marker.exists(), "a killed waiter cannot let its command start")
+        self.assertIn(f"while pid {child} runs", self.lease("status").stdout)
+        r = self.lease("release", "job")
+        self.assertEqual(r.returncode, 75, "a command's lease cannot be released by name")
+        self.assertIn(f"while pid {child} runs", self.lease("status").stdout)
+        os.kill(child, signal.SIGTERM)
+        self.assertEqual(first.wait(timeout=5), 128 + signal.SIGTERM)
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
+    def test_a_take_lease_is_renewed_and_released_by_name_and_a_run_under_it_leaves_it(self):
+        self.assertEqual(self.lease("take", "mine", "--ttl", "2").returncode, 0)
+        self.assertEqual(self.lease("take", "mine", "--ttl", "60").returncode, 0, "renewed across calls")
+        time.sleep(2.5)
+        self.assertIn("mine (", self.lease("status").stdout, "the renewal's ttl")
+        record = self.state / "mac-lease" / "lease"
+        original = record.read_bytes()
+        self.assertEqual(self.lease("run", "mine", "--ttl", "1", "--", "true").returncode, 0, "a run under one's own take")
+        self.assertEqual(record.read_bytes(), original, "the run did not shorten or extend the manual lease")
+        self.assertIn("mine (", self.lease("status").stdout, "the run left the take's lease held")
+        self.assertEqual(self.lease("release", "mine").returncode, 0)
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
+    def test_a_recycled_pid_does_not_keep_a_previous_run_held(self):
+        self.lease("status")
+        now = int(time.time())
+        (self.state / "mac-lease" / "lease").write_text(
+            f"previous\t{now + 600}\t{os.getpid()}\t{now}\tMon Jan 1 00:00:00 2001\n"
+        )
+        self.assertEqual(self.lease("status").stdout, "free\n")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+
+    def waiter(self, name, wait="30"):
+        return subprocess.Popen([str(BIN / "mac-lease"), "take", name, "--wait", wait, "--ttl", "60"], env=self.env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    def test_waiters_are_served_first_come_first_served(self):
+        # Polling, whichever waiter looked first after a release won: one that had waited an hour lost to one
+        # that came a second ago. Now the oldest live ticket gets a free lease.
+        for _ in range(3):
+            self.lease("take", "holder")
+            early = self.waiter("early")
+            time.sleep(0.6)
+            late = self.waiter("late")
+            time.sleep(0.6)
+            self.assertEqual(self.lease("release", "holder").returncode, 0)
+            self.assertEqual(early.wait(timeout=10), 0)
+            self.assertIn("early", self.lease("status").stdout)
+            self.assertIsNone(late.poll(), "the later waiter still waits")
+            self.lease("release", "early")
+            self.assertEqual(late.wait(timeout=10), 0)
+            self.lease("release", "late")
+
+    def test_a_take_that_does_not_wait_gets_no_lease_while_others_are_queued(self):
+        self.lease("take", "holder")
+        queued = self.waiter("queued")
+        time.sleep(0.6)
+        r = self.lease("take", "jumper")
+        self.assertEqual(r.returncode, 75)
+        self.assertIn("1 queued before you", r.stderr)
+        self.lease("release", "holder")
+        self.assertEqual(queued.wait(timeout=10), 0)
+        self.lease("release", "queued")
+        self.assertEqual(self.lease("take", "jumper").returncode, 0, "free and nobody queued")
+
+    def test_a_dead_waiters_ticket_does_not_hold_the_queue(self):
+        self.lease("take", "holder")
+        gone = self.waiter("gone")
+        self.addCleanup(lambda: (gone.kill(), gone.communicate(timeout=5)))
+        time.sleep(0.6)
+        gone.kill()
+        # Inspect without poll() or wait(): the waiting process has exited but its PID still exists.
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            state = subprocess.check_output(["/bin/ps", "-p", str(gone.pid), "-o", "stat="], text=True)
+            if state.strip().startswith("Z"):
+                break
+            time.sleep(0.02)
+        self.assertTrue(state.strip().startswith("Z"), "the waiter was not reaped")
+        self.lease("release", "holder")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+
+    def test_a_waiter_that_gives_up_leaves_the_queue(self):
+        self.lease("take", "holder", "--ttl", "60")
+        r = self.lease("take", "brief", "--wait", "1")
+        self.assertEqual(r.returncode, 75)
+        self.lease("release", "holder")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+        self.assertEqual(os.listdir(self.state / "mac-lease" / "queue"), [])
+
+    def test_a_stopped_waiters_ticket_expires_at_its_deadline(self):
+        self.assertEqual(self.lease("take", "holder").returncode, 0)
+        parked = self.waiter("parked", "3")
+        self.addCleanup(lambda: (parked.kill(), parked.communicate(timeout=5)))
+        queue = self.state / "mac-lease" / "queue"
+        until = time.monotonic() + 2
+        tickets = []
+        while not tickets and time.monotonic() < until:
+            tickets = [p for p in queue.glob("*-parked") if p.stat().st_size]
+            if not tickets:
+                time.sleep(0.02)
+        self.assertEqual(len(tickets), 1)
+        deadline = int(tickets[0].read_text())
+        os.kill(parked.pid, signal.SIGSTOP)
+        self.assertEqual(self.lease("release", "holder").returncode, 0)
+        time.sleep(max(0, deadline - time.time()) + 0.15)
+        self.assertIsNone(parked.poll(), "the stopped waiter is still alive")
+        self.assertEqual(self.lease("take", "next").returncode, 0)
+        self.assertFalse(tickets[0].exists())
 
 
 class Peekaboo(Base):

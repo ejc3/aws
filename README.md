@@ -1144,8 +1144,10 @@ All in `~/.local/bin` on the Mac, first on `PATH` in every SSH session (a manage
   environment (passed in a 0600 file, never on a command line); stdin, stdout, stderr and the exit status are CMD's,
   124 on timeout.
 - **`mac-lease`**: the desktop lease, so two sessions' clicks, typing and app relaunches do not interleave. Advisory
-  and lightweight: `mac-lease run NAME [--ttl S] [--wait S] -- CMD` holds it for one command; `take NAME` / `release
-  NAME` hold it across several `ssh mac` calls (default ttl 600 s, renewable by taking it again); `status` shows the
+  and lightweight: `mac-lease run NAME [--wait S] -- CMD` holds the lease until its command exits. Another call with the
+  same name cannot take or release that lease. `take NAME` / `release NAME` hold it across several `ssh mac` calls
+  (default ttl 600 s, renewable by taking it again). Waiters get first-come, first-served tickets that expire at their
+  wait deadline. A `run` under your own explicit `take` leaves that lease and its expiry in place. `status` shows the
   holder. The `peekaboo` wrapper waits (up to `MAC_LEASE_WAIT`, default 120 s) before any click, typing, app, window,
   menu or dialog command while another session holds the lease; pass yours as `MAC_LEASE=NAME`. Looking (`see`,
   `image`, `capture`, `permissions`) never waits. Take the lease before anything that relaunches or signs out of an
