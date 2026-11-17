@@ -152,6 +152,17 @@ class Lease(Base):
         p.kill(); p.wait()
         self.assertEqual(self.lease("status").stdout, "free\n")
 
+    def test_a_runs_lease_outlives_its_ttl_while_the_command_runs(self):
+        # A screen tour runs 15-40 min; with the 600 s ttl its lease lapsed mid-run and the next waiter
+        # started a second build beside it. A `run`'s lease now ends with its process only.
+        p = subprocess.Popen([str(BIN / "mac-lease"), "run", "long", "--ttl", "1", "--", "sleep", "30"], env=self.env)
+        self.addCleanup(lambda: (p.kill(), p.wait()))
+        time.sleep(2)
+        self.assertIn("long (", self.lease("status").stdout, "still held past its ttl")
+        self.assertEqual(self.lease("take", "other").returncode, 75)
+        p.kill(); p.wait()
+        self.assertEqual(self.lease("status").stdout, "free\n")
+
     def test_wait_takes_it_once_released(self):
         self.lease("take", "first", "--ttl", "2")
         start = time.time()

@@ -8,8 +8,9 @@
 #   mac-lease check [NAME]                                  0 if free or held by NAME, 75 if someone else holds it
 #   mac-lease status                                        print the holder, or "free"
 #
-# A lease ends when released, at its expiry (default ttl 600 s), or when the process that took it with
-# `run` exits. `take` fails with 75 while another live lease exists, unless --wait gives it time.
+# A `take`'s lease ends when released or at its expiry (default ttl 600 s). A `run`'s lease ends when the
+# process that took it exits, however long its command runs: --ttl does not cut it short. `take` fails
+# with 75 while another live lease exists, unless --wait gives it time.
 # Installed by ejc3/aws scripts/mac-setup.sh; state in ~/.local/state/mac-lease (MAC_STATE_DIR overrides).
 use strict;
 use warnings;
@@ -40,16 +41,16 @@ sub read_lease {
     chomp $line;
     my ($name, $expiry, $pid, $since) = split /\t/, $line;
     return undef unless defined $expiry && $expiry =~ /^\d+$/;
-    return undef if $expiry <= time;                                   # expired
-    return undef if $pid && $pid =~ /^\d+$/ && $pid > 0 && !kill(0, $pid);   # its `run` process is gone
+    my $run = $pid && $pid =~ /^\d+$/ && $pid > 0;
+    return undef if $run && !kill(0, $pid);                            # its `run` process is gone
+    return undef if !$run && $expiry <= time;                          # a `take`'s, expired
     return { name => $name, expiry => $expiry, pid => $pid // 0, since => $since // $expiry };
 }
 
 sub describe {
     my ($l) = @_;
-    return sprintf("%s (since %s, until %s%s)", $l->{name},
-        strftime("%H:%M:%S", localtime $l->{since}), strftime("%H:%M:%S", localtime $l->{expiry}),
-        $l->{pid} ? ", pid $l->{pid}" : "");
+    return sprintf("%s (since %s, %s)", $l->{name}, strftime("%H:%M:%S", localtime $l->{since}),
+        $l->{pid} ? "while pid $l->{pid} runs" : "until " . strftime("%H:%M:%S", localtime $l->{expiry}));
 }
 
 sub write_lease {
