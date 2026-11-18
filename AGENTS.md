@@ -1024,9 +1024,10 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
 - **Dashboard** `claude-master` (`claw-master-dashboard.tf`): requests by user, subscription, box, model and
   outcome; latency percentiles, Anthropic's first-byte time against claw-master's own overhead; each
   subscription's allowance, resets and Anthropic's own utilization; switches, rate limits, API-backup use;
-  login health; connections; host memory; the log-derived alarms. Two Metrics Insights QUERY alarms with no
-  dimension names (so a renamed dimension cannot turn one silently green): every subscription past 90% of its
-  weekly allowance, and more than 20 Anthropic errors in 10 minutes. Every query was checked against the live
+  failed login refreshes and usage polls by subscription; connections; host memory; the log-derived alarms. The
+  pool alarms detect every subscription past 90% of its weekly allowance and more than 20 Anthropic errors in
+  10 minutes. A contributor alarm names each profile whose token stays expired across three five-minute periods,
+  including profiles serving no traffic. Every query was checked against the live
   API (`window` and `result` are reserved words and must be quoted); `scripts/test-claw-master-server.py`
   keeps them valid.
 - **The claw-master dashboard site** (`claw-master-dashboard-site.tf`; the Worker `claw-master-dashboard`, code in
