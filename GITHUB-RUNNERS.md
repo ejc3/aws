@@ -521,8 +521,32 @@ regardless of a held lease, regardless of anything else, because it is computed 
 instance's launch time alone.
 The poll runs every 5 minutes, so the observed maximum is 13h30m plus at most one poll
 interval. A ceiling termination that never observed the runner idle logs `HARD-CEILING KILL`
-with the GitHub state it saw, and reports it in the poll result as `hard_killed`; that line
-is the only record distinguishing our termination from an AWS spot reclaim.
+with the GitHub state it saw, and reports it in the poll result as `hard_killed`.
+
+### Look up a lost metal runner
+
+The failed GitHub job's runner name is `runner-i-…`. Take its EC2 instance ID
+and run this from a metal dev box. Both architectures use the same log group in
+the control region, including runners that ran in Ohio.
+
+```sh
+iid=i-0123456789abcdef0
+aws logs filter-log-events --region us-west-1 \
+  --log-group-name /aws/lambda/github-runner-loss \
+  --filter-pattern "{ $.instance_id = \"$iid\" }" \
+  --query 'events[].message' --output text
+```
+
+`runner_instance_end_observed` means EC2 reported `terminated` during a five-minute
+scan. `runner_instance_shutdown_observed` means shutdown was still in progress.
+`Server.SpotInstanceTermination` is evidence of a Spot reclaim.
+Several observations can describe the same instance. `runner_termination_accepted`
+records when EC2 accepted a controller request to start termination and gives the
+controller's reason. A generic user-initiated shutdown without a matching controller
+record leaves the caller unconfirmed. The dedicated group retains evidence for
+30 days. Collection starts at deployment. For older Spot losses an administrator
+can look up Ohio CloudTrail events by **event name** `BidEvictedEvent` and match
+the instance IDs in `serviceEventDetails.instanceIdSet`.
 
 The soft cap is a deliberate **local policy**, not a platform limit: GitHub allows a
 self-hosted job to run for up to 5 days (the 6h cap applies to GitHub-hosted runners

@@ -2611,7 +2611,10 @@ watch them: `runner-scale-up-starved` fires when queued work goes unserved for t
 because a host that wedges mid-job keeps reporting `busy` to GitHub), and
 `runner-zero-online` fires within ten minutes when jobs are queued and nothing is online
 or booting to take them.
-Runner roots and instance-store data are disposable. See `GITHUB-RUNNERS.md` for the
+Runner roots and instance-store data are disposable. The metal dev boxes can
+[look up a lost runner by instance ID](GITHUB-RUNNERS.md#look-up-a-lost-metal-runner)
+for 30 days, including AWS Spot evidence and controller-initiated terminations.
+See `GITHUB-RUNNERS.md` for the
 webhook, AMI, lease, health, and cleanup internals.
 
 Runner-image publication is a separate privilege from running CI. The replacement

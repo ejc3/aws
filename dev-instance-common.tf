@@ -62,6 +62,14 @@ resource "aws_iam_policy" "dev_server_service_quotas_read" {
         Action   = ["servicequotas:ListServiceQuotas", "servicequotas:GetAWSDefaultServiceQuota"]
         Resource = "*"
       },
+      # Both managed policy attachment slots and inline space are scarce. The same
+      # metal dev role reads EC2 capacity diagnostics from this single curated group.
+      {
+        Sid      = "ReadMetalRunnerLosses"
+        Effect   = "Allow"
+        Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+        Resource = "${aws_cloudwatch_log_group.runner_loss.arn}:*"
+      },
     ]
   })
 }
