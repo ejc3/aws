@@ -68,11 +68,6 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
       id         = cloudflare_zero_trust_access_policy.workers_stage_agents.id
       precedence = 3
     },
-    # dolphin-labs' staging check after each deploy (dolphin-labs-stage-check.tf).
-    {
-      id         = cloudflare_zero_trust_access_policy.dolphin_labs_stage_check.id
-      precedence = 4
-    },
   ]
 }
 

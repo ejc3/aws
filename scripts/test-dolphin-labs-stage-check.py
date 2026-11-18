@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""dolphin-labs-stage-check.tf: dolphin-labs' staging check gets an Access service token that the staging-Workers
-application alone admits, held as secrets of the main-only `cloudflare-deploy` environment, with no copy elsewhere."""
+"""dolphin-labs-stage-check.tf: dolphin-labs' staging check gets an Access service token that only the canonical Dolphin Labs staging
+hostname admits, held as secrets of the main-only `cloudflare-deploy` environment, with no copy elsewhere."""
 import re
 import unittest
 from pathlib import Path
@@ -25,15 +25,19 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(re.findall(r"token_id = (\S+)", policy),
                          ["cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check.id"])
 
-    def test_only_the_staging_workers_application_admits_it(self):
+    def test_only_the_exact_dolphin_labs_hostname_admits_the_ci_token(self):
         policy_id = "cloudflare_zero_trust_access_policy.dolphin_labs_stage_check.id"
-        app = block(STAGE, "cloudflare_zero_trust_access_application", "workers_stage")
-        self.assertIn(policy_id, app)
+        app = block(TF, "cloudflare_zero_trust_access_application", "dolphin_labs_stage_check")
+        self.assertRegex(app, r'(?m)^  domain\s*= "dolphin-labs-stage\.cc-games\.workers\.dev"$')
+        self.assertNotRegex(app, r'\b(destinations|self_hosted_domains)\s*=')
         self.assertEqual(EVERYTHING.count(policy_id), 1)
         self.assertEqual(EVERYTHING.count("cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check.id"), 1)
-        # Precedences on the application stay distinct.
-        precedences = re.findall(r"precedence = (\d+)", app)
-        self.assertEqual(len(precedences), len(set(precedences)))
+        shared = block(STAGE, "cloudflare_zero_trust_access_application", "workers_stage")
+        policy = r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+\.id),?\s+precedence\s*=\s*(\d+)"
+        self.assertNotIn(policy_id, shared)
+        self.assertEqual(re.findall(policy, app), re.findall(policy, shared) + [(policy_id, "4")])
+        self.assertIn('for name in local.workers_stage_names', shared)
+        self.assertIn('"dolphin-labs-stage"', STAGE)
 
 
 class GitHubTests(unittest.TestCase):
@@ -45,6 +49,7 @@ class GitHubTests(unittest.TestCase):
             self.assertIn('secret_name     = "%s"' % secret, sec)
             self.assertIn("environment     = github_repository_environment.dolphin_labs_cloudflare_deploy.environment", sec)
             self.assertIn("cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check.%s" % value, sec)
+            self.assertIn("depends_on = [cloudflare_zero_trust_access_application.dolphin_labs_stage_check]", sec)
 
     def test_no_copy_for_a_dev_box(self):
         self.assertNotIn("aws_secretsmanager_secret", TF)
@@ -53,4 +58,4 @@ class GitHubTests(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)
