@@ -561,6 +561,47 @@ resource "aws_sns_topic" "alerts" {
   name  = "fcvm-fleet-alerts"
 }
 
+data "aws_caller_identity" "current" {}
+
+# The account's own principals (the default policy's grant) and AWS Budgets for this account's budgets: the fleet's
+# daily budget and its spend backstop notify here (fcvm-fleet-budget.tf). Replacing the default policy needs both.
+resource "aws_sns_topic_policy" "alerts" {
+  count = length(aws_sns_topic.alerts)
+  arn   = aws_sns_topic.alerts[0].arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "AccountOwner"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action = [
+          "SNS:GetTopicAttributes",
+          "SNS:SetTopicAttributes",
+          "SNS:AddPermission",
+          "SNS:RemovePermission",
+          "SNS:DeleteTopic",
+          "SNS:Subscribe",
+          "SNS:ListSubscriptionsByTopic",
+          "SNS:Publish",
+        ]
+        Resource = aws_sns_topic.alerts[0].arn
+      },
+      {
+        Sid       = "ThisAccountsBudgets"
+        Effect    = "Allow"
+        Principal = { Service = "budgets.amazonaws.com" }
+        Action    = "SNS:Publish"
+        Resource  = aws_sns_topic.alerts[0].arn
+        Condition = {
+          StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }
+          ArnLike      = { "aws:SourceArn" = "arn:aws:budgets::${data.aws_caller_identity.current.account_id}:*" }
+        }
+      },
+    ]
+  })
+}
+
 resource "aws_sns_topic_subscription" "alerts_email" {
   count     = length(local.host_archs) > 0 ? 1 : 0
   topic_arn = aws_sns_topic.alerts[0].arn
@@ -814,6 +855,8 @@ output "host_template_arns" {
 output "alert_topic_arns" {
   description = "Existing fleet alert destinations, with their confirmed subscriptions retained"
   value       = aws_sns_topic.alerts[*].arn
+  # A budget that names the topic must find the policy that lets it publish (fcvm-fleet-budget.tf).
+  depends_on = [aws_sns_topic_policy.alerts]
 }
 
 output "host_types" {

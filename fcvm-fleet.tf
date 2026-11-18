@@ -18,10 +18,12 @@
 #   spot quota), so one g4dn.metal: $4.76-5.44 an hour spot there on 2026-10-22. A region and architecture without an AMI
 #   gets no template.
 #   ON-DEMAND FALLBACK: when spot is refused for capacity the coordinator launches the host on demand in the same pass
-#   (modules/fcvm-fleet-region, "GPU hosts"), at most local.fcvm_fleet_on_demand_max = 8 on-demand hosts across the fleet
-#   (owner, 2026-10-24: "Up to 8 on-demand max"; FLEET_HOST_ON_DEMAND_MAX). A g4dn.metal on demand is $7.824 an hour in
-#   us-east-1, so 8 is $62.59 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is 384 vCPU, 4 hosts at 96
-#   each, less any on-demand EC2 tiles (4 vCPU each); launches beyond the quota fail.
+#   (modules/fcvm-fleet-region, "GPU hosts"), at most local.fcvm_fleet_on_demand_max = 2 on-demand hosts across the fleet
+#   (owner, 2026-11-18: two awake GPU hosts cover a spot shortage; FLEET_HOST_ON_DEMAND_MAX). A g4dn.metal on demand is
+#   $7.824 an hour in us-east-1, so 2 is $15.65 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is
+#   local.fcvm_fleet_on_demand_g_vcpus (fcvm-fleet-account.tf), shared with the on-demand EC2 tiles (4 vCPU each), the
+#   gpubox test hosts and the AMI builders; the cap, not the quota, is what bounds the wall's on-demand hosts.
+#   The spend backstop is fcvm-fleet-budget.tf; the alarms are fcvm-fleet-alarms.tf.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
 #   month; 4 vCPU and 8 GB, about $115, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
@@ -67,8 +69,8 @@ locals {
   # The bootstrap image, before main-only CI's first release. Active releases are
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
-  # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
-  fcvm_fleet_on_demand_max       = 8
+  # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-11-18: two awake hosts for spot cover).
+  fcvm_fleet_on_demand_max       = 2
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
   fcvm_fleet_alert_topic_arns    = concat(module.fcvm_fleet_east2.alert_topic_arns, module.fcvm_fleet_west2.alert_topic_arns, module.fcvm_fleet_east1.alert_topic_arns)
   # The coordinator's host launches (fcvm fleet coord, FLEET_HOST_TEMPLATES and FLEET_HOST_SUBNETS, ejc3/fcvm#1257): every
@@ -110,8 +112,6 @@ locals {
   fcvm_fleet_host_gpu_slots     = local.fcvm_fleet_tls_port_ranges.slot.count # a g4dn.metal's T4s
   fcvm_fleet_host_windows       = local.fcvm_fleet_tls_port_ranges.windows.count
   fcvm_fleet_host_minecraft     = local.fcvm_fleet_tls_port_ranges.minecraft.count
-  # One past the last place's port: GPU slots, Windows sandboxes and Minecraft servers.
-  fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : r.offset + r.count if m != "aggregate"]...)
 
   # Aggregated streaming (ejc3/fcvm#1232): each GPU host's aggregator, and the EC2 half's beside the coordinator, serve
   # browsers with TLS under per-launch names (agg-<host>-<token>, agg-ec2-<token>). Off: the page runs direct (one stream
@@ -123,16 +123,23 @@ locals {
   # stats) is on fcvm_fleet_aggregate_port, which the security group does not admit.
   fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_tls_port_ranges.aggregate.offset
   fcvm_fleet_aggregate_port     = 20300
-  fcvm_fleet_slot_tls_ports = {
-    from = local.fcvm_fleet_slot_tls_port_base
-    to   = local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_gpu_slots - 1
+  # The declared modes each region's security group admits over IPv4. us-east-1 admits every place (and the aggregator
+  # when aggregated streaming is on): its host bootstrap is the one reviewed for starting Windows (ejc3/fcvm#1839) and
+  # Minecraft. us-east-2 and us-west-2 have no fleet host AMI, and in us-west-2 the shared group also serves independently
+  # launched lab hosts, so they admit the GPU slots only. Only these mode lists differ by region: every range is computed
+  # from fcvm-fleet-published-ports.json by the one expression in fcvm_fleet_ipv4_viewer_ports, so a mode, count or base
+  # fcvm changes reaches every region's group together.
+  fcvm_fleet_ipv4_viewer_modes = {
+    "us-east-1" = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? [
+      for m in keys(local.fcvm_fleet_tls_port_ranges) : m if m != "aggregate" || local.fcvm_fleet_aggregated
+    ] : ["slot"]
+    "us-east-2" = ["slot"]
+    "us-west-2" = ["slot"]
   }
-  fcvm_fleet_east1_slot_tls_ports = {
-    from = local.fcvm_fleet_slot_tls_ports.from
-    to = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? (
-      local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1
-    ) : local.fcvm_fleet_slot_tls_ports.to
-  }
+  fcvm_fleet_ipv4_viewer_ports = { for region, modes in local.fcvm_fleet_ipv4_viewer_modes : region => {
+    from = local.fcvm_fleet_slot_tls_port_base + min([for m in modes : local.fcvm_fleet_tls_port_ranges[m].offset]...)
+    to   = local.fcvm_fleet_slot_tls_port_base + max([for m in modes : local.fcvm_fleet_tls_port_ranges[m].offset + local.fcvm_fleet_tls_port_ranges[m].count]...) - 1
+  } }
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
@@ -292,6 +299,27 @@ resource "aws_s3_bucket_versioning" "fcvm_fleet_private" {
   }
 }
 
+# The coordinator rewrites state.json on every change, up to about once a second, so versioning adds up to ~86,000
+# noncurrent versions a day. Keep every version younger than 7 days and, past that, the newest 100, for recovering an
+# earlier state when the current one will not parse; S3 expires a noncurrent version only when both limits are passed.
+resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {}
+    noncurrent_version_expiration {
+      noncurrent_days           = 7
+      newer_noncurrent_versions = 100
+    }
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.fcvm_fleet_private]
+}
+
 resource "aws_s3_bucket_public_access_block" "fcvm_fleet_private" {
   for_each                = { assets = aws_s3_bucket.fcvm_fleet_assets.id, state = aws_s3_bucket.fcvm_fleet_coordinator_state.id }
   provider                = aws.fcvm_fleet
@@ -430,7 +458,7 @@ module "fcvm_fleet_east2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
-  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-east-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -450,7 +478,7 @@ module "fcvm_fleet_west2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
-  slot_tls_ports            = local.fcvm_fleet_slot_tls_ports
+  slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-west-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -502,7 +530,7 @@ module "fcvm_fleet_east1" {
     gpu_slots   = local.fcvm_fleet_host_gpu_slots
     source_cidr = "::/0"
   }
-  slot_tls_ports            = local.fcvm_fleet_east1_slot_tls_ports
+  slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-east-1"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
   host_profile_name         = aws_iam_instance_profile.fcvm_fleet_host.name
@@ -656,7 +684,8 @@ resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_on_demand_launches" {
 }
 
 # Alarm actions stay in the coordinator's region. This small forwarder publishes through each retained topic's SNS
-# regional endpoint, preserving the existing confirmed subscriber without relying on cross-region alarm actions.
+# regional endpoint, preserving the existing confirmed subscriber without relying on cross-region alarm actions. Its
+# name is from when it carried this alarm only; it now forwards the health alarms of fcvm-fleet-alarms.tf too.
 data "archive_file" "fcvm_fleet_on_demand_notify" {
   type        = "zip"
   output_path = "${path.module}/.terraform/fcvm-fleet-on-demand-notify.zip"
@@ -714,7 +743,8 @@ resource "aws_lambda_function" "fcvm_fleet_on_demand_notify" {
   memory_size      = 128
   environment {
     variables = {
-      ALARM_ARN  = local.fcvm_fleet_on_demand_alarm_arn
+      # This alarm and the coordinator's health alarms (fcvm-fleet-alarms.tf).
+      ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], values(local.fcvm_fleet_health_alarm_arns)))
       TOPIC_ARNS = jsonencode(local.fcvm_fleet_alert_topic_arns)
     }
   }
