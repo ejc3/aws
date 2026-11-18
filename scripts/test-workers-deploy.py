@@ -60,12 +60,16 @@ class TokenResourceTests(unittest.TestCase):
         self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.cloudflare_account_token.secret_string)", TF)
         self.assertIn('alias = "token_minter"', TF)
 
-    def test_the_token_has_exactly_two_permissions_on_one_account(self):
+    def test_the_token_has_two_permissions_on_one_account_and_one_read_on_one_bucket(self):
         self.assertIn('workers_scripts_write = "%s"' % WORKERS_SCRIPTS_WRITE, TF)
         self.assertIn('account_settings_read = "%s"' % ACCOUNT_SETTINGS_READ, TF)
         self.assertIn("permission_groups = [{ id = local.workers_scripts_write }, { id = local.account_settings_read }]", TF)
-        self.assertEqual(code(TF).count("permission_groups"), 1)
         self.assertIn('resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })', TF)
+        # wrangler's check of a newly bound bucket (dolphin-maps' TILES): read on that one bucket, nothing more.
+        self.assertIn("permission_groups = [{ id = local.r2_bucket_item_read }]", TF)
+        self.assertIn('resources         = jsonencode({ "com.cloudflare.edge.r2.bucket.${var.cloudflare_account_id}_default_${cloudflare_r2_bucket.dolphin_maps_tiles.name}" = "*" })', TF)
+        self.assertEqual(code(TF).count("permission_groups"), 2)
+        self.assertNotIn("r2_bucket_item_write", code(TF))
 
     def test_the_new_token_uses_the_minting_provider_and_is_not_ip_pinned_for_github_runners(self):
         r = self.resource("cloudflare_account_token", "workers_deploy")

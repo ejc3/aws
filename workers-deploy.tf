@@ -5,8 +5,9 @@
 #
 #   cloudflare-workers-deploy-token   Secrets Manager (us-west-1), the raw token string.
 #                                     Permissions: Workers Scripts Write and Account Settings
-#                                     Read on this one account, nothing else (no zones, no DNS,
-#                                     no Access, no tunnels).
+#                                     Read on this one account, and Bucket Item Read on the
+#                                     dolphin-maps-tiles R2 bucket alone, nothing else (no zones,
+#                                     no DNS, no Access, no tunnels).
 #
 # The token is a typed Terraform resource (cloudflare_account_token), minted through an aliased
 # provider that reads the account-owned `cloudflare-account-token` ephemerally (see AGENTS.md,
@@ -60,6 +61,15 @@ locals {
     effect            = "allow"
     permission_groups = [{ id = local.workers_scripts_write }, { id = local.account_settings_read }]
     resources         = jsonencode({ "com.cloudflare.api.account.${var.cloudflare_account_id}" = "*" })
+    }, {
+    # Read on dolphin-maps' tile bucket only (dolphin-maps-tiles.tf), for wrangler's check of a newly bound R2 bucket:
+    # a deploy that first binds TILES asks GET /accounts/<id>/r2/buckets/dolphin-maps-tiles, and without R2 read the
+    # deploy fails ("Authentication error [code: 10000]", dolphin-maps run 44310723194, 2026-11-18). Bucket Item Read
+    # (dolphin-labs-podcasts.tf's pinned id) lists and reads that bucket's objects; it cannot write, delete, list buckets
+    # or reach any other bucket.
+    effect            = "allow"
+    permission_groups = [{ id = local.r2_bucket_item_read }]
+    resources         = jsonencode({ "com.cloudflare.edge.r2.bucket.${var.cloudflare_account_id}_default_${cloudflare_r2_bucket.dolphin_maps_tiles.name}" = "*" })
   }]
 }
 
