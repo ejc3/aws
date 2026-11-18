@@ -578,11 +578,58 @@ class NodeWebImageScriptTests(unittest.TestCase):
             self.assertNotEqual(out.returncode, 0, pins)
             self.assertIn("RUST_TOOLCHAIN", out.stderr)
 
+    def swift_fixture(self, corrupt=False):
+        tmp = self.fixture()
+        src = tmp / "swift-src" / "swift-6.3.3-RELEASE-ubuntu24.04" / "usr" / "bin"
+        src.mkdir(parents=True)
+        (src / "swift").write_text("#!/bin/sh\necho 'Swift version 6.3.3 (swift-6.3.3-RELEASE)'\n")
+        served = tmp / "served" / "swift-6.3.3-release" / "ubuntu2404" / "swift-6.3.3-RELEASE"
+        served.mkdir(parents=True)
+        archive = served / "swift-6.3.3-RELEASE-ubuntu24.04.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(src.parent.parent, arcname="swift-6.3.3-RELEASE-ubuntu24.04")
+        digest = "0" * 64 if corrupt else hashlib.sha256(archive.read_bytes()).hexdigest()
+        (tmp / "bin" / "apt-get").write_text(f'#!/bin/sh\necho "apt-get $*" >> {tmp}/apt.log\n')
+        (tmp / "bin" / "apt-get").chmod(0o755)
+        return tmp, digest
+
+    def test_swift_is_swift_orgs_build_at_the_pinned_hash_in_opt_with_its_bin_on_the_path(self):
+        tmp, digest = self.swift_fixture()
+        path_file = tmp / "etc" / "path"
+        path_file.parent.mkdir()
+        path_file.write_text("/home/runner/.cargo/bin\n")
+        out = self.run_steps(tmp, "install_swift", SWIFT_VERSION="6.3.3", SWIFT_SHA256=digest,
+                             SWIFT_MIRROR="https://mirror.example", SWIFT_ROOT=str(tmp / "opt"),
+                             RUNNER_PATH_FILE=str(path_file))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        swift = tmp / "opt" / "swift-6.3.3" / "usr" / "bin" / "swift"
+        self.assertTrue(swift.is_file(), "the archive's top directory stripped")
+        self.assertEqual(path_file.read_text(), f"/home/runner/.cargo/bin\n{swift.parent}\n",
+                         "added after what install_rust wrote, not over it")
+        self.assertIn("libcurl4t64", (tmp / "apt.log").read_text(), "the packages its tools and the link need")
+
+    def test_a_swift_archive_that_does_not_match_its_pinned_sha256_fails_the_build(self):
+        tmp, digest = self.swift_fixture(corrupt=True)
+        out = self.run_steps(tmp, "install_swift", SWIFT_VERSION="6.3.3", SWIFT_SHA256=digest,
+                             SWIFT_MIRROR="https://mirror.example", SWIFT_ROOT=str(tmp / "opt"),
+                             RUNNER_PATH_FILE=str(tmp / "path"))
+        self.assertNotEqual(out.returncode, 0)
+        self.assertFalse((tmp / "opt" / "swift-6.3.3").exists())
+        self.assertFalse((tmp / "path").exists(), "nothing put on a job's PATH")
+
+    def test_swift_pins_need_each_other(self):
+        tmp = self.fixture()
+        for pins in ({"SWIFT_VERSION": "6.3.3"}, {"SWIFT_SHA256": "0" * 64}):
+            out = self.run_steps(tmp, "main", NODE_MAJOR="22", **pins)
+            self.assertNotEqual(out.returncode, 0, pins)
+            self.assertIn("set with SWIFT_", out.stderr)
+
     def test_the_script_is_valid_and_every_image_using_it_pins_only_what_it_reads(self):
         subprocess.run(["bash", "-n", str(NODE_WEB_SCRIPT)], check=True)
         text = NODE_WEB_SCRIPT.read_text()
         known = {"NODE_MAJOR", "PYTHON_VERSIONS", "PLAYWRIGHT_VERSION", "PLAYWRIGHT_BROWSERS", "APT_PACKAGES",
-                 "RUST_TOOLCHAIN", "RUST_COMPONENTS", "RUST_TARGETS", "WASM_BINDGEN_VERSION"}
+                 "RUST_TOOLCHAIN", "RUST_COMPONENTS", "RUST_TARGETS", "WASM_BINDGEN_VERSION", "SWIFT_VERSION",
+                 "SWIFT_SHA256"}
         for pin in known:
             self.assertIn("${" + pin, text, "the script reads every pin an image may set")
         entries = re.findall(r'^    "([a-z0-9-]+)" = \{\n      repo\s+= "([^"]+)"\n      script = "node-web-runner\.sh"\n'
@@ -591,12 +638,15 @@ class NodeWebImageScriptTests(unittest.TestCase):
                          {"dolphin-labs-runner", "dolphin-films-runner", "dolphin-maps-runner", "colton-games-runner"})
         repos = set(re.findall(r'^    "([^"]+/[^"]+)"\s+= \{ label', APP_TF, re.M))
         for name, repo, _, block in entries:
-            pins = dict(re.findall(r'^\s+([A-Z_]+)\s+= "([^"]*)"', block, re.M))
+            pins = dict(re.findall(r'^\s+([A-Z0-9_]+)\s+= "([^"]*)"', block, re.M))
             self.assertIn("NODE_MAJOR", pins, name)
             self.assertLessEqual(set(pins), known, name)
             self.assertEqual("PLAYWRIGHT_VERSION" in pins, "PLAYWRIGHT_BROWSERS" in pins, name)
             if {"RUST_COMPONENTS", "RUST_TARGETS", "WASM_BINDGEN_VERSION"} & set(pins):
                 self.assertIn("RUST_TOOLCHAIN", pins, name)
+            self.assertEqual("SWIFT_VERSION" in pins, "SWIFT_SHA256" in pins, name)
+            if "SWIFT_SHA256" in pins:
+                self.assertRegex(pins["SWIFT_SHA256"], r"^[0-9a-f]{64}$", name)
             self.assertIn(repo, repos, f"{name} is for an app runner repo")
             for value in pins.values():
                 self.assertRegex(value, r"^[A-Za-z0-9][A-Za-z0-9._:/@+,-]{0,199}$", "image_builder.py's VERSION_VALUE")

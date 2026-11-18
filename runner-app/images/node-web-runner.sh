@@ -16,6 +16,9 @@
 #                        on a job's PATH (bootstrap.sh reads /etc/github-app-runner/path)
 #   WASM_BINDGEN_VERSION optional, with RUST_TOOLCHAIN: wasm-bindgen-cli at exactly that version in
 #                        ~/.cargo/bin, as the repo's Cargo.toml pins the wasm-bindgen crate
+#   SWIFT_VERSION        optional, with SWIFT_SHA256: swift.org's x86_64 Ubuntu toolchain of that release,
+#                        checked against SWIFT_SHA256 (the repo's pin), in /opt/swift-<version> with its
+#                        usr/bin on a job's PATH, and the Ubuntu packages it needs to build and link
 #
 # Each goes where the repo's own setup step looks before it downloads (rustup and wasm-bindgen: on
 # the job's PATH), so a job finds it and skips that download. A job that does not find what it asks for (an image built before a version changed)
@@ -29,9 +32,17 @@ PYTHON_MANIFEST=${PYTHON_MANIFEST:-https://raw.githubusercontent.com/actions/pyt
 UBUNTU_RELEASE=${UBUNTU_RELEASE:-24.04}
 RUNNER_HOME=${RUNNER_HOME:-/home/runner}
 RUSTUP_INIT_URL=${RUSTUP_INIT_URL:-https://sh.rustup.rs}
-RUNNER_PATH_FILE=${RUNNER_PATH_FILE:-/etc/github-app-runner/path}  # bootstrap.sh reads it
+RUNNER_PATH_FILE=${RUNNER_PATH_FILE:-/etc/github-app-runner/path}  # bootstrap.sh reads it, a directory a line
+SWIFT_MIRROR=${SWIFT_MIRROR:-https://download.swift.org}
+SWIFT_ROOT=${SWIFT_ROOT:-/opt}
+# What swift.org's toolchain needs on Ubuntu 24.04 to build and link a package (its list, less what only lldb,
+# the REPL and C interop use).
+SWIFT_APT="binutils libc6-dev libcurl4t64 libgcc-13-dev libncurses6 libsqlite3-0 libstdc++-13-dev libxml2 libuuid1 zlib1g-dev"
 
 get() { curl -fsSL --retry 3 --retry-all-errors "$@"; }
+
+# A directory first on every job's PATH (bootstrap.sh joins the file's lines in order).
+on_path() { mkdir -p "$(dirname "$RUNNER_PATH_FILE")"; printf '%s\n' "$1" >> "$RUNNER_PATH_FILE"; }
 
 # "a,b" -> "a b", for the pins that are lists (a pin cannot hold a space).
 words() { printf '%s' "${1//,/ }"; }
@@ -111,8 +122,24 @@ install_rust() {
   if [ -n "${WASM_BINDGEN_VERSION:-}" ]; then
     sudo -u runner -H "$cargo_bin/cargo" install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
   fi
-  mkdir -p "$(dirname "$RUNNER_PATH_FILE")"
-  printf '%s\n' "$cargo_bin" > "$RUNNER_PATH_FILE"
+  on_path "$cargo_bin"
+}
+
+install_swift() {
+  # swift.org's x86_64 Ubuntu build of the pinned release, checked against the pinned sha256 (swift.org publishes
+  # PGP signatures, not checksums: the repo checked the signature when it set the pin), in /opt/swift-<version>.
+  local name="swift-$SWIFT_VERSION-RELEASE-ubuntu$UBUNTU_RELEASE"
+  local dir="$SWIFT_ROOT/swift-$SWIFT_VERSION"
+  # shellcheck disable=SC2086 # one word per package
+  apt-get install -y -q --no-install-recommends $SWIFT_APT
+  get -o "$TMPDIR/$name.tar.gz" \
+    "$SWIFT_MIRROR/swift-$SWIFT_VERSION-release/ubuntu${UBUNTU_RELEASE//./}/swift-$SWIFT_VERSION-RELEASE/$name.tar.gz"
+  echo "$SWIFT_SHA256  $TMPDIR/$name.tar.gz" | sha256sum -c -
+  rm -rf "$dir"
+  mkdir -p "$dir"
+  tar -xzf "$TMPDIR/$name.tar.gz" -C "$dir" --strip-components=1
+  rm -f "$TMPDIR/$name.tar.gz"
+  on_path "$dir/usr/bin"
 }
 
 main() {
@@ -123,12 +150,16 @@ main() {
   if [ -n "${RUST_COMPONENTS:-}${RUST_TARGETS:-}${WASM_BINDGEN_VERSION:-}" ]; then
     : "${RUST_TOOLCHAIN:?set with RUST_COMPONENTS, RUST_TARGETS or WASM_BINDGEN_VERSION}"
   fi
+  if [ -n "${SWIFT_VERSION:-}" ] || [ -n "${SWIFT_SHA256:-}" ]; then
+    : "${SWIFT_VERSION:?set with SWIFT_SHA256}" "${SWIFT_SHA256:?set with SWIFT_VERSION}"
+  fi
   TMPDIR=${TMPDIR:-/tmp}
   [ -z "${APT_PACKAGES:-}" ] || install_apt_packages
   install_node
   [ -z "${PYTHON_VERSIONS:-}" ] || install_python
   [ -z "${PLAYWRIGHT_VERSION:-}" ] || install_playwright
   [ -z "${RUST_TOOLCHAIN:-}" ] || install_rust
+  [ -z "${SWIFT_VERSION:-}" ] || install_swift
   chown -R runner:runner "$TOOL_CACHE"
 }
 
