@@ -182,11 +182,21 @@ data "archive_file" "runner_webhook" {
                   response = self.clients[region].create_tags(Resources=ids, Tags=Tags, **kwargs)
               return response
 
-          def terminate_instances(self, InstanceIds, **kwargs):
+          def terminate_instances(self, InstanceIds, runner_reason=None, **kwargs):
               self._locate(InstanceIds)
               response = None
               for region, ids in self._by_region(InstanceIds).items():
                   response = self.clients[region].terminate_instances(InstanceIds=ids, **kwargs)
+                  changes = response.get('TerminatingInstances') if isinstance(response, dict) else None
+                  if runner_reason and isinstance(changes, list):
+                      # An idempotent repeat can succeed after somebody else has ended the host.
+                      for change in changes:
+                          match change:
+                              case {'InstanceId': instance_id, 'PreviousState': {'Name': previous}, 'CurrentState': {'Name': current}}:
+                                  if (instance_id in ids and previous in ('pending', 'running', 'stopping', 'stopped')
+                                          and current in ('shutting-down', 'terminated')):
+                                      print(json.dumps({'event': 'runner_termination_accepted', 'instance_id': instance_id,
+                                                        'region': region, 'reason': runner_reason}))
               return response
 
           def __getattr__(self, name):
@@ -1016,7 +1026,7 @@ data "archive_file" "runner_webhook" {
               except Exception as error:
                   print(f'BOOTSTRAP BROKER FAILED for {instance_id}: {type(error).__name__}')
                   try:
-                      ec2.terminate_instances(InstanceIds=[instance_id])
+                      ec2.terminate_instances(InstanceIds=[instance_id], runner_reason='bootstrap-failure')
                   except Exception as terminate_error:
                       print(f'BOOTSTRAP TERMINATE FAILED for {instance_id}: {type(terminate_error).__name__}')
                   # A lost PutParameter response may have left the credential.
@@ -1612,6 +1622,7 @@ resource "aws_lambda_function" "runner_webhook" {
     aws_iam_role_policy.runner_bootstrap,
     aws_iam_role_policy.runner_bootstrap_controller,
     aws_lambda_function.runner_cleanup,
+    aws_cloudwatch_log_subscription_filter.runner_loss_controller,
     # A runner launched into us-west-1c before its route exists can reach nothing,
     # and one launched before the IPv6 grant covers that subnet fails the IPv6 gate.
     aws_route_table_association.runner_us_west_1c,
@@ -2604,11 +2615,21 @@ data "archive_file" "runner_cleanup" {
                   response = self.clients[region].create_tags(Resources=ids, Tags=Tags, **kwargs)
               return response
 
-          def terminate_instances(self, InstanceIds, **kwargs):
+          def terminate_instances(self, InstanceIds, runner_reason=None, **kwargs):
               self._locate(InstanceIds)
               response = None
               for region, ids in self._by_region(InstanceIds).items():
                   response = self.clients[region].terminate_instances(InstanceIds=ids, **kwargs)
+                  changes = response.get('TerminatingInstances') if isinstance(response, dict) else None
+                  if runner_reason and isinstance(changes, list):
+                      # An idempotent repeat can succeed after somebody else has ended the host.
+                      for change in changes:
+                          match change:
+                              case {'InstanceId': instance_id, 'PreviousState': {'Name': previous}, 'CurrentState': {'Name': current}}:
+                                  if (instance_id in ids and previous in ('pending', 'running', 'stopping', 'stopped')
+                                          and current in ('shutting-down', 'terminated')):
+                                      print(json.dumps({'event': 'runner_termination_accepted', 'instance_id': instance_id,
+                                                        'region': region, 'reason': runner_reason}))
               return response
 
           def __getattr__(self, name):
@@ -3223,7 +3244,7 @@ data "archive_file" "runner_cleanup" {
       # the same window to decide an instance type has just failed.
       STARTUP_TIMEOUT_MINUTES = 15
 
-      def reap_stalled_launch(instance_id, now):
+      def reap_stalled_launch(instance, now):
           """Record why this launch died, then terminate it.
 
           The tag has to be written before the terminate call. Once we terminate,
@@ -3232,6 +3253,7 @@ data "archive_file" "runner_cleanup" {
           pick the same instance type again on the next poll - which is exactly the
           loop that pinned x86 to c5d.metal for three consecutive attempts.
           """
+          instance_id = instance['InstanceId']
           try:
               ec2.create_tags(
                   Resources=[instance_id],
@@ -3245,14 +3267,9 @@ data "archive_file" "runner_cleanup" {
               # both the tag and the terminate.
               print(f'Failed to tag {instance_id} as a capacity failure: {e}; deferring the terminate')
               return False
-          try:
-              ec2.terminate_instances(InstanceIds=[instance_id])
-              return True
-          except Exception as e:
-              print(f'Failed to terminate stalled launch {instance_id}: {e}')
-          return False
+          return terminate(instance, 'stalled-launch')
 
-      def terminate(instance_id, reason):
+      def terminate(instance, reason):
           """Terminate one instance; True only if EC2 accepted the call.
 
           The per-instance guard in the sweep must not absorb this. A rejected
@@ -3262,8 +3279,15 @@ data "archive_file" "runner_cleanup" {
           worse, would log the cause as an unreadable EC2 record. The next poll
           retries; the age it is judged on only grows.
           """
+          instance_id = instance['InstanceId']
+          # The reaper also owns AMI builders. Only fcvm runner launches belong in its dev-readable record.
+          tags = instance.get('Tags')
+          identity = {tag['Key']: tag.get('Value') for tag in tags
+                      if isinstance(tag, dict) and tag.get('Key') in ('Role', 'Name')} if isinstance(tags, list) else {}
+          is_runner = (identity.get('Role') == 'github-runner'
+                       and identity.get('Name') in ('github-runner-x86_64', 'github-runner-arm64'))
           try:
-              ec2.terminate_instances(InstanceIds=[instance_id])
+              ec2.terminate_instances(InstanceIds=[instance_id], runner_reason=reason if is_runner else None)
               return True
           except Exception as e:
               print(f'TERMINATE FAILED: {instance_id} ({reason}) is STILL RUNNING: '
@@ -3799,7 +3823,7 @@ data "archive_file" "runner_cleanup" {
                       # instance alone: an instance over the ceiling gets no
                       # optional write after EC2 has refused the required one.
                       ceiling_instances.add(instance_id)
-                      if not terminate(instance_id, 'hard ceiling'):
+                      if not terminate(instance, 'hard-ceiling'):
                           terminate_failed.append(instance_id)
                           continue
                       terminated.append(instance_id)
@@ -3999,7 +4023,7 @@ data "archive_file" "runner_cleanup" {
                                     f'the table could not be read; holding')
                               continue
                           minutes_until_expiry = (lease_expires - now).total_seconds() / 60
-                          if terminate(instance_id, 'never registered, lease expired'):
+                          if terminate(instance, 'unregistered-lease-expired'):
                               print(f'Terminating never-registered: {instance_id} '
                                     f'(lease expired {-minutes_until_expiry:.1f}m ago, '
                                     f'reaping row claimed)')
@@ -4041,7 +4065,7 @@ data "archive_file" "runner_cleanup" {
                                     f'not on re-read; leaving it alone)')
                               draining.append(instance_id)
                               continue
-                          if not terminate(instance_id, 'drained, past the soft cap'):
+                          if not terminate(instance, 'drained-soft-cap'):
                               # Left registered on purpose: it is alive and idle, so it
                               # should keep taking work rather than be forced out of
                               # GitHub and left running with nothing to do.
@@ -4148,7 +4172,7 @@ data "archive_file" "runner_cleanup" {
                                         f'not read as idle on a fresh read; holding')
                                   continue
                               runner_info = fresh
-                          if terminate(instance_id, 'lease expired'):
+                          if terminate(instance, 'lease-expired'):
                               if runner_info.get('id'):
                                   deregister_runner(runner_info['id'], pat)
                               print(f'Terminating expired: {instance_id} '
@@ -4214,17 +4238,17 @@ data "archive_file" "runner_cleanup" {
           # .get, because the sweep above deliberately tolerates a record it cannot
           # read; rebuilding this set with [] would re-raise on the same record and
           # take every phase after it with it, on every poll.
-          running_ids = {i.get('InstanceId') for r in response['Reservations'] for i in r['Instances']}
+          running_by_id = {i.get('InstanceId'): i for r in response['Reservations'] for i in r['Instances']}
           for runner_name, (job_name, minutes) in sorted(stuck_runners.items()):
               instance_id = runner_name.replace('runner-', '')
-              if instance_id not in running_ids or instance_id in terminated:
+              if instance_id not in running_by_id or instance_id in terminated:
                   continue
               # Through terminate(), like every site in the sweep. A raw call here
               # raised straight out of the handler on a rejected TerminateInstances
               # and took every later phase with it, the queued-job launcher
               # included - and since the sweep moved ahead of the orphan cleanup,
               # that cleanup no longer runs before this point either.
-              if not terminate(instance_id, 'job past MAX_JOB_RUNTIME_MINUTES'):
+              if not terminate(running_by_id[instance_id], 'job-runtime-limit'):
                   terminate_failed.append(instance_id)
                   continue
               runner_info = runners.get(runner_name, {})
@@ -4242,7 +4266,7 @@ data "archive_file" "runner_cleanup" {
                   print(f'Skipping {runner_name} (not runner-i- pattern)')
                   continue
               instance_id = runner_name.replace('runner-', '')
-              if instance_id in running_ids:
+              if instance_id in running_by_id:
                   # The sweep listed this instance as running moments ago, so it is
                   # demonstrably alive whatever a per-id lookup says now.
                   # DescribeInstances is eventually consistent and AWS documents
@@ -4278,7 +4302,7 @@ data "archive_file" "runner_cleanup" {
                       # Through terminate() for the same reason as the sweep: a raw
                       # call here loses the stalled-launch reap and the launcher to
                       # one rejected TerminateInstances.
-                      if terminate(instance_id, 'stale AMI builder'):
+                      if terminate(instance, 'stale AMI builder'):
                           print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
                           ami_builder_terminated.append(instance_id)
 
@@ -4302,7 +4326,7 @@ data "archive_file" "runner_cleanup" {
                       print(f'{instance_id}: pending {pending_minutes:.0f}m, inside the startup window')
                       continue
                   print(f'Reaping stalled launch: {instance_id} ({instance.get("InstanceType")}, pending {pending_minutes:.0f}m)')
-                  if reap_stalled_launch(instance_id, now):
+                  if reap_stalled_launch(instance, now):
                       stalled_launches.append(instance_id)
 
           # Phase 6: Launch runners for queued jobs
@@ -4381,7 +4405,7 @@ data "archive_file" "runner_cleanup" {
                   if not deregister_runner(runner_id, pat):
                       print(f'{instance_id}: GitHub did not deregister {runner_name}; leaving it running')
                       continue
-                  if terminate(instance_id, 'idle with nothing queued'):
+                  if terminate(running_by_id[instance_id], 'idle-no-demand'):
                       print(f'Terminating idle: {instance_id} ({runner_name} idle, nothing queued for {arch})')
                       terminated.append(instance_id)
                       idle_terminated.append(instance_id)
@@ -4428,7 +4452,7 @@ resource "aws_lambda_function" "runner_cleanup" {
     Name = "github-runner-cleanup"
   }
 
-  depends_on = [aws_iam_role_policy.runner_bootstrap_controller]
+  depends_on = [aws_iam_role_policy.runner_bootstrap_controller, aws_cloudwatch_log_subscription_filter.runner_loss_controller]
 }
 
 # Async invocations of the unqualified function (the cleanup poll's requests and
@@ -4488,7 +4512,7 @@ resource "aws_lambda_function" "runner_reuse" {
     Name = "github-runner-reuse"
   }
 
-  depends_on = [aws_iam_role_policy.runner_lambda]
+  depends_on = [aws_iam_role_policy.runner_lambda, aws_cloudwatch_log_subscription_filter.runner_loss_controller]
 }
 
 resource "aws_lambda_function_event_invoke_config" "runner_reuse" {

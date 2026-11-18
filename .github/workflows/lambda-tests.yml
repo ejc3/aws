@@ -68,6 +68,11 @@ jobs:
       - name: Runner Lambda logic
         run: python3 scripts/test-runner-lambdas.py
 
+      - name: Metal runner termination evidence and read permissions
+        run: |
+          python3 -S -B scripts/test-runner-loss.py
+          python3 -S -B scripts/test-runner-loss-infra.py
+
       - name: Backup copy and restore safety
         run: python3 -S -B scripts/test-backup-recovery.py
 

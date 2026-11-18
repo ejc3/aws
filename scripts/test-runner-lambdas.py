@@ -166,9 +166,14 @@ class FakeEC2:
         # An accepted terminate MOVES the instance. Leaving it 'running' let a case
         # assert an outcome that only held because the fake froze the world: later
         # phases in the same poll see 'shutting-down' in reality, not 'running'.
+        changes = []
         for inst in self.instances:
             if inst.get("InstanceId") in kw["InstanceIds"]:
-                inst["State"] = {"Name": "shutting-down"}
+                previous = inst["State"]
+                current = previous if previous["Name"] == "terminated" else {"Name": "shutting-down"}
+                inst["State"] = current
+                changes.append({"InstanceId": inst["InstanceId"], "PreviousState": previous, "CurrentState": current})
+        return {"TerminatingInstances": changes}
 
     def ops(self, name):
         return [kw for op, kw in self.calls if op == name]
@@ -909,8 +914,20 @@ def case_registration_credential_is_brokered_only_after_instance_exists():
     assert "ghp_test" not in json.dumps(ec2.ops("run_instances")), "PAT leaked into EC2"
 
 
+def termination_events(output):
+    events = [json.loads(line) for line in output.splitlines() if line.startswith("{")]
+    return [event for event in events if event.get("event") == "runner_termination_accepted"]
+
+
 def case_broker_failure_never_falls_through_to_another_launch():
-    ec2 = FakeEC2()
+    class TrackedLaunch(FakeEC2):
+        def run_instances(self, **kw):
+            response = super().run_instances(**kw)
+            instance_id = response["Instances"][0]["InstanceId"]
+            self.instances.append(instance(instance_id, kw["InstanceType"], "pending", 0, arch="arm64"))
+            return response
+
+    ec2 = TrackedLaunch()
     ssm = FakeSSM(put_error=OSError("do-not-print-this-secret"))
     module = webhook(ec2, ssm=ssm)
     output = io.StringIO()
@@ -924,6 +941,10 @@ def case_broker_failure_never_falls_through_to_another_launch():
     assert len(ec2.ops("run_instances")) == 1, ec2.calls
     assert len(ec2.ops("terminate_instances")) == 1, ec2.calls
     assert len(ssm.deletes) == 1, ssm.deletes
+    assert termination_events(output.getvalue()) == [{
+        "event": "runner_termination_accepted", "instance_id": ec2.instances[0]["InstanceId"],
+        "region": REGION, "reason": "bootstrap-failure",
+    }]
     assert "do-not-print-this-secret" not in output.getvalue(), output.getvalue()
 
 
@@ -2353,8 +2374,13 @@ def case_bootstrap_cleanup_never_precedes_any_instance_hard_ceiling():
 def case_stalled_launch_is_tagged_then_terminated():
     """The tag has to land before the terminate, or the reason is lost."""
     ec2 = FakeEC2([instance("i-stuck", "c5d.metal", "pending", 30)])
-    result = cleanup(ec2, FakeGitHub())["handler"]({}, None)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, FakeGitHub())["handler"]({}, None)
     assert result["stalled_launches"] == ["i-stuck"], result
+    assert termination_events(buf.getvalue()) == [{
+        "event": "runner_termination_accepted", "instance_id": "i-stuck", "region": REGION, "reason": "stalled-launch",
+    }]
     ops = [op for op, _ in ec2.calls if op in ("create_tags", "terminate_instances")]
     assert ops == ["create_tags", "terminate_instances"], ops
     tags = {t["Key"]: t["Value"] for t in ec2.ops("create_tags")[0]["Tags"]}
@@ -2472,6 +2498,47 @@ def case_hard_ceiling_kill_of_a_busy_runner_is_loud():
     assert "HARD-CEILING KILL" in out, out
     assert "not an AWS spot reclaim" in out, out
     assert "busy=True" in out, out
+    assert termination_events(out) == [{
+        "event": "runner_termination_accepted", "instance_id": "i-aged", "region": REGION, "reason": "hard-ceiling",
+    }]
+
+
+def case_idempotent_termination_and_non_metal_hosts_supply_no_cause():
+    # EC2 accepts an idempotent TerminateInstances even after a Spot interruption started.
+    for state, name, role in (
+        ("shutting-down", "github-runner-x86_64", "github-runner"),
+        ("terminated", "github-runner-x86_64", "github-runner"),
+        ("running", "ami-builder-temp", "github-runner"),
+        ("running", "github-app-runner", "github-runner"),
+        ("running", "github-runner-x86_64", "ami-builder"),
+    ):
+        host = instance("i-test", "r5d.metal", state, 14 * 60, tags={"Name": name, "Role": role})
+        ec2 = FakeEC2([host])
+        module = cleanup(ec2, FakeGitHub())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            accepted = module["terminate"](host, "hard-ceiling")
+        assert accepted is True, (state, name)
+        assert not termination_events(buf.getvalue()), (state, name, role, buf.getvalue())
+
+
+def case_unusable_metadata_or_ec2_receipt_preserves_the_accepted_hard_ceiling():
+    class PartialReceipt(FakeEC2):
+        def terminate_instances(self, **kw):
+            super().terminate_instances(**kw)
+            return {"TerminatingInstances": [None, {"InstanceId": "i-test", "PreviousState": None}]}
+
+    for tags in (None, [None, {}, {"Key": ["invalid"]}],
+                 [{"Key": "Role", "Value": "github-runner"}, {"Key": "Name", "Value": "github-runner-x86_64"}]):
+        host = instance("i-test", "r5d.metal", "running", 14 * 60)
+        host["Tags"] = tags
+        ec2 = PartialReceipt([host])
+        module = cleanup(ec2, FakeGitHub())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert module["terminate"](host, "hard-ceiling") is True
+        assert host["State"]["Name"] == "shutting-down"
+        assert not termination_events(buf.getvalue())
 
 
 def case_idle_runner_past_the_soft_cap_is_terminated_immediately():
@@ -2989,6 +3056,7 @@ def case_a_failed_ceiling_terminate_is_not_announced_as_a_dead_job():
         terminate_error=FakeClientError("UnauthorizedOperation"))
     assert result["hard_killed"] == [], result
     assert "HARD-CEILING KILL" not in out, out
+    assert not termination_events(out), out
     assert "TERMINATE FAILED" in out, out
     # And the runner keeps its registration. Deregistering first, then failing to
     # terminate, forces a live runner out of GitHub (killing whatever it runs) and
