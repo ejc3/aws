@@ -16,7 +16,7 @@ variable "fcvm_ami_pipeline_enabled" {
 # kernel (ejc3/fcvm#1874) and the launch-path proof in the validator (ejc3/fcvm#1876, #1878),
 # and its request workflow refuses a source without them (ejc3/fcvm#1873). The one request
 # queued from before the fix is retired by the dispatcher (#852).
-# Leave normal and critical builds enabled while preparing drills. A separately reviewed drill
+# Leave normal and critical builds enabled while preparing a drill. A separately reviewed drill
 # window can pause publication; until then the source fence refuses a drill whose base is stale.
 variable "fcvm_ami_factory_paused" {
   description = "Start no factory build; requests stay queued or are answered disabled"

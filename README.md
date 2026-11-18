@@ -575,17 +575,17 @@ To copy the active release on demand, invoke the publisher below. If copies are 
 invoke it again after they become available:
 `aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
 
-The staging release-gate drills are separate fixed publisher actions:
-`activate-release-gate-drill` sends invalid frames and `activate-no-agent-drill`
-prevents host agents registering. Deploying these actions does not run them or pause the
-image factory. Before a drill, verify the current predecessor with the release gate and
-use the updated `fleet/tools/gpubox.sh` that rejects drill releases. During either drill,
-the shared image-copy record continues to name its healthy predecessor, including when
-replication is requested explicitly. A stale drill source refuses rather than replacing
-a newer release. Each action spends an immutable per-image attempt under the publication
-lock before changing any launch template. If that write or promotion is interrupted,
-inspect the reserved record and publication transaction; do not delete the reservation
-and repeat the fault over a recovered release.
+The staging release-gate drills are fixed publisher actions in `publish.py` `DRILLS`, one per
+hand-built drill host. The table is empty between drills: the 2026-11-18 renderer and no-agent
+drills (#862, #886) have finished. Removing their activation entries leaves the images and backing
+snapshots in place for separate cleanup. A retired drill keeps its source and
+build identity in `RETIRED_DRILL_SOURCES` and `RETIRED_DRILL_IDENTITIES`, so the shared
+image-copy record never takes a drill release. To add a drill, build its host from a `drill/`
+branch merged with the verified live release's source, add its entry and catalog line, and run it
+in the session that applies it: a newer factory release makes the source fence refuse it. Each
+action spends an immutable per-image attempt under the publication lock before changing any launch
+template. If that write or promotion is interrupted, inspect the reserved record and publication
+transaction; do not delete the reservation and repeat the fault over a recovered release.
 
 Before changing `fcvm_ami_build_region`, pause factory admission in the existing deployment
 with a saved targeted Terraform plan using `fcvm_ami_pipeline_enabled=false` for the dispatcher
