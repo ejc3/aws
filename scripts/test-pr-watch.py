@@ -62,6 +62,29 @@ class ClaimTests(unittest.TestCase):
             self.assertEqual(self.claim(home, "/s/b", "claim"), "owner")
 
 
+class PublicTextTests(unittest.TestCase):
+    def test_filters_plain_and_embedded_account_ids_without_disturbing_links_or_ami_ids(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.assertEqual(run(["bash", str(INSTALL), "--watcher"], home).returncode, 0)
+            script = pathlib.Path(home) / ".local/share/pr-watch/public-text.py"
+            account = "012345" + "678901"
+            content = (f"owner={account} ARN arn:aws-us-gov:iam::{account}:role/a\n"
+                       f"https://{account}.dkr.ecr.us-west-1.amazonaws.com/image\n"
+                       "ami-0123456789abcdef0 and 1234567890123")
+            image = "ami-" + account + "abcde"
+            provenance = f"\nimage={image}, owner={account}, malformed=ami-{account}"
+            out = run([sys.executable, "-I", str(script)], home, input=content + provenance)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout, content.replace(account, "(account hidden)") +
+                             f"\nimage={image}, owner=(account hidden), malformed=ami-(account hidden)")
+
+    def test_publication_workflow_covers_titles_reviews_and_api_replies(self):
+        skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
+        self.assertIn("public-text.py", skill)
+        self.assertIn("final title and body", skill)
+        self.assertIn('body=@"$public_body"', skill)
+
+
 class HookTests(unittest.TestCase):
     def test_hook_always_reminds_and_records_nothing(self):
         with tempfile.TemporaryDirectory() as home:
