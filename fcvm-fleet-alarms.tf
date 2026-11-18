@@ -91,7 +91,7 @@ resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_coordinator_not_running" {
   metric_name         = "CPUUtilization"
   dimensions = {
     ClusterName = aws_ecs_cluster.fcvm_fleet.name
-    ServiceName = local.fcvm_fleet_coordinator_service_name
+    ServiceName = "fcvm-fleet-coordinator" # Stable ECS name; the alarm can deploy independently of task revisions.
   }
   statistic           = "SampleCount"
   period              = 60

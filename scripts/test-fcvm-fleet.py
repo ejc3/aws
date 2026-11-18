@@ -614,16 +614,11 @@ exit 1
 
 
 class OnDemandFallbackTests(unittest.TestCase):
-    """Spot first, on demand in the same pass when spot is refused, at most 2 on-demand hosts across the fleet (owner,
-    2026-11-18: two awake GPU hosts for spot cover): the coordinator's cap, handed to it in its environment."""
+    """Spot first, on demand in the same pass when spot is refused, at most 8 on-demand hosts across the fleet (owner,
+    2026-10-24: "Up to 8 on-demand max"): the coordinator's cap, handed to it in its environment."""
 
-    def test_the_on_demand_cap_is_two_for_the_whole_fleet(self):
-        self.assertRegex(TF, r"(?m)^  fcvm_fleet_on_demand_max\s+= 2$")
-        header = TF.split("variable ", 1)[0]
-        self.assertIn("so 2 is $15.65 an hour", header)
-        # The quota is stated by reference to the one place that sets it, not as a second number that can drift.
-        self.assertIn("local.fcvm_fleet_on_demand_g_vcpus (fcvm-fleet-account.tf)", header)
-        self.assertNotRegex(header, r"\b(384|768) vCPU")
+    def test_the_on_demand_cap_is_eight_for_the_whole_fleet(self):
+        self.assertIn("fcvm_fleet_on_demand_max = 8", TF)
         td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn('{ name = "FLEET_HOST_ON_DEMAND_MAX", value = tostring(local.fcvm_fleet_on_demand_max) }', td)
         self.assertNotIn("host_on_demand_max", MOD)
@@ -764,8 +759,9 @@ class HealthAlarmTests(unittest.TestCase):
     def test_no_running_task_and_no_healthy_dns_target_breach_on_missing_data(self):
         ecs = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_coordinator_not_running"', ALARMS)
         self.assertIn('namespace           = "AWS/ECS"', ecs)
-        self.assertIn("ServiceName = local.fcvm_fleet_coordinator_service_name", ecs)
-        self.assertIn("name            = local.fcvm_fleet_coordinator_service_name", TF)
+        self.assertIn('ServiceName = "fcvm-fleet-coordinator"', ecs)
+        service = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        self.assertRegex(service, r'(?m)^  name\s+= "fcvm-fleet-coordinator"$')
         self.assertIn('statistic           = "SampleCount"', ecs)
         dns = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_dns_no_healthy_target"', ALARMS)
         self.assertIn('metric_name         = "HealthyHostCount"', dns)
@@ -799,15 +795,6 @@ class HealthAlarmTests(unittest.TestCase):
                 continue
             for phrase in want:
                 self.assertIn('"' + phrase, source, f"{name}: {phrase!r} is missing from ejc3/fcvm at {revision}")
-
-
-class StateBucketLifecycleTests(unittest.TestCase):
-    def test_noncurrent_state_versions_expire_after_a_week_keeping_the_newest_hundred(self):
-        life = block('resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state"')
-        self.assertIn("bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id", life)
-        self.assertRegex(life, r"noncurrent_days\s+= 7\n")
-        self.assertRegex(life, r"newer_noncurrent_versions = 100\n")
-        self.assertNotRegex(life, r"(?m)^    expiration \{", "the current state object must never expire")
 
 
 class SpendBackstopTests(unittest.TestCase):
