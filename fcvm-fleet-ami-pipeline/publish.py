@@ -704,7 +704,7 @@ class Publisher:
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
 
     # Release gate drills. Each is one host image built by hand
-    # from an ejc3/fcvm drill/ branch: generation seventeen's source (3cace583) merged with one change
+    # from an ejc3/fcvm drill/ branch: generation eighteen's source (26a1ebe5) merged with one change
     # that makes the release fail the gate. Each is published once, as a normal release, over the live
     # release after the gate has verified it, and the gate is expected to roll it back. The factory is
     # paused only for a bounded drill window (fcvm_ami_factory_paused): the source fence requires
@@ -714,14 +714,14 @@ class Publisher:
         # The renderer sends every frame without its FCVF magic, so the staging viewer smoke reports
         # each fcvm wall tile as an image failure on its host.
         "activate-release-gate-drill": {
-            "source": "7457a0ff977a3471f4e8a2502b8248417576f737", "image": "ami-0c19d1cb5f3ec0332",
-            "name": "fcvm-fleet-host-x86_64-7457a0ff-202611161233", "branch": "drill/unframed-renderer",
+            "source": "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff", "image": "ami-0bbc6f68b3492b784",
+            "name": "fcvm-fleet-host-x86_64-415ea4bd-202611180206", "branch": "drill/unframed-renderer",
             "identity": "reviewed-release-gate-drill"},
         # The fleet agent never dials the coordinator, so no host of the release registers and the
         # gate's no-agent check (#886) rolls it back.
         "activate-no-agent-drill": {
-            "source": "c3831f6c43313e36db9ef461df87d6620755c6b4", "image": "ami-03dad8b8bdb96efe4",
-            "name": "fcvm-fleet-host-x86_64-c3831f6c-202611161233", "branch": "drill/agent-never-registers",
+            "source": "df10f45d90593abdb70b564f1fb44042ce2144fc", "image": "ami-0e8d3b0237f9e1dda",
+            "name": "fcvm-fleet-host-x86_64-df10f45d-202611180216", "branch": "drill/agent-never-registers",
             "identity": "reviewed-no-agent-drill"},
     }
 
