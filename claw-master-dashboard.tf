@@ -17,9 +17,8 @@
 #   * Metrics Insights queries (SELECT ... FROM "ClawMaster" GROUP BY ...) aggregate across all the
 #     dimension combinations, so the panels below need no dimension lists.
 #
-# Alarms here are Metrics Insights QUERY alarms with no dimension names, on purpose: an alarm that selects
-# dimensions the series does not have sees no data and, with notBreaching, stays green forever (the memory
-# alarms had exactly that bug in review). A query alarm cannot.
+# Metrics Insights selects across the proxy instances and their changing resource dimensions. Group by profile
+# when a single broken subscription needs attention even while the rest of the pool is healthy.
 
 locals {
   cm_ns = local.claw_master_metrics_namespace
@@ -113,9 +112,10 @@ locals {
       ]
     },
     {
-      title   = "Login health: seconds until each token expires"
-      stacked = false
-      queries = [{ label = "", q = "SELECT MIN(\"claw_master.auth.token_expires_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
+      title          = "Login health: seconds until each token expires"
+      stacked        = false
+      allow_negative = true
+      queries        = [{ label = "", q = "SELECT MAX(\"claw_master.auth.token_expires_in_seconds\") FROM \"${local.cm_ns}\" GROUP BY profile" }]
     },
     {
       title   = "Login refreshes and usage polls (by result)"
@@ -124,6 +124,16 @@ locals {
         { label = "refresh", q = "SELECT SUM(\"claw_master.auth.refresh\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
         { label = "usage poll", q = "SELECT SUM(\"claw_master.usage.polls\") FROM \"${local.cm_ns}\" GROUP BY \"result\"" },
       ]
+    },
+    {
+      title   = "Failed login refreshes by subscription"
+      stacked = false
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.auth.refresh\") FROM \"${local.cm_ns}\" WHERE \"result\" = 'failed' GROUP BY profile" }]
+    },
+    {
+      title   = "Failed usage polls by subscription"
+      stacked = false
+      queries = [{ label = "", q = "SELECT SUM(\"claw_master.usage.polls\") FROM \"${local.cm_ns}\" WHERE \"result\" = 'failed' GROUP BY profile" }]
     },
     {
       title   = "Proxy connections (by result) and refused handshakes"
@@ -170,6 +180,7 @@ locals {
           [for a in aws_cloudwatch_metric_alarm.claw_master_server_swap : a.arn],
           [for a in aws_cloudwatch_metric_alarm.claw_master_server_log : a.arn],
           [for a in aws_cloudwatch_metric_alarm.claw_master_pool : a.arn],
+          aws_cloudwatch_metric_alarm.claw_master_login_expired[*].arn,
         )
       }
     }],
@@ -188,7 +199,7 @@ locals {
           ] : [
           [{ expression = q.q, label = q.label, id = "q${i}_${n}", region = var.aws_region, visible = true }],
         ])]...)
-        yAxis = { left = { min = 0 } }
+        yAxis = { left = lookup(p, "allow_negative", false) ? {} : { min = 0 } }
       }
     }],
   )
@@ -221,5 +232,27 @@ resource "aws_cloudwatch_metric_alarm" "claw_master_pool" {
     # One ten-minute datapoint for the error count (two consecutive five-minute ones would each have to pass
     # 20 on their own); the allowance is judged over three five-minute points.
     period = each.key == "pool_exhausted" ? 300 : 600
+  }
+}
+
+# Monitor each configured login even when it serves no requests. MAX across overlapping proxy colors gives a
+# refreshed token precedence over the draining copy. ORDER BY is required for multi-series query alarms.
+resource "aws_cloudwatch_metric_alarm" "claw_master_login_expired" {
+  count               = var.enable_claw_master_server ? 1 : 0
+  alarm_name          = "claude-master-subscription-login-expired"
+  alarm_description   = "A subscription is still exporting an expired OAuth access token after three five-minute periods. Check the profile in the alarm contributors and its failed refreshes and usage polls on the claude-master dashboard. Renew that subscription on the proxy if refresh is failing."
+  comparison_operator = "LessThanOrEqualToThreshold"
+  threshold           = 0
+  evaluation_periods  = 3
+  datapoints_to_alarm = 3
+  treat_missing_data  = "notBreaching"
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+
+  metric_query {
+    id          = "expiry"
+    return_data = true
+    expression  = "SELECT MAX(\"claw_master.auth.token_expires_in_seconds\") FROM \"${local.cm_ns}\" WHERE \"provider\" = 'claude' GROUP BY profile ORDER BY MAX() ASC"
+    period      = 300
   }
 }

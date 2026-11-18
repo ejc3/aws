@@ -417,8 +417,8 @@ class DashboardTests(unittest.TestCase):
     # words, which the API rejected) must be double quoted.
     SAFE = {"profile", "client_account", "client", "model", "status_class", "status", "route", "reason", "quantile", "measure"}
 
-    def queries(self):
-        found = re.findall(r'"(SELECT (?:[^"\\]|\\.)*)"', DASH)
+    def queries(self, source=DASH):
+        found = re.findall(r'"(SELECT (?:[^"\\]|\\.)*)"', source)
         return [q.replace('\\"', '"').replace("${local.cm_ns}", "ClawMaster") for q in found]
 
     def test_there_are_queries_and_every_one_reads_the_agents_namespace_and_a_known_metric(self):
@@ -434,7 +434,7 @@ class DashboardTests(unittest.TestCase):
         for q in self.queries():
             tail = re.split(r'FROM "[^"]+"', q, maxsplit=1)[1]
             idents = []
-            group = re.search(r"GROUP BY (.+)$", tail)
+            group = re.search(r"GROUP BY (.+?)(?: ORDER BY |$)", tail)
             if group:
                 idents += [x.strip() for x in group.group(1).split(",")]
             idents += re.findall(r'(?:WHERE|AND)\s+("?\w+"?)\s*=', tail)
@@ -467,6 +467,26 @@ class DashboardTests(unittest.TestCase):
         self.assertIn('evaluation_periods  = each.key == "pool_exhausted" ? 3 : 1', alarm)
         self.assertIn('period = each.key == "pool_exhausted" ? 300 : 600', alarm)
         self.assertIn("More than 20 Anthropic error responses in 10 minutes", alarm)
+
+    def test_expiry_alarms_on_each_profile_even_with_healthy_profiles_in_the_pool(self):
+        alarm = block_in(DASH, "aws_cloudwatch_metric_alarm", "claw_master_login_expired")
+        query, = self.queries(alarm)
+        self.assertEqual(query, 'SELECT MAX("claw_master.auth.token_expires_in_seconds") FROM "ClawMaster" '
+                         """WHERE "provider" = 'claude' GROUP BY profile ORDER BY MAX() ASC""")
+        self.assertIn('comparison_operator = "LessThanOrEqualToThreshold"', alarm)
+        for field, value in (("period", 300), ("evaluation_periods", 3), ("datapoints_to_alarm", 3), ("threshold", 0)):
+            self.assertRegex(alarm, rf"\b{field}\s*= {value}\b")
+        self.assertIn('treat_missing_data  = "notBreaching"', alarm)
+        self.assertIn("alarm_actions       = [aws_sns_topic.cost_alerts.arn]", alarm)
+        self.assertIn("aws_cloudwatch_metric_alarm.claw_master_login_expired[*].arn", DASH)
+
+    def test_login_diagnostics_show_failed_attempts_per_profile_and_negative_expiry(self):
+        for metric in ("auth.refresh", "usage.polls"):
+            self.assertIn(f'SELECT SUM("claw_master.{metric}") FROM "ClawMaster" '
+                          """WHERE "result" = 'failed' GROUP BY profile""", self.queries())
+        panel = DASH.split('title          = "Login health: seconds until each token expires"', 1)[1].split("},\n")[0]
+        self.assertIn("allow_negative = true", panel)
+        self.assertIn('lookup(p, "allow_negative", false) ? {} : { min = 0 }', DASH)
 
     def test_a_panel_titled_hours_divides_the_seconds_the_proxy_publishes(self):
         self.assertIn("divide  = 3600", DASH)
