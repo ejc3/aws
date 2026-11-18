@@ -577,7 +577,8 @@ invoke it again after they become available:
 
 The staging release-gate drills are fixed publisher actions in `publish.py` `DRILLS`, one per
 hand-built drill host. The table is empty between drills: the 2026-11-18 renderer and no-agent
-drills (#862, #886) are done and their images deregistered. A retired drill keeps its source and
+drills (#862, #886) have finished. Removing their activation entries leaves the images and backing
+snapshots in place for separate cleanup. A retired drill keeps its source and
 build identity in `RETIRED_DRILL_SOURCES` and `RETIRED_DRILL_IDENTITIES`, so the shared
 image-copy record never takes a drill release. To add a drill, build its host from a `drill/`
 branch merged with the verified live release's source, add its entry and catalog line, and run it

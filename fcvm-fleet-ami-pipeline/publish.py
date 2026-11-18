@@ -708,7 +708,7 @@ class Publisher:
     # published once, as a normal release, over the live release after the gate has verified it, and
     # the gate is expected to roll it back. The source fence requires each drill commit to descend
     # from the live release's source, so a drill built before a newer factory release refuses.
-    # The 2026-11-18 drills (ejc3/aws #862, #886) are done and their images deregistered, so the
+    # The 2026-11-18 drills (ejc3/aws #862, #886) are complete, so the
     # table is empty. A retired drill's source and build identity stay below, because release and
     # rollback records outlive the table and replication must never copy a drill.
     RETIRED_DRILL_SOURCES = (
