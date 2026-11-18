@@ -709,7 +709,11 @@ class Publisher:
     # release after the gate has verified it, and the gate is expected to roll it back. The factory is
     # paused only for a bounded drill window (fcvm_ami_factory_paused): the source fence requires
     # each drill commit to descend from the live release's source. Stale drill images refuse.
-    # The actions and these constants are removed once the drills are done.
+    # When retiring an activation pin, keep its source below for persisted release records.
+    RETIRED_DRILL_SOURCES = (
+        "7457a0ff977a3471f4e8a2502b8248417576f737",
+        "c3831f6c43313e36db9ef461df87d6620755c6b4",
+    )
     DRILLS = {
         # The renderer sends every frame without its FCVF magic, so the staging viewer smoke reports
         # each fcvm wall tile as an image failure on its host.
@@ -1761,9 +1765,11 @@ class Publisher:
 
     @classmethod
     def is_drill_release(cls, release):
-        return (release.get("source_sha") in {d["source"] for d in cls.DRILLS.values()}
-                or any(str(release.get("build_id", "")).startswith(d["identity"] + ":")
-                       for d in cls.DRILLS.values()))
+        source = release.get("source_sha")
+        build = str(release.get("build_id", ""))
+        return source in cls.RETIRED_DRILL_SOURCES or any(
+            source == drill["source"] or build.startswith(drill["identity"] + ":")
+            for drill in cls.DRILLS.values())
 
     def run_replicate(self, event):
         need(event == {"action": "replicate-active-release"}, "image copy accepts no caller configuration")

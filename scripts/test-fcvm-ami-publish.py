@@ -3136,6 +3136,28 @@ class PublisherTests(unittest.TestCase):
                     self.assertEqual(self.fleet_ssm.values["/release-copies"], copies)
                     self.assertEqual(self.west.copies, before_copies)
 
+    def test_repinning_cannot_make_a_source_only_drill_eligible_for_replication(self):
+        # Release and rollback records can outlive the activation catalog.
+        sources = (
+            "7457a0ff977a3471f4e8a2502b8248417576f737", "c3831f6c43313e36db9ef461df87d6620755c6b4",
+            "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff", "df10f45d90593abdb70b564f1fb44042ce2144fc",
+        )
+        self.active_new_pair()
+        release = self.fleet_ssm.values["/release"]
+        healthy = copy.deepcopy(release)
+        release.update(generation=healthy["generation"] + 1)
+        del release["build_id"]
+        for source in sources:
+            with self.subTest(source=source):
+                release["source_sha"] = source
+                release["previous"] = healthy
+                result = self.publisher().run({"action": "replicate-active-release"})
+                self.assertEqual(result["generation"], healthy["generation"])
+                self.assertEqual(self.fleet_ssm.values["/release-copies"]["source_sha"], healthy["source_sha"])
+                release["previous"] = dict(healthy, source_sha=source, build_id="unknown:example")
+                with self.assertRaisesRegex(MODULE.Refused, "no ordinary release to replicate"):
+                    self.publisher().run({"action": "replicate-active-release"})
+
     def test_drill_replication_refuses_a_missing_or_drill_predecessor(self):
         self.active_new_pair()
         release = self.fleet_ssm.values["/release"]
