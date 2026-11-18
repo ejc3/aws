@@ -415,6 +415,9 @@ jobs:
       - name: "fcvm.dev: DNSSEC, DNS-only token, coordinator tunnel behind Access, staging only (fcvm-dev.tf)"
         run: python3 -S -B scripts/test-fcvm-dev.py
 
+      - name: "fcvm.dev prod: tunnel, Access and Turnstile, all off until fcvm_fleet_prod_enabled (fcvm-dev-prod.tf)"
+        run: python3 -S -B scripts/test-fcvm-dev-prod.py
+
       - name: "fcvm-metal-arm host kernel: the pinned fcvm commit, installed once, never rebooted (firecracker-dev.tf)"
         run: python3 -S -B scripts/test-fcvm-host-kernel.py
 

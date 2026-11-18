@@ -23,6 +23,7 @@
 #   fleet-api-direct-stage.fcvm.dev -> /live only, gated by the page's Access application and exact audience. Sign-in
 #                                     sets cookies on both hosts, without admitting the Worker token to either one.
 # The public apex and fleet-api.fcvm.dev go live only on the owner's go-ahead: neither has a record or an application here.
+# The production stack's tunnel, Access and Turnstile are fcvm-dev-prod.tf's, off until var.fcvm_fleet_prod_enabled.
 #
 # CREDENTIAL: the provider token (cloudflare-tunnel-token) has DNS Write account-wide and Zone Settings Write on this zone
 # (added 2026-10-22 with one PUT of the token's own definition, as for mapslink.app). The DNS token is minted through the
