@@ -944,9 +944,9 @@ a week, so a quiet stretch banks room for a busy day.
 
 ### Dolphin organization Linux pool
 
-When enabled, the `dolphin-labs-hq` pool registers disposable Linux x64 runners in one organization
-runner group, `dolphin-linux`. Repositories in the group can draw on the same Spot capacity. Each VM
-still takes one job and terminates; there is no idle fleet. The Mac runner group and the Linux runners
+The default configuration registers the disposable Linux x64 runners for Labs, Films and Maps in
+the `dolphin-labs-hq` organization runner group `dolphin-linux`. These repositories share Spot
+capacity. Each VM takes one job and terminates. The Mac runner group and the Linux runners
 belonging to other GitHub owners continue on their existing paths.
 
 **Sizing.** Across 4,032 matched five-minute CloudWatch samples from November 2 to November 16, 2026,
@@ -976,14 +976,16 @@ switching any job that might rely on a prebuilt tool.
    on the dedicated runtime GitHub App (`dolphin-labs-runners`). That permission
    issues credentials for the selected group and lets the controller reconcile its registrations.
    Keep repository Actions reads on repository-scoped tokens, and keep reusable App credentials in
-   the controller. A job VM receives only its one-job JIT configuration. Set
-   `enable_dolphin_runner_pool` in a separate reviewed change after verifying the grant.
+   the controller. A job VM receives only its one-job JIT configuration. On a fresh installation
+   or during recovery, keep `enable_dolphin_runner_pool=false` until the runtime App can read
+   the expected group and its exact membership using its organization runner grant.
 2. Existing `runs-on: [self-hosted, dolphin, s]` selectors (also `l` and `xl`) remain compatible.
    A canary can explicitly select the `dolphin-linux` group with the same labels. Run smoke jobs
    concurrently from two of the selected repositories at a supported size. Check that
-   both use ephemeral runners from the group, that the jobs tolerate any eligible VM, that a
-   repository outside the group cannot claim one, and that the runners disappear when the
-   queue empties. Only after those checks, add business and cloud as expansion canaries once
+   both use ephemeral runners from the group. Match the job's runner name to its EC2 instance
+   ID and compare the host's `Repo` tag with the repository that executed the job. A mismatch
+   proves cross-repository pickup. Check that a repository outside the group cannot claim a runner
+   and that the runners disappear when the queue empties. Only after those checks, add business and cloud as expansion canaries once
    the runtime App can read their Actions jobs. The separate
    `enable_dolphin_runner_pool_expansion` gate adds both webhooks and group memberships.
    Include a job without a repository AMI in that expansion smoke.

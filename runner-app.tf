@@ -42,7 +42,7 @@ locals {
   # group (burst_max_vcpus per repo, throttled_vcpus for the whole group), and are counted the same way.
   #
   # The dolphin repos share the `dolphin` selector and one budget bucket (runner_budget_groups). The first three
-  # share a runner group after activation; other Dolphin repos still register per repo. `alarm` keeps their existing
+  # share the dolphin-linux organization runner group; other Dolphin repos still register per repo. `alarm` keeps their existing
   # per-repo diagnostics distinct even though they share a workflow label.
   #
   # ejc3/imagine has the owner of ejc3/fcvm, so nothing here may rest on the owner: its runners
@@ -576,7 +576,7 @@ resource "aws_lambda_function" "runner_app" {
       # Every repo the runners app is meant to cover, token gates or not: what an installation may select.
       APP_INSTALLATION_REPOS = jsonencode(local.runner_app_github_app_repos)
       # Group creation does not change registration. Activate only once the runtime app has the org permission.
-      DOLPHIN_POOL_GROUP_ID = local.dolphin_runner_group && var.enable_dolphin_runner_pool ? github_actions_runner_group.dolphin_linux[0].id : "0"
+      DOLPHIN_POOL_GROUP_ID = local.dolphin_runner_pool_active ? github_actions_runner_group.dolphin_linux[0].id : "0"
       DOLPHIN_POOL_REPOS    = jsonencode(local.dolphin_runner_pool_repos)
 
       # The budget buckets (locals above): one item per group in BUDGET_TABLE.
@@ -595,9 +595,9 @@ resource "aws_lambda_function" "runner_app" {
 
   lifecycle {
     precondition {
-      condition = !var.enable_dolphin_runner_pool || (local.dolphin_runner_group && alltrue([
+      condition = !local.dolphin_runner_pool_active || alltrue([
         for repo in local.dolphin_runner_pool_repos : try(local.runner_app_config[repo].label == "dolphin" && local.runner_app_config[repo].app_repo == repo, false)
-      ]))
+      ])
       error_message = "The Dolphin runner pool needs its GitHub group and each pool repository enabled on the runners app."
     }
     precondition {
@@ -998,7 +998,7 @@ variable "enable_runner_app_webhooks" {
 variable "enable_dolphin_runner_pool" {
   description = "Switch the initial Dolphin Linux repositories to organization registration after approving the runners App's organization permission"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "enable_dolphin_runner_pool_expansion" {
@@ -1055,7 +1055,8 @@ locals {
   runner_app_webhooks = var.enable_github_runner && var.enable_runner_app_webhooks
 
   # Share the existing admin App provider only for group management. The controller keeps the separate runners App.
-  dolphin_runner_group = local.runner_app_webhooks
+  dolphin_runner_group       = local.runner_app_webhooks
+  dolphin_runner_pool_active = local.dolphin_runner_group && var.enable_dolphin_runner_pool
   dolphin_runner_pool_repos = concat([
     "dolphin-labs-hq/dolphin-films",
     "dolphin-labs-hq/dolphin-labs",
