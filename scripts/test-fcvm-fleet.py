@@ -612,11 +612,16 @@ exit 1
 
 
 class OnDemandFallbackTests(unittest.TestCase):
-    """Spot first, on demand in the same pass when spot is refused, at most 8 on-demand hosts across the fleet (owner,
-    2026-10-24: "Up to 8 on-demand max"): the coordinator's cap, handed to it in its environment."""
+    """Spot first, on demand in the same pass when spot is refused, at most 2 on-demand hosts across the fleet (owner,
+    2026-11-18: two awake GPU hosts for spot cover): the coordinator's cap, handed to it in its environment."""
 
-    def test_the_on_demand_cap_is_eight_for_the_whole_fleet(self):
-        self.assertIn("fcvm_fleet_on_demand_max = 8", TF)
+    def test_the_on_demand_cap_is_two_for_the_whole_fleet(self):
+        self.assertRegex(TF, r"(?m)^  fcvm_fleet_on_demand_max\s+= 2$")
+        header = TF.split("variable ", 1)[0]
+        self.assertIn("so 2 is $15.65 an hour", header)
+        # The quota is stated by reference to the one place that sets it, not as a second number that can drift.
+        self.assertIn("local.fcvm_fleet_on_demand_g_vcpus (fcvm-fleet-account.tf)", header)
+        self.assertNotRegex(header, r"\b(384|768) vCPU")
         td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn('{ name = "FLEET_HOST_ON_DEMAND_MAX", value = tostring(local.fcvm_fleet_on_demand_max) }', td)
         self.assertNotIn("host_on_demand_max", MOD)
