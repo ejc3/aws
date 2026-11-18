@@ -764,7 +764,8 @@ class HealthAlarmTests(unittest.TestCase):
     def test_no_running_task_and_no_healthy_dns_target_breach_on_missing_data(self):
         ecs = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_coordinator_not_running"', ALARMS)
         self.assertIn('namespace           = "AWS/ECS"', ecs)
-        self.assertIn("ServiceName = aws_ecs_service.fcvm_fleet_coordinator.name", ecs)
+        self.assertIn("ServiceName = local.fcvm_fleet_coordinator_service_name", ecs)
+        self.assertIn("name            = local.fcvm_fleet_coordinator_service_name", TF)
         self.assertIn('statistic           = "SampleCount"', ecs)
         dns = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_dns_no_healthy_target"', ALARMS)
         self.assertIn('metric_name         = "HealthyHostCount"', dns)
@@ -775,8 +776,7 @@ class HealthAlarmTests(unittest.TestCase):
             self.assertIn('treat_missing_data  = "breaching"', alarm)
 
     def test_log_patterns_are_lines_the_coordinator_writes(self):
-        """Each quoted phrase must appear in ejc3/fcvm main's coordinator source (read from a local checkout when one is
-        at ~/fcvm, else skipped as unverifiable here, never passed)."""
+        """The coordinator filters match log calls from the staging image. CI verifies the excerpts at their source."""
         phrases = {
             "fcvm-fleet-state-not-written": ["state not written", "the last state was not stored"],
             "fcvm-fleet-coordinator-degraded": ["listing the GPU hosts failed", "terminating GPU hosts failed",
@@ -792,19 +792,13 @@ class HealthAlarmTests(unittest.TestCase):
             self.assertEqual(re.findall(r'\?\\"([^"\\]+)\\"', pattern), want, name)
         # A spot capacity refusal is routine and is not a degraded state.
         self.assertFalse([l for l in ALARMS.splitlines() if "pattern" in l and "spot launch refused" in l])
-        fcvm = Path.home() / "fcvm"
-        if not (fcvm / ".git").exists():
-            self.skipTest("no ejc3/fcvm checkout at ~/fcvm to read the coordinator's log lines from")
-        source = subprocess.run(["git", "-C", str(fcvm), "grep", "-h", "-F", "-e", "tracing::", "origin/main", "--",
-                                 "src/fleet/coord"], capture_output=True, text=True, check=True).stdout
-        source += subprocess.run(["git", "-C", str(fcvm), "show", "origin/main:src/fleet/coord/text_check.rs",
-                                  "origin/main:src/fleet/coord/hosts.rs", "origin/main:src/fleet/coord/mod.rs"],
-                                 capture_output=True, text=True, check=True).stdout
+        revision, source = (ROOT / "scripts/fixtures/fcvm-coordinator-log-lines.txt").read_text().split("\n", 1)
+        self.assertRegex(revision, r"^[0-9a-f]{40}$")
         for name, want in phrases.items():
             if name == "fcvm-fleet-tunnel-down":
                 continue
             for phrase in want:
-                self.assertIn(phrase, source, f"{name}: {phrase!r} is not a line ejc3/fcvm main writes")
+                self.assertIn('"' + phrase, source, f"{name}: {phrase!r} is missing from ejc3/fcvm at {revision}")
 
 
 class StateBucketLifecycleTests(unittest.TestCase):
@@ -845,17 +839,22 @@ class SpendBackstopTests(unittest.TestCase):
         self.assertIn('Action   = ["ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances"]', cap)
         for kept in ("TerminateInstances", "StopInstances", "Describe"):
             self.assertNotIn(kept, cap)
-        action = block('resource "aws_budgets_budget_action" "fcvm_fleet_daily"', BUDGET)
-        self.assertIn('approval_model     = "AUTOMATIC"', action)
-        self.assertIn("action_threshold_value = 100", action)
-        self.assertIn("roles      = [aws_iam_role.fcvm_fleet_coordinator_task.name]", action)
-        self.assertIn("for_each = local.fcvm_fleet_alert_topic_arns", action)
+        self.assertNotIn('resource "aws_budgets_budget_action"', BUDGET)  # unsupported for DAILY
         grant = block('resource "aws_iam_role_policy" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)
         self.assertIn("Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn", grant)
         self.assertIn('ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn }', grant)
+        self.assertIn('Action   = "budgets:ViewBudget"', grant)
+        self.assertIn("Resource = aws_budgets_budget.fcvm_fleet_daily.arn", grant)
+        self.assertNotIn('Resource = "*"', grant)
         trust = block('resource "aws_iam_role" "fcvm_fleet_budget_action"', BUDGET)
-        self.assertIn('StringEquals = { "aws:SourceAccount" = local.fcvm_fleet_account_id }', trust)
+        self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', trust)
+        worker = block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET)
+        self.assertIn("reserved_concurrent_executions = 1", worker)
+        self.assertIn('expire    = "cron(0 0 * * ? *)"', BUDGET)
+        self.assertIn('reconcile = "cron(2/5 * * * ? *)"', BUDGET)
+        self.assertIn('"fcvm-fleet-spend-cap-unhealthy"', ALARMS)
+        self.assertIn('"fcvm-fleet-spend-cap-unhealthy"', BUDGET)
 
     def test_budgets_may_publish_to_the_fleet_alert_topic(self):
         policy = block('resource "aws_sns_topic_policy" "alerts"', MOD)

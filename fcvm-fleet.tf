@@ -69,6 +69,8 @@ locals {
   # The bootstrap image, before main-only CI's first release. Active releases are
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
+
+  fcvm_fleet_coordinator_service_name = "fcvm-fleet-coordinator"
   # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-11-18: two awake hosts for spot cover).
   fcvm_fleet_on_demand_max       = 2
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
@@ -817,7 +819,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
       {
         # Without ListBucket, S3 answers a read of a missing object with 403, which the coordinator must treat as an error;
-        # with it, a fresh fleet's first read is a 404 and it starts empty. The bucket holds only the state object.
+        # with it, a fresh fleet's first read is a 404 and it starts empty. The coordinator can read or write only its own state object.
         Sid      = "StateObjectMissingReadsAs404"
         Effect   = "Allow"
         Action   = "s3:ListBucket"
@@ -1236,7 +1238,7 @@ resource "aws_ecs_service" "fcvm_fleet_coordinator" {
     aws_iam_role_policy_attachment.fcvm_fleet_coordinator_broadcast,
   ]
   provider        = aws.fcvm_fleet
-  name            = "fcvm-fleet-coordinator"
+  name            = local.fcvm_fleet_coordinator_service_name
   cluster         = aws_ecs_cluster.fcvm_fleet.id
   task_definition = aws_ecs_task_definition.fcvm_fleet_coordinator.arn
   launch_type     = "FARGATE"

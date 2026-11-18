@@ -65,7 +65,7 @@ locals {
   ) : []
   # Built from the names, as fcvm_fleet_on_demand_alarm_arn is: the Lambda permission names the alarm before it exists.
   fcvm_fleet_health_alarm_arns = {
-    for n in local.fcvm_fleet_health_alarm_names :
+    for n in concat(local.fcvm_fleet_health_alarm_names, ["fcvm-fleet-spend-cap-unhealthy"]) :
     n => "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:${n}"
   }
 }
@@ -91,7 +91,7 @@ resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_coordinator_not_running" {
   metric_name         = "CPUUtilization"
   dimensions = {
     ClusterName = aws_ecs_cluster.fcvm_fleet.name
-    ServiceName = aws_ecs_service.fcvm_fleet_coordinator.name
+    ServiceName = local.fcvm_fleet_coordinator_service_name
   }
   statistic           = "SampleCount"
   period              = 60

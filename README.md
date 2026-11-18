@@ -500,6 +500,15 @@ an ordinary Terraform apply never allocates a billed Mac host.
 
 ## Fleet
 
+The staging fleet alerts at $600 and $750 of daily GPU host and tile charges. AWS Budgets
+reports completed UTC days, so the billing figures can arrive after an overage. Every five
+minutes the spend guard checks the last three complete days. The first time a day's bill
+reaches $750 it blocks new coordinator launches and starts for the rest of the UTC day
+when it was detected. Already running hosts can still stop or terminate. At midnight the
+guard releases the restriction without querying billing. If AWS is unavailable, the next
+successful check reconciles it. Duplicate and late notifications cannot extend a processed
+bill's restriction. The guard's logs are in `/aws/lambda/fcvm-fleet-spend-cap` in us-east-2.
+
 The GPU demonstration Fleet's x86 host and tile AMIs have a continuous image factory
 in `fcvm-fleet-ami-pipeline.tf`. Successful `ejc3/fcvm` main CI requests immutable
 source builds; routine changes batch for six hours from the first queued request,

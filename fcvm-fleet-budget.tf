@@ -14,15 +14,13 @@
 #   untagged EBS volumes, together a few dollars a day.
 # - Purpose must be an active cost allocation tag, which only the management account can set; it applies to every member
 #   account. Tags count only for costs after activation, and activation takes up to 24 hours.
-# - At 80% ($600) and 100% ($750) of actual daily spend, a notice to fcvm-fleet-alerts (the fleet's email subscriber; see
-#   fcvm-fleet-alarms.tf for why there is no pager). At 100%, AWS Budgets attaches fcvm-fleet-spend-cap to the
-#   coordinator's task role: no new host or tile launches and no tile pool starts. Terminating, stopping, describing and
-#   everything else stay allowed, so the coordinator can still sleep the fleet and serve the hosts already running. Its
-#   launch attempts then fail, which fcvm-fleet-coordinator-degraded reports.
-# - AWS documents that IAM policy actions reset at the start of each budget period (here each UTC day), not whether the
-#   reset detaches the policy. After the cap trips, check the coordinator role's attached policies; to lift it, reverse
-#   the action (`aws budgets execute-budget-action ... --execution-type REVERSE_BUDGET_ACTION`) as an administrator of
-#   the fleet account. Reversing it stops the action from firing again until the next period.
+# - At $600 and $750, notify the fleet topic. Daily budgets evaluate completed UTC days and do not support
+#   native budget actions. The reconciler reads the latest three complete UTC billing periods. A previously
+#   unseen daily actual at or above $750 blocks new launches through detection day's next UTC midnight.
+#   Stop, terminate and describe remain available. Intraday control belongs to the coordinator.
+# - One serialized worker owns the deny attachment. The midnight reset checks its durable decision without
+#   reading billing; the five-minute reconciliation also releases an expired deny after delivery or IAM outages.
+#   Recorded billed days prevent duplicate or delayed messages from extending the block.
 
 locals {
   fcvm_fleet_daily_budget_usd = 750
@@ -78,11 +76,11 @@ resource "aws_budgets_budget" "fcvm_fleet_daily" {
   depends_on = [aws_ce_cost_allocation_tag.purpose]
 }
 
-# Attached to the coordinator's task role by the budget action. A deny wins over the role's own grants.
+# Attached to the coordinator's task role only by the daily billing reconciler. A deny wins over the role's own grants.
 resource "aws_iam_policy" "fcvm_fleet_spend_cap" {
   provider    = aws.fcvm_fleet
   name        = "fcvm-fleet-spend-cap"
-  description = "Attached to fcvm-fleet-coordinator by the fcvm-fleet-daily budget action: no new GPU hosts or EC2 tiles"
+  description = "Attached to fcvm-fleet-coordinator by the daily billing reconciler: no new GPU hosts or EC2 tiles"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
@@ -95,6 +93,18 @@ resource "aws_iam_policy" "fcvm_fleet_spend_cap" {
   tags = { Project = "fcvm-fleet" }
 }
 
+resource "aws_s3_object" "fcvm_fleet_spend_cap_state" {
+  provider     = aws.fcvm_fleet
+  bucket       = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  key          = "spend-cap/daily.json"
+  content      = jsonencode({ blocked_on = "", billed_days = [] })
+  content_type = "application/json"
+  lifecycle {
+    ignore_changes  = [content]
+    prevent_destroy = true
+  }
+}
+
 resource "aws_iam_role" "fcvm_fleet_budget_action" {
   provider = aws.fcvm_fleet
   name     = "fcvm-fleet-budget-action"
@@ -102,63 +112,158 @@ resource "aws_iam_role" "fcvm_fleet_budget_action" {
     Version = "2012-10-17"
     Statement = [{
       Effect    = "Allow"
-      Principal = { Service = "budgets.amazonaws.com" }
+      Principal = { Service = "lambda.amazonaws.com" }
       Action    = "sts:AssumeRole"
-      Condition = {
-        StringEquals = { "aws:SourceAccount" = local.fcvm_fleet_account_id }
-        ArnLike      = { "aws:SourceArn" = "arn:aws:budgets::${local.fcvm_fleet_account_id}:budget/*" }
-      }
     }]
   })
-  tags = { Project = "fcvm-fleet" }
 }
 
-# Attach and detach the cap on the coordinator's task role, and nothing else.
+resource "aws_cloudwatch_log_group" "fcvm_fleet_budget_action" {
+  provider          = aws.fcvm_fleet
+  name              = "/aws/lambda/fcvm-fleet-spend-cap"
+  retention_in_days = 14
+}
+
 resource "aws_iam_role_policy" "fcvm_fleet_budget_action" {
   provider = aws.fcvm_fleet
-  name     = "attach-fcvm-fleet-spend-cap"
+  name     = "reconcile-fcvm-fleet-spend-cap"
   role     = aws_iam_role.fcvm_fleet_budget_action.id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "CapTheCoordinator"
-      Effect    = "Allow"
-      Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
-      Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn
-      Condition = { ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn } }
-    }]
+    Statement = [
+      {
+        Sid       = "CapTheCoordinator"
+        Effect    = "Allow"
+        Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
+        Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn
+        Condition = { ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn } }
+      },
+      {
+        Sid      = "CheckAttachment"
+        Effect   = "Allow"
+        Action   = "iam:ListAttachedRolePolicies"
+        Resource = aws_iam_role.fcvm_fleet_coordinator_task.arn
+      },
+      {
+        Sid      = "ReadFleetBudget"
+        Effect   = "Allow"
+        Action   = "budgets:ViewBudget"
+        Resource = aws_budgets_budget.fcvm_fleet_daily.arn
+      },
+      {
+        Sid      = "RememberDailyDecisions"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${aws_s3_object.fcvm_fleet_spend_cap_state.key}"
+      },
+      {
+        Sid      = "LogReconciliation"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${aws_cloudwatch_log_group.fcvm_fleet_budget_action.arn}:*"
+      },
+    ]
   })
 }
 
-resource "aws_budgets_budget_action" "fcvm_fleet_daily" {
-  provider           = aws.fcvm_fleet
-  budget_name        = aws_budgets_budget.fcvm_fleet_daily.name
-  action_type        = "APPLY_IAM_POLICY"
-  approval_model     = "AUTOMATIC"
-  notification_type  = "ACTUAL"
-  execution_role_arn = aws_iam_role.fcvm_fleet_budget_action.arn
-
-  action_threshold {
-    action_threshold_type  = "PERCENTAGE"
-    action_threshold_value = 100
+data "archive_file" "fcvm_fleet_budget_action" {
+  type = "zip"
+  source {
+    filename = "index.py"
+    content  = file("${path.module}/scripts/fcvm-fleet-spend-cap.py")
   }
+  output_path = "${path.module}/.terraform/fcvm-fleet-spend-cap.zip"
+}
 
-  definition {
-    iam_action_definition {
-      policy_arn = aws_iam_policy.fcvm_fleet_spend_cap.arn
-      roles      = [aws_iam_role.fcvm_fleet_coordinator_task.name]
+resource "aws_lambda_function" "fcvm_fleet_budget_action" {
+  provider                       = aws.fcvm_fleet
+  function_name                  = "fcvm-fleet-spend-cap"
+  role                           = aws_iam_role.fcvm_fleet_budget_action.arn
+  handler                        = "index.handler"
+  runtime                        = "python3.12"
+  architectures                  = ["arm64"]
+  filename                       = data.archive_file.fcvm_fleet_budget_action.output_path
+  source_code_hash               = data.archive_file.fcvm_fleet_budget_action.output_base64sha256
+  timeout                        = 45
+  reserved_concurrent_executions = 1
+  environment {
+    variables = {
+      ACCOUNT_ID   = local.fcvm_fleet_account_id
+      BUDGET_NAME  = aws_budgets_budget.fcvm_fleet_daily.name
+      LIMIT_USD    = tostring(local.fcvm_fleet_daily_budget_usd)
+      STATE_BUCKET = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+      STATE_KEY    = aws_s3_object.fcvm_fleet_spend_cap_state.key
+      ROLE_NAME    = aws_iam_role.fcvm_fleet_coordinator_task.name
+      POLICY_ARN   = aws_iam_policy.fcvm_fleet_spend_cap.arn
     }
   }
-
-  dynamic "subscriber" {
-    for_each = local.fcvm_fleet_alert_topic_arns
-    content {
-      address           = subscriber.value
-      subscription_type = "SNS"
-    }
-  }
-
   depends_on = [aws_iam_role_policy.fcvm_fleet_budget_action]
+}
+
+locals {
+  fcvm_fleet_budget_ticks = {
+    reconcile = "cron(2/5 * * * ? *)"
+    expire    = "cron(0 0 * * ? *)"
+  }
+}
+
+resource "aws_cloudwatch_event_rule" "fcvm_fleet_spend_cap" {
+  for_each            = local.fcvm_fleet_budget_ticks
+  provider            = aws.fcvm_fleet
+  name                = "fcvm-fleet-spend-cap-${each.key}"
+  schedule_expression = each.value
+}
+
+resource "aws_lambda_permission" "fcvm_fleet_spend_cap" {
+  for_each      = aws_cloudwatch_event_rule.fcvm_fleet_spend_cap
+  provider      = aws.fcvm_fleet
+  statement_id  = "FleetBudget-${each.key}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.fcvm_fleet_budget_action.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = each.value.arn
+}
+
+resource "aws_cloudwatch_event_target" "fcvm_fleet_spend_cap" {
+  for_each   = aws_cloudwatch_event_rule.fcvm_fleet_spend_cap
+  provider   = aws.fcvm_fleet
+  rule       = each.value.name
+  arn        = aws_lambda_function.fcvm_fleet_budget_action.arn
+  input      = jsonencode({ action = each.key })
+  depends_on = [aws_lambda_permission.fcvm_fleet_spend_cap]
+}
+
+# A successful run every five minutes is expected even on days below budget. Missing invocations,
+# throttling that prevents any execution, and repeated worker errors all need the fleet operator.
+resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_spend_cap_unhealthy" {
+  provider            = aws.fcvm_fleet
+  alarm_name          = "fcvm-fleet-spend-cap-unhealthy"
+  alarm_description   = "No successful spend-cap reconciliation in 15 minutes. Check the fcvm-fleet-spend-cap Lambda in us-east-2 and the coordinator role's cap attachment."
+  comparison_operator = "LessThanThreshold"
+  threshold           = 1
+  evaluation_periods  = 1
+  treat_missing_data  = "breaching"
+  metric_query {
+    id          = "success"
+    expression  = "FILL(calls, 0) - FILL(errors, 0)"
+    return_data = true
+  }
+  dynamic "metric_query" {
+    for_each = { calls = "Invocations", errors = "Errors" }
+    content {
+      id = metric_query.key
+      metric {
+        metric_name = metric_query.value
+        namespace   = "AWS/Lambda"
+        period      = 900
+        stat        = "Sum"
+        dimensions  = { FunctionName = aws_lambda_function.fcvm_fleet_budget_action.function_name }
+      }
+    }
+  }
+  alarm_actions = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]
+  ok_actions    = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]
+  depends_on    = [aws_lambda_permission.fcvm_fleet_health_alarms]
 }
 
 output "fcvm_fleet_budget" {
