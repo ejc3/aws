@@ -44,6 +44,21 @@ to approve if it is safe; we have many code review agents"):
   runs in the repository's credential-free CI or on fcvm-metal-arm. Test a fix of your own here only once the PR's
   changes to test and build code have been read and found harmless; when in doubt, use fcvm-metal-arm.
 
+**Public GitHub text.** Before creating or editing a PR or issue, posting a comment or review, or replying in a
+review thread (including replies through the REST or GraphQL API), pass the final title and body through the installed
+`python3 -I ~/.local/share/pr-watch/public-text.py`. It replaces each 12-digit AWS account ID with `(account hidden)`,
+including IDs embedded in ARNs, URLs and copied command output. For image provenance give the AMI ID and source commit.
+Use a private draft file and publish only the filtered output, for example:
+
+```sh
+python3 -I ~/.local/share/pr-watch/public-text.py <"$draft" >"$public_body" &&
+  gh pr comment "$number" -R ejc3/aws --body-file "$public_body"
+```
+
+For a review reply, use the same filtered file in `gh api "$reply_endpoint" -F body=@"$public_body"`.
+For API payloads with multiple comments or replies, filter each text field before serializing the payload.
+If filtering fails, stop before posting. Continue to check other private information separately.
+
 ## Each run
 
 0. **Keep this session's job alive, then claim the watch.** First, in every session, owner or standby: a recurring
