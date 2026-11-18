@@ -16,6 +16,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-fleet.tf").read_text()
 DNS = (ROOT / "fcvm-fleet-dns.tf").read_text()
+ALARMS = (ROOT / "fcvm-fleet-alarms.tf").read_text() if (ROOT / "fcvm-fleet-alarms.tf").exists() else ""
+BUDGET = (ROOT / "fcvm-fleet-budget.tf").read_text() if (ROOT / "fcvm-fleet-budget.tf").exists() else ""
 MOD = (ROOT / "modules" / "fcvm-fleet-region" / "main.tf").read_text()
 
 
@@ -656,6 +658,8 @@ class OnDemandFallbackTests(unittest.TestCase):
         self.assertIn('statistic           = "Sum"', alarm)
         self.assertIn('threshold           = 1', alarm)
         self.assertIn('alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]', alarm)
+        self.assertIn('ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], '
+                      'values(local.fcvm_fleet_health_alarm_arns)))', TF)
         for region in ('east2', 'west2', 'east1'):
             self.assertIn('module.fcvm_fleet_%s.alert_topic_arns' % region, TF)
         # A launch-event counter returning to zero says nothing about whether the host is still charging.
@@ -672,6 +676,7 @@ class OnDemandFallbackTests(unittest.TestCase):
 
 class OnDemandNotificationTests(unittest.TestCase):
     ALARM = 'arn:aws:cloudwatch:us-east-2:123456789012:alarm:fcvm-fleet-on-demand-host-launches'
+    HEALTH = 'arn:aws:cloudwatch:us-east-2:123456789012:alarm:fcvm-fleet-coordinator-not-running'
     TOPICS = ['arn:aws:sns:us-east-1:123456789012:fcvm-fleet-alerts',
               'arn:aws:sns:us-west-2:123456789012:fcvm-fleet-alerts']
 
@@ -681,13 +686,17 @@ class OnDemandNotificationTests(unittest.TestCase):
         self.notify = importlib.util.module_from_spec(spec)
         with mock.patch.dict('sys.modules', {'boto3': self.sdk}):
             spec.loader.exec_module(self.notify)
-        env = mock.patch.dict('os.environ', {'ALARM_ARN': self.ALARM, 'TOPIC_ARNS': json.dumps(self.TOPICS)})
+        env = mock.patch.dict('os.environ', {'ALARM_ARNS': json.dumps([self.ALARM, self.HEALTH]),
+                                             'TOPIC_ARNS': json.dumps(self.TOPICS)})
         env.start()
         self.addCleanup(env.stop)
 
-    def event(self, state='ALARM', alarm=None, source='aws.cloudwatch'):
-        return {'source': source, 'alarmArn': alarm or self.ALARM,
-                'alarmData': {'state': {'value': state, 'reason': 'accepted on-demand launch'}}}
+    def event(self, state='ALARM', alarm=None, source='aws.cloudwatch', description='This counts launch events, not running hosts.'):
+        arn = alarm or self.ALARM
+        return {'source': source, 'alarmArn': arn,
+                'alarmData': {'alarmName': arn.rsplit(':', 1)[-1],
+                              'state': {'value': state, 'reason': 'threshold crossed'},
+                              'configuration': {'description': description}}}
 
     def test_accepted_launch_alarm_uses_each_existing_topics_regional_endpoint(self):
         self.assertEqual(self.notify.handler(self.event(), None), {'notified': 2})
@@ -695,10 +704,29 @@ class OnDemandNotificationTests(unittest.TestCase):
                          [mock.call('sns', region_name='us-east-1'), mock.call('sns', region_name='us-west-2')])
         calls = self.sdk.client.return_value.publish.call_args_list
         self.assertEqual([c.kwargs['TopicArn'] for c in calls], self.TOPICS)
-        self.assertTrue(all('not a running-host count' in c.kwargs['Message'] for c in calls))
+        self.assertTrue(all('not running hosts' in c.kwargs['Message'] for c in calls))
+        self.assertEqual(calls[0].kwargs['Subject'], 'fcvm fleet: fcvm-fleet-on-demand-host-launches is ALARM')
 
-    def test_ok_other_alarms_and_other_event_sources_do_not_send(self):
-        for event in (self.event(state='OK'), self.event(alarm='unrelated'), self.event(source='unrelated'), {}):
+    def test_a_health_alarm_and_its_recovery_are_forwarded_with_their_description(self):
+        for state in ('ALARM', 'OK'):
+            self.sdk.reset_mock()
+            self.assertEqual(self.notify.handler(self.event(state=state, alarm=self.HEALTH, description='no task'), None),
+                             {'notified': 2})
+            call = self.sdk.client.return_value.publish.call_args_list[0]
+            self.assertEqual(call.kwargs['Subject'], f'fcvm fleet: fcvm-fleet-coordinator-not-running is {state}')
+            self.assertTrue(call.kwargs['Message'].startswith('no task\n\nState: ' + state))
+
+    def test_subjects_stay_within_sns_limits(self):
+        long = 'arn:aws:cloudwatch:us-east-2:123456789012:alarm:' + 'x' * 200
+        with mock.patch.dict('os.environ', {'ALARM_ARNS': json.dumps([long])}):
+            self.notify.handler(self.event(alarm=long), None)
+        subject = self.sdk.client.return_value.publish.call_args_list[0].kwargs['Subject']
+        self.assertLess(len(subject), 100)
+        self.assertNotIn('\n', subject)
+
+    def test_insufficient_data_other_alarms_and_other_event_sources_do_not_send(self):
+        for event in (self.event(state='INSUFFICIENT_DATA'), self.event(alarm='unrelated'),
+                      self.event(source='unrelated'), {}):
             self.assertEqual(self.notify.handler(event, None), {'notified': 0})
         self.sdk.client.assert_not_called()
 
@@ -706,6 +734,122 @@ class OnDemandNotificationTests(unittest.TestCase):
         self.sdk.client.return_value.publish.side_effect = RuntimeError('publish unavailable')
         with self.assertRaisesRegex(RuntimeError, 'publish unavailable'):
             self.notify.handler(self.event(), None)
+
+
+class HealthAlarmTests(unittest.TestCase):
+    """fcvm-fleet-alarms.tf: the coordinator's outages page through the fleet's existing alert path, and the log patterns
+    are the strings ejc3/fcvm and the pinned cloudflared actually write."""
+
+    def test_every_health_alarm_exists_only_while_the_coordinator_runs_and_reaches_the_forwarder(self):
+        self.assertIn('fcvm_fleet_health_alarm_names = local.fcvm_fleet_coordinator_running ? concat(', ALARMS)
+        for name in ("fcvm-fleet-coordinator-not-running", "fcvm-fleet-dns-no-healthy-target", "fcvm-fleet-state-not-written",
+                     "fcvm-fleet-coordinator-degraded", "fcvm-fleet-certificate-renewal-failed", "fcvm-fleet-tunnel-down"):
+            self.assertIn(f'"{name}"', ALARMS)
+        alarms = re.findall(r'resource "aws_cloudwatch_metric_alarm" "[^"]+" \{.*?\n\}\n', ALARMS, re.S)
+        self.assertEqual(len(alarms), 3)
+        for alarm in alarms:
+            self.assertRegex(alarm, r"(count|for_each)\s+= local\.fcvm_fleet_coordinator_running \?")
+            self.assertIn("alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]", alarm)
+            self.assertIn("depends_on          = [aws_lambda_permission.fcvm_fleet_health_alarms]", alarm)
+        permission = block('resource "aws_lambda_permission" "fcvm_fleet_health_alarms"', ALARMS)
+        self.assertIn("for_each       = local.fcvm_fleet_health_alarm_arns", permission)
+        self.assertIn('principal      = "lambda.alarms.cloudwatch.amazonaws.com"', permission)
+        self.assertIn("source_arn     = each.value", permission)
+
+    def test_no_running_task_and_no_healthy_dns_target_breach_on_missing_data(self):
+        ecs = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_coordinator_not_running"', ALARMS)
+        self.assertIn('namespace           = "AWS/ECS"', ecs)
+        self.assertIn('ServiceName = "fcvm-fleet-coordinator"', ecs)
+        service = block('resource "aws_ecs_service" "fcvm_fleet_coordinator"')
+        self.assertRegex(service, r'(?m)^  name\s+= "fcvm-fleet-coordinator"$')
+        self.assertIn('statistic           = "SampleCount"', ecs)
+        dns = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_dns_no_healthy_target"', ALARMS)
+        self.assertIn('metric_name         = "HealthyHostCount"', dns)
+        self.assertIn("TargetGroup  = aws_lb_target_group.fcvm_fleet_dns.arn_suffix", dns)
+        for alarm in (ecs, dns):
+            self.assertIn('comparison_operator = "LessThanThreshold"', alarm)
+            self.assertIn("threshold           = 1", alarm)
+            self.assertIn('treat_missing_data  = "breaching"', alarm)
+
+    def test_log_patterns_are_lines_the_coordinator_writes(self):
+        """The coordinator filters match log calls from the staging image. CI verifies the excerpts at their source."""
+        phrases = {
+            "fcvm-fleet-state-not-written": ["state not written", "the last state was not stored"],
+            "fcvm-fleet-coordinator-degraded": ["listing the GPU hosts failed", "terminating GPU hosts failed",
+                                                "launching GPU hosts failed", "EC2 refused a GPU host launch",
+                                                "asking a lost GPU host launch again failed", "text check failed"],
+            "fcvm-fleet-certificate-renewal-failed": ["certificate renewal failed", "the renewed certificate was not stored",
+                                                      "the certificate secret could not be read"],
+            "fcvm-fleet-tunnel-down": ["Serve tunnel error", "Unable to establish connection", "Retrying connection in up to"],
+        }
+        for name, want in phrases.items():
+            entry = ALARMS.split(f'"{name}" = {{', 1)[1].split("\n    }", 1)[0]
+            pattern = re.search(r'pattern\s+= "(.*)"\n', entry)[1]
+            self.assertEqual(re.findall(r'\?\\"([^"\\]+)\\"', pattern), want, name)
+        # A spot capacity refusal is routine and is not a degraded state.
+        self.assertFalse([l for l in ALARMS.splitlines() if "pattern" in l and "spot launch refused" in l])
+        revision, source = (ROOT / "scripts/fixtures/fcvm-coordinator-log-lines.txt").read_text().split("\n", 1)
+        self.assertRegex(revision, r"^[0-9a-f]{40}$")
+        for name, want in phrases.items():
+            if name == "fcvm-fleet-tunnel-down":
+                continue
+            for phrase in want:
+                self.assertIn('"' + phrase, source, f"{name}: {phrase!r} is missing from ejc3/fcvm at {revision}")
+
+
+class SpendBackstopTests(unittest.TestCase):
+    """fcvm-fleet-budget.tf: $750 a day of host and tile spend (owner, 2026-11-18) stops new launches."""
+
+    def test_the_daily_budget_is_750_on_the_fleets_tagged_instances_only(self):
+        self.assertIn("fcvm_fleet_daily_budget_usd = 750", BUDGET)
+        budget = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        self.assertIn("provider     = aws.fcvm_fleet", budget)
+        self.assertIn('time_unit    = "DAILY"', budget)
+        self.assertIn("limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)", budget)
+        self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]', BUDGET)
+        self.assertIn('format("user:Purpose$%s", p)', budget)
+        # The gpubox test hosts and AMI builders share the account and must not stop the wall.
+        self.assertNotIn("fcvm-fleet-gpubox\"]", BUDGET)
+        self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", budget), ["80", "100"])
+        self.assertEqual(budget.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+        self.assertIn("depends_on = [aws_ce_cost_allocation_tag.purpose]", budget)
+        tag = block('resource "aws_ce_cost_allocation_tag" "purpose"', BUDGET)
+        self.assertNotRegex(tag, r"provider\s+=")  # only the management account activates cost allocation tags
+        self.assertIn("prevent_destroy = true", tag)
+        # Each host and tile launch template tags its instance with the Purpose the budget filters on.
+        self.assertEqual(len(re.findall(r'Purpose = "fcvm-fleet-host"', MOD)), 1)
+        self.assertGreaterEqual(len(re.findall(r'Purpose = "fcvm-fleet-tile"', MOD)), 3)
+
+    def test_the_backstop_denies_only_new_launches_to_the_coordinator(self):
+        cap = block('resource "aws_iam_policy" "fcvm_fleet_spend_cap"', BUDGET)
+        self.assertIn('Effect   = "Deny"', cap)
+        self.assertIn('Action   = ["ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances"]', cap)
+        for kept in ("TerminateInstances", "StopInstances", "Describe"):
+            self.assertNotIn(kept, cap)
+        self.assertNotIn('resource "aws_budgets_budget_action"', BUDGET)  # unsupported for DAILY
+        grant = block('resource "aws_iam_role_policy" "fcvm_fleet_budget_action"', BUDGET)
+        self.assertIn('Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)
+        self.assertIn("Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn", grant)
+        self.assertIn('ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn }', grant)
+        self.assertIn('Action   = "budgets:ViewBudget"', grant)
+        self.assertIn("Resource = aws_budgets_budget.fcvm_fleet_daily.arn", grant)
+        self.assertNotIn('Resource = "*"', grant)
+        trust = block('resource "aws_iam_role" "fcvm_fleet_budget_action"', BUDGET)
+        self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', trust)
+        worker = block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET)
+        self.assertIn("reserved_concurrent_executions = 1", worker)
+        self.assertIn('expire    = "cron(0 0 * * ? *)"', BUDGET)
+        self.assertIn('reconcile = "cron(2/5 * * * ? *)"', BUDGET)
+        self.assertIn('"fcvm-fleet-spend-cap-unhealthy"', ALARMS)
+        self.assertIn('"fcvm-fleet-spend-cap-unhealthy"', BUDGET)
+
+    def test_budgets_may_publish_to_the_fleet_alert_topic(self):
+        policy = block('resource "aws_sns_topic_policy" "alerts"', MOD)
+        self.assertIn('Principal = { Service = "budgets.amazonaws.com" }', policy)
+        self.assertIn('"aws:SourceAccount" = data.aws_caller_identity.current.account_id', policy)
+        # Replacing the default policy must keep the account's own grant (the forwarder Lambda publishes as the account).
+        self.assertIn('Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }', policy)
+        self.assertIn("depends_on = [aws_sns_topic_policy.alerts]", block('output "alert_topic_arns"', MOD))
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -1063,20 +1207,22 @@ class SlotV4Tests(unittest.TestCase):
                             ("fcvm_fleet_host_minecraft", "minecraft")):
             self.assertRegex(TF, rf"{local}\s+= local\.fcvm_fleet_tls_port_ranges\.{mode}\.count\b")
         self.assertNotRegex(TF, r"fcvm_fleet_slot_tls_port_base\s+=\s+\d", "the base is a literal again")
-        self.assertIn("fcvm_fleet_host_tls_places_end = max([for m, r in local.fcvm_fleet_tls_port_ranges : "
-                      "r.offset + r.count if m != \"aggregate\"]...)", TF)
-        self.assertIn("from = local.fcvm_fleet_slot_tls_port_base", TF)
+        # Every region's range is one expression over the declaration; regions differ only in which modes they admit.
+        ports = re.search(r"  fcvm_fleet_ipv4_viewer_ports = \{(.*?)\n  \} \}", TF, re.S)[1]
+        self.assertIn("from = local.fcvm_fleet_slot_tls_port_base + min([for m in modes : "
+                      "local.fcvm_fleet_tls_port_ranges[m].offset]...)", ports)
+        self.assertIn("to   = local.fcvm_fleet_slot_tls_port_base + max([for m in modes : "
+                      "local.fcvm_fleet_tls_port_ranges[m].offset + local.fcvm_fleet_tls_port_ranges[m].count]...) - 1", ports)
+        self.assertNotRegex(ports, r"\b20\d\d\d\b", "a port number is written into the expression")
         # Only us-east-1 may add the extra ports; closing its gate reuses the ordinary GPU slot range.
         gate = "fcvm_fleet_extra_ipv4_viewer_ports_enabled"
         self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= true$")
-        base_ports = re.search(r"  fcvm_fleet_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
-        self.assertRegex(base_ports, r"to\s*= local.fcvm_fleet_slot_tls_port_base \+ local.fcvm_fleet_host_gpu_slots - 1")
-        ports = re.search(r"  fcvm_fleet_east1_slot_tls_ports = \{(.*?)\n  \}", TF, re.S)[1]
-        self.assertIn(f"to = var.{gate} ? (", ports)
-        self.assertIn(") : local.fcvm_fleet_slot_tls_ports.to", ports)
-        # With the gate open: every place's port, and with aggregated streaming the host aggregator's declared port after them.
-        self.assertIn("local.fcvm_fleet_aggregated ? local.fcvm_fleet_aggregate_tls_port : "
-                      "local.fcvm_fleet_slot_tls_port_base + local.fcvm_fleet_host_tls_places_end - 1", ports)
+        modes = re.search(r"  fcvm_fleet_ipv4_viewer_modes = \{(.*?)\n  \}", TF, re.S)[1]
+        self.assertIn(f'"us-east-1" = var.{gate} ? [', modes)
+        self.assertIn('for m in keys(local.fcvm_fleet_tls_port_ranges) : m if m != "aggregate" || local.fcvm_fleet_aggregated', modes)
+        self.assertIn('] : ["slot"]', modes)
+        self.assertRegex(modes, r'(?m)^    "us-east-2" = \["slot"\]$')
+        self.assertRegex(modes, r'(?m)^    "us-west-2" = \["slot"\]$')
         self.assertIn("fcvm_fleet_aggregate_tls_port = local.fcvm_fleet_slot_tls_port_base + "
                       "local.fcvm_fleet_tls_port_ranges.aggregate.offset", TF)
         # What that evaluates to today: the range admits every place, and the aggregator's port is the one after.
@@ -1101,12 +1247,10 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn("from_port   = var.slot_tls_ports.from", slots[0])
         self.assertIn("to_port     = var.slot_tls_ports.to", slots[0])
         self.assertIn('cidr_blocks = ["0.0.0.0/0"]', slots[0])
-        # Only the region whose host bootstrap was verified may open the extra ports.
-        for region, port_range in (("east1", "fcvm_fleet_east1_slot_tls_ports"),
-                                   ("east2", "fcvm_fleet_slot_tls_ports"),
-                                   ("west2", "fcvm_fleet_slot_tls_ports")):
-            self.assertRegex(block(f'module "fcvm_fleet_{region}"'),
-                             rf"(?m)^  slot_tls_ports\s*= local\.{port_range}$")
+        # Every region module takes its range from the one map, under its own region's key.
+        for module, region in (("east1", "us-east-1"), ("east2", "us-east-2"), ("west2", "us-west-2")):
+            self.assertRegex(block(f'module "fcvm_fleet_{module}"'),
+                             rf'(?m)^  slot_tls_ports\s*= local\.fcvm_fleet_ipv4_viewer_ports\["{region}"\]$')
 
     def test_the_coordinator_serves_the_launch_names_subzone(self):
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
