@@ -703,31 +703,24 @@ class Publisher:
              "reviewed host release accepts no caller configuration")
         return self.run_build_region_host_release(self.reviewed_ipv4_host_release(), "reviewed-ipv4-host-release")
 
-    # Release gate drills. Each is one host image built by hand
-    # from an ejc3/fcvm drill/ branch: generation eighteen's source (26a1ebe5) merged with one change
-    # that makes the release fail the gate. Each is published once, as a normal release, over the live
-    # release after the gate has verified it, and the gate is expected to roll it back. The factory is
-    # paused only for a bounded drill window (fcvm_ami_factory_paused): the source fence requires
-    # each drill commit to descend from the live release's source. Stale drill images refuse.
-    # When retiring an activation pin, keep its source below for persisted release records.
+    # Release gate drills. Each is one host image built by hand from an ejc3/fcvm drill/ branch: a
+    # verified release's source merged with one change that makes the release fail the gate. Each is
+    # published once, as a normal release, over the live release after the gate has verified it, and
+    # the gate is expected to roll it back. The source fence requires each drill commit to descend
+    # from the live release's source, so a drill built before a newer factory release refuses.
+    # The 2026-11-18 drills (ejc3/aws #862, #886) are done and their images deregistered, so the
+    # table is empty. A retired drill's source and build identity stay below, because release and
+    # rollback records outlive the table and replication must never copy a drill.
     RETIRED_DRILL_SOURCES = (
         "7457a0ff977a3471f4e8a2502b8248417576f737",
         "c3831f6c43313e36db9ef461df87d6620755c6b4",
+        "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff",
+        "df10f45d90593abdb70b564f1fb44042ce2144fc",
     )
-    DRILLS = {
-        # The renderer sends every frame without its FCVF magic, so the staging viewer smoke reports
-        # each fcvm wall tile as an image failure on its host.
-        "activate-release-gate-drill": {
-            "source": "415ea4bdcfee38f17f6222a2f2f1f1905ebeceff", "image": "ami-0bbc6f68b3492b784",
-            "name": "fcvm-fleet-host-x86_64-415ea4bd-202611180206", "branch": "drill/unframed-renderer",
-            "identity": "reviewed-release-gate-drill"},
-        # The fleet agent never dials the coordinator, so no host of the release registers and the
-        # gate's no-agent check (#886) rolls it back.
-        "activate-no-agent-drill": {
-            "source": "df10f45d90593abdb70b564f1fb44042ce2144fc", "image": "ami-0e8d3b0237f9e1dda",
-            "name": "fcvm-fleet-host-x86_64-df10f45d-202611180216", "branch": "drill/agent-never-registers",
-            "identity": "reviewed-no-agent-drill"},
-    }
+    RETIRED_DRILL_IDENTITIES = ("reviewed-release-gate-drill", "reviewed-no-agent-drill")
+    # action -> {"source", "image", "name", "branch", "identity"}; see scripts/test-fcvm-ami-publish.py
+    # DRILL_FIXTURE for the shape.
+    DRILLS = {}
 
     def drill_receipt_name(self, drill):
         # Under /publications/, a path the publisher role may already write (fcvm-fleet-ami-pipeline.tf).
@@ -1767,9 +1760,9 @@ class Publisher:
     def is_drill_release(cls, release):
         source = release.get("source_sha")
         build = str(release.get("build_id", ""))
-        return source in cls.RETIRED_DRILL_SOURCES or any(
-            source == drill["source"] or build.startswith(drill["identity"] + ":")
-            for drill in cls.DRILLS.values())
+        identities = cls.RETIRED_DRILL_IDENTITIES + tuple(drill["identity"] for drill in cls.DRILLS.values())
+        return (source in cls.RETIRED_DRILL_SOURCES or any(source == drill["source"] for drill in cls.DRILLS.values())
+                or any(build.startswith(identity + ":") for identity in identities))
 
     def run_replicate(self, event):
         need(event == {"action": "replicate-active-release"}, "image copy accepts no caller configuration")

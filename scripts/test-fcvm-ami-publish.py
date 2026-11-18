@@ -23,6 +23,19 @@ SOURCE = Path(__file__).resolve().parents[1] / "fcvm-fleet-ami-pipeline/publish.
 SPEC = importlib.util.spec_from_file_location("fleet_image_publisher", SOURCE)
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+# The table as shipped (empty once a round of drills is retired), and the drills the tests run:
+# the shape of the 2026-11-18 pair, with made-up commits and image ids.
+SHIPPED_DRILLS = dict(MODULE.Publisher.DRILLS)
+DRILL_FIXTURE = {
+    "activate-release-gate-drill": {
+        "source": "1a2b3c4d" + "1" * 32, "image": "ami-0a1a1a1a1a1a1a1a1",
+        "name": "fcvm-fleet-host-x86_64-1a2b3c4d-202601010000", "branch": "drill/unframed-renderer",
+        "identity": "reviewed-release-gate-drill"},
+    "activate-no-agent-drill": {
+        "source": "5e6f7a8b" + "2" * 32, "image": "ami-0b2b2b2b2b2b2b2b2",
+        "name": "fcvm-fleet-host-x86_64-5e6f7a8b-202601010000", "branch": "drill/agent-never-registers",
+        "identity": "reviewed-no-agent-drill"},
+}
 
 
 class ParameterNotFound(Exception):
@@ -319,6 +332,9 @@ class PublisherTests(unittest.TestCase):
         network = mock.patch.object(http.client, "HTTPSConnection", side_effect=AssertionError("offline fixture forbids network"))
         network.start()
         self.addCleanup(network.stop)
+        drills = mock.patch.object(MODULE.Publisher, "DRILLS", DRILL_FIXTURE)
+        drills.start()
+        self.addCleanup(drills.stop)
         self.build = "factory:00000000-0000-0000-0000-000000000001"
         self.source, self.input = "a" * 40, "b" * 64
         self.ids = ["lt-" + format(i, "017x") for i in range(1, 5)]
@@ -3157,6 +3173,19 @@ class PublisherTests(unittest.TestCase):
                 release["previous"] = dict(healthy, source_sha=source, build_id="unknown:example")
                 with self.assertRaisesRegex(MODULE.Refused, "no ordinary release to replicate"):
                     self.publisher().run({"action": "replicate-active-release"})
+
+    def test_retired_drills_stay_drill_releases_after_the_table_is_emptied(self):
+        self.assertEqual(SHIPPED_DRILLS, {})
+        with mock.patch.object(MODULE.Publisher, "DRILLS", {}):
+            for identity in ("reviewed-release-gate-drill", "reviewed-no-agent-drill"):
+                with self.subTest(identity=identity):
+                    self.assertTrue(MODULE.Publisher.is_drill_release({"source_sha": "e" * 40, "build_id": identity + ":x"}))
+            for source in MODULE.Publisher.RETIRED_DRILL_SOURCES:
+                with self.subTest(source=source):
+                    self.assertTrue(MODULE.Publisher.is_drill_release({"source_sha": source, "build_id": "unknown:x"}))
+            self.assertFalse(MODULE.Publisher.is_drill_release({"source_sha": "e" * 40, "build_id": "fcvm-fleet-image-factory:x"}))
+            with self.assertRaises(MODULE.Refused):
+                self.publisher().run({"action": "activate-release-gate-drill"})
 
     def test_drill_replication_refuses_a_missing_or_drill_predecessor(self):
         self.active_new_pair()

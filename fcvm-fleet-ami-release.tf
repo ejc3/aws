@@ -135,13 +135,6 @@ locals {
     "host/x86_64/0e910245" = { image = "ami-0c1f87eea5c86c172", kind = "host", name = "fcvm-fleet-host-x86_64-0e910245-202611121727" }
     "host/x86_64/cad0ddad" = { image = "ami-05c06ef8ae037b10a", kind = "host", name = "fcvm-fleet-host-x86_64-cad0ddad-202611131412" }
     "host/x86_64/c12ad070" = { image = "ami-0c2656522631215d1", kind = "host", name = "fcvm-fleet-host-x86_64-c12ad070-202611141114" }
-    # RELEASE GATE DRILLS (publish.py DRILLS): two hosts built from ejc3/fcvm drill/ branches,
-    # each generation eighteen's source (26a1ebe5) merged with one change that fails the gate. 415ea4bd
-    # (drill/unframed-renderer): the renderer sends frames without their FCVF magic. df10f45d
-    # (drill/agent-never-registers): the fleet agent never dials the coordinator. Each is published once over the live,
-    # gate-verified release; both are removed after the drills.
-    "host/x86_64/415ea4bd" = { image = "ami-0bbc6f68b3492b784", kind = "host", name = "fcvm-fleet-host-x86_64-415ea4bd-202611180206" }
-    "host/x86_64/df10f45d" = { image = "ami-0e8d3b0237f9e1dda", kind = "host", name = "fcvm-fleet-host-x86_64-df10f45d-202611180216" }
   }
 }
 
