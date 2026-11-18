@@ -48,7 +48,9 @@ class GitHubTests(unittest.TestCase):
             self.assertIn("provider        = github.dolphin_labs_ci", sec)
             self.assertIn('secret_name     = "%s"' % secret, sec)
             self.assertIn("environment     = github_repository_environment.dolphin_labs_cloudflare_deploy.environment", sec)
-            self.assertIn("cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check.%s" % value, sec)
+            reference = f"cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check.{value}"
+            self.assertRegex(sec, rf"(?m)^  plaintext_value\s*= {re.escape(reference)}$")
+            self.assertEqual(EVERYTHING.count(reference), 1)
             self.assertIn("depends_on = [cloudflare_zero_trust_access_application.dolphin_labs_stage_check]", sec)
 
     def test_no_copy_for_a_dev_box(self):

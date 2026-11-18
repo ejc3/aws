@@ -13,8 +13,10 @@
 # Hostname-level Access takes precedence over the Worker-native gate. The exact hostname gets the same three
 # existing policies and the CI token. Preview URLs and sibling staging Workers retain their Worker-level gate.
 # https://developers.cloudflare.com/workers/configuration/cloudflare-access/#understand-access-hierarchy
-# The token lives in Terraform state and the main-only GitHub environment. Rotate it with
+# The token lives in Terraform state and the main-only GitHub environment. Rotate between deploys with
 # terraform apply -replace=cloudflare_zero_trust_access_service_token.dolphin_labs_stage_check
+# Replacement revokes the old pair before both GitHub secrets are refreshed. If rotation is interrupted, finish the
+# apply and rerun the staging check with the new pair before promoting a build.
 
 resource "cloudflare_zero_trust_access_service_token" "dolphin_labs_stage_check" {
   account_id = var.cloudflare_account_id
