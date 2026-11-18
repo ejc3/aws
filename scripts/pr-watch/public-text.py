@@ -4,8 +4,12 @@ import re
 import sys
 
 
+# A complete AMI ID can itself contain twelve consecutive decimal digits.
+TOKEN = re.compile(r"(?P<ami>\bami-(?:[0-9a-f]{17}|[0-9a-f]{8})\b)|(?<![0-9])[0-9]{12}(?![0-9])")
+
+
 def public_text(body: str) -> str:
-    return re.sub(r"(?<![0-9])[0-9]{12}(?![0-9])", "(account hidden)", body)
+    return TOKEN.sub(lambda match: match.group("ami") or "(account hidden)", body)
 
 
 if __name__ == "__main__":

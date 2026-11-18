@@ -71,10 +71,12 @@ class PublicTextTests(unittest.TestCase):
             content = (f"owner={account} ARN arn:aws-us-gov:iam::{account}:role/a\n"
                        f"https://{account}.dkr.ecr.us-west-1.amazonaws.com/image\n"
                        "ami-0123456789abcdef0 and 1234567890123")
-            out = run([sys.executable, "-I", str(script)], home, input=content)
+            image = "ami-" + account + "abcde"
+            provenance = f"\nimage={image}, owner={account}, malformed=ami-{account}"
+            out = run([sys.executable, "-I", str(script)], home, input=content + provenance)
             self.assertEqual(out.returncode, 0, out.stderr)
-            self.assertEqual(out.stdout, content.replace(account, "(account hidden)"))
-            self.assertNotIn(account, out.stdout)
+            self.assertEqual(out.stdout, content.replace(account, "(account hidden)") +
+                             f"\nimage={image}, owner=(account hidden), malformed=ami-(account hidden)")
 
     def test_publication_workflow_covers_titles_reviews_and_api_replies(self):
         skill = (ROOT / "scripts/pr-watch/SKILL.md").read_text()
