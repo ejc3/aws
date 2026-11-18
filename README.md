@@ -338,6 +338,12 @@ terraform apply -var enable_runner_app_webhooks=false \
 Then populate `/alerts/email`, `/github-runner/pat`, and `fcvm-ec2-ssh-key` through the AWS
 console or AWS CLI without printing their values.
 
+In a new installation, enable the Dolphin runner webhooks with
+`enable_dolphin_runner_pool=false` to create the group and keep per-repository registration.
+Enable the pool after the dedicated runners App can read the `dolphin-linux` group and its
+three selected repositories and issue a single-job registration.
+See the [Dolphin Linux pool rollout](GITHUB-RUNNERS.md#dolphin-organization-linux-pool).
+
 The runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films`,
 `dolphin-labs-hq/dolphin-maps`, `ejc3/imagine` and `ejc3/constellation` also need one controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
 containers created above, from `runner-repos.tf`; Terraform never holds the value). The full
