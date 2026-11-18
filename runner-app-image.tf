@@ -102,7 +102,9 @@ locals {
       # engine-rs/rust-toolchain.toml and engine-rs/Cargo.toml (built natively and to WebAssembly);
       # ci.yml's ffmpeg step (pipeline/test/recorder.test.ts measures the voice clips' loudness);
       # cloudflare-stage.yml's Tiles step (osmium-tool reads Geofabrik's California extract for pipeline/src/build-tiles.ts);
-      # ci.yml's Chromium step (web/test/car-compact.test.ts lays the car page out in headless Chrome).
+      # ci.yml's Chromium step (web/test/car-compact.test.ts lays the car page out in headless Chrome);
+      # .github/scripts/swift-dolphinkit.sh's SWIFT_VERSION and SWIFT_SHA256 (the iPhone app's DolphinKit, built and
+      # tested on Linux).
       versions = {
         NODE_MAJOR           = "22"
         PYTHON_VERSIONS      = "3.12"
@@ -113,6 +115,8 @@ locals {
         RUST_TARGETS         = "wasm32-unknown-unknown"
         WASM_BINDGEN_VERSION = "0.2.129"
         APT_PACKAGES         = "ffmpeg,osmium-tool"
+        SWIFT_VERSION        = "6.3.3"
+        SWIFT_SHA256         = "da8272a5fddccd65b1529ed0e52e04526e2eadd4237d58d6220efeb973c6cd19"
       }
     }
     "colton-games-runner" = {
