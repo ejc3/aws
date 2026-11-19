@@ -1,8 +1,9 @@
 # Nationwide road tiles for dolphin-labs-hq/dolphin-maps (ejc3/aws#747).
 # Workers bind this private bucket as TILES in a later Maps change; this file does
 # not deploy a Worker or change its routes. The uploader writes tiles/<id>.json.
-# Only the bucket-scoped token enters protected state and the main-only GitHub
-# environment. The existing token_minter reads its administration token ephemerally.
+# Only the bucket-scoped token enters protected state, the main-only GitHub
+# environment and the dolphin-maps/tiles-upload secret below. The existing token_minter reads
+# its administration token ephemerally.
 
 locals {
   dolphin_maps_tiles_bucket      = "dolphin-maps-tiles"
@@ -80,4 +81,37 @@ resource "github_actions_environment_secret" "dolphin_maps_tiles" {
 
   # Do not expose a credential while the new environment still admits all refs.
   depends_on = [github_repository_environment_deployment_policy.dolphin_maps_tiles_main]
+}
+
+# The same bucket-scoped credentials for the dev boxes (dolphin-labs-hq/dolphin-maps#1508): the nationwide build moves
+# off the shared CI pool, where its xl job held the dolphin group's whole throttled vCPU budget for three hours, onto a
+# pbox started by a dev box's weekly cron. The pbox only builds; the dev box reads this secret into its environment and
+# uploads (pipeline/src/upload-tiles.ts), so no credential reaches the pbox. JSON: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+# R2_SECRET_ACCESS_KEY, R2_BUCKET. Its value is the token above (read and write on dolphin-maps-tiles only), written
+# by Terraform, so it rotates with that token.
+resource "aws_secretsmanager_secret" "dolphin_maps_tiles_upload" {
+  name                    = "dolphin-maps/tiles-upload"
+  description             = "dolphin-maps' tile upload credentials (JSON: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET): read and write on the dolphin-maps-tiles R2 bucket only. Written by Terraform; see dolphin-maps-tiles.tf."
+  recovery_window_in_days = 7
+  tags                    = { Name = "dolphin-maps/tiles-upload", Project = "dolphin-maps" }
+}
+
+resource "aws_secretsmanager_secret_version" "dolphin_maps_tiles_upload" {
+  secret_id     = aws_secretsmanager_secret.dolphin_maps_tiles_upload.id
+  secret_string = jsonencode(local.dolphin_maps_tiles_credentials)
+}
+
+resource "aws_secretsmanager_secret_policy" "dolphin_maps_tiles_upload" {
+  secret_arn = aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevServerRoleCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+    }]
+  })
 }

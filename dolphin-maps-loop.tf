@@ -348,6 +348,13 @@ data "aws_iam_policy_document" "dolphin_maps_pems_dev" {
     actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
     resources = [aws_secretsmanager_secret.dolphin_maps_drives_read.arn]
   }
+  # dolphin-maps' tile upload credentials (dolphin-maps-tiles.tf): read only, for the weekly build on a pbox, here for the
+  # role's 20-policy cap.
+  statement {
+    sid       = "ReadTheTilesUpload"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn]
+  }
   # dolphin-maps' MusicKit key (dolphin-maps-musickit.tf): put and described, never read, here for the role's 20-policy cap.
   statement {
     sid       = "PutTheMusicKitKey"
