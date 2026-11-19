@@ -5,7 +5,7 @@
   SyntheticOk 1 when every check passed, 0 when one failed.
 - {"check": "worker-deploys"}, every 5 minutes: reads the last WINDOW_MINUTES of the Cloudflare account's audit log
   (v2, GET /accounts/<id>/logs/audit) and counts the writes to the prod Worker (WORKER) made by anything but the prod
-  release token (RELEASE_TOKEN_NAME). Puts WorkerChangesOutsideRelease, the count. A read that fails raises, so no
+  release token (RELEASE_TOKEN_ID). Puts WorkerChangesOutsideRelease, the count. A read that fails raises, so no
   metric is put and the alarm's missing data breaches.
 - An EventBridge "AWS API Call via CloudTrail" event: a change to the prod coordinator's ECS service or to a prod launch
   template. Puts ProdChangesOutsideRelease 1 unless the caller is that API's release role (RELEASE_ROLES).
@@ -165,13 +165,13 @@ def touches_worker(entry, worker):
     return not path and resource.get("id") == worker and "worker" in (resource.get("product") or "").lower()
 
 
-def by_release_token(entry, token_name):
+def by_release_token(entry, token_id):
     actor = entry.get("actor") or {}
-    return actor.get("context") == "api_token" and actor.get("token_name") == token_name
+    return actor.get("context") == "api_token" and bool(token_id) and actor.get("token_id") == token_id
 
 
-def foreign_worker_changes(entries, worker, token_name):
-    return [e for e in entries if touches_worker(e, worker) and not by_release_token(e, token_name)]
+def foreign_worker_changes(entries, worker, token_id):
+    return [e for e in entries if touches_worker(e, worker) and not by_release_token(e, token_id)]
 
 
 def audit_entries(account, token, since, before, opener=urllib.request.urlopen):
@@ -199,7 +199,7 @@ def worker_deploys(now=None, opener=urllib.request.urlopen):
     token = boto3.client("secretsmanager").get_secret_value(SecretId=os.environ["CF_TOKEN_SECRET"])["SecretString"].strip()
     stamp = "%Y-%m-%dT%H:%M:%SZ"
     entries = audit_entries(os.environ["CF_ACCOUNT_ID"], token, since.strftime(stamp), now.strftime(stamp), opener)
-    foreign = foreign_worker_changes(entries, os.environ["WORKER"], os.environ["RELEASE_TOKEN_NAME"])
+    foreign = foreign_worker_changes(entries, os.environ["WORKER"], os.environ["RELEASE_TOKEN_ID"])
     for e in foreign:
         actor, raw, action = e.get("actor") or {}, e.get("raw") or {}, e.get("action") or {}
         print(json.dumps({"worker_change_outside_release": {

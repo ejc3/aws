@@ -3,6 +3,7 @@
 Offline: real git repositories in a temp directory and a fake launcher."""
 import importlib.util
 import base64
+import gzip
 import json
 import os
 import shutil
@@ -479,6 +480,67 @@ class RebootTests(Base):
 
 
 class ClaudeRetirementTests(Base):
+    def setUp(self):
+        super().setUp()
+        config = mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")})
+        config.start()
+        self.addCleanup(config.stop)
+
+    def eligibility(self, folder, age, *, pane_age=None, process_age=None, bridge_age=None,
+                    message=False, registry_ticks=str):
+        now = 2_000_000_000
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        watcher = ass.ClaudeRetirement(self.cfg)
+        root = Path(watcher.root)
+        transcript = root / "projects" / ("-" + folder.name) / (sid + ".jsonl")
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        if message:
+            transcript.write_text('{"type":"user","message":{"role":"user"}}\n')
+        elif bridge_age is not None:
+            when = ass.datetime.datetime.fromtimestamp(now - bridge_age, ass.datetime.timezone.utc)
+            transcript.write_text(json.dumps({"type": "system", "subtype": "bridge_status",
+                                              "timestamp": when.isoformat(), "sessionId": sid}) + "\n")
+        else:
+            transcript.write_bytes(b"")
+        with subprocess.Popen(["sleep", "60"], cwd=folder) as child:
+            try:
+                _, ticks = ass.linux_process(child.pid)
+                registry = root / "sessions"
+                registry.mkdir(exist_ok=True)
+                (registry / f"{child.pid}.json").write_text(json.dumps({
+                    "pid": child.pid, "cwd": str(folder), "sessionId": sid, "status": "idle",
+                    "startedAt": (now - age) * 1000, "procStart": registry_ticks(ticks), "statusUpdatedAt": now * 1000,
+                }))
+                fields = ("@1", "%1", str(os.getpid()), "1", "0", launch,
+                          str(now - (age if pane_age is None else pane_age)), sid, "",
+                          "resume" if bridge_age is not None else "startup", str(folder), str(transcript))
+                uptime = ticks / os.sysconf("SC_CLK_TCK") + (age if process_age is None else process_age)
+                with mock.patch.object(ass, "linux_uptime", return_value=uptime):
+                    return watcher.eligible(fields, now)
+            finally:
+                child.terminate()
+
+    def test_only_unused_linked_worktrees_qualify_after_two_days(self):
+        main = make_repo(self.home, "main")
+        worktree = self.home / "linked"
+        git(main, "worktree", "add", "-q", str(worktree), "-b", "linked")
+        two_days = 48 * 3600
+        self.assertIsNone(self.eligibility(worktree, two_days - 1))
+        self.assertIsNotNone(self.eligibility(worktree, two_days + 1))
+        self.assertIsNone(self.eligibility(worktree, two_days + 1, process_age=60))
+        self.assertIsNone(self.eligibility(worktree, two_days + 1, pane_age=60))
+        self.assertIsNone(self.eligibility(worktree, two_days + 1, message=True))
+        self.assertIsNone(self.eligibility(worktree, 60, bridge_age=two_days - 1))
+        self.assertIsNotNone(self.eligibility(worktree, 60, bridge_age=two_days + 1))
+        self.assertIsNone(self.eligibility(main, 60, bridge_age=two_days + 1))
+        self.assertIsNone(self.eligibility(main, two_days + 1))
+        self.assertIsNotNone(self.eligibility(main, 7 * 86400 + 1, registry_ticks=int))
+        self.assertIsNone(self.eligibility(main, 7 * 86400 + 1, registry_ticks=lambda t: str(t + 1)))
+        prior = self.home / ".claude" / "projects" / "-linked" / "469463d6-fc76-4ddd-9fa6-2d2d7b907abf.jsonl"
+        prior.write_text('{"type":"assistant","message":{}}\n')
+        self.assertIsNone(self.eligibility(worktree, 8 * 86400))
+
     def test_retirement_only_mode_does_not_discover_or_launch_repositories(self):
         make_repo(self.home, "should-not-be-discovered")
         self.assertEqual(ass.main(["--retire-claude-only", "--once", "--home", str(self.home),
@@ -525,6 +587,22 @@ class ClaudeRetirementTests(Base):
         self.assertFalse(ass.claude_retired(folder, self.home))
         ass.write_marker(marker, b"retired\n", replace=True)
         self.assertTrue(ass.claude_retired(folder, self.home), "a confirmed close stays retired")
+
+    def test_sibling_message_after_a_worktree_retirement_intent_allows_boot(self):
+        main = make_repo(self.home, "main")
+        linked = self.home / "linked"
+        git(main, "worktree", "add", "-q", str(linked), "-b", "linked")
+        launch = "c71d1421-bf8b-4d78-97ce-f83876c83cf5"
+        sid = "7cbaad62-68fd-410b-8ef1-d9219f643513"
+        project = self.home / ".claude" / "projects" / "linked"
+        project.mkdir(parents=True)
+        transcript = project / (sid + ".jsonl")
+        transcript.touch()
+        marker = ass.retirement_marker(linked, self.home)
+        ass.retirement_intent(marker, launch, sid, "resume", str(transcript))
+        self.assertTrue(ass.claude_retired(linked, self.home))
+        (project / (launch + ".jsonl")).write_text('{"type":"user","message":{}}\n')
+        self.assertFalse(ass.claude_retired(linked, self.home))
 
     def test_retiring_a_linked_worktree_does_not_retire_its_main_checkout_or_sibling(self):
         main = make_repo(self.home, "main")
@@ -633,6 +711,17 @@ class EmptyTranscriptTests(Base):
         self.write({"type": "queue-operation", "operation": "enqueue", "sessionId": self.sid})
         self.assertFalse(self.empty(), "a pending turn is evidence of activity")
 
+    def test_native_disconnect_warning_is_bookkeeping_but_other_cli_warnings_preserve_the_session(self):
+        warning = {"type": "system", "subtype": "informational", "level": "warning", "entrypoint": "cli",
+                   "sessionId": self.sid, "isMeta": False, "isSidechain": False,
+                   "content": "Remote Control disconnected — OAuth token unavailable — run /login to restore Remote Control"}
+        self.write(warning)
+        self.assertTrue(self.empty())
+        self.write(dict(warning, content="Remote Control disconnected — a message is waiting"))
+        self.assertFalse(self.empty())
+        self.write(dict(warning, message={"role": "user"}))
+        self.assertFalse(self.empty())
+
     def test_unknown_or_unreadable_records_are_not_assumed_empty(self):
         for raw in (b'{"type":"future-event"}\n', b'{"type":\n', b'[]\n', b'\xff\n',
                     b'{"type":"file-history-snapshot","message":{}}\n',
@@ -657,6 +746,82 @@ class EmptyTranscriptTests(Base):
         self.transcript.parent.mkdir()
         self.transcript.symlink_to(outside / self.transcript.name)
         self.assertFalse(self.empty(), "a dangling transcript symlink cannot prove absence")
+
+
+class WorktreeTranscriptHistoryTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.root = self.home / ".claude"
+        self.project = self.root / "projects" / "worktree"
+        self.project.mkdir(parents=True)
+        self.folder = str(self.home / "worktree")
+        self.active = self.project / "7cbaad62-68fd-410b-8ef1-d9219f643513.jsonl"
+        self.earlier = self.project / "ac984442-bdc1-4657-8fda-c7251e2e33b4.jsonl"
+
+    def other_sessions_empty(self):
+        return ass.other_sessions_empty(str(self.active), str(self.root), self.folder)
+
+    def test_subdirectory_prompt_protects_worktree_even_if_root_project_is_absent(self):
+        child = self.project.with_name(self.project.name + "-src")
+        child.mkdir()
+        self.project.rmdir()
+        prior = child / self.earlier.name
+        prior.write_text(json.dumps({"type": "user", "cwd": self.folder + "/src", "message": {}}))
+        self.assertFalse(self.other_sessions_empty())
+        # Claude encodes both / and - as a dash. A session with an authoritative outside cwd is unrelated.
+        prior.write_text(json.dumps({"type": "user", "cwd": self.folder + "-src", "message": {}}))
+        self.assertTrue(self.other_sessions_empty())
+        prior.write_text(json.dumps({"type": "user", "message": {}}))
+        self.assertFalse(self.other_sessions_empty())
+        prior.unlink()
+        index = child / "sessions-index.json"
+        index.write_text(json.dumps({"entries": [{"messageCount": 1, "projectPath": self.folder + "/src"}]}))
+        self.assertFalse(self.other_sessions_empty())
+        index.write_text(json.dumps({"entries": [{"messageCount": 1, "projectPath": self.folder + "-src"}]}))
+        self.assertTrue(self.other_sessions_empty())
+
+    def test_prefix_neighbor_with_mixed_cwds_keeps_worktree(self):
+        child = self.project.with_name(self.project.name + "-lib")
+        child.mkdir()
+        rows = [{"type": "assistant", "cwd": self.folder + suffix, "message": {}}
+                for suffix in ("-lib", "/lib")]
+        (child / self.earlier.name).write_text("\n".join(map(json.dumps, rows)))
+        self.assertFalse(self.other_sessions_empty())
+
+    def test_prior_conversation_protects_only_its_project(self):
+        self.earlier.write_text('{"type":"assistant","message":{}}\n')
+        self.assertFalse(self.other_sessions_empty())
+        sibling = self.project.with_name("other-worktree")
+        sibling.mkdir()
+        self.earlier.rename(sibling / self.earlier.name)
+        self.assertTrue(self.other_sessions_empty())
+
+    def test_blank_bookkeeping_sibling_and_absent_project_allow_retirement(self):
+        self.earlier.write_text('{"type":"file-history-snapshot","snapshot":{}}\n')
+        self.assertTrue(self.other_sessions_empty())
+        self.earlier.unlink()
+        self.project.rmdir()
+        self.assertTrue(self.other_sessions_empty())
+
+    def test_prior_use_in_index_survives_transcript_cleanup(self):
+        index = self.project / "sessions-index.json"
+        index.write_text(json.dumps({"entries": [{"sessionId": self.earlier.stem, "messageCount": 1}]}))
+        self.assertFalse(self.other_sessions_empty())
+        index.write_text('{"entries":[]}')
+        self.assertTrue(self.other_sessions_empty())
+        index.write_text('{"newSchema":[]}')
+        self.assertFalse(self.other_sessions_empty())
+        index.write_text('[' * 2000 + ']' * 2000)
+        self.assertFalse(self.other_sessions_empty())
+
+    def test_unsafe_large_or_unrecognized_sibling_preserves_worktree(self):
+        self.earlier.symlink_to(self.home / "missing")
+        self.assertFalse(self.other_sessions_empty())
+        self.earlier.unlink()
+        self.earlier.write_text('{"type":"unknown"}\n')
+        self.assertFalse(self.other_sessions_empty())
+        self.earlier.write_bytes(b' ' * (1024**2 + 1))
+        self.assertFalse(self.other_sessions_empty())
 
 
 class TrustKeeperTests(Base):
@@ -781,9 +946,42 @@ class UpdateWiringTests(unittest.TestCase):
         self.assertIn('install -m "\\$3" "\\$1" "\\$2.new" && mv -f "\\$2.new" "\\$2"', sh)
         self.assertNotIn("> /usr/local/bin/agent-session-sync", sh, "never write the live script in place")
 
+    def test_rendered_ssm_parameters_fit_and_extract_the_checked_in_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            capture = tmp / "parameters.json"
+            aws = tmp / "aws"
+            aws.write_text("""#!/bin/sh
+case "$2" in
+    describe-instance-information) echo Online ;;
+    send-command)
+        while [ "$1" != --parameters ]; do shift; done
+        printf %s "$2" > "$CAPTURE"
+        exit 31 ;;
+    *) exit 32 ;;
+esac
+""")
+            aws.chmod(0o755)
+            result = subprocess.run(["bash", ROOT / "scripts/ssm-agent-session-sync.sh", "test-instance", "us-west-1"],
+                                    env=dict(os.environ, PATH=f"{tmp}:/usr/bin:/bin", CAPTURE=str(capture),
+                                             ASS_ARGS="--owner ejc3 --repo dolphin-labs-hq/dolphin-labs --require-clone-marker"),
+                                    capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 31, result.stderr)
+            # Leave headroom in the 64 KiB document for AWS-RunShellScript and its wrapper.
+            self.assertLess(capture.stat().st_size, 60_000)
+            command, = json.loads(capture.read_text())["commands"]
+            unpack, separator, _ = command.partition("printf '[Service]")
+            self.assertTrue(separator)
+            subprocess.run(["sh", "-ec", unpack + 'cp "$t/"* "$OUT/"'], check=True,
+                           env=dict(os.environ, OUT=str(tmp)), capture_output=True, timeout=10)
+            for name, source in {"script": "agent-session-sync.py", "active": "agent-active-dirs.py",
+                                 "seeder": "codex-seed-thread.py", "unit": "agent-session-sync@.service"}.items():
+                with self.subTest(name=name):
+                    self.assertEqual((tmp / name).read_bytes(), (ROOT / "scripts" / source).read_bytes())
+
     def test_the_jumpboxes_get_the_codex_seeder_the_watcher_calls(self):
         sh = self.read("scripts/ssm-agent-session-sync.sh")
-        self.assertIn('seeder=$(base64 -w0 "$here/codex-seed-thread.py")', sh)
+        self.assertIn('seeder=$(encode "$here/codex-seed-thread.py")', sh)
         self.assertIn('put "\\$t/seeder" /usr/local/bin/codex-seed-thread 755 || true', sh)
         self.assertNotRegex(sh, r'seeder" /usr/local/bin/codex-seed-thread 755 && restart=1')
         self.assertIn("codex-seed-thread.py", self.read("agent-session-sync.tf"), "a changed seeder re-runs the step")
@@ -877,7 +1075,7 @@ esac
             sh = (ROOT / "scripts/ssm-agent-session-sync.sh").read_text()
             body = sh.split("read -r -d '' remote <<REMOTE || true\n", 1)[1].split("\nREMOTE\n", 1)[0].replace("\\$", "$")
             for key, data in (("script", b"new script\n"), ("seeder", b"seeder\n"), ("active", b"active\n"), ("unit", b"unit\n")):
-                body = body.replace("$" + key, base64.b64encode(data).decode())
+                body = body.replace("$" + key, base64.b64encode(gzip.compress(data, mtime=0)).decode())
             body = body.replace("$ASS_ARGS", args)
         else:
             prepare = tf.split("agent_session_sync_prepare_admin = <<-PREPARE\n", 1)[1].split("\nPREPARE\n", 1)[0]

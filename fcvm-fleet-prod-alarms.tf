@@ -22,16 +22,10 @@
 #   an alarm is the control); and CloudTrail events for the prod service's UpdateService and the prod launch templates'
 #   ModifyLaunchTemplate and CreateLaunchTemplateVersion by anything but the release roles.
 #
-# Names this PR does not create, and which their PRs must keep:
-# - The release roles (plan A4, ejc3/aws#919, fcvm-fleet-prod-ci.tf): fcvm-coordinator-release-prod (UpdateService) and
-#   fcvm-fleet-ami-prod-release (the templates), in the fleet account. A Terraform apply that changes the prod service or
-#   a prod template runs as OrganizationAccountAccessRole and so alarms too; that is intended.
-# - The prod Worker deploy token (A4): the Cloudflare account token named fcvm-prod-workers-deploy. The audit log names
-#   the token behind an API call; the check accepts that name with context api_token. Only the account-token minter
-#   (administration) can create a token, so another token by that name is an administration act. Once A4 merges, the
-#   check can match the token's id instead (cloudflare_account_token.fcvm_prod_workers_deploy[0].id).
-# - fcvm.dev serving the Worker (plan A6): until then the synthetic check opens /live only; A6 sets
-#   fcvm_fleet_prod_page_public to true.
+# The watch function exempts the release roles and the account token defined by fcvm-fleet-prod-ci.tf.
+# A Terraform apply that changes the prod service or templates alarms. Cloudflare audit entries must
+# identify the immutable release token ID to be exempt; a matching display name is insufficient.
+# The synthetic check opens /live until plan A6 serves the Worker at fcvm.dev and sets fcvm_fleet_prod_page_public.
 #
 # Cost while on: 22 alarms ($0.10 a month each; the three metric math ones read two metrics, $0.20), two Lambda
 # invocations every 5 minutes, and the three custom metrics the watch function puts ($0.30 a month each).
@@ -40,13 +34,11 @@ locals {
   fcvm_fleet_prod_alarm_prefix = local.fcvm_fleet_prod_stack.prefix # fcvm-fleet-prod
   fcvm_fleet_prod_dimension    = { Fleet = local.fcvm_fleet_prod_stack.fleet }
 
-  # Plan A4's names (above). Built from names so this file needs nothing A4 creates.
   fcvm_fleet_prod_release_roles = {
-    "ecs.amazonaws.com" = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-coordinator-release-prod"]
-    "ec2.amazonaws.com" = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-fleet-ami-prod-release"]
+    "ecs.amazonaws.com" = aws_iam_role.fcvm_coordinator_release_prod_fleet[*].arn
+    "ec2.amazonaws.com" = aws_iam_role.fcvm_ami_prod_release_fleet[*].arn
   }
-  fcvm_fleet_prod_worker                    = "fcvm-fleet" # ejc3/fcvm fleet/web/wrangler.jsonc, env.production
-  fcvm_fleet_prod_worker_release_token_name = "fcvm-prod-workers-deploy"
+  fcvm_fleet_prod_worker = "fcvm-fleet" # ejc3/fcvm fleet/web/wrangler.jsonc, env.production
   # Plan A6 serves the Worker at fcvm.dev and sets this.
   fcvm_fleet_prod_page_public     = false
   fcvm_fleet_prod_template_prefix = "${local.fcvm_fleet_prod_stack.prefix}-"
@@ -553,11 +545,11 @@ resource "aws_lambda_function" "fcvm_fleet_prod_watch" {
       LIVE_URL = "wss://${local.fcvm_dev_api_prod_hostname}/live"
       ORIGIN   = local.fcvm_fleet_prod_site_origin
       # The audit log poll: 20 minutes read every 5, so a late entry is still seen.
-      CF_TOKEN_SECRET    = aws_secretsmanager_secret.fcvm_fleet_prod_audit_read[0].arn
-      CF_ACCOUNT_ID      = var.cloudflare_account_id
-      WORKER             = local.fcvm_fleet_prod_worker
-      RELEASE_TOKEN_NAME = local.fcvm_fleet_prod_worker_release_token_name
-      WINDOW_MINUTES     = "20"
+      CF_TOKEN_SECRET  = aws_secretsmanager_secret.fcvm_fleet_prod_audit_read[0].arn
+      CF_ACCOUNT_ID    = var.cloudflare_account_id
+      WORKER           = local.fcvm_fleet_prod_worker
+      RELEASE_TOKEN_ID = cloudflare_account_token.fcvm_prod_workers_deploy[0].id
+      WINDOW_MINUTES   = "20"
       # Changes outside a release.
       PROD_SERVICE         = local.fcvm_fleet_prod_coordinator
       PROD_TEMPLATE_IDS    = jsonencode(local.fcvm_fleet_prod_template_ids)
@@ -589,9 +581,8 @@ resource "aws_cloudwatch_event_target" "fcvm_fleet_prod_watch_schedule" {
 # ------------------------------------------------------------------------------------------------ changes outside a release
 # CloudTrail's management events reach EventBridge in the region of the call (the organization trail,
 # security-monitoring.tf). The prod service is in us-east-2, the prod templates in us-east-1; the us-east-1 rule forwards
-# its matches to us-east-2's default bus, where the second rule hands them to the watch function. Each pattern leaves out
-# the API's release role by its session ARN; the function checks the session issuer again and that the call named prod's
-# service or a prod template.
+# its matches to us-east-2's default bus, where the second rule hands them to the watch function. Some callers have no
+# userIdentity.arn. Forward all matching changes and let the function compare each API's release-role issuer.
 locals {
   fcvm_fleet_prod_change_patterns = {
     service = {
@@ -603,7 +594,6 @@ locals {
           eventSource       = ["ecs.amazonaws.com"]
           eventName         = ["UpdateService"]
           requestParameters = { service = [local.fcvm_fleet_prod_coordinator, { suffix = "/${local.fcvm_fleet_prod_coordinator}" }] }
-          userIdentity      = { arn = [{ "anything-but" = { prefix = "arn:aws:sts::${local.fcvm_fleet_account_id}:assumed-role/fcvm-coordinator-release-prod/" } }] }
         }
       }
     }
@@ -613,10 +603,9 @@ locals {
         source        = ["aws.ec2"]
         "detail-type" = ["AWS API Call via CloudTrail"]
         detail = {
-          eventSource  = ["ec2.amazonaws.com"]
-          eventName    = ["ModifyLaunchTemplate", "CreateLaunchTemplateVersion"]
-          awsRegion    = [local.fcvm_fleet_prod_region]
-          userIdentity = { arn = [{ "anything-but" = { prefix = "arn:aws:sts::${local.fcvm_fleet_account_id}:assumed-role/fcvm-fleet-ami-prod-release/" } }] }
+          eventSource = ["ec2.amazonaws.com"]
+          eventName   = ["ModifyLaunchTemplate", "CreateLaunchTemplateVersion"]
+          awsRegion   = [local.fcvm_fleet_prod_region]
         }
       }
     }
@@ -724,7 +713,7 @@ resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_prod_worker_changes" {
   count               = local.fcvm_fleet_prod
   provider            = aws.fcvm_fleet
   alarm_name          = "${local.fcvm_fleet_prod_alarm_prefix}-worker-changed-outside-release"
-  alarm_description   = "The Cloudflare audit log shows a write to the prod Worker (${local.fcvm_fleet_prod_worker}: an upload, a version, a deployment, settings or secrets) by something other than the prod release token (${local.fcvm_fleet_prod_worker_release_token_name}), or the audit log could not be read for 15 minutes. The staging deploy token can deploy prod; check what fcvm.dev serves (wrangler deployments list --name ${local.fcvm_fleet_prod_worker}) and roll back by version id if it is not the release's. Who and what: /aws/lambda/${local.fcvm_fleet_prod_alarm_prefix}-watch, worker_change_outside_release."
+  alarm_description   = "The Cloudflare audit log shows a write to the prod Worker (${local.fcvm_fleet_prod_worker}: an upload, a version, a deployment, settings or secrets) by something other than the prod release token (${cloudflare_account_token.fcvm_prod_workers_deploy[0].name}), or the audit log could not be read for 15 minutes. The staging deploy token can deploy prod; check what fcvm.dev serves (wrangler deployments list --name ${local.fcvm_fleet_prod_worker}) and roll back by version id if it is not the release's. Who and what: /aws/lambda/${local.fcvm_fleet_prod_alarm_prefix}-watch, worker_change_outside_release."
   comparison_operator = "GreaterThanOrEqualToThreshold"
   namespace           = "FCVM/Fleet"
   metric_name         = "WorkerChangesOutsideRelease"

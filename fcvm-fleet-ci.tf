@@ -241,6 +241,11 @@ resource "aws_lambda_function" "fcvm_coordinator_release" {
       IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
       LOCK_TABLE      = "ejc3-terraform-locks"
       LOCK_ID         = local.fcvm_stage_lock_id
+      # release.py serves one stack per function; production's is fcvm-fleet-prod-ci.tf.
+      STACK   = "stage"
+      CLUSTER = aws_ecs_cluster.fcvm_fleet.name
+      SERVICE = aws_ecs_service.fcvm_fleet_coordinator.name
+      FAMILY  = aws_ecs_task_definition.fcvm_fleet_coordinator.family
     }
   }
   depends_on = [aws_iam_role_policy.fcvm_coordinator_release, aws_iam_role_policy.fcvm_coordinator_release_fleet]

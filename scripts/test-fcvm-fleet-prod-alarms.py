@@ -191,12 +191,15 @@ class LogAlarmTests(unittest.TestCase):
 
 
 class ChangeRuleTests(unittest.TestCase):
-    def test_release_role_names_match_plan_a4(self):
-        self.assertIn('"ecs.amazonaws.com" = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-coordinator-release-prod"]', ALARMS)
-        self.assertIn('"ec2.amazonaws.com" = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-fleet-ami-prod-release"]', ALARMS)
-        self.assertIn('assumed-role/fcvm-coordinator-release-prod/', ALARMS)
-        self.assertIn('assumed-role/fcvm-fleet-ami-prod-release/', ALARMS)
-        self.assertIn('fcvm_fleet_prod_worker_release_token_name = "fcvm-prod-workers-deploy"', ALARMS)
+    def test_release_identities_come_from_the_prod_release_resources(self):
+        self.assertIn('"ecs.amazonaws.com" = aws_iam_role.fcvm_coordinator_release_prod_fleet[*].arn', ALARMS)
+        self.assertIn('"ec2.amazonaws.com" = aws_iam_role.fcvm_ami_prod_release_fleet[*].arn', ALARMS)
+        self.assertRegex(ALARMS, r'RELEASE_TOKEN_ID\s*= cloudflare_account_token\.fcvm_prod_workers_deploy\[0\]\.id')
+        self.assertNotIn("RELEASE_TOKEN_NAME", ALARMS)
+
+    def test_aws_events_without_a_principal_arn_reach_the_watcher(self):
+        patterns = ALARMS.split("fcvm_fleet_prod_change_patterns = {", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("userIdentity", patterns)
 
     def test_template_changes_are_forwarded_from_us_east_1_to_the_home_bus(self):
         east1 = block('resource "aws_cloudwatch_event_target" "fcvm_fleet_prod_template_changes_east1"')
@@ -206,7 +209,7 @@ class ChangeRuleTests(unittest.TestCase):
                       block('resource "aws_cloudwatch_event_rule" "fcvm_fleet_prod_template_changes_east1"'))
         target = block('resource "aws_cloudwatch_event_target" "fcvm_fleet_prod_changes"')
         self.assertIn("arn        = aws_lambda_function.fcvm_fleet_prod_watch[0].arn", target)
-        for want in ('eventName         = ["UpdateService"]', 'eventName    = ["ModifyLaunchTemplate", "CreateLaunchTemplateVersion"]'):
+        for want in ('eventName         = ["UpdateService"]', 'eventName   = ["ModifyLaunchTemplate", "CreateLaunchTemplateVersion"]'):
             self.assertIn(want, ALARMS)
 
     def test_the_watch_role_can_put_fleet_metrics_and_read_one_secret_only(self):
@@ -223,7 +226,7 @@ class Watch(unittest.TestCase):
     ENV = {
         "FLEET": "prod", "PAGE_URL": "", "LIVE_URL": "wss://fleet-api.example.test/live", "ORIGIN": "https://example.test",
         "CF_TOKEN_SECRET": "audit", "CF_ACCOUNT_ID": "0123456789abcdef", "WORKER": "fcvm-fleet",
-        "RELEASE_TOKEN_NAME": "fcvm-prod-workers-deploy", "WINDOW_MINUTES": "20",
+        "RELEASE_TOKEN_ID": "release-id", "WINDOW_MINUTES": "20",
         "PROD_SERVICE": "fcvm-fleet-prod-coordinator", "PROD_TEMPLATE_IDS": json.dumps(["lt-0prod"]),
         "PROD_TEMPLATE_PREFIX": "fcvm-fleet-prod-",
         "RELEASE_ROLES": json.dumps({"ecs.amazonaws.com": ["arn:aws:iam::000000000001:role/fcvm-coordinator-release-prod"],
@@ -248,8 +251,9 @@ class Watch(unittest.TestCase):
 
 
 def audit(uri, method="POST", token="fcvm-prod-workers-deploy", context="api_token", action="create", **extra):
+    token_id = "release-id" if token == "fcvm-prod-workers-deploy" else "other-id"
     entry = {"action": {"type": action, "result": "success", "time": "2026-11-19T12:00:00Z"},
-             "actor": {"context": context, "token_name": token, "token_id": "t1", "type": "account"},
+             "actor": {"context": context, "token_name": token, "token_id": token_id, "type": "account"},
              "raw": {"method": method, "uri": uri}, "resource": {"product": "workers", "id": "x"}}
     entry.update(extra)
     return entry
@@ -260,6 +264,9 @@ A = "/client/v4/accounts/0123456789abcdef"
 
 class WorkerAuditTests(Watch):
     FOREIGN = [
+        audit(f"{A}/workers/scripts/fcvm-fleet", actor={"context": "api_token", "token_name": "fcvm-prod-workers-deploy",
+                                                       "token_id": "another-id", "type": "user"}),
+        audit(f"{A}/workers/scripts/fcvm-fleet", actor={"context": "api_token", "token_name": "fcvm-prod-workers-deploy"}),
         audit(f"{A}/workers/scripts/fcvm-fleet", "PUT", token="workers-deploy-terraform"),            # the staging token
         audit(f"{A}/workers/scripts/fcvm-fleet/versions", token=None, context="dash"),                # the dashboard
         audit(f"{A}/workers/scripts/fcvm-fleet/deployments?force=true", token="other"),               # versions deploy
@@ -269,6 +276,7 @@ class WorkerAuditTests(Watch):
         audit("", "PUT", token="other", resource={"product": "Workers", "id": "fcvm-fleet"}),          # no URI
     ]
     NOT_COUNTED = [
+        audit(f"{A}/workers/scripts/fcvm-fleet", actor={"context": "api_token", "token_name": "renamed", "token_id": "release-id"}),
         audit(f"{A}/workers/scripts/fcvm-fleet/deployments"),                                         # the release token
         audit(f"{A}/workers/scripts/fcvm-fleet", "PUT"),
         audit(f"{A}/workers/scripts/fcvm-fleet/deployments", "GET", token="other", action="view"),     # a read
@@ -281,11 +289,16 @@ class WorkerAuditTests(Watch):
 
     def test_writes_to_the_prod_worker_by_anything_but_the_release_token_are_counted(self):
         for entry in self.FOREIGN:
-            self.assertEqual(self.watch.foreign_worker_changes([entry], "fcvm-fleet", "fcvm-prod-workers-deploy"), [entry],
+            self.assertEqual(self.watch.foreign_worker_changes([entry], "fcvm-fleet", "release-id"), [entry],
                              entry["raw"])
         for entry in self.NOT_COUNTED:
-            self.assertEqual(self.watch.foreign_worker_changes([entry], "fcvm-fleet", "fcvm-prod-workers-deploy"), [],
+            self.assertEqual(self.watch.foreign_worker_changes([entry], "fcvm-fleet", "release-id"), [],
                              entry["raw"])
+
+    def test_missing_or_empty_release_identity_never_exempts_a_write(self):
+        for token_id in ("", None):
+            event = audit(f"{A}/workers/scripts/fcvm-fleet", actor={"context": "api_token", "token_id": token_id})
+            self.assertEqual(self.watch.foreign_worker_changes([event], "fcvm-fleet", token_id), [event])
 
     def pages(self, *pages):
         bodies = iter(pages)
@@ -365,6 +378,11 @@ class ChangeTests(Watch):
         for event in counted:
             self.assertEqual(self.outside(event), 1, event["detail"])
         self.assertEqual(self.metrics()[0][0], "ProdChangesOutsideRelease")
+
+    def test_service_principal_without_an_arn_is_counted(self):
+        event = trail("ecs.amazonaws.com", "UpdateService", self.SERVICE)
+        event["detail"]["userIdentity"] = {"type": "AWSService", "invokedBy": "ecs.amazonaws.com"}
+        self.assertEqual(self.outside(event), 1)
 
     def test_release_role_calls_and_staging_changes_are_not_counted(self):
         quiet = [
