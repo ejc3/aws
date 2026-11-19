@@ -90,6 +90,9 @@ def stacks(env):
     """Each fleet stack's settings for reconcile(): its budget, decision record and coordinator role (STACKS, a JSON
     list), with the account, limit, bucket and deny policy they share."""
     shared = {key: env[key] for key in ("ACCOUNT_ID", "LIMIT_USD", "STATE_BUCKET", "POLICY_ARN")}
+    # During rollback, the old environment can arrive before the old handler.
+    if "STACKS" not in env:
+        return [{**shared, **{key: env[key] for key in ("BUDGET_NAME", "STATE_KEY", "ROLE_NAME")}}]
     listed = json.loads(env["STACKS"])
     if not listed:
         raise ValueError("No fleet stack to reconcile")

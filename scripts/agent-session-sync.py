@@ -37,9 +37,10 @@ a Codex that is not logged in yet does not hold up Claude and is retried.
 
 COST. Per tick: one listing and one stat per entry in the roots. Anything already handled is skipped
 before any deeper check, so an idle box does almost nothing. Separately, the watcher retires
-unused unattended Claude windows after one week and records the decision per checkout.
+unused unattended Claude windows after two days in linked worktrees or one week elsewhere.
 """
 import argparse
+import contextlib
 import datetime
 import fcntl
 import glob
@@ -137,6 +138,10 @@ def is_main_checkout(path):
     """`.git` is a directory. A linked worktree (or a submodule) has a `.git` FILE."""
     git = os.path.join(path, ".git")
     return os.path.isdir(git) and not os.path.islink(git)
+
+
+def is_linked_worktree(git, common):
+    return git is not None and os.path.realpath(git) != os.path.realpath(common)
 
 
 def is_finished(path):
@@ -269,12 +274,18 @@ def repo_identity(path):
 # ----------------------------------------------------- unattended Claude session retirement
 
 RETIRE_AFTER = 7 * 24 * 60 * 60
+WORKTREE_RETIRE_AFTER = 2 * 24 * 60 * 60
 RETIRE_SCAN = 60
 RETIRED_MARKER = "claude-remote-retired"
 UUID = re.compile(r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}")
 # A Claude-written transcript may contain bookkeeping before its first turn. Unknown
 # records count as activity: the CLI can add types without coordinating with this script.
 EMPTY_RECORDS = {"file-history-snapshot", "mode", "permission-mode", "session-owner", "bridge-session", "atis-latch"}
+RC_DISCONNECT_NOTICES = (
+    "Remote Control disconnected — OAuth token unavailable — run /login to restore Remote Control",
+    "Remote Control disconnected — the server no longer reports this session — "
+    "it may have been deleted from another device or app (code 4090)",
+)
 USAGE_FIELDS = {"totalAPIDuration", "totalAPIDurationWithoutRetries", "totalCostUSD",
                 "totalLinesAdded", "totalLinesRemoved", "totalToolDuration"}
 COST_FIELDS = USAGE_FIELDS | {"type", "sessionId", "startTime", "totalDuration", "modelUsage", "hasUnknownModelCost"}
@@ -310,8 +321,13 @@ def claude_retired(path, home):
         return True  # completed (or explicitly created) tombstone
     # A reboot can separate the durable intent from the close. Re-read the exact
     # transcript: a message delivered to the surviving session overrides the intent.
-    empty, exists, _ = transcript_evidence(intent["transcript"], claude_root(home), intent["sid"])
-    return empty and (exists or intent["source"] == "startup")
+    root = claude_root(home)
+    empty, exists, _ = transcript_evidence(intent["transcript"], root, intent["sid"])
+    if not empty or (not exists and intent["source"] != "startup"):
+        return False
+    folder = os.path.realpath(path)
+    git, common = git_dirs(folder)
+    return not is_linked_worktree(git, common) or other_sessions_empty(intent["transcript"], root, folder)
 
 
 def regular_read(path, limit):
@@ -327,7 +343,13 @@ def regular_read(path, limit):
         return data
 
 
-def transcript_evidence(path, root, sid):
+def outside_worktree(cwd, folder):
+    """Only an explicit canonical cwd disambiguates projects whose encoded names collide."""
+    return (folder is not None and isinstance(cwd, str) and os.path.isabs(cwd)
+            and cwd != folder and not cwd.startswith(folder + os.sep) and os.path.realpath(cwd) == cwd)
+
+
+def transcript_evidence(path, root, sid, *, limit=1024**2, folder=None):
     """Return (empty, existing, earliest bridge timestamp) for the exact native transcript."""
     if not UUID.fullmatch(sid) or not os.path.isabs(path):
         return False, False, None
@@ -339,11 +361,16 @@ def transcript_evidence(path, root, sid):
         return False, False, None
     bridge_times, metadata_ids, last_pointers = [], set(), set()
     try:
-        data = regular_read(path, 1024 * 1024)
+        data = regular_read(path, limit)
         for line in data.splitlines():
             row = json.loads(line)
-            if (not isinstance(row, dict) or row.get("sessionId") not in (None, sid)
-                    or any(k in row for k in ("message", "prompt", "role"))):
+            if not isinstance(row, dict) or row.get("sessionId") not in (None, sid):
+                return False, True, None
+            if outside_worktree(row.get("cwd"), folder):
+                if isinstance(row.get("uuid"), str):
+                    metadata_ids.add(row["uuid"])
+                continue
+            if any(k in row for k in ("message", "prompt", "role")):
                 return False, True, None
             kind = row.get("type")
             if kind in EMPTY_RECORDS:
@@ -355,6 +382,11 @@ def transcript_evidence(path, root, sid):
                     timestamp = datetime.datetime.fromisoformat(when.replace("Z", "+00:00"))
                     if timestamp.tzinfo is not None:
                         bridge_times.append(timestamp.timestamp())
+            elif ((kind, row.get("subtype"), row.get("level"), row.get("entrypoint"))
+                  == ("system", "informational", "warning", "cli")
+                  and row.get("sessionId") == sid and row.get("isMeta") is False
+                  and row.get("isSidechain") is False and row.get("content") in RC_DISCONNECT_NOTICES):
+                pass
             elif kind == "cost-state" and (set(row) <= COST_FIELDS
                     and all(row.get(k) == 0 for k in USAGE_FIELDS)
                     and row.get("modelUsage") == {} and row.get("hasUnknownModelCost") is False):
@@ -369,13 +401,76 @@ def transcript_evidence(path, root, sid):
     except FileNotFoundError:
         # A new SessionStart can report its path before Claude writes the first record.
         return True, False, None
-    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+    except (OSError, ValueError, TypeError, AttributeError, OverflowError, RecursionError):
         return False, False, None
     return last_pointers <= metadata_ids, True, min(bridge_times, default=None)
 
 
 def empty_transcript(path, root, sid):
     return transcript_evidence(path, root, sid)[0]
+
+
+def project_history_files(projects, directory):
+    """Read entries only in this native project or a possible encoded subdirectory project."""
+    prefix = os.path.basename(directory) + "-"
+    try:
+        listing = os.scandir(projects)
+    except FileNotFoundError:
+        return  # a fresh startup can precede the first project directory
+    with listing as paths:
+        for count, project in enumerate(paths, 1):
+            if count > 2048:
+                raise ValueError("project listing exceeds budget")
+            descendant = project.path != directory
+            if descendant and not project.name.startswith(prefix):
+                continue
+            if not project.is_dir(follow_symlinks=False):
+                raise ValueError("invalid project directory")
+            with os.scandir(project.path) as entries:
+                for entry in entries:
+                    yield entry, descendant
+
+
+def other_sessions_empty(transcript, root, folder):
+    """Check retained history for the worktree and sessions launched from its subdirectories."""
+    directory = os.path.dirname(transcript)
+    projects = os.path.join(root, "projects")
+    if os.path.dirname(directory) != projects or os.path.realpath(directory) != directory:
+        return False
+    try:
+        remaining = 4 * 1024**2
+        with contextlib.closing(project_history_files(projects, directory)) as entries:
+            for count, (entry, descendant) in enumerate(entries, 1):
+                if count > 256:
+                    return False
+                if entry.name != "sessions-index.json" and (not entry.name.endswith(".jsonl") or entry.path == transcript):
+                    continue
+                size = entry.stat(follow_symlinks=False).st_size
+                remaining -= size
+                if remaining < 0:
+                    return False
+                scope = folder if descendant else None
+                if entry.name == "sessions-index.json":
+                    # The index can retain evidence of turns after a transcript is cleaned up.
+                    rows = json.loads(regular_read(entry.path, min(size, 128 * 1024)))["entries"]
+                    if not isinstance(rows, list):
+                        return False
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            return False
+                        if outside_worktree(row.get("projectPath"), scope):
+                            continue
+                        if (type(row.get("messageCount")) is not int
+                                or row["messageCount"] != 0 or row.get("firstPrompt")):
+                            return False
+                else:
+                    empty, exists, _ = transcript_evidence(entry.path, root, entry.name[:-6],
+                                                          limit=min(size, 1024**2), folder=scope)
+                    if not empty or not exists:
+                        return False
+        return True
+    except (KeyError, OSError, TypeError, ValueError, RecursionError):
+        return False
 
 
 def linux_process(pid):
@@ -462,7 +557,7 @@ def linux_uptime():
         return float(fh.read().split()[0])
 
 
-def idle_claude(root, pane_pid, sid, folder, now):
+def idle_claude(root, pane_pid, sid, folder, now, retire_after):
     """Find the exact native Claude child, using the CLI's own PID/UUID/idle record."""
     candidates = []
     try:
@@ -479,14 +574,15 @@ def idle_claude(root, pane_pid, sid, folder, now):
         try:
             meta = json.loads(regular_read(entry.path, 32 * 1024))
             if (not isinstance(meta, dict) or meta.get("pid") != pid or meta.get("sessionId") != sid
-                    or meta.get("status") != "idle" or type(meta.get("procStart")) is not int
+                    or meta.get("status") != "idle"
                     or type(meta.get("startedAt")) is not int or type(meta.get("statusUpdatedAt")) is not int
                     or not isinstance(meta.get("cwd"), str) or os.path.realpath(meta["cwd"]) != folder):
                 continue
         except (OSError, ValueError, TypeError):
             continue
         process = linux_process(pid)
-        if not process or process[1] != meta["procStart"]:
+        # Claude versions write the kernel start tick as a JSON number or decimal string.
+        if not process or str(process[1]) != str(meta.get("procStart")):
             continue
         try:
             # The pathname in the registry can now name a replacement checkout.
@@ -495,7 +591,8 @@ def idle_claude(root, pane_pid, sid, folder, now):
                 continue
         except OSError:
             continue
-        old_process = now - meta["startedAt"] / 1000 > RETIRE_AFTER and uptime - process[1] / hz > RETIRE_AFTER
+        old_process = (now - meta["startedAt"] / 1000 > retire_after
+                       and uptime - process[1] / hz > retire_after)
         parent = process[0]
         for _ in range(64):
             if parent <= 1:
@@ -536,17 +633,21 @@ class ClaudeRetirement:
                 or source not in ("startup", "resume")
                 or not os.path.isabs(folder) or os.path.realpath(folder) != folder or not os.path.isdir(folder)):
             return None
-        proc = idle_claude(self.root, int(pid), sid, folder, now)
+        git, common = git_dirs(folder)
+        linked = is_linked_worktree(git, common)
+        retire_after = WORKTREE_RETIRE_AFTER if linked else RETIRE_AFTER
+        proc = idle_claude(self.root, int(pid), sid, folder, now, retire_after)
         if proc is None:
             return None
         empty, exists, first_bridge = transcript_evidence(transcript, self.root, sid)
         # A resumed conversation without its transcript is not proof of emptiness.
         if not empty or (not exists and source != "startup"):
             return None
-        old_process = proc[-1] and now - int(started) > RETIRE_AFTER
-        if not old_process and (first_bridge is None or now - first_bridge <= RETIRE_AFTER):
+        old_process = proc[-1] and now - int(started) > retire_after
+        if not old_process and (first_bridge is None or now - first_bridge <= retire_after):
             return None
-        git, _ = git_dirs(folder)
+        if linked and not other_sessions_empty(transcript, self.root, folder):
+            return None
         try:
             checkout = os.stat(git or folder)
         except OSError:

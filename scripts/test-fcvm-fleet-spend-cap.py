@@ -319,8 +319,8 @@ class Fleet:
 
 
 STACKS_ENV = {
-    "ACCOUNT_ID": ENV["ACCOUNT_ID"], "LIMIT_USD": "750", "STATE_BUCKET": "coordinator-state",
-    "POLICY_ARN": ENV["POLICY_ARN"],
+    **ENV,
+    "STATE_KEY": "spend-cap/daily.json", "ROLE_NAME": "stage-coordinator",
     "STACKS": json.dumps([
         {"budget": "fleet-daily", "state_key": "spend-cap/daily.json", "role": "stage-coordinator"},
         {"budget": "fleet-prod-daily", "state_key": "spend-cap/prod-daily.json", "role": "prod-coordinator"},
@@ -336,6 +336,12 @@ class StackTests(unittest.TestCase):
 
     def run_all(self, now=DAY, expiry_only=False):
         cap.reconcile_all(STACKS_ENV, self.fleet, self.fleet, self.fleet, now, expiry_only=expiry_only)
+
+    def test_current_worker_reconciles_staging_with_previous_configuration(self):
+        self.fleet.pages[ENV["BUDGET_NAME"]] = [cost(DAY - timedelta(days=1))]
+        cap.reconcile_all(ENV, self.fleet, self.fleet, self.fleet, DAY)
+        self.assertEqual(self.fleet.attached, {ENV["ROLE_NAME"]: {ENV["POLICY_ARN"]}})
+        self.assertEqual(self.fleet.states[ENV["STATE_KEY"]]["blocked_on"], DAY.date().isoformat())
 
     def test_one_stacks_overage_blocks_only_that_stacks_coordinator(self):
         self.fleet.pages["fleet-prod-daily"] = [cost(DAY - timedelta(days=1), "751")]
