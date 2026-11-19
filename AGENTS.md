@@ -1841,8 +1841,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   to `fcvm-fleet-flow-logs-<id>`); GPU host launch templates per architecture (g4dn.metal, g5g.metal; `Ipv6PrefixCount = 1`
   only, IMDSv2 hop 1) the coordinator launches from itself; EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
   coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
-  `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/tls-wildcard` secret. The
-  Cloudflare-fed secrets (DNS token, tunnel token, agent Access token) come from `fcvm-dev.tf`.
+  `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/stage/tls` secret, which the
+  coordinator issues and renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`; `fcvm-fleet/tls-wildcard`, the
+  zone certificate from before, is kept unread for a revert). The Cloudflare-fed secrets (tunnel token, agent Access
+  token, and the DNS token no role reads any more) come from `fcvm-dev.tf`.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
   terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit

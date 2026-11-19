@@ -12,9 +12,9 @@
 #   UDP keeps the client's address at the target, which the coordinator's per-prefix response rate limit needs.
 # - In fcvm.dev (Cloudflare): ns1-/ns2-tiles-stage.fcvm.dev A records on the two addresses, and the NS delegation. No DS
 #   record: the subzone is unsigned, so validators treat the delegation as insecure, and fcvm.dev stays signed.
-# - The certificate: the coordinator adds *.tiles-stage.fcvm.dev to the wildcard certificate it renews (fcvm-fleet.tf,
-#   --tls-secret). Its DNS-01 records stay in fcvm.dev at _acme-challenge.fcvm.dev; the coordinator answers
-#   _acme-challenge.tiles-stage.fcvm.dev with a CNAME to that name. No new Cloudflare permission.
+# - The certificate covers *.tiles-stage.fcvm.dev only (fcvm-fleet.tf, --tls-secret with --tls-scope subzone,
+#   ejc3/fcvm#1973). The coordinator answers _acme-challenge.tiles-stage.fcvm.dev with the renewal's TXT record from this
+#   server, so nothing is written in fcvm.dev and the coordinator holds no Cloudflare token.
 #
 # IPv4 only. A dualstack load balancer carries UDP over IPv6 only to an IPv6 target group, and an ECS service registers a
 # dual-stack Fargate task's IPv4 address. Recursive resolvers all reach nameservers over IPv4, and viewers ask their own

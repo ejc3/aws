@@ -5,10 +5,10 @@
 # registration and is managed here. What lives on Cloudflare is built here, because Cloudflare credentials stay on the
 # jumpboxes; what the fleet reads is written into the fcvm-fleet account (fcvm-fleet-account.tf):
 #
-#   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else: the coordinator
-#                                        writes the _acme-challenge TXT records for the wildcard certificate, and once
-#                                        deletes the launch names it wrote here before it served them from
-#                                        tiles-stage.fcvm.dev (fcvm-fleet-dns.tf)
+#   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else. No role reads it
+#                                        now: the coordinator's certificate covers tiles-stage.fcvm.dev only and answers
+#                                        its own DNS-01 record (--tls-scope subzone, fcvm-fleet.tf). It stays so that a
+#                                        revert to the zone certificate works; delete it once that is no longer wanted.
 #   fcvm-fleet/coordinator-tunnel-token  the connector token of tunnel fcvm-fleet-coordinator, for the cloudflared container
 #                                        in the coordinator's Fargate task (TUNNEL_TOKEN)
 #   fcvm-fleet/agent-access-token        the Access service token the GPU hosts' agents present at /agent (client_id,

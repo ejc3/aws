@@ -46,7 +46,7 @@ locals {
       pattern     = "?\"certificate renewal failed\" ?\"the renewed certificate was not stored\" ?\"the certificate secret could not be read\""
       periods     = 1
       ok          = false
-      description = "The coordinator failed to renew or store the fleet's wildcard certificate (fcvm-fleet/tls-wildcard). Hosts and tiles read it at boot; when it expires, every viewer connection fails TLS. Read /ecs/fcvm-fleet-coordinator."
+      description = "The coordinator failed to renew or store the fleet's *.tiles-stage.fcvm.dev certificate (fcvm-fleet/stage/tls). Hosts and tiles read it at boot; when it expires, every viewer connection fails TLS. Read /ecs/fcvm-fleet-coordinator."
     }
     "fcvm-fleet-tunnel-down" = {
       metric = "TunnelConnectionErrors"
