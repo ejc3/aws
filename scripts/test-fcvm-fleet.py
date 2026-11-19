@@ -101,7 +101,10 @@ class NetworkTests(unittest.TestCase):
         self.assertRegex(admitted, r'owners\s*=\s*\["self"\]')
         validated = re.search(r'  dynamic "filter" \{\n.*?\n  \}', admitted, re.S)
         self.assertIsNotNone(validated)
-        self.assertRegex(validated.group(), r'for_each\s*=\s*var\.ami_release_parameter_arn != "" \? \[true\] : \[\]')
+        self.assertRegex(validated.group(), r'for_each\s*=\s*local\.release_guarded \? \[true\] : \[\]')
+        # Guarded whenever a release pointer is named, or when the caller says so before the pointer's ARN is known.
+        self.assertIn('release_guarded = var.ami_release_guarded != null ? var.ami_release_guarded : var.ami_release_parameter_arn != ""', MOD)
+        self.assertIn("count           = local.release_guarded ? 1 : 0", block('ephemeral "aws_ssm_parameter" "ami_release_guard"', MOD))
         self.assertEqual(dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]', validated.group())),
                          {"tag:FleetImageValidated": '"true"'})
         filters = dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]',
@@ -516,7 +519,8 @@ class HostTests(unittest.TestCase):
         # Feed the actual fallback shell fake read-only probes, using a non-default
         # Minecraft count to verify it still comes from the port allocation's input.
         fallback = MOD.split('    unset token boot_ami\n    %{endif~}\n', 1)[1].split("    printf 'FLEET_AGENT_ARGS", 1)[0]
-        fallback = fallback.replace('    %{~if var.ami_release_parameter_arn != ""~}\n', '').replace('    %{endif~}\n', '')
+        self.assertIn('    %{~if local.release_guarded~}\n', fallback)
+        fallback = fallback.replace('    %{~if local.release_guarded~}\n', '').replace('    %{endif~}\n', '')
         with tempfile.TemporaryDirectory() as temp:
             fixtures = Path(temp)
             windows_env = fixtures / 'windows.env'
@@ -1457,7 +1461,9 @@ class StackScopeTests(unittest.TestCase):
 
     def test_the_coordinator_touches_only_its_own_stacks_instances(self):
         pol = self.scope()
-        self.assertRegex(pol, r"\n  for_each\s+= local\.fcvm_fleet_stacks\n")
+        # Every stack that exists: production's only while its switch is on (ProdStackTests).
+        self.assertRegex(pol, r"\n  for_each\s+= local\.fcvm_fleet_stacks_enabled\n")
+        self.assertIn('fcvm_fleet_stacks_enabled = { for k, s in local.fcvm_fleet_stacks : k => s if k != "prod" || var.fcvm_fleet_prod_enabled }', TF)
         self.assertEqual(len(re.findall(r'Effect\s+= "Deny"', pol)), 4, pol)
         self.assertNotRegex(pol, r'Effect\s+= "Allow"')
         touch = self.deny("OnlyThisStacksInstances")
@@ -1488,9 +1494,12 @@ class StackScopeTests(unittest.TestCase):
         self.assertRegex(att, r"\n  for_each\s+= local\.fcvm_fleet_stack_coordinator_roles\n")
         self.assertIn("role       = each.value", att)
         self.assertIn("policy_arn = aws_iam_policy.fcvm_fleet_stack_scope[each.key].arn", att)
-        self.assertIn("fcvm_fleet_stack_coordinator_roles = { stage = aws_iam_role.fcvm_fleet_coordinator_task.name }", TF)
+        roles = TF.split("fcvm_fleet_stack_coordinator_roles = merge(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn("{ stage = aws_iam_role.fcvm_fleet_coordinator_task.name },", roles)
+        self.assertIn('{ for r in aws_iam_role.fcvm_fleet_prod_coordinator_task : "prod" => r.name },', roles)
         # The deny on launches must not take effect before the templates carry the Fleet tag.
-        self.assertRegex(att, r"depends_on = \[module\.fcvm_fleet_east2, module\.fcvm_fleet_west2, module\.fcvm_fleet_east1\]")
+        self.assertRegex(att, r"depends_on = \[module\.fcvm_fleet_east2, module\.fcvm_fleet_west2, module\.fcvm_fleet_east1, "
+                              r"module\.fcvm_fleet_prod_east1\]")
         # The coordinator's inline policy is at its size limit: the scope adds nothing to it.
         self.assertNotIn('/Fleet"', block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
 
@@ -1509,6 +1518,317 @@ class StackScopeTests(unittest.TestCase):
         bc = (ROOT / "fcvm-fleet-broadcast.tf").read_text()
         self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_broadcast"', bc),
                          r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet")
+
+
+PROD = (ROOT / "fcvm-fleet-prod.tf").read_text() if (ROOT / "fcvm-fleet-prod.tf").exists() else ""
+PROD_DNS = (ROOT / "fcvm-fleet-prod-dns.tf").read_text() if (ROOT / "fcvm-fleet-prod-dns.tf").exists() else ""
+PROD_BC = (ROOT / "fcvm-fleet-prod-broadcast.tf").read_text() if (ROOT / "fcvm-fleet-prod-broadcast.tf").exists() else ""
+DEV_PROD = (ROOT / "fcvm-dev-prod.tf").read_text()
+
+
+def tf_code(text):
+    return "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#")) + "\n"
+
+
+def blocks(text):
+    """Every top-level resource, data, ephemeral and module block: (kind, type, name, body)."""
+    code = tf_code(text)
+    found = []
+    for m in re.finditer(r'^(resource|data|ephemeral) "(\w+)" "(\w+)" \{|^(module) "(\w+)" \{', code, re.M):
+        start = m.start()
+        body = code[start:code.index("\n}\n", start) + 2]
+        if m.group(1):
+            found.append((m.group(1), m.group(2), m.group(3), body))
+        else:
+            found.append(("module", "", m.group(5), body))
+    return found
+
+
+def command(text, name):
+    return text.split(f"{name} = ", 1)[1].split("\n  ) : []\n", 1)[0] if name == "fcvm_fleet_prod_coordinator_command" \
+        else text.split(f"{name} = concat(", 1)[1].split("\n  )\n", 1)[0]
+
+
+class ProdStackTests(unittest.TestCase):
+    """fcvm-fleet-prod*.tf: the production fleet (fcvm.dev) beside staging in the same account, behind
+    var.fcvm_fleet_prod_enabled (ejc3/fcvm fleet production plan, A3). With the switch off nothing is created; with it on,
+    every prod launch, instance and spot request is Fleet=prod and the prod coordinator acts on nothing else; and
+    staging's resources render exactly as before."""
+
+    PROD_FILES = {"fcvm-fleet-prod.tf": PROD, "fcvm-fleet-prod-dns.tf": PROD_DNS, "fcvm-fleet-prod-broadcast.tf": PROD_BC}
+    GATES = (r"local\.fcvm_fleet_prod", r"2 \* local\.fcvm_fleet_prod", r"local\.fcvm_fleet_prod_broadcast",
+             r"var\.fcvm_fleet_prod_enabled \? .+ : 0", r"length\(aws_iam_policy\.fcvm_fleet_prod_coordinator_java\)")
+
+    def stack(self, name):
+        return TF.split("fcvm_fleet_stacks = {", 1)[1].split("\n  }\n", 1)[0].split(f"{name} = {{", 1)[1].split("\n    }", 1)[0]
+
+    # ------------------------------------------------------------------------------------------- nothing while off
+    def test_every_prod_block_exists_only_while_the_switch_is_on(self):
+        self.assertIn("default     = false", block('variable "fcvm_fleet_prod_enabled"', DEV_PROD))
+        self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", DEV_PROD)
+        self.assertIn("fcvm_fleet_prod_broadcast = var.fcvm_fleet_prod_enabled && local.fcvm_fleet_broadcast ? 1 : 0", PROD_BC)
+        seen = []
+        for path, text in self.PROD_FILES.items():
+            self.assertTrue(text, path)
+            for kind, rtype, name, body in blocks(text):
+                seen.append(rtype or kind)
+                gate = re.search(r"\n  (count|for_each)\s+= (.+)\n", body)
+                self.assertIsNotNone(gate, f"{path}: {kind} {rtype} {name} has no count or for_each")
+                if gate.group(1) == "count":
+                    self.assertTrue(any(re.fullmatch(g, gate.group(2)) for g in self.GATES), f"{name}: count = {gate.group(2)}")
+                else:
+                    self.assertTrue(gate.group(2).startswith("var.fcvm_fleet_prod_enabled ? "), f"{name}: {gate.group(2)}")
+                    self.assertTrue(gate.group(2).endswith(" : {}"), name)
+        # The things that cost money while they exist are among them.
+        for billable in ("aws_lb", "aws_eip", "aws_ivs_channel", "aws_ecs_service", "aws_ecs_task_definition", "module"):
+            self.assertIn(billable, seen)
+        for output, text in (("fcvm_fleet_prod", PROD),):
+            self.assertIn("value = var.fcvm_fleet_prod_enabled ? {", block(f'output "{output}"', text))
+
+    def test_nothing_prod_is_created_outside_the_prod_files_while_off(self):
+        # The one prod entry outside them: the stack map, whose scope policy and attachment skip prod while off.
+        self.assertIn('fcvm_fleet_stacks_enabled = { for k, s in local.fcvm_fleet_stacks : k => s if k != "prod" || var.fcvm_fleet_prod_enabled }', TF)
+        self.assertIn("for_each    = local.fcvm_fleet_stacks_enabled", block('resource "aws_iam_policy" "fcvm_fleet_stack_scope"'))
+        self.assertIn('{ for r in aws_iam_role.fcvm_fleet_prod_coordinator_task : "prod" => r.name },', TF)
+        # The prod values reach staging's resources nowhere else.
+        for header in ('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"', 'resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"',
+                       'resource "aws_ecs_service" "fcvm_fleet_coordinator"', 'module "fcvm_fleet_east1"'):
+            self.assertNotRegex(block(header), r'fcvm_fleet_prod|stacks\.prod|"prod"|/prod/', header)
+        self.assertNotRegex(command(TF, "fcvm_fleet_coordinator_command"), r'fcvm_fleet_prod|stacks\.prod|"prod"|/prod/')
+
+    # ------------------------------------------------------------------------------------------- Fleet=prod
+    def test_the_prod_stack_has_its_own_tag_names_secret_and_state_key(self):
+        prod = self.stack("prod")
+        self.assertRegex(prod, r'\bfleet\s+= "prod"')
+        self.assertRegex(prod, r'\bprefix\s+= "fcvm-fleet-prod"')
+        self.assertRegex(prod, r'\btls_secret\s+= "fcvm-fleet/prod/tls"')
+        self.assertRegex(prod, r'\bstate_key\s+= "prod/state.json"')
+        # A new stack has no untagged spot requests: it may cancel only requests tagged Fleet=prod.
+        self.assertRegex(prod, r"\buntagged_spot_requests\s+= false")
+        self.assertIn("fcvm_fleet_prod_stack  = local.fcvm_fleet_stacks.prod", PROD)
+        # The coordinator role names fcvm-dev-prod.tf's Turnstile secret policy admits.
+        self.assertIn('name     = "${local.fcvm_fleet_prod_coordinator}-execution"', block('resource "aws_iam_role" "fcvm_fleet_prod_coordinator_execution"', PROD))
+        self.assertIn("name     = local.fcvm_fleet_prod_coordinator\n", block('resource "aws_iam_role" "fcvm_fleet_prod_coordinator_task"', PROD))
+
+    def test_prod_templates_tag_what_they_launch_fleet_prod_in_their_own_vpc(self):
+        mod = block('module "fcvm_fleet_prod_east1"', PROD)
+        self.assertIn("fleet                   = local.fcvm_fleet_prod_stack.fleet", mod)
+        self.assertIn("name_prefix             = local.fcvm_fleet_prod_stack.prefix", mod)
+        self.assertIn('source                  = "./modules/fcvm-fleet-region"', mod)
+        self.assertIn("providers               = { aws = aws.fcvm_fleet_east1 }", mod)
+        self.assertIn("cidr_block              = local.fcvm_fleet_prod_cidr", mod)
+        self.assertIn('fcvm_fleet_prod_cidr   = "10.23.0.0/16"', PROD)
+        self.assertNotIn("10.23.", TF.split("fcvm_fleet_cidrs", 1)[1].split("\n", 1)[0])
+        self.assertIn("host_profile_name         = aws_iam_instance_profile.fcvm_fleet_prod_host[0].name", mod)
+        self.assertIn("tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_prod_tile[0].name", mod)
+        self.assertIn("tile_tls_secret = aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name", mod)
+        self.assertIn("alert_topic     = false", mod)
+        # Its images come from prod's own pointer, which the staging publisher cannot write.
+        self.assertIn("gpu_amis                = local.fcvm_fleet_prod_host_amis", mod)
+        self.assertIn("tile_amis               = local.fcvm_fleet_prod_tile_amis", mod)
+        self.assertIn("ami_release_guarded           = true", mod)
+        self.assertIn("ami_release_parameter_arn     = aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn", mod)
+        self.assertIn('name        = "/fcvm-fleet/prod/ami-release"', block('resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release"', PROD))
+        release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
+        self.assertIn("fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates", release)
+        for name in ("fcvm-fleet-ami-pipeline.tf", "fcvm-fleet-ami-release.tf"):
+            self.assertNotIn("fcvm_fleet_prod", (ROOT / name).read_text(), name)
+
+    def test_the_prod_coordinator_launches_only_through_prod_templates_and_passes_only_prod_roles(self):
+        launch = block('resource "aws_iam_policy" "fcvm_fleet_prod_coordinator_launch"', PROD)
+        images = block('resource "aws_iam_policy" "fcvm_fleet_prod_validated_images"', PROD)
+        task = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task"', PROD)
+        for pol in (launch, images, task):
+            # Never staging's templates, roles or launch resources.
+            self.assertNotRegex(pol, r"local\.fcvm_fleet_(tile|host)_(template_condition|referenced_arns|created_arns)")
+            self.assertNotIn("aws_iam_role.fcvm_fleet_host", pol)
+            self.assertNotIn("aws_iam_role.fcvm_fleet_tile", pol)
+            self.assertNotIn("local.fcvm_fleet_regions", pol)
+        for cond in re.findall(r'"ec2:LaunchTemplate" = (\S+) \}', launch + images):
+            self.assertIn(cond, ("local.fcvm_fleet_prod_tile_template_condition", "local.fcvm_fleet_prod_host_template_condition"))
+        self.assertIn("Resource  = [aws_iam_role.fcvm_fleet_prod_host[0].arn, aws_iam_role.fcvm_fleet_prod_tile[0].arn]", task)
+        # The same statements as staging's launch policy: a staging change to one shows up here.
+        staging = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        sids = lambda text: set(re.findall(r'Sid\s+= "(\w+)"', text))
+        self.assertEqual(sids(launch) | sids(task) - {"StateObjectEarlierVersions", "StateObjectVersionList", "PassTheProdHostAndTileRolesOnly"},
+                         sids(staging) - {"PassTheHostAndTileRolesOnly"})
+        # The prod scope policy (Fleet=prod) is attached to the prod task role.
+        self.assertIn("aws_iam_role_policy_attachment.fcvm_fleet_stack_scope", block('resource "aws_ecs_service" "fcvm_fleet_prod_coordinator"', PROD))
+
+    def test_prod_instance_roles_read_only_prod_secrets(self):
+        host = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_host"', PROD)
+        self.assertIn("Resource = [aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].arn, aws_secretsmanager_secret.fcvm_fleet_prod_agent_access[0].arn]", host)
+        tile = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_tile"', PROD)
+        self.assertIn("Resource = aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].arn", tile)
+        for pol in (host, tile):
+            self.assertNotIn("local.fcvm_fleet_secret_arn", pol)
+        # And no other identity reads or writes the prod certificate, whatever its own policy says.
+        sp = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_prod_tls"', PROD)
+        self.assertIn('Effect    = "Deny"', sp)
+        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', sp)
+        self.assertEqual(re.findall(r"^\s+(aws_iam_role\.\w+\[0\]\.arn|local\.\w+),$", sp, re.M),
+                         ["aws_iam_role.fcvm_fleet_prod_coordinator_task[0].arn", "aws_iam_role.fcvm_fleet_prod_host[0].arn",
+                          "aws_iam_role.fcvm_fleet_prod_tile[0].arn", "local.fcvm_fleet_access_role_arn"])
+        self.assertNotIn('"Allow"', sp)
+
+    def test_the_prod_state_object_is_its_own_key_with_its_versions(self):
+        task = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task"', PROD)
+        key = '"${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_prod_stack.state_key}"'
+        self.assertEqual(task.count(key), 2)
+        self.assertIn('Action   = ["s3:GetObject", "s3:PutObject"]', task)
+        self.assertIn('Action   = "s3:GetObjectVersion"', task)
+        self.assertIn('Condition = { StringEquals = { "s3:prefix" = local.fcvm_fleet_prod_stack.state_key } }', task)
+        self.assertNotIn("state.json", task)
+        self.assertIn('{ name = "FLEET_STATE_KEY", value = local.fcvm_fleet_prod_stack.state_key }',
+                      block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD))
+
+    # ------------------------------------------------------------------------------------------- the coordinator
+    def test_the_prod_coordinator_arguments(self):
+        cmd = command(PROD, "fcvm_fleet_prod_coordinator_command")
+        self.assertIn('["--fleet-name", local.fcvm_fleet_prod_stack.fleet]', cmd)
+        self.assertIn('"--allowed-origin", local.fcvm_fleet_prod_site_origin', cmd)
+        self.assertIn('fcvm_fleet_prod_site_origin = "https://fcvm.dev"', PROD)
+        # The page connects straight to the coordinator: CF-Connecting-IP is the viewer.
+        self.assertIn('"--trust-cf-connecting-ip"', cmd)
+        self.assertNotIn("--access-viewer-address", cmd)
+        # No Cloudflare token for fcvm.dev anywhere in the prod task: the certificate is the subzone's only.
+        self.assertNotIn("--dns-token-secret", cmd)
+        self.assertNotIn("--dns-zone-id", cmd)
+        self.assertNotIn("fcvm_fleet_dns_token", PROD)
+        self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name', cmd)
+        self.assertIn('["--dns-subzone", local.fcvm_fleet_prod_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_prod_names_ns)', cmd)
+        self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_prod_daily_spend_usd)]', cmd)
+        self.assertIn("fcvm_fleet_prod_daily_spend_usd = 750", PROD)
+        self.assertIn("local.fcvm_fleet_prod_f6_args,", cmd)
+        self.assertNotIn("--warm-hours", cmd)
+        self.assertIn('"--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[0].name', cmd)
+        for template in ("tile", "tile-on-demand", "tile-pool"):
+            self.assertIn('"${local.fcvm_fleet_prod_stack.prefix}-%s-x86_64"' % template, cmd)
+
+    def test_the_prod_coordinator_verifies_the_access_tokens_prods_tunnel_admits(self):
+        cmd = command(PROD, "fcvm_fleet_prod_coordinator_command")
+        app = "cloudflare_zero_trust_access_application"
+        self.assertIn('"--access-team-domain", trimprefix(local.browser_manager_issuer, "https://")', cmd)
+        live = re.findall(r'"--access-aud", (\S+?\.aud)\b', cmd)
+        agent = re.findall(r'"--agent-access-aud", (\S+?\.aud)\b', cmd)
+        self.assertEqual(live, [f"{app}.fcvm_dev_ops_prod[0].aud"])
+        self.assertEqual(agent, [f"{app}.fcvm_dev_agent_prod[0].aud"])
+        tunnel = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_prod_coordinator"', DEV_PROD)
+        admitted = re.findall(r"aud_tag\s*=\s*\[(\S+\.aud)\]\n", tunnel)
+        self.assertEqual(len(admitted), tunnel.count("aud_tag"))
+        self.assertEqual(sorted(admitted), sorted(live + agent))
+
+    def test_turnstile_reaches_the_coordinator_through_the_execution_role(self):
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD)
+        for name in ("FLEET_TURNSTILE_SECRET", "FLEET_TURNSTILE_SITE_KEY"):
+            self.assertIn('{ name = "%s", valueFrom = "${aws_secretsmanager_secret.fcvm_fleet_prod_turnstile[0].arn}:%s::" }' % (name, name), td)
+        ex = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_execution_secret"', PROD)
+        self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_turnstile[0].arn", ex)
+        self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_coordinator_tunnel[0].arn", ex)
+        self.assertIn('"${aws_secretsmanager_secret.fcvm_fleet_prod_coordinator_tunnel[0].arn}:TUNNEL_TOKEN::"', td)
+        self.assertIn("execution_role_arn       = aws_iam_role.fcvm_fleet_prod_coordinator_execution[0].arn", td)
+
+    def test_the_prod_service_is_one_task_replaced_in_place_from_its_own_pointer(self):
+        svc = block('resource "aws_ecs_service" "fcvm_fleet_prod_coordinator"', PROD)
+        self.assertIn("desired_count                      = 1", svc)
+        self.assertIn("deployment_minimum_healthy_percent = 0", svc)
+        self.assertIn("deployment_maximum_percent         = 100", svc)
+        self.assertIn("cluster         = aws_ecs_cluster.fcvm_fleet_prod[0].id", svc)
+        self.assertIn("target_group_arn = aws_lb_target_group.fcvm_fleet_prod_dns[0].arn", svc)
+        self.assertIn("subnets          = local.fcvm_fleet_prod_dns_subnets", svc)
+        self.assertRegex(svc, r"depends_on = \[[^\]]*aws_lb_listener\.fcvm_fleet_prod_dns")
+        ptr = block('resource "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_release"', PROD)
+        self.assertIn('name     = "/fcvm-fleet/prod/coordinator-image"', ptr)
+        self.assertIn("ignore_changes = [value]", ptr)
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD)
+        self.assertIn("image                  = nonsensitive(aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].value)", td)
+        self.assertIn("@sha256:[0-9a-f]{64}$", td)
+        self.assertIn("depends_on               = [ephemeral.aws_ssm_parameter.fcvm_fleet_prod_coordinator_release_guard]", td)
+
+    def test_the_prod_agents_differ_from_stagings_only_in_their_stack(self):
+        stage = re.findall(r'^    "(--[^"]+)",$', TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ] : []))", 1)[0], re.M)
+        prod = re.findall(r'^    "(--[^"]+)",$', PROD.split("fcvm_fleet_prod_host_agent_args = ", 1)[1].split("\n  ] : [])) : \"\"", 1)[0], re.M)
+        flag = lambda a: a.split(" ", 1)[0]
+        self.assertEqual([flag(a) for a in stage], [flag(a) for a in prod])
+        differ = {flag(s): p for s, p in zip(stage, prod) if s != p}
+        self.assertEqual(differ, {
+            "--dial": "--dial wss://${local.fcvm_dev_agent_prod_path}",
+            "--access-secret": "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_prod_agent_access[0].name}",
+            "--tls-secret": "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name}",
+            "--frame-zone": "--frame-zone ${local.fcvm_fleet_prod_names_zone}",
+        })
+        self.assertIn('fcvm_dev_agent_prod_path    = "${local.fcvm_dev_api_prod_hostname}/agent"', DEV_PROD)
+
+    def test_all_modes_are_the_same_as_stagings(self):
+        stage, prod = tf_code(block('module "fcvm_fleet_east1"')), tf_code(block('module "fcvm_fleet_prod_east1"', PROD))
+        for arg in ("potato_host_amis", "windows_host_amis", "minecraft_host_amis", "minecraft_java_access",
+                    "slot_tls_ports", "windows_count", "minecraft_count", "hosts_enabled"):
+            pick = lambda text: re.sub(r"\s+", " ", re.search(r"\n  %s\s+= (.*?)\n  [a-z_]+\s+=" % arg, text, re.S).group(1))
+            self.assertEqual(pick(stage), pick(prod), arg)
+
+    # ------------------------------------------------------------------------------------------- DNS and broadcast
+    def test_the_prod_subzone_is_tiles_fcvm_dev_with_its_own_addresses(self):
+        self.assertIn('fcvm_fleet_prod_names_zone = "tiles.fcvm.dev"', PROD_DNS)
+        self.assertIn('fcvm_fleet_prod_names_ns   = ["ns1-tiles.fcvm.dev", "ns2-tiles.fcvm.dev"]', PROD_DNS)
+        lb = block('resource "aws_lb" "fcvm_fleet_prod_dns"', PROD_DNS)
+        self.assertIn("allocation_id = aws_eip.fcvm_fleet_prod_dns[subnet_mapping.key].id", lb)
+        self.assertIn("enable_cross_zone_load_balancing = true", lb)
+        self.assertIn('protocol          = "TCP_UDP"', block('resource "aws_lb_listener" "fcvm_fleet_prod_dns"', PROD_DNS))
+        self.assertIn('preserve_client_ip   = "true"', block('resource "aws_lb_target_group" "fcvm_fleet_prod_dns"', PROD_DNS))
+        ns = block('resource "cloudflare_dns_record" "fcvm_fleet_prod_names_delegation"', PROD_DNS)
+        self.assertIn('type       = "NS"', ns)
+        self.assertIn("name       = local.fcvm_fleet_prod_names_zone", ns)
+        addr = block('resource "cloudflare_dns_record" "fcvm_fleet_prod_names_ns_address"', PROD_DNS)
+        self.assertIn("content = aws_eip.fcvm_fleet_prod_dns[count.index].public_ip", addr)
+        self.assertIn("proxied = false", addr)
+        self.assertNotRegex(PROD_DNS, r'type\s*=\s*"(DS|AAAA)"')
+        # The page (ejc3/fcvm fleet/web, env.production) expects this subzone and fleet-api.fcvm.dev, which
+        # fcvm-dev-prod.tf routes through prod's tunnel.
+        self.assertIn('fcvm_dev_api_prod_hostname  = "fleet-api.fcvm.dev"', DEV_PROD)
+        # Staging's subzone and addresses are unchanged.
+        self.assertIn('fcvm_fleet_names_zone = "tiles-stage.fcvm.dev"', DNS)
+        self.assertIn("count    = 2\n", block('resource "aws_eip" "fcvm_fleet_dns"', DNS))
+
+    def test_the_prod_broadcast_is_its_own_channel_key_pair_and_secret(self):
+        self.assertIn('name         = "${local.fcvm_fleet_prod_stack.prefix}-broadcast"', block('resource "aws_ivs_channel" "fcvm_fleet_prod_broadcast"', PROD_BC))
+        self.assertIn("public_key = tls_private_key.fcvm_fleet_prod_broadcast_playback[0].public_key_pem",
+                      block('resource "aws_ivs_playback_key_pair" "fcvm_fleet_prod_broadcast"', PROD_BC))
+        self.assertIn('name                    = "fcvm-fleet/prod/broadcast"', block('resource "aws_secretsmanager_secret" "fcvm_fleet_prod_broadcast"', PROD_BC))
+        self.assertNotIn("aws_ivs_channel.fcvm_fleet_broadcast", PROD_BC)
+        self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[*].arn", block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task"', PROD))
+
+    # ------------------------------------------------------------------------------------------- staging unchanged
+    def test_the_region_module_renders_stagings_names_as_before(self):
+        # Staging's three regions pass the prefix fcvm-fleet; with it, every network name is the literal it was.
+        staged = MOD.replace("${var.name_prefix}", "fcvm-fleet").replace("= var.name_prefix\n", '= "fcvm-fleet"\n')
+        for line in ('  tags                             = { Name = "fcvm-fleet-${local.region}" }',
+                     '  tags                                           = { Name = "fcvm-fleet-${each.key}" }',
+                     '  name        = "fcvm-fleet"', '  name        = "fcvm-fleet-minecraft-java"',
+                     '  tags                     = { Name = "fcvm-fleet-${local.region}-flow-log", BucketPolicy = var.flow_log_bucket_policy_id }',
+                     '  name  = "fcvm-fleet-alerts"'):
+            self.assertIn(line + "\n", staged)
+        self.assertNotIn('"fcvm-fleet-${local.region}"', MOD)
+        # The new inputs default to what staging had, and no staging region sets them.
+        self.assertRegex(block('variable "alert_topic"', MOD), r"default\s+= true")
+        self.assertRegex(block('variable "tile_tls_secret"', MOD), r'default\s+= ""')
+        self.assertRegex(block('variable "ami_release_guarded"', MOD), r"default\s+= null")
+        for name in ("east2", "west2", "east1"):
+            mod = block('module "fcvm_fleet_%s"' % name)
+            for arg in ("alert_topic", "tile_tls_secret", "ami_release_guarded"):
+                self.assertNotIn(arg, mod)
+        self.assertIn("count = var.alert_topic && length(local.host_archs) > 0 ? 1 : 0", MOD)
+        # Nothing is moved: no staging address changes.
+        for text in (TF, MOD, PROD, PROD_DNS, PROD_BC):
+            self.assertNotRegex(text, r"(?m)^\s*moved \{")
+
+    def test_a_tile_without_its_own_secret_boots_with_the_same_user_data(self):
+        tile = MOD.split("  tile_user_data = base64encode(<<-EOT\n", 1)[1].split("  EOT\n", 1)[0]
+        cond = tile[tile.index('    %{if var.tile_tls_secret != ""~}\n'):tile.index("    %{endif~}\n") + len("    %{endif~}\n")]
+        # With the condition false the template renders what precedes it (verified byte for byte with terraform 1.10.3).
+        self.assertEqual(tile.replace(cond, ""), "    #!/bin/bash\n    set -eu\n    ${var.ip_options_bootstrap}\n")
+        self.assertIn("Environment=FLEET_TLS_SECRET=%s", cond)
+        self.assertIn("'${var.tile_tls_secret}'", cond)
+        self.assertIn("systemctl restart --no-block fcvm-fleet-tls.service", cond)
 
 
 if __name__ == "__main__":

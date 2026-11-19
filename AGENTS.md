@@ -1880,6 +1880,15 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   load balancer needs an IPv6 target group, which an ECS service does not fill for a dual-stack task. The certificate
   gains `*.tiles-stage.fcvm.dev`; its DNS-01 records stay at `_acme-challenge.fcvm.dev`, which the coordinator's
   `_acme-challenge.tiles-stage.fcvm.dev` CNAME points to.
+- **Production** (`fcvm-fleet-prod.tf`, `fcvm-fleet-prod-dns.tf`, `fcvm-fleet-prod-broadcast.tf`; Cloudflare side
+  `fcvm-dev-prod.tf`): a second stack in the same account, behind `var.fcvm_fleet_prod_enabled` (false: nothing is
+  created). `local.fcvm_fleet_stacks` holds each stack's Fleet tag, name prefix, certificate secret and state key;
+  `aws_iam_policy.fcvm_fleet_stack_scope` holds each coordinator to instances and spot requests tagged with its own
+  stack. Prod has its own VPC and templates in us-east-1 (`module.fcvm_fleet_prod_east1`, prefix `fcvm-fleet-prod`),
+  roles, ECS cluster and service, `prod/state.json`, subzone `tiles.fcvm.dev` with its own load balancer and addresses,
+  certificate `fcvm-fleet/prod/tls` (`*.tiles.fcvm.dev` only, no Cloudflare token), IVS channel, and the pointers
+  `/fcvm-fleet/prod/ami-release` and `/fcvm-fleet/prod/coordinator-image`, each seeded from staging's on the apply
+  that creates it.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)
