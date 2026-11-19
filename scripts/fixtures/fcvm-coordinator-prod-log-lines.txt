@@ -1,0 +1,27 @@
+c8e6817ae7de17e7e53fe2717a5654425b86429d
+agents.rs:32:pub const AGENT_REFUSED_MARKER: &str = "fleet-agent-refused";
+agents.rs:138:                marker = AGENT_REFUSED_MARKER,
+cert.rs:449:                tracing::warn!(error = %format!("{e:#}"), "the certificate secret could not be read");
+cert.rs:476:                        tracing::error!(error = %format!("{e:#}"), "the renewed certificate was not stored")
+cert.rs:479:                Err(e) => tracing::error!(error = %format!("{e:#}"), "certificate renewal failed"),
+hosts.rs:97:            Market::OnDemand => "on-demand",
+hosts.rs:416:                    tracing::warn!(%region, error = %format!("{e:#}"), "listing the GPU hosts failed");
+hosts.rs:511:                        tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+hosts.rs:538:                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+hosts.rs:719:                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
+hosts.rs:800:                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
+hosts.rs:808:            tracing::info!(%region, instance = %id, market = market.name(), zone = ?zone, request_ms, "wake: host launch accepted");
+hosts.rs:829:            tracing::warn!(%region, market = market.name(), error = %why, "EC2 refused a GPU host launch");
+live.rs:267:                marker = super::agents::AGENT_REFUSED_MARKER,
+live.rs:864:                            marker = SITEVERIFY_ERROR_MARKER,
+mod.rs:328:                reason = ?f.power.reason,
+mod.rs:330:                "fleet asleep"
+mod.rs:970:                "the last state was not stored"
+mod.rs:1719:    tracing::info!(listen = %args.listen, "coordinator serving /live");
+mod.rs:1834:                "the last state was not stored, so this coordinator may not own the state object; the EC2 sweep is left to the next coordinator's start"
+store.rs:13:pub const UNREADABLE_STATE_MARKER: &str = "FLEET_STATE_UNREADABLE";
+store.rs:16:pub const LOST_WRITE_MARKER: &str = "FLEET_STATE_WRITE_LOST";
+store.rs:145:                        tracing::error!(error = %format!("{e:#}"), "state not written; kept for the next write")
+text_check.rs:201:            tracing::warn!(error = %format!("{e:#}"), "text check failed");
+text_check.rs:211:                "text check failed: no answer in time"
+turnstile.rs:21:pub const SITEVERIFY_ERROR_MARKER: &str = "turnstile-siteverify-error";
