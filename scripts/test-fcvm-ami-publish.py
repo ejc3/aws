@@ -54,7 +54,8 @@ class SSM:
         assert WithDecryption is False
         if Name not in self.values:
             raise ParameterNotFound()
-        return {"Parameter": {"Value": MODULE.encoded(self.values[Name])}}
+        return {"Parameter": {"Value": MODULE.encoded(self.values[Name]),
+                              "LastModifiedDate": datetime.datetime(2026, 11, 19, tzinfo=datetime.timezone.utc)}}
 
     def put_parameter(self, Name, Type, Value, Overwrite):
         assert Type == "String" and type(Overwrite) is bool
@@ -3386,6 +3387,33 @@ class PublisherTests(unittest.TestCase):
             "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet"}, {"Key": "FleetImageKind", "Value": kind}],
             "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot}}] if snapshot else []}
 
+    def test_retention_keeps_prod_release_images_and_their_previous(self):
+        # Prod launches from its own pointer while staging moves on: staging's retention keeps both prod releases.
+        self.build_in_west()
+        current, earlier = "ami-" + "e1" * 8 + "e", "ami-" + "e3" * 8 + "e"
+        self.publisher_copy(self.ec2, current, "ami-" + "f1" * 8 + "f", "us-west-2")
+        self.publisher_copy(self.ec2, earlier, "ami-" + "f3" * 8 + "f", "us-west-2", kind="tile")
+        self.env["PROD_RELEASE_PARAMETER"] = "/prod/release"
+        self.fleet_ssm.values["/prod/release"] = {
+            "host_amis": {"us-east-1": {"x86_64": current}}, "tile_amis": {"us-east-1": {"x86_64": self.old["tile"]}},
+            "previous": {"host_amis": {"us-east-1": {"x86_64": self.old["host"]}}, "tile_amis": {"us-east-1": {"x86_64": earlier}}}}
+        with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+        self.ec2.available()
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual(self.ec2.deregistered, [])
+        for image in (current, earlier):
+            self.assertIn(image, self.ec2.images)
+
+    def test_retention_without_a_prod_pointer_yet_is_unchanged(self):
+        self.build_in_west()
+        stale = "ami-" + "e1" * 8 + "e"
+        self.publisher_copy(self.ec2, stale, "ami-" + "f1" * 8 + "f", "us-west-2")
+        self.env["PROD_RELEASE_PARAMETER"] = "/prod/release"
+        with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
+        self.ec2.available()
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual(self.ec2.deregistered, [stale])
+
     def test_retention_removes_only_copies_nothing_needs(self):
         self.build_in_west()
         stale, in_use, previous = "ami-" + "e1" * 8 + "e", "ami-" + "e2" * 8 + "e", "ami-" + "e3" * 8 + "e"
@@ -3530,6 +3558,196 @@ class PublisherTests(unittest.TestCase):
         self.setUp()
         self.env["FACTORY_PAUSED"] = "false"
         self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+
+class CloudWatch:
+    def __init__(self):
+        self.power = [0.0, 0.0, 0.0]
+        self.status = "Complete"
+
+    def get_metric_data(self, MetricDataQueries, StartTime, EndTime, ScanBy):
+        stat = MetricDataQueries[0]["MetricStat"]
+        assert stat["Metric"] == {"Namespace": "FCVM/Fleet", "MetricName": "Power",
+                                  "Dimensions": [{"Name": "Fleet", "Value": "prod"}]}
+        assert stat["Stat"] == "Maximum" and (EndTime - StartTime).total_seconds() == 300
+        return {"MetricDataResults": [{"Id": "power", "StatusCode": self.status, "Values": list(self.power)}]}
+
+
+class ProdPublisherTests(unittest.TestCase):
+    """promote-prod and rollback-prod: gate-verified receipts only, prod's templates only, asleep only."""
+
+    GUARD = "c" * 64
+
+    def setUp(self):
+        network = mock.patch.object(http.client, "HTTPSConnection", side_effect=AssertionError("offline fixture forbids network"))
+        network.start()
+        self.addCleanup(network.stop)
+        self.stage_ids = ["lt-" + format(i, "017x") for i in range(1, 5)]
+        self.prod_ids = ["lt-" + format(i, "017x") for i in range(0xa1, 0xa5)]
+        self.templates = [{"region": "us-east-1", "id": name, "kind": "host" if i == 0 else "tile", "arch": "x86_64"}
+                          for i, name in enumerate(self.prod_ids)]
+        self.env = {"TEMPLATES_JSON": json.dumps(self.templates), "CONTROL_REGION": "us-west-1",
+                    "COMPUTE_REGION": "us-east-1", "FLEET_ACCOUNT": "222222222222", "STATE_PREFIX": "/prod-journal",
+                    "RELEASE_PARAMETER": "/prod/release", "STAGE_RELEASE_PARAMETER": "/release",
+                    "GATE_PARAMETER": "/factory/gate", "GUARD_SHA256": self.GUARD, "LOCK_ID": "exact-backend/key",
+                    "LOCK_TABLE": "locks", "COPY_REGIONS": "", "BUILD_REGION": "us-west-2",
+                    "METRICS_REGION": "us-east-2", "METRIC_FLEET": "prod"}
+        self.main_ssm, self.fleet_ssm, self.ddb, self.ec2, self.cloudwatch = SSM(), SSM(), DDB(), EC2(), CloudWatch()
+        self.old = {"host": "ami-" + "1" * 17, "tile": "ami-" + "2" * 17}
+        self.new = {"host": "ami-" + "3" * 17, "tile": "ami-" + "4" * 17}
+        for kind in ("host", "tile"):
+            for image in (self.old[kind], self.new[kind]):
+                self.ec2.images[image] = {"ImageId": image, "OwnerId": "222222222222", "Public": False, "State": "available",
+                    "Architecture": "x86_64", "RootDeviceType": "ebs", "Tags": [{"Key": k, "Value": v} for k, v in {
+                        "Purpose": "fcvm-fleet", "FleetImageKind": kind, "FleetImageValidated": "true",
+                        "GuardHelperSHA256": self.GUARD}.items()]}
+        for ids in (self.stage_ids, self.prod_ids):
+            for i, name in enumerate(ids):
+                kind = "host" if i == 0 else "tile"
+                self.ec2.templates[name] = {"default": 1, "versions": {1: {"LaunchTemplateId": name, "VersionNumber": 1,
+                    "VersionDescription": "terraform", "LaunchTemplateData": {"ImageId": self.old[kind],
+                        "UserData": "prod" if ids is self.prod_ids else "stage", "SecurityGroupIds": ["known-group"]}}}}
+        def release(generation, build_id, images, previous=None):
+            return {"version": 1, "generation": generation, "source_sha": "9" * 40, "build_id": build_id,
+                    "guard_sha256": self.GUARD, "host_amis": {"us-east-1": {"x86_64": images["host"]}},
+                    "tile_amis": {"us-east-1": {"x86_64": images["tile"]}}, "versions": {}, "previous": previous}
+        self.prod_before = release(11, "factory:old", self.old)
+        self.fleet_ssm.values["/prod/release"] = copy.deepcopy(self.prod_before)
+        self.fleet_ssm.values["/release"] = release(12, "factory:new", self.new,
+                                                    {k: v for k, v in self.prod_before.items() if k != "previous"})
+        self.receipt = {"generation": 12, "build_id": "factory:new"}
+        self.main_ssm.values["/factory/gate"] = dict(self.receipt)
+
+    def publisher(self):
+        clients = {("ssm", False, "us-west-1"): self.main_ssm, ("ssm", True, "us-east-1"): self.fleet_ssm,
+                   ("dynamodb", False, "us-west-1"): self.ddb, ("ec2", True, "us-east-1"): self.ec2,
+                   ("cloudwatch", True, "us-east-2"): self.cloudwatch}
+        publisher = MODULE.ProdPublisher(self.env, sleep=lambda _: None)
+        regions = {("ec2", True): "us-east-1", ("ssm", True): "us-east-1", ("ssm", False): "us-west-1",
+                   ("dynamodb", False): "us-west-1"}
+        publisher.client = lambda service, fleet=False, region=None: clients[(service, fleet, region or regions[(service, fleet)])]
+        return publisher
+
+    def promote(self, receipt=None):
+        return self.publisher().prod_event({"action": "promote-prod", "receipt": receipt or self.receipt})
+
+    def defaults(self, ids):
+        return [self.ec2.templates[name]["versions"][self.ec2.templates[name]["default"]]["LaunchTemplateData"]["ImageId"]
+                for name in ids]
+
+    def test_a_verified_receipt_moves_only_prods_templates_and_pointer(self):
+        self.assertEqual(self.promote(), {"status": "promoted", **self.receipt})
+        self.assertEqual(self.defaults(self.prod_ids), [self.new["host"]] + [self.new["tile"]] * 3)
+        self.assertEqual(self.defaults(self.stage_ids), [self.old["host"]] + [self.old["tile"]] * 3)
+        self.assertEqual({name for name, _, _ in self.ec2.created}, set(self.prod_ids))
+        prod = self.fleet_ssm.values["/prod/release"]
+        stage = self.fleet_ssm.values["/release"]
+        self.assertEqual({k: v for k, v in prod.items() if k not in ("versions", "previous")},
+                         {k: v for k, v in stage.items() if k not in ("versions", "previous")})
+        self.assertEqual(prod["previous"], {k: v for k, v in self.prod_before.items() if k != "previous"})
+        self.assertEqual(prod["versions"], {"us-east-1/" + name: 2 for name in self.prod_ids})
+        for name in self.prod_ids:
+            versions = self.ec2.templates[name]["versions"]
+            self.assertEqual({k: v for k, v in versions[2]["LaunchTemplateData"].items() if k != "ImageId"},
+                             {k: v for k, v in versions[1]["LaunchTemplateData"].items() if k != "ImageId"})
+        self.assertIsNone(self.ddb.item)
+        self.assertEqual(self.promote(), {"status": "unchanged", **self.receipt})
+        self.assertEqual(len(self.ec2.created), 4)
+
+    def test_only_the_gate_verified_receipt_that_staging_runs_is_promoted(self):
+        cases = {"unverified": lambda: self.main_ssm.values.__setitem__("/factory/gate", {"generation": 11, "build_id": "factory:old"}),
+                 "staging moved on": lambda: self.fleet_ssm.values["/release"].update(generation=13, build_id="factory:newer"),
+                 "another receipt": lambda: None}
+        for name, change in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                change()
+                receipt = {"generation": 12, "build_id": "factory:other"} if name == "another receipt" else None
+                self.assertEqual(self.promote(receipt)["status"], "refused")
+                self.assertEqual((self.ec2.created, self.fleet_ssm.values["/prod/release"]), ([], self.prod_before))
+                self.assertIsNone(self.ddb.item)
+
+    def test_prod_awake_or_unobserved_holds_without_any_change(self):
+        def running():
+            self.ec2.instances["i-" + "a" * 17] = {"InstanceId": "i-" + "a" * 17, "ImageId": self.old["tile"],
+                "State": {"Name": "running"}, "Tags": [{"Key": "aws:ec2launchtemplate:id", "Value": self.prod_ids[1]}]}
+        cases = {"awake": (lambda: setattr(self.cloudwatch, "power", [0.0, 2.0]), "awake"),
+                 "waking": (lambda: setattr(self.cloudwatch, "power", [1.0]), "awake"),
+                 "no data": (lambda: setattr(self.cloudwatch, "power", []), "no-power-data"),
+                 "partial": (lambda: setattr(self.cloudwatch, "status", "PartialData"), "no-power-data"),
+                 "a prod instance runs": (running, "instances-running")}
+        for name, (change, reason) in cases.items():
+            with self.subTest(case=name):
+                self.setUp()
+                change()
+                self.assertEqual(self.promote(), {"status": "held", "reason": reason})
+                self.assertEqual((self.ec2.created, self.fleet_ssm.values["/prod/release"]), ([], self.prod_before))
+                self.assertNotIn("/prod-journal", "".join(self.main_ssm.values))
+
+    def test_a_staging_instance_does_not_hold_prod(self):
+        self.ec2.instances["i-" + "b" * 17] = {"InstanceId": "i-" + "b" * 17, "ImageId": self.old["host"],
+            "State": {"Name": "running"}, "Tags": [{"Key": "aws:ec2launchtemplate:id", "Value": self.stage_ids[0]}]}
+        self.assertEqual(self.promote()["status"], "promoted")
+
+    def test_prod_waking_during_the_publication_rolls_it_back_and_a_retry_is_a_new_attempt(self):
+        real = self.ec2.modify_launch_template
+        def wakes(**kwargs):
+            real(**kwargs)
+            self.cloudwatch.power = [1.0]
+        self.ec2.modify_launch_template = wakes
+        with self.assertRaisesRegex(MODULE.Refused, "woke"):
+            self.promote()
+        self.assertEqual(self.defaults(self.prod_ids), [self.old["host"]] + [self.old["tile"]] * 3)
+        self.assertEqual(self.fleet_ssm.values["/prod/release"], self.prod_before)
+        self.assertIsNone(self.ddb.item)
+        self.ec2.modify_launch_template = real
+        self.cloudwatch.power = [0.0]
+        self.assertEqual(self.promote()["status"], "promoted")
+        self.assertEqual(self.defaults(self.prod_ids), [self.new["host"]] + [self.new["tile"]] * 3)
+
+    def test_an_image_that_is_not_validated_is_refused(self):
+        tags = self.ec2.images[self.new["host"]]["Tags"]
+        next(t for t in tags if t["Key"] == "FleetImageValidated")["Value"] = "false"
+        with self.assertRaisesRegex(MODULE.Refused, "validated"):
+            self.promote()
+        self.assertEqual((self.ec2.created, self.fleet_ssm.values["/prod/release"]), ([], self.prod_before))
+
+    def test_rollback_returns_prod_to_its_previous_release_once(self):
+        self.assertEqual(self.promote()["status"], "promoted")
+        rollback = {"action": "rollback-prod", "receipt": self.receipt}
+        self.cloudwatch.power = [2.0]
+        self.assertEqual(self.publisher().prod_event(rollback), {"status": "held", "reason": "awake"})
+        self.cloudwatch.power = [0.0]
+        self.assertEqual(self.publisher().prod_event(rollback),
+                         {"status": "rolled_back", "generation": 11, "build_id": "factory:old"})
+        self.assertEqual(self.defaults(self.prod_ids), [self.old["host"]] + [self.old["tile"]] * 3)
+        prod = self.fleet_ssm.values["/prod/release"]
+        self.assertEqual(self.publisher().gate_receipt(prod["previous"]), self.receipt)
+        created = list(self.ec2.created)
+        self.assertEqual(self.publisher().prod_event(rollback), {"status": "unchanged", "generation": 11, "build_id": "factory:old"})
+        self.assertEqual(self.ec2.created, created)
+        with self.assertRaises(MODULE.Refused):
+            self.publisher().prod_event({"action": "rollback-prod", "receipt": {"generation": 5, "build_id": "x"}})
+
+    def test_status_reports_both_receipts_and_whether_prod_sleeps(self):
+        self.assertEqual(self.publisher().prod_event({"action": "prod-status"}), {
+            "status": "ok", "stage": self.receipt, "verified": self.receipt, "stage_verified": True,
+            "verified_at": int(datetime.datetime(2026, 11, 19, tzinfo=datetime.timezone.utc).timestamp()),
+            "prod": {"generation": 11, "build_id": "factory:old"}, "asleep": True, "reason": None})
+
+    def test_the_prod_function_never_reads_the_staging_bundle(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp) / "publisher-config.json"
+            staging = [{**t, "id": name} for t, name in zip(self.templates, self.stage_ids)]
+            bundle.write_text(json.dumps({"TEMPLATES_JSON": json.dumps(staging)}))
+            with mock.patch.object(MODULE, "BUNDLED_CONFIG", str(bundle)):
+                with self.assertRaises(MODULE.Refused):
+                    MODULE.Publisher(self.env)  # the staging class would read it and refuse the overlap
+                publisher = MODULE.ProdPublisher(self.env)
+        self.assertEqual([t["id"] for t in publisher.templates], self.prod_ids)
+        with self.assertRaises(MODULE.Refused):
+            self.publisher().prod_event({"action": "promote-prod", "receipt": self.receipt, "images": self.old})
+
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

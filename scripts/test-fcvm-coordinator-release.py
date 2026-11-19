@@ -31,7 +31,8 @@ REPO = "registry.example/fcvm-fleet/coordinator"
 DIGEST = "sha256:" + "a" * 64
 EVENT = {"commit": "b" * 40, "digest": DIGEST}
 ENV = {"REPOSITORY_URL": REPO, "LOCK_TABLE": "locks", "LOCK_ID": "state-bucket/state-key",
-       "IMAGE_PARAMETER": "/fleet/stage/image"}
+       "IMAGE_PARAMETER": "/fleet/stage/image", "STACK": "stage", "CLUSTER": "fcvm-fleet",
+       "SERVICE": "fcvm-fleet-coordinator", "FAMILY": "fcvm-fleet-coordinator"}
 
 
 class AWS:
@@ -78,6 +79,7 @@ class AWS:
         self.calls.append("unlock")
 
     def describe_services(self, **kwargs):
+        assert kwargs == {"cluster": os.environ["CLUSTER"], "services": [os.environ["SERVICE"]]}, kwargs
         return {"services": [{"taskDefinition": self.arn, "desiredCount": 1, "runningCount": 1,
                               "pendingCount": 0, "deployments": [{"rolloutState":
                                   "FAILED" if self.fail_rollout and self.arn == NEW else "COMPLETED"}]}]}
@@ -102,6 +104,7 @@ class AWS:
 
     def update_service(self, **kwargs):
         assert self.lock, "service change outside the Terraform backend lock"
+        assert (kwargs["cluster"], kwargs["service"]) == (os.environ["CLUSTER"], os.environ["SERVICE"]), kwargs
         self.arn = kwargs["taskDefinition"]
         self.calls.append(self.arn)
 
@@ -255,6 +258,240 @@ class ReleaseTests(unittest.TestCase):
         with self.assertRaises(ClientError):
             release.deploy(EVENT, self.aws, self.aws, self.aws, self.aws, progress=progress)
         self.assertEqual(progress["step"], "unlock")
+
+
+PROD_ENV = {**ENV, "STACK": "prod", "CLUSTER": "fcvm-fleet-prod", "SERVICE": "fcvm-fleet-prod-coordinator",
+            "FAMILY": "fcvm-fleet-prod-coordinator", "IMAGE_PARAMETER": "/fleet/prod/image",
+            "STAGE_IMAGE_PARAMETER": "/fleet/stage/image", "RELEASE_RECORD": "/fleet/prod/release",
+            "METRICS_NAMESPACE": "FCVM/Fleet", "METRIC_FLEET": "prod"}
+PROD_OLD = PROD_ENV["FAMILY"]
+
+
+class ProdAWS(AWS):
+    """Prod's service, its pointer history, the release record and the ActiveViewers metric."""
+
+    def __init__(self):
+        super().__init__()
+        self.old["taskDefinition"]["family"] = PROD_OLD
+        self.viewers = [0.0, 0.0, 0.0]
+        self.metric_status = "Complete"
+        self.metric_reads = 0
+        self.history = [self.image]
+        self.stage_image = REPO + "@" + DIGEST
+        self.record = "{}"
+        self.tags = {DIGEST: ["b" * 40], "sha256:" + "c" * 64: ["e" * 40, "bdaa0003"]}
+
+    def get_metric_data(self, **kwargs):
+        query = kwargs["MetricDataQueries"][0]["MetricStat"]
+        assert query["Metric"] == {"Namespace": "FCVM/Fleet", "MetricName": "ActiveViewers",
+                                   "Dimensions": [{"Name": "Fleet", "Value": "prod"}]}, query
+        assert query["Stat"] == "Maximum" and (kwargs["EndTime"] - kwargs["StartTime"]).total_seconds() == 300
+        self.metric_reads += 1
+        return {"MetricDataResults": [{"Id": "viewers", "StatusCode": self.metric_status, "Values": list(self.viewers)}]}
+
+    def get_parameter(self, **kwargs):
+        name = kwargs["Name"]
+        if name == PROD_ENV["STAGE_IMAGE_PARAMETER"]:
+            return {"Parameter": {"Value": self.stage_image}}
+        if name == PROD_ENV["RELEASE_RECORD"]:
+            return {"Parameter": {"Value": self.record}}
+        assert name == PROD_ENV["IMAGE_PARAMETER"], name
+        return super().get_parameter(**kwargs)
+
+    def put_parameter(self, **kwargs):
+        if kwargs["Name"] == PROD_ENV["RELEASE_RECORD"]:
+            self.record = kwargs["Value"]
+            self.calls.append("record")
+            return
+        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"], kwargs["Name"]
+        super().put_parameter(**kwargs)
+        self.history.append(kwargs["Value"])
+
+    def get_parameter_history(self, **kwargs):
+        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"] and kwargs["WithDecryption"] is False
+        return {"Parameters": [{"Value": value} for value in self.history]}
+
+    def describe_images(self, **kwargs):
+        ids = kwargs["imageIds"][0]
+        if "imageDigest" in ids:
+            return {"imageDetails": [{"imageDigest": ids["imageDigest"], "imageTags": self.tags.get(ids["imageDigest"], [])}]}
+        return super().describe_images(**kwargs)
+
+
+class ProdReleaseTests(unittest.TestCase):
+    """The prod function: the viewer hold, force for rollback only, and the release record."""
+
+    def setUp(self):
+        self.aws = ProdAWS()
+        self.env = patch.dict(os.environ, PROD_ENV)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def run_release(self, event=EVENT):
+        return release.deploy(event, self.aws, self.aws, self.aws, self.aws, self.aws)
+
+    def test_a_viewer_in_the_last_five_minutes_holds_the_release_without_a_lock_or_a_change(self):
+        self.aws.viewers = [0.0, 1.0, 0.0]
+        self.assertEqual(self.run_release(), {"status": "held", "reason": "viewers"})
+        self.assertEqual(self.aws.calls, [])
+        self.assertIsNone(self.aws.lock)
+
+    def test_no_viewer_data_holds_the_release(self):
+        for values, status in (([], "Complete"), ([0.0], "PartialData")):
+            with self.subTest(values=values, status=status):
+                self.setUp()
+                self.aws.viewers, self.aws.metric_status = values, status
+                self.assertEqual(self.run_release(), {"status": "held", "reason": "no-viewer-data"})
+                self.assertEqual(self.aws.calls, [])
+
+    def test_quiet_releases_prod_and_checks_the_viewers_again_under_the_lock(self):
+        result = self.run_release()
+        self.assertEqual(result["status"], "deployed")
+        self.assertEqual(self.aws.metric_reads, 2)
+        self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, "pointer", "unlock"])
+
+    def test_a_viewer_who_arrives_while_the_lock_is_taken_holds_the_release(self):
+        real = self.aws.put_item
+        def arrives(**kwargs):
+            real(**kwargs)
+            self.aws.viewers = [1.0]
+        self.aws.put_item = arrives
+        self.assertEqual(self.run_release(), {"status": "held", "reason": "viewers"})
+        self.assertEqual(self.aws.calls, ["lock", "unlock"])
+        self.assertEqual(self.aws.arn, OLD)
+
+    def test_force_skips_the_hold_only_for_an_image_prod_ran_before(self):
+        self.aws.viewers = [3.0]
+        with self.assertRaisesRegex(RuntimeError, "ran before"):
+            self.run_release({**EVENT, "force": True})
+        self.assertEqual(self.aws.calls, [])
+        self.aws.history.insert(0, REPO + "@" + DIGEST)
+        self.assertEqual(self.run_release({**EVENT, "force": True})["status"], "deployed")
+        self.assertEqual(self.aws.metric_reads, 0)
+
+    def test_force_must_be_true_and_staging_takes_no_force_or_action(self):
+        with self.assertRaises(ValueError):
+            self.run_release({**EVENT, "force": "yes"})
+        with patch.dict(os.environ, ENV):
+            for event in ({**EVENT, "force": True}, {"action": "quiet"}, {"action": "candidate"}):
+                with self.subTest(event=event), self.assertRaises(ValueError):
+                    self.run_release(event)
+        self.assertEqual(self.aws.calls, [])
+
+    def test_the_prod_function_never_releases_another_family(self):
+        self.aws.old["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
+        with self.assertRaisesRegex(ValueError, "task family"):
+            self.run_release()
+        self.assertNotIn("register", self.aws.calls)
+
+    def test_quiet_is_read_only(self):
+        self.assertEqual(self.run_release({"action": "quiet"}), {"status": "quiet"})
+        self.aws.viewers = [2.0]
+        self.assertEqual(self.run_release({"action": "quiet"}), {"status": "held", "reason": "viewers"})
+        self.assertEqual(self.aws.calls, [])
+
+    def test_candidate_names_both_images_by_digest_and_commit(self):
+        self.assertEqual(self.run_release({"action": "candidate"}), {
+            "status": "ok", "stage": {"digest": DIGEST, "commits": ["b" * 40]},
+            "prod": {"digest": "sha256:" + "c" * 64, "commits": ["e" * 40]}, "release": None})
+
+    def entry(self, digest="sha256:" + "c" * 64, commit="e" * 40, generation=7):
+        return {"coordinator": {"commit": commit, "digest": digest}, "web_commit": "f" * 40, "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12,
+                "generation": generation, "build_id": "factory:1", "smoke_run": 42}
+
+    def test_the_record_names_what_prod_runs_and_swaps_only_its_predecessor(self):
+        first = {**self.entry(), "previous": None}
+        self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "recorded"})
+        self.assertEqual(json.loads(self.aws.record), first)
+        self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "unchanged"})
+        stale = {**self.entry(generation=8), "previous": self.entry(generation=6)}
+        with self.assertRaisesRegex(RuntimeError, "changed since"):
+            self.run_release({"action": "record", "release": stale})
+        other = {**self.entry(digest=DIGEST, commit="b" * 40), "previous": self.entry()}
+        with self.assertRaisesRegex(RuntimeError, "prod runs"):
+            self.run_release({"action": "record", "release": other})
+        for field, value in (("worker_version", "latest"), ("web_commit", "main")):
+            with self.assertRaises(ValueError):
+                self.run_release({"action": "record", "release": {**self.entry(), field: value, "previous": None}})
+        self.assertEqual(json.loads(self.aws.record), first)
+
+
+class ProdCiTerraformTests(unittest.TestCase):
+    """fcvm-fleet-prod-ci.tf: what the prod CI role and the prod functions may do, and that all of it is gated."""
+
+    def setUp(self):
+        self.text = (ROOT / "fcvm-fleet-prod-ci.tf").read_text()
+
+    def block(self, kind, name):
+        start = self.text.index(f'{kind} "{name}"')
+        depth, i = 0, self.text.index("{", start)
+        for j in range(i, len(self.text)):
+            depth += {"{": 1, "}": -1}.get(self.text[j], 0)
+            if depth == 0:
+                return self.text[start:j + 1]
+        raise AssertionError("unterminated block")
+
+    def test_every_resource_exists_only_with_the_prod_stack(self):
+        names = re.findall(r'^resource "([a-z0-9_]+)" "([a-z0-9_]+)"', self.text, re.M)
+        self.assertGreater(len(names), 15)
+        for kind, name in names:
+            with self.subTest(resource=name):
+                head = self.block(f'resource "{kind}"', name).split("\n")[1:4]
+                self.assertTrue(any(re.match(r"\s*count\s*=\s*local\.fcvm_fleet_prod$", line) or
+                                    re.match(r"\s*for_each\s*=\s*var\.fcvm_fleet_prod_enabled \?", line) or
+                                    re.match(r"\s*provider\s*=", line) for line in head[:1]) and
+                                any("local.fcvm_fleet_prod" in line or "var.fcvm_fleet_prod_enabled" in line for line in head),
+                                f"{name} is not behind fcvm_fleet_prod_enabled")
+
+    def test_the_ci_role_is_the_prod_environment_on_main_and_may_only_invoke_the_prod_functions(self):
+        role = self.block('resource "aws_iam_role"', "fcvm_prod_ci")
+        self.assertIn('"repo:ejc3/fcvm:environment:${local.fcvm_prod_environment}"', role)
+        self.assertIn('fcvm_prod_environment           = "fleet-prod-deploy"', self.text)
+        self.assertIn('branch_pattern = "main"', self.block('resource "github_repository_environment_deployment_policy"', "fcvm_prod_main"))
+        self.assertIn("can_admins_bypass = false", self.block('resource "github_repository_environment"', "fcvm_prod"))
+        policy = self.block('resource "aws_iam_role_policy"', "fcvm_prod_ci")
+        allows = re.findall(r'Effect = "Allow", Action = "([^"]+)", Resource = ([^ }]+)', policy)
+        self.assertEqual(allows, [("lambda:InvokeFunction", "local.fcvm_prod_release_functions")])
+        self.assertIn('NotResource = local.fcvm_prod_release_functions', policy)
+        self.assertIn('"ecr:*"', policy)
+        functions = self.text.split("fcvm_prod_release_functions = concat(", 1)[1].split("\n  )", 1)[0]
+        self.assertEqual(re.findall(r"aws_lambda_function\.([a-z_]+)", functions),
+                         ["fcvm_coordinator_release_prod", "fcvm_ami_prod_release"])
+        # The ECR repository's policy grants push to staging's CI role only.
+        ci = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        repo_policy = ci.split('resource "aws_ecr_repository_policy" "fcvm_coordinator_ci"', 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn("fcvm_prod_ci", repo_policy)
+
+    def test_the_prod_functions_reach_prod_only(self):
+        fleet = self.block('resource "aws_iam_role_policy"', "fcvm_coordinator_release_prod_fleet")
+        self.assertNotIn("aws_ecs_service.fcvm_fleet_coordinator.", fleet)
+        self.assertNotIn("aws_ecs_task_definition.fcvm_fleet_coordinator.", fleet)
+        # Staging's pointer: read only.
+        self.assertRegex(fleet, r'Action = "ssm:GetParameter", Resource = aws_ssm_parameter\.fcvm_coordinator_release\.arn')
+        images = self.block('resource "aws_iam_role_policy"', "fcvm_ami_prod_release_fleet")
+        self.assertIn("module.fcvm_fleet_prod_east1[0].image_templates", images)
+        self.assertNotIn("local.fcvm_ami_templates", images)
+        self.assertRegex(images, r'Action = "ssm:GetParameter", Resource = aws_ssm_parameter\.fcvm_ami_release\.arn')
+        function = self.block('resource "aws_lambda_function"', "fcvm_ami_prod_release")
+        self.assertIn('handler                        = "publish.prod_handler"', function)
+        self.assertIn("data.archive_file.fcvm_ami_prod_release.output_path", function)
+        archive = self.block('data "archive_file"', "fcvm_ami_prod_release")
+        self.assertNotIn("publisher-config.json", archive)
+
+    def test_the_prod_worker_token_lives_only_in_the_prod_environment(self):
+        secrets = self.block('resource "github_actions_environment_secret"', "fcvm_prod")
+        self.assertIn("cloudflare_account_token.fcvm_prod_workers_deploy[0].value", secrets)
+        self.assertIn("github_repository_environment.fcvm_prod[0].environment", secrets)
+        self.assertEqual(len(re.findall(r"cloudflare_account_token\.fcvm_prod_workers_deploy", self.text)), 2)
+
+    def test_both_functions_name_their_stack(self):
+        staging = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        self.assertRegex(staging, r'STACK   = "stage"\n\s*CLUSTER = aws_ecs_cluster\.fcvm_fleet\.name')
+        prod = self.block('resource "aws_lambda_function"', "fcvm_coordinator_release_prod")
+        for line in ('STACK                 = "prod"', "CLUSTER               = aws_ecs_cluster.fcvm_fleet_prod[0].name",
+                     "FAMILY                = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family",
+                     'METRICS_NAMESPACE     = "FCVM/Fleet"'):
+            self.assertIn(line, prod)
 
 
 class Session:
