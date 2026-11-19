@@ -422,7 +422,7 @@ locals {
     ${var.ip_options_bootstrap}
     %{if var.tile_tls_secret != ""~}
     install -d -m 0755 /etc/systemd/system/fcvm-fleet-tls.service.d
-    printf '[Service]\nEnvironment=FLEET_TLS_SECRET=%s\n' '${var.tile_tls_secret}' > /etc/systemd/system/fcvm-fleet-tls.service.d/10-fleet-stack.conf
+    printf '[Service]\nEnvironment=FLEET_TLS_SECRET=%s\nExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service\n' '${var.tile_tls_secret}' > /etc/systemd/system/fcvm-fleet-tls.service.d/10-fleet-stack.conf
     systemctl daemon-reload
     systemctl restart --no-block fcvm-fleet-tls.service
     %{endif~}

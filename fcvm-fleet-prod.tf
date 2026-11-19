@@ -909,6 +909,7 @@ resource "aws_ecs_service" "fcvm_fleet_prod_coordinator" {
     aws_secretsmanager_secret_version.fcvm_fleet_prod_coordinator_tunnel,
     aws_iam_role_policy.fcvm_fleet_prod_coordinator_task,
     aws_iam_role_policy.fcvm_fleet_prod_coordinator_execution_secret,
+    aws_iam_role_policy_attachment.fcvm_fleet_prod_coordinator_execution,
     aws_iam_role_policy_attachment.fcvm_fleet_prod_coordinator_launch,
     aws_iam_role_policy_attachment.fcvm_fleet_prod_validated_images,
     aws_iam_role_policy_attachment.fcvm_fleet_stack_scope,
@@ -922,6 +923,11 @@ resource "aws_ecs_service" "fcvm_fleet_prod_coordinator" {
   desired_count                      = 1
   deployment_minimum_healthy_percent = 0
   deployment_maximum_percent         = 100
+
+  # The coordinator owns EC2 workers outside Terraform. Drain its pool before removing the service.
+  lifecycle {
+    prevent_destroy = true
+  }
 
   network_configuration {
     subnets          = local.fcvm_fleet_prod_dns_subnets

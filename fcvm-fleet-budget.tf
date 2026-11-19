@@ -33,12 +33,14 @@ locals {
   fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]
   # The Fleet tags of the stacks other than staging: staging's budget counts what carries none of them.
   fcvm_fleet_budget_other_fleets = [for k, s in local.fcvm_fleet_stacks : s.fleet if k != "stage"]
+  # Keep enforcing the existing budget while the new stage-only budget accumulates billing history.
+  fcvm_fleet_stage_budget = var.fcvm_fleet_prod_enabled ? aws_budgets_budget.fcvm_fleet_stage_daily : aws_budgets_budget.fcvm_fleet_daily
   # What the worker reconciles: each existing stack's budget, decision record and coordinator role.
   fcvm_fleet_spend_cap_stacks = concat(
     [{
       fleet     = local.fcvm_fleet_stage.fleet
-      budget    = aws_budgets_budget.fcvm_fleet_daily.name
-      budget_id = aws_budgets_budget.fcvm_fleet_daily.arn
+      budget    = local.fcvm_fleet_stage_budget.name
+      budget_id = local.fcvm_fleet_stage_budget.arn
       state_key = aws_s3_object.fcvm_fleet_spend_cap_state.key
       role      = aws_iam_role.fcvm_fleet_coordinator_task.name
       role_arn  = aws_iam_role.fcvm_fleet_coordinator_task.arn
@@ -64,9 +66,47 @@ resource "aws_ce_cost_allocation_tag" "purpose" {
   }
 }
 
+# Preserve the budget's original legacy API representation and all its history. The pinned
+# provider would retain CostTypes/CostFilters when adding Metrics/FilterExpression in place.
 resource "aws_budgets_budget" "fcvm_fleet_daily" {
   provider     = aws.fcvm_fleet
   name         = "fcvm-fleet-daily"
+  budget_type  = "COST"
+  limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
+
+  cost_filter {
+    name   = "TagKeyValue"
+    values = [for p in local.fcvm_fleet_budget_purposes : format("user:Purpose$%s", p)]
+  }
+
+  dynamic "notification" {
+    for_each = var.fcvm_fleet_prod_enabled ? [] : [80, 100]
+    content {
+      comparison_operator       = "GREATER_THAN"
+      threshold                 = notification.value
+      threshold_type            = "PERCENTAGE"
+      notification_type         = "ACTUAL"
+      subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(local.fcvm_fleet_alert_topic_arns) > 0
+      error_message = "The fleet's daily budget needs the fcvm-fleet-alerts topic, which exists only in a region with a GPU host template."
+    }
+  }
+
+  depends_on = [aws_ce_cost_allocation_tag.purpose]
+}
+
+# Start collecting scoped history before the production cutover. Only one staging budget
+# sends notifications or drives the worker at a time, and both share the existing decision key.
+resource "aws_budgets_budget" "fcvm_fleet_stage_daily" {
+  provider     = aws.fcvm_fleet
+  name         = "fcvm-fleet-stage-daily"
   budget_type  = "COST"
   limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)
   limit_unit   = "USD"
@@ -94,20 +134,15 @@ resource "aws_budgets_budget" "fcvm_fleet_daily" {
     }
   }
 
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 80
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
-  }
-
-  notification {
-    comparison_operator       = "GREATER_THAN"
-    threshold                 = 100
-    threshold_type            = "PERCENTAGE"
-    notification_type         = "ACTUAL"
-    subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
+  dynamic "notification" {
+    for_each = var.fcvm_fleet_prod_enabled ? [80, 100] : []
+    content {
+      comparison_operator       = "GREATER_THAN"
+      threshold                 = notification.value
+      threshold_type            = "PERCENTAGE"
+      notification_type         = "ACTUAL"
+      subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
+    }
   }
 
   lifecycle {
