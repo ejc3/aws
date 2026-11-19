@@ -1176,7 +1176,9 @@ scan plus about a second.
   reboot there is no tmux until someone connects; the watcher retries every tick and starts the sessions
   (including the post-reboot ones) the moment a server exists. A boot launcher that owns the server is a
   design decision of its own (what owns the cgroup, what a restart kills), not part of this watcher.
-- **Unused Claude Remote Control windows retire after seven days.** The watcher checks only windows
+- **Unused Claude Remote Control windows retire after two days in linked Git worktrees and seven days elsewhere.**
+  A recorded conversation from an earlier session in the worktree also keeps its window open.
+  The watcher checks only windows
   stamped by an unattended t-claude launch, using the exact idle Claude process, its hook-reported
   transcript, and a prompt latch. A client viewing the pane, a message, or uncertain evidence keeps it
   open. The marker lives in the checkout's Git directory (per-user local state for non-Git folders)
