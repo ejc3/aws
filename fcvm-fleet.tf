@@ -793,22 +793,6 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
       },
       {
-        # When state.json does not parse, the coordinator reads an earlier version of that one object (GetObject with a versionId).
-        Sid      = "StateObjectEarlierVersions"
-        Effect   = "Allow"
-        Action   = "s3:GetObjectVersion"
-        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
-      },
-      {
-        # ListObjectVersions with prefix=state.json authorizes as s3:ListBucketVersions on the bucket; the condition keeps
-        # the listing to the state key.
-        Sid       = "StateObjectVersionList"
-        Effect    = "Allow"
-        Action    = "s3:ListBucketVersions"
-        Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
-        Condition = { StringEquals = { "s3:prefix" = "state.json" } } # FLEET_STATE_KEY
-      },
-      {
         # Without ListBucket, S3 answers a read of a missing object with 403, which the coordinator must treat as an error;
         # with it, a fresh fleet's first read is a 404 and it starts empty. The coordinator can read or write only its own state object.
         Sid      = "StateObjectMissingReadsAs404"
@@ -1034,6 +1018,40 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
     ]
   })
+}
+
+# Keep version recovery in a managed policy: the task role's inline policies are near IAM's 10,240-character limit.
+resource "aws_iam_policy" "fcvm_fleet_state_recovery" {
+  provider    = aws.fcvm_fleet
+  name        = "fcvm-fleet-coordinator-state-recovery"
+  description = "Read earlier versions of the staging coordinator's state object."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # When state.json does not parse, the coordinator reads an earlier version of that one object (GetObject with a versionId).
+        Sid      = "StateObjectEarlierVersions"
+        Effect   = "Allow"
+        Action   = "s3:GetObjectVersion"
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
+      },
+      {
+        # ListObjectVersions with prefix=state.json authorizes as s3:ListBucketVersions on the bucket; the condition keeps
+        # the listing to the state key.
+        Sid       = "StateObjectVersionList"
+        Effect    = "Allow"
+        Action    = "s3:ListBucketVersions"
+        Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
+        Condition = { StringEquals = { "s3:prefix" = "state.json" } } # FLEET_STATE_KEY
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_state_recovery" {
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_state_recovery.arn
 }
 
 # The existing coordinator role is near its aggregate inline policy limit.

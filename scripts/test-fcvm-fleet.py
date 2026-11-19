@@ -1400,22 +1400,23 @@ class BroadcastTests(unittest.TestCase):
 class StateVersionRecoveryTests(unittest.TestCase):
     """ejc3/fcvm#1951: the coordinator reads an earlier version of state.json when the current one does not parse, and
     logs two markers that page through the fleet's alert path."""
-    stmt = CoordinatorLaunchSplit.stmt
-    TF = CoordinatorLaunchSplit.TF
-
     def test_the_role_reads_versions_of_the_state_object_and_lists_versions_of_its_bucket_only(self):
-        get = self.stmt("StateObjectEarlierVersions")
-        self.assertIn('Action   = "s3:GetObjectVersion"', get)
+        recovery = block('resource "aws_iam_policy" "fcvm_fleet_state_recovery"')
+        self.assertEqual(re.findall(r'Action\s+= "([^"]+)"', recovery), ["s3:GetObjectVersion", "s3:ListBucketVersions"])
+        get, listing = recovery.split('Sid       = "StateObjectVersionList"')
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', get)
-        listing = self.stmt("StateObjectVersionList")
-        self.assertIn('Action    = "s3:ListBucketVersions"', listing)
-        self.assertIn("Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", listing + "\n")
+        self.assertIn("Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", listing)
         self.assertIn('"s3:prefix" = "state.json"', listing)
-        # No other statement grants either action, and neither is granted on a wildcard.
-        self.assertEqual(len(re.findall(r"s3:GetObjectVersion", TF.split("aws_iam_role_policy\" \"fcvm_fleet_coordinator_task", 1)[1]
-                                        .split("\n}\n", 1)[0])), 1)
-        self.assertEqual(TF.count('"s3:ListBucketVersions"'), 1)
-        self.assertNotIn("*", get + listing)
+        self.assertNotIn("*", recovery)
+
+    def test_state_recovery_is_attached_without_using_the_roles_inline_policy_quota(self):
+        inline = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        for action in ('"s3:GetObjectVersion"', '"s3:ListBucketVersions"'):
+            self.assertNotIn(action, inline)
+            self.assertEqual(TF.count(action), 1)
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_state_recovery"')
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_coordinator_task.name", attachment)
+        self.assertIn("policy_arn = aws_iam_policy.fcvm_fleet_state_recovery.arn", attachment)
 
     def test_both_state_markers_alarm_into_the_on_demand_alarms_forwarder(self):
         for name, metric, marker in (("fcvm-fleet-state-write-lost", "StateWriteLost", "FLEET_STATE_WRITE_LOST"),
