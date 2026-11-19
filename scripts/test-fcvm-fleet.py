@@ -802,24 +802,43 @@ class HealthAlarmTests(unittest.TestCase):
 
 
 class SpendBackstopTests(unittest.TestCase):
-    """fcvm-fleet-budget.tf: $750 a day of host and tile spend (owner, 2026-11-18) stops new launches."""
+    """fcvm-fleet-budget.tf: $750 a day of each stack's host and tile spend (owner, 2026-11-18) stops that stack's new
+    launches."""
 
-    def test_the_daily_budget_is_750_on_the_fleets_tagged_instances_only(self):
+    def test_the_daily_budget_is_750_on_each_stacks_tagged_instances_only(self):
         self.assertIn("fcvm_fleet_daily_budget_usd = 750", BUDGET)
-        budget = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
-        self.assertIn("provider     = aws.fcvm_fleet", budget)
-        self.assertIn('time_unit    = "DAILY"', budget)
-        self.assertIn("limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)", budget)
         self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]', BUDGET)
-        self.assertIn('format("user:Purpose$%s", p)', budget)
+        stage = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        prod = block('resource "aws_budgets_budget" "fcvm_fleet_prod_daily"', BUDGET)
+        self.assertIn('name         = "fcvm-fleet-daily"', stage)
+        self.assertIn('name         = "${local.fcvm_fleet_prod_stack.prefix}-daily"', prod)
+        self.assertIn("count        = local.fcvm_fleet_prod\n", prod)
+        for budget in (stage, prod):
+            self.assertIn("provider     = aws.fcvm_fleet", budget)
+            self.assertIn('time_unit    = "DAILY"', budget)
+            self.assertIn("limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)", budget)
+            self.assertNotIn("cost_filter", budget)
+            self.assertRegex(budget, r'\n  metrics\s+= \["UnblendedCost"\]\n')
+            purpose, fleet = re.findall(r"tags \{\n\s+key\s+= \"(\w+)\"\n\s+values\s+= (\S+)\n\s+match_options = \[\"EQUALS\"\]", budget)
+            self.assertEqual(purpose, ("Purpose", "local.fcvm_fleet_budget_purposes"))
+            self.assertEqual(fleet[0], "Fleet")
+            self.assertEqual(budget.count("    and {\n"), 2)
+            self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", budget), ["80", "100"])
+            self.assertEqual(budget.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+            self.assertIn("depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]", budget)
+        # Prod counts Fleet=prod; staging counts what carries no other stack's Fleet tag, untagged instances included.
+        fleet_values = lambda b: re.findall(r'key\s+= "Fleet"\n\s+values\s+= (\S+)\n', b)
+        self.assertEqual(fleet_values(prod), ["[local.fcvm_fleet_prod_stack.fleet]"])
+        self.assertEqual(fleet_values(stage), ["local.fcvm_fleet_budget_other_fleets"])
+        self.assertIn("      not {\n        tags {\n          key           = \"Fleet\"\n          values        = local.fcvm_fleet_budget_other_fleets\n", stage)
+        self.assertNotIn("not {", prod)
+        self.assertIn('fcvm_fleet_budget_other_fleets = [for k, s in local.fcvm_fleet_stacks : s.fleet if k != "stage"]', BUDGET)
         # The gpubox test hosts and AMI builders share the account and must not stop the wall.
         self.assertNotIn("fcvm-fleet-gpubox\"]", BUDGET)
-        self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", budget), ["80", "100"])
-        self.assertEqual(budget.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
-        self.assertIn("depends_on = [aws_ce_cost_allocation_tag.purpose]", budget)
-        tag = block('resource "aws_ce_cost_allocation_tag" "purpose"', BUDGET)
-        self.assertNotRegex(tag, r"provider\s+=")  # only the management account activates cost allocation tags
-        self.assertIn("prevent_destroy = true", tag)
+        for key in ("purpose", "fleet"):
+            tag = block('resource "aws_ce_cost_allocation_tag" "%s"' % key, BUDGET)
+            self.assertNotRegex(tag, r"provider\s+=")  # only the management account activates cost allocation tags
+            self.assertIn("prevent_destroy = true", tag)
         # Each host and tile launch template tags its instance with the Purpose the budget filters on.
         self.assertEqual(len(re.findall(r'Purpose = "fcvm-fleet-host"', MOD)), 1)
         self.assertGreaterEqual(len(re.findall(r'Purpose = "fcvm-fleet-tile"', MOD)), 3)
@@ -833,11 +852,27 @@ class SpendBackstopTests(unittest.TestCase):
         self.assertNotIn('resource "aws_budgets_budget_action"', BUDGET)  # unsupported for DAILY
         grant = block('resource "aws_iam_role_policy" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)
-        self.assertIn("Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn", grant)
+        self.assertIn("Resource  = [for s in local.fcvm_fleet_spend_cap_stacks : s.role_arn]", grant)
         self.assertIn('ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn }', grant)
         self.assertIn('Action   = "budgets:ViewBudget"', grant)
-        self.assertIn("Resource = aws_budgets_budget.fcvm_fleet_daily.arn", grant)
+        self.assertIn("Resource = [for s in local.fcvm_fleet_spend_cap_stacks : s.budget_id]", grant)
         self.assertNotIn('Resource = "*"', grant)
+        # Each stack: its own budget, decision record and coordinator role; prod's only while its switch is on.
+        stacks = BUDGET.split("fcvm_fleet_spend_cap_stacks = concat(", 1)[1].split("\n  )\n", 1)[0]
+        for line in ("budget    = aws_budgets_budget.fcvm_fleet_daily.name",
+                     "state_key = aws_s3_object.fcvm_fleet_spend_cap_state.key",
+                     "role_arn  = aws_iam_role.fcvm_fleet_coordinator_task.arn",
+                     "[for i, b in aws_budgets_budget.fcvm_fleet_prod_daily : {",
+                     "state_key = aws_s3_object.fcvm_fleet_prod_spend_cap_state[i].key",
+                     "role_arn  = aws_iam_role.fcvm_fleet_prod_coordinator_task[i].arn"):
+            self.assertIn(line, stacks)
+        self.assertIn('key          = "spend-cap/${local.fcvm_fleet_prod_stack.fleet}-daily.json"',
+                      block('resource "aws_s3_object" "fcvm_fleet_prod_spend_cap_state"', BUDGET))
+        self.assertIn('key          = "spend-cap/daily.json"', block('resource "aws_s3_object" "fcvm_fleet_spend_cap_state"', BUDGET))
+        self.assertIn("STACKS = jsonencode([for s in local.fcvm_fleet_spend_cap_stacks : { budget = s.budget, state_key = s.state_key, role = s.role }])",
+                      block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET))
+        # The deny policy keeps its name and description (a new description would replace it).
+        self.assertIn('description = "Attached to fcvm-fleet-coordinator by the daily billing reconciler: no new GPU hosts or EC2 tiles"', cap)
         trust = block('resource "aws_iam_role" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', trust)
         worker = block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET)
@@ -1650,7 +1685,9 @@ class ProdStackTests(unittest.TestCase):
         # The same statements as staging's launch policy: a staging change to one shows up here.
         staging = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
         sids = lambda text: set(re.findall(r'Sid\s+= "(\w+)"', text))
-        self.assertEqual(sids(launch) | sids(task) - {"StateObjectEarlierVersions", "StateObjectVersionList", "PassTheProdHostAndTileRolesOnly"},
+        prod_only = {"StateObjectEarlierVersions", "StateObjectVersionList", "PassTheProdHostAndTileRolesOnly",
+                     "AskWhetherTheProdBroadcastIsLive"}
+        self.assertEqual(sids(launch) | sids(task) - prod_only,
                          sids(staging) - {"PassTheHostAndTileRolesOnly"})
         # The prod scope policy (Fleet=prod) is attached to the prod task role.
         self.assertIn("aws_iam_role_policy_attachment.fcvm_fleet_stack_scope", block('resource "aws_ecs_service" "fcvm_fleet_prod_coordinator"', PROD))
@@ -1699,8 +1736,17 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn('["--dns-subzone", local.fcvm_fleet_prod_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_prod_names_ns)', cmd)
         self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_prod_daily_spend_usd)]', cmd)
         self.assertIn("fcvm_fleet_prod_daily_spend_usd = 750", PROD)
-        self.assertIn('fcvm_fleet_prod_f6_args = ["--awake-hosts", "2", "--host-spread", "az", "--tls-scope", "subzone"]', PROD)
-        self.assertIn("local.fcvm_fleet_prod_f6_args,", cmd)
+        # ejc3/fcvm#1973 (src/cli/args.rs, src/fleet/coord/cert.rs): two awake hosts, one per zone, and the subzone
+        # certificate, which refuses --dns-token-secret. --awake-capacity is gone from fcvm, so no file may pass it.
+        self.assertIn('["--awake-hosts", tostring(local.fcvm_fleet_prod_awake_hosts), "--host-spread", "az"]', cmd)
+        self.assertRegex(PROD, r"\n  fcvm_fleet_prod_awake_hosts\s+= 2\n")
+        self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name, "--tls-scope", "subzone"', cmd)
+        for path in ROOT.glob("*.tf"):
+            self.assertNotIn("awake-capacity", path.read_text(), path.name)
+            self.assertNotIn("FLEET_AWAKE_HOSTS", path.read_text(), path.name)
+        # No _acme-challenge record anywhere for prod: its challenge is answered by its own subzone server.
+        for text in (PROD, PROD_DNS, DEV_PROD):
+            self.assertNotRegex(tf_code(text), r"_acme-challenge")
         self.assertNotIn("--warm-hours", cmd)
         self.assertIn('"--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[0].name', cmd)
         for template in ("tile", "tile-on-demand", "tile-pool"):
@@ -1728,6 +1774,16 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_coordinator_tunnel[0].arn", ex)
         self.assertIn('"${aws_secretsmanager_secret.fcvm_fleet_prod_coordinator_tunnel[0].arn}:TUNNEL_TOKEN::"', td)
         self.assertIn("execution_role_arn       = aws_iam_role.fcvm_fleet_prod_coordinator_execution[0].arn", td)
+
+    def test_the_prod_hosts_have_three_zones_to_spread_over(self):
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD)
+        self.assertIn("condition     = length(local.fcvm_fleet_prod_host_subnets) >= local.fcvm_fleet_prod_min_host_zones", td)
+        self.assertRegex(PROD, r"\n  fcvm_fleet_prod_min_host_zones\s+= 3\n")
+        self.assertIn('{ name = "FLEET_HOST_SUBNETS", value = join(",", local.fcvm_fleet_prod_host_subnets) }', td)
+        # One host subnet per zone that offers a host type, from a subnet in every zone of the prod VPC.
+        self.assertIn("host_subnets = [for az in local.host_azs : aws_subnet.public[az].id if contains(local.azs, az)]", MOD)
+        self.assertIn("for_each                                       = { for i, az in local.azs : az => i }",
+                      block('resource "aws_subnet" "public"', MOD))
 
     def test_the_prod_service_is_one_task_replaced_in_place_from_its_own_pointer(self):
         svc = block('resource "aws_ecs_service" "fcvm_fleet_prod_coordinator"', PROD)
@@ -1796,7 +1852,14 @@ class ProdStackTests(unittest.TestCase):
                       block('resource "aws_ivs_playback_key_pair" "fcvm_fleet_prod_broadcast"', PROD_BC))
         self.assertIn('name                    = "fcvm-fleet/prod/broadcast"', block('resource "aws_secretsmanager_secret" "fcvm_fleet_prod_broadcast"', PROD_BC))
         self.assertNotIn("aws_ivs_channel.fcvm_fleet_broadcast", PROD_BC)
-        self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[*].arn", block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task"', PROD))
+        task = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task"', PROD)
+        self.assertIn("aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[*].arn", task)
+        # BroadcastLive (ejc3/fcvm#1974): IVS GetStream on the prod channel, and nothing else of IVS.
+        live = task.split('[for channel in aws_ivs_channel.fcvm_fleet_prod_broadcast : {', 1)[1].split("}])", 1)[0]
+        self.assertRegex(live, r'Action\s+= "ivs:GetStream"\n')
+        self.assertRegex(live, r"Resource\s+= channel\.arn\n")
+        self.assertEqual(re.findall(r'"ivs:[^"]*"', tf_code(PROD)), ['"ivs:GetStream"'])
+        self.assertNotIn("ivs:", tf_code(TF) + tf_code(PROD_BC))
 
     # ------------------------------------------------------------------------------------------- staging unchanged
     def test_the_region_module_renders_stagings_names_as_before(self):

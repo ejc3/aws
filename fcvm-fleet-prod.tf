@@ -24,7 +24,7 @@
 #   one task, deployment minimum healthy 0 and maximum 100 as staging's. Its cloudflared container runs prod's tunnel
 #   (fcvm-dev-prod.tf: fleet-api.fcvm.dev with /live and /poster.jpg public and /agent behind Access, fleet-ops.fcvm.dev
 #   behind Access). Its image comes from /fcvm-fleet/prod/coordinator-image.
-# - The certificate covers *.tiles.fcvm.dev only (--tls-scope subzone, ejc3/fcvm "F6"): the coordinator answers its
+# - The certificate covers *.tiles.fcvm.dev only (--tls-scope subzone, ejc3/fcvm#1973): the coordinator answers its
 #   DNS-01 record from its own subzone server (fcvm-fleet-prod-dns.tf), so it is given no Cloudflare token at all.
 #
 # Cost while on (prices from the staging files): the GPU hosts and tiles while awake, bounded by --daily-spend-usd; the
@@ -39,10 +39,11 @@ locals {
   fcvm_fleet_prod_site_origin = "https://fcvm.dev"
   # Owner, 2026-11-18: $750 a day, metered at the Spot price; the coordinator sleeps the fleet at the ceiling.
   fcvm_fleet_prod_daily_spend_usd = 750
-  # The coordinator flags of ejc3/fcvm "F6" (fleet coord: N awake hosts across zones, subzone-only certificate), which
-  # are not on fcvm main yet: an image without them refuses the arguments and does not start. Two awake GPU hosts in
-  # us-east-1, each launched into an availability zone no live host is in; the certificate for the subzone only.
-  fcvm_fleet_prod_f6_args = ["--awake-hosts", "2", "--host-spread", "az", "--tls-scope", "subzone"]
+  # Two awake GPU hosts in us-east-1, each launched by its own request into an availability zone no live host is in
+  # (ejc3/fcvm#1973, src/cli/args.rs --awake-hosts and --host-spread az). A host given a spot notice is replaced at the
+  # notice, so the replacement needs a third zone: the task definition requires three host zones.
+  fcvm_fleet_prod_awake_hosts    = 2
+  fcvm_fleet_prod_min_host_zones = 3
 
   # The prod region module, as a map so nothing below indexes an empty tuple while the stack is off.
   fcvm_fleet_prod_regional = { for m in module.fcvm_fleet_prod_east1 : local.fcvm_fleet_prod_region => m }
@@ -113,9 +114,11 @@ locals {
   #   execution role, fcvm-dev-prod.tf): a connection joins, takes a seat or wakes the fleet only after it passes.
   # - Access JWTs verified by the coordinator itself (as ejc3/aws#915 for staging): /live accepts the fleet-ops.fcvm.dev
   #   application's tokens (the owner and prod CI), /agent the prod agents' application's only.
-  # - --daily-spend-usd 750, and the F6 arguments above.
-  # - The certificate and the launch names in tiles.fcvm.dev, with no Cloudflare token: no --dns-token-secret and no
-  #   --dns-zone-id.
+  # - --daily-spend-usd 750, and two awake hosts spread across zones (above).
+  # - The certificate and the launch names in tiles.fcvm.dev, with no Cloudflare token: --tls-scope subzone (ejc3/fcvm#1973,
+  #   src/fleet/coord/cert.rs) orders *.tiles.fcvm.dev alone and answers its DNS-01 record from the coordinator's own
+  #   subzone server, refuses --dns-token-secret, and names the EC2 tiles' health checks ec2-<n>.tiles.fcvm.dev. No
+  #   --dns-zone-id, and no _acme-challenge record in fcvm.dev.
   # No --warm-hours: the owner has not given the windows.
   fcvm_fleet_prod_coordinator_command = var.fcvm_fleet_prod_enabled ? concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--allowed-origin", local.fcvm_fleet_prod_site_origin],
@@ -123,7 +126,7 @@ locals {
     ["--fleet-name", local.fcvm_fleet_prod_stack.fleet],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", local.fcvm_fleet_prod_region, "--ec2-template", "${local.fcvm_fleet_prod_stack.prefix}-tile-x86_64", "--ec2-on-demand-template", "${local.fcvm_fleet_prod_stack.prefix}-tile-on-demand-x86_64"],
     local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "${local.fcvm_fleet_prod_stack.prefix}-tile-pool-x86_64"] : [],
-    ["--dns-zone", "fcvm.dev", "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name, "--secrets-region", local.fcvm_fleet_home_region],
+    ["--dns-zone", "fcvm.dev", "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name, "--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region],
     ["--dns-subzone", local.fcvm_fleet_prod_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_prod_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     local.fcvm_fleet_broadcast ? ["--broadcast-listen", "127.0.0.1:${local.fcvm_fleet_broadcast_port}", "--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[0].name, "--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)] : [],
     ["--text-check", "bedrock", "--text-check-model", local.bedrock_haiku_profile, "--text-check-region", local.bedrock_haiku_region],
@@ -131,7 +134,7 @@ locals {
       "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_ops_prod[0].aud,
     "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent_prod[0].aud],
     ["--daily-spend-usd", tostring(local.fcvm_fleet_prod_daily_spend_usd)],
-    local.fcvm_fleet_prod_f6_args,
+    ["--awake-hosts", tostring(local.fcvm_fleet_prod_awake_hosts), "--host-spread", "az"],
   ) : []
 }
 
@@ -445,7 +448,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task" {
   role     = aws_iam_role.fcvm_fleet_prod_coordinator_task[0].id
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid      = "StateObject"
         Effect   = "Allow"
@@ -559,7 +562,14 @@ resource "aws_iam_role_policy" "fcvm_fleet_prod_coordinator_task" {
         Resource  = [aws_iam_role.fcvm_fleet_prod_host[0].arn, aws_iam_role.fcvm_fleet_prod_tile[0].arn]
         Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
       },
-    ]
+      ], [for channel in aws_ivs_channel.fcvm_fleet_prod_broadcast : {
+        # BroadcastLive (ejc3/fcvm#1974, src/fleet/coord/metrics.rs): GetStream on the broadcast secret's channel_arn
+        # every pass. Without it the metric always reads 0. The prod channel only.
+        Sid      = "AskWhetherTheProdBroadcastIsLive"
+        Effect   = "Allow"
+        Action   = "ivs:GetStream"
+        Resource = channel.arn
+    }])
   })
 }
 
@@ -878,6 +888,12 @@ resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator" {
         nonsensitive(aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].value),
       ))
       error_message = "The prod coordinator release must be an immutable digest in its own ECR repository."
+    }
+    # --host-spread az places each host in a zone no live host is in; with two zones a replacement can only go to the
+    # zone just reclaimed. us-east-1 offers g4dn.metal in five of its six zones.
+    precondition {
+      condition     = length(local.fcvm_fleet_prod_host_subnets) >= local.fcvm_fleet_prod_min_host_zones
+      error_message = "The prod hosts need subnets in at least three us-east-1 zones that offer the host type (FLEET_HOST_SUBNETS)."
     }
   }
 }

@@ -1888,7 +1888,9 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   roles, ECS cluster and service, `prod/state.json`, subzone `tiles.fcvm.dev` with its own load balancer and addresses,
   certificate `fcvm-fleet/prod/tls` (`*.tiles.fcvm.dev` only, no Cloudflare token), IVS channel, and the pointers
   `/fcvm-fleet/prod/ami-release` and `/fcvm-fleet/prod/coordinator-image`, each seeded from staging's on the apply
-  that creates it.
+  that creates it. The $750/day backstop (`fcvm-fleet-budget.tf`) is per stack: staging's budget counts host and tile
+  spend not tagged `Fleet=prod`, prod's (`fcvm-fleet-prod-daily`) spend tagged `Fleet=prod`, and the one reconciler
+  blocks each stack's coordinator for its own budget only (`Fleet` is an active cost allocation tag for this).
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)

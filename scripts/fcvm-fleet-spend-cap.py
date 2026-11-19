@@ -86,8 +86,31 @@ def reconcile(env, budgets, s3, iam, now, expiry_only=False):
         enforce(iam, env, decision["blocked_on"], clock)
 
 
+def stacks(env):
+    """Each fleet stack's settings for reconcile(): its budget, decision record and coordinator role (STACKS, a JSON
+    list), with the account, limit, bucket and deny policy they share."""
+    shared = {key: env[key] for key in ("ACCOUNT_ID", "LIMIT_USD", "STATE_BUCKET", "POLICY_ARN")}
+    listed = json.loads(env["STACKS"])
+    if not listed:
+        raise ValueError("No fleet stack to reconcile")
+    return [{**shared, "BUDGET_NAME": s["budget"], "STATE_KEY": s["state_key"], "ROLE_NAME": s["role"]} for s in listed]
+
+
+def reconcile_all(env, budgets, s3, iam, now, expiry_only=False):
+    """Reconcile every stack; one stack's failure does not skip the next one's, and the run still fails."""
+    failed = []
+    for stack in stacks(env):
+        try:
+            reconcile(stack, budgets, s3, iam, now, expiry_only=expiry_only)
+        except Exception as error:  # noqa: BLE001 - reported, then raised below
+            print(json.dumps({"event": "spend_cap_failed", "budget": stack["BUDGET_NAME"], "error": type(error).__name__}))
+            failed.append(stack["BUDGET_NAME"])
+    if failed:
+        raise RuntimeError("Spend cap reconciliation failed for " + ", ".join(failed))
+
+
 def handler(event, context):
     import boto3
 
-    reconcile(os.environ, boto3.client("budgets", region_name="us-east-1"), boto3.client("s3"),
-              boto3.client("iam"), lambda: datetime.now(UTC), expiry_only=event == {"action": "expire"})
+    reconcile_all(os.environ, boto3.client("budgets", region_name="us-east-1"), boto3.client("s3"),
+                  boto3.client("iam"), lambda: datetime.now(UTC), expiry_only=event == {"action": "expire"})
