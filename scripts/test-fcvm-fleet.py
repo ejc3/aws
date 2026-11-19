@@ -876,6 +876,13 @@ class SpendBackstopTests(unittest.TestCase):
         trust = block('resource "aws_iam_role" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', trust)
         worker = block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET)
+        # The previous Lambda revision may still run after AWS updates the environment.
+        for key, resource in {
+            "BUDGET_NAME": "aws_budgets_budget.fcvm_fleet_daily.name",
+            "STATE_KEY": "aws_s3_object.fcvm_fleet_spend_cap_state.key",
+            "ROLE_NAME": "aws_iam_role.fcvm_fleet_coordinator_task.name",
+        }.items():
+            self.assertRegex(worker, rf"(?m)^      {key} += {re.escape(resource)}$")
         self.assertIn("reserved_concurrent_executions = 1", worker)
         self.assertIn('expire    = "cron(0 0 * * ? *)"', BUDGET)
         self.assertIn('reconcile = "cron(2/5 * * * ? *)"', BUDGET)

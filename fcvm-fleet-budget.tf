@@ -311,7 +311,12 @@ resource "aws_lambda_function" "fcvm_fleet_budget_action" {
   reserved_concurrent_executions = 1
   environment {
     variables = {
+      # AWS updates $LATEST's environment separately from its code. Keep the previous
+      # worker's single-stack settings so it continues protecting staging during that interval.
       ACCOUNT_ID   = local.fcvm_fleet_account_id
+      BUDGET_NAME  = aws_budgets_budget.fcvm_fleet_daily.name
+      STATE_KEY    = aws_s3_object.fcvm_fleet_spend_cap_state.key
+      ROLE_NAME    = aws_iam_role.fcvm_fleet_coordinator_task.name
       LIMIT_USD    = tostring(local.fcvm_fleet_daily_budget_usd)
       STATE_BUCKET = aws_s3_bucket.fcvm_fleet_coordinator_state.id
       POLICY_ARN   = aws_iam_policy.fcvm_fleet_spend_cap.arn

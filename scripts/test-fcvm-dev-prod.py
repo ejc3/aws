@@ -34,6 +34,11 @@ class SwitchTests(unittest.TestCase):
         self.assertIn("default     = false", var)
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", CODE)
 
+    def test_prod_activation_requires_retiring_parent_zone_credentials(self):
+        var = block('variable "fcvm_fleet_prod_enabled"')
+        self.assertRegex(var, r"validation \{\s*condition\s*= !var\.fcvm_fleet_prod_enabled\s*\n")
+        self.assertIn("ejc3/aws#922", var)
+
     def test_every_resource_and_data_source_follows_the_switch(self):
         found = [("resource", k, n) for k, n in headers("resource")] + [("data", k, n) for k, n in headers("data")]
         self.assertGreater(len(found), 15)
