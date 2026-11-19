@@ -1424,6 +1424,8 @@ class StateVersionRecoveryTests(unittest.TestCase):
             self.assertIn(f'metric = "{metric}"', entry)
             self.assertIn('pattern     = "\\"%s\\""' % marker, entry)
             self.assertIn("periods     = 1", entry)
+            revision, source = (ROOT / "scripts/fixtures/fcvm-coordinator-log-lines.txt").read_text().split("\n", 1)
+            self.assertIn('"%s"' % marker, source, f"{marker} is missing from ejc3/fcvm at {revision}")
             self.assertIn(f'"{name}"', ALARMS.split("fcvm_fleet_health_alarm_names", 1)[0])
         # The shared resources give each entry the on-demand alarm's namespace, forwarder, 5-minute Sum >= 1 and
         # not-breaching treatment of missing data.
