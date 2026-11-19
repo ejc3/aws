@@ -1,15 +1,17 @@
-26a1ebe5316532dd2272b8a49897fb315845a0a3
+fd0ba3d5e4f2695c3eeac543c525430ed12f3916
 cert.rs:256:                tracing::warn!(error = %format!("{e:#}"), "the certificate secret could not be read");
 cert.rs:283:                        tracing::error!(error = %format!("{e:#}"), "the renewed certificate was not stored")
 cert.rs:286:                Err(e) => tracing::error!(error = %format!("{e:#}"), "certificate renewal failed"),
 hosts.rs:343:                    tracing::warn!(%region, error = %format!("{e:#}"), "listing the GPU hosts failed");
 hosts.rs:416:                        tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
+hosts.rs:443:                            tracing::warn!(%region, error = %format!("{e:#}"), "terminating GPU hosts failed");
 hosts.rs:613:                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "asking a lost GPU host launch again failed");
 hosts.rs:680:                tracing::warn!(%region, market = market.name(), error = %format!("{e:#}"), "launching GPU hosts failed");
 hosts.rs:706:            tracing::warn!(%region, market = market.name(), error = %why, "EC2 refused a GPU host launch");
-mod.rs:780:            tracing::error!(
-mod.rs:781:                attempts = SHUTDOWN_WRITE_ATTEMPTS,
-mod.rs:782:                "the last state was not stored"
-mod.rs:783:            );
-store.rs:90:                        tracing::error!(error = %format!("{e:#}"), "state not written; kept for the next write")
-text_check.rs:75:            tracing::warn!(error = %format!("{e:#}"), "text check failed");
+mod.rs:900:                "the last state was not stored"
+mod.rs:1652:                "the last state was not stored, so this coordinator may not own the state object; the EC2 sweep is left to the next coordinator's start"
+store.rs:13:pub const UNREADABLE_STATE_MARKER: &str = "FLEET_STATE_UNREADABLE";
+store.rs:16:pub const LOST_WRITE_MARKER: &str = "FLEET_STATE_WRITE_LOST";
+store.rs:145:                        tracing::error!(error = %format!("{e:#}"), "state not written; kept for the next write")
+text_check.rs:201:            tracing::warn!(error = %format!("{e:#}"), "text check failed");
+text_check.rs:211:                "text check failed: no answer in time"
