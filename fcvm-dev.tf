@@ -5,8 +5,8 @@
 # registration and is managed here. What lives on Cloudflare is built here, because Cloudflare credentials stay on the
 # jumpboxes; what the fleet reads is written into the fcvm-fleet account (fcvm-fleet-account.tf):
 #
-#   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else. No role reads it
-#                                        now: the coordinator's certificate covers tiles-stage.fcvm.dev only and answers
+#   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else. Staging runtime
+#                                        roles lose the read grant. The coordinator uses tiles-stage.fcvm.dev and answers
 #                                        its own DNS-01 record (--tls-scope subzone, fcvm-fleet.tf). It stays so that a
 #                                        revert to the zone certificate works; delete it once that is no longer wanted.
 #   fcvm-fleet/coordinator-tunnel-token  the connector token of tunnel fcvm-fleet-coordinator, for the cloudflared container

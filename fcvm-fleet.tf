@@ -369,9 +369,8 @@ resource "aws_s3_bucket_ownership_controls" "fcvm_fleet_private" {
 }
 
 # ------------------------------------------------------------------------------------------------ the TLS certificate
-# The zone certificate staging used before --tls-scope subzone (*.fcvm.dev, fcvm.dev and *.tiles-stage.fcvm.dev). Nothing
-# reads it now: no role is granted it, and the coordinator no longer renews it. It stays so that reverting the change
-# that moved staging to fcvm-fleet/stage/tls restores a working certificate; it expires on its own.
+# Staging runtime roles no longer read or renew this legacy zone certificate. A rollback can reuse it while valid.
+# Removing the read grants leaves previously issued keys usable. Production cutover tracks their retirement in #922.
 resource "aws_secretsmanager_secret" "fcvm_fleet_tls" {
   provider                = aws.fcvm_fleet
   name                    = "fcvm-fleet/tls-wildcard"

@@ -1842,9 +1842,15 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   only, IMDSv2 hop 1) the coordinator launches from itself; EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
   coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/stage/tls` secret, which the
-  coordinator issues and renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`; `fcvm-fleet/tls-wildcard`, the
-  zone certificate from before, is kept unread for a revert). The Cloudflare-fed secrets (tunnel token, agent Access
-  token, and the DNS token no role reads any more) come from `fcvm-dev.tf`.
+  coordinator issues and renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`). The tunnel token and agent
+  Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
+  and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
+  including copies on host or tile disks and in backups. Production activation depends on completing #922.
+- **Staging certificate cutover.** Already-created pool tiles retain their original boot configuration. On a wake,
+  an old tile may spend up to 600 seconds waiting for renderer health before the coordinator replaces it. The cold
+  launch takes additional time. Once the new certificate is issued, verify a fresh tile and host serve frames on
+  IPv4 and IPv6 under `tiles-stage.fcvm.dev`. Verify users of the legacy `slot-<n>.fcvm.dev` and
+  `ec2-<n>.fcvm.dev` names have migrated before retiring the old credentials.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
   terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
@@ -1870,8 +1876,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile
-  roles; read and write only `state.json`; read the DNS token and the certificate
-  and store the certificate it issues. The fleet account has EC2's spot service-linked role; instant EC2 Fleets need no
+  roles; persist coordinator state in `state.json`; and read and update the staging subzone certificate.
+  The fleet account has EC2's spot service-linked role; instant EC2 Fleets need no
   EC2 Fleet service-linked role. Hosts read the certificate,
   the agent token and the asset bucket.
 - **Launch names** (`fcvm-fleet-dns.tf`, ejc3/fcvm#1256): the coordinator is the authoritative DNS server of
