@@ -793,6 +793,22 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
       },
       {
+        # When state.json does not parse, the coordinator reads an earlier version of that one object (GetObject with a versionId).
+        Sid      = "StateObjectEarlierVersions"
+        Effect   = "Allow"
+        Action   = "s3:GetObjectVersion"
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
+      },
+      {
+        # ListObjectVersions with prefix=state.json authorizes as s3:ListBucketVersions on the bucket; the condition keeps
+        # the listing to the state key.
+        Sid       = "StateObjectVersionList"
+        Effect    = "Allow"
+        Action    = "s3:ListBucketVersions"
+        Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
+        Condition = { StringEquals = { "s3:prefix" = "state.json" } } # FLEET_STATE_KEY
+      },
+      {
         # Without ListBucket, S3 answers a read of a missing object with 403, which the coordinator must treat as an error;
         # with it, a fresh fleet's first read is a 404 and it starts empty. The coordinator can read or write only its own state object.
         Sid      = "StateObjectMissingReadsAs404"

@@ -1397,5 +1397,51 @@ class BroadcastTests(unittest.TestCase):
         })
 
 
+class StateVersionRecoveryTests(unittest.TestCase):
+    """ejc3/fcvm#1951: the coordinator reads an earlier version of state.json when the current one does not parse, and
+    logs two markers that page through the fleet's alert path."""
+    stmt = CoordinatorLaunchSplit.stmt
+    TF = CoordinatorLaunchSplit.TF
+
+    def test_the_role_reads_versions_of_the_state_object_and_lists_versions_of_its_bucket_only(self):
+        get = self.stmt("StateObjectEarlierVersions")
+        self.assertIn('Action   = "s3:GetObjectVersion"', get)
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', get)
+        listing = self.stmt("StateObjectVersionList")
+        self.assertIn('Action    = "s3:ListBucketVersions"', listing)
+        self.assertIn("Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", listing + "\n")
+        self.assertIn('"s3:prefix" = "state.json"', listing)
+        # No other statement grants either action, and neither is granted on a wildcard.
+        self.assertEqual(len(re.findall(r"s3:GetObjectVersion", TF.split("aws_iam_role_policy\" \"fcvm_fleet_coordinator_task", 1)[1]
+                                        .split("\n}\n", 1)[0])), 1)
+        self.assertEqual(TF.count('"s3:ListBucketVersions"'), 1)
+        self.assertNotIn("*", get + listing)
+
+    def test_both_state_markers_alarm_into_the_on_demand_alarms_forwarder(self):
+        for name, metric, marker in (("fcvm-fleet-state-write-lost", "StateWriteLost", "FLEET_STATE_WRITE_LOST"),
+                                     ("fcvm-fleet-state-unreadable", "StateUnreadable", "FLEET_STATE_UNREADABLE")):
+            entry = ALARMS.split(f'"{name}" = {{', 1)[1].split("\n    }", 1)[0]
+            self.assertIn(f'metric = "{metric}"', entry)
+            self.assertIn('pattern     = "\\"%s\\""' % marker, entry)
+            self.assertIn("periods     = 1", entry)
+            self.assertIn(f'"{name}"', ALARMS.split("fcvm_fleet_health_alarm_names", 1)[0])
+        # The shared resources give each entry the on-demand alarm's namespace, forwarder, 5-minute Sum >= 1 and
+        # not-breaching treatment of missing data.
+        alarm = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_health_logs"', ALARMS)
+        for line in ('comparison_operator = "GreaterThanOrEqualToThreshold"', 'statistic           = "Sum"',
+                     "period              = 300", "threshold           = 1", 'treat_missing_data  = "notBreaching"',
+                     "alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]"):
+            self.assertIn(line, alarm)
+        metric_filter = block('resource "aws_cloudwatch_log_metric_filter" "fcvm_fleet_health"', ALARMS)
+        self.assertIn('namespace     = "FCVM/Fleet"', metric_filter)
+        self.assertIn("log_group_name = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name", metric_filter)
+        on_demand = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_on_demand_launches"')
+        self.assertIn("alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]", on_demand)
+        # The forwarder is allowed to be invoked by, and publishes for, every alarm of the map.
+        self.assertIn("values(local.fcvm_fleet_health_alarm_arns)", TF)
+        self.assertIn("for_each       = local.fcvm_fleet_health_alarm_arns",
+                      block('resource "aws_lambda_permission" "fcvm_fleet_health_alarms"', ALARMS))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
