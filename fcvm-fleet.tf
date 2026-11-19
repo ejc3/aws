@@ -132,7 +132,7 @@ locals {
 
   # The host agent's arguments (fcvm fleet/PROTOCOL.md, "Agent", "Running it"): it dials the coordinator through Access with
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
-  # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
+  # host's delegated /80, reports it as slot-<n>.tiles-stage.fcvm.dev, and hands the renderers the subzone certificate. The secrets
   # are in the home region, not the host's.
   # The IPv4 path to a GPU host's tiles: its one public IPv4 address, each place's TLS forwarded on its own port. Every port
   # a viewer connects to is declared once, in ejc3/fcvm fleet/published-ports.json, copied here byte for byte as
@@ -661,7 +661,7 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
 # execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
-# cannot change under it; the bootstrap image and the 20 newest are kept.
+# cannot change under it. While staging is the only consumer, retain the bootstrap image and 20 newest.
 resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
   provider             = aws.fcvm_fleet
   name                 = "fcvm-fleet/coordinator"
@@ -678,7 +678,7 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
   provider   = aws.fcvm_fleet
   repository = aws_ecr_repository.fcvm_fleet_coordinator.name
   policy = jsonencode({
-    rules = [{
+    rules = concat([{
       # A higher-priority tag match excludes the immutable bootstrap image from
       # the rolling rule, even after many releases. Exactly one image has this tag.
       rulePriority = 1
@@ -690,12 +690,13 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
         countNumber    = 1
       }
       action = { type = "expire" }
-      }, {
+      }], var.fcvm_fleet_prod_enabled ? [] : [{
+      # Production can still run or roll back to an older staging digest. ECR cannot read its pointers.
       rulePriority = 2
       description  = "Keep the 20 newest images"
       selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
       action       = { type = "expire" }
-    }]
+    }])
   })
 }
 

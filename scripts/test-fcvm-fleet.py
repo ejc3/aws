@@ -808,9 +808,20 @@ class SpendBackstopTests(unittest.TestCase):
     def test_the_daily_budget_is_750_on_each_stacks_tagged_instances_only(self):
         self.assertIn("fcvm_fleet_daily_budget_usd = 750", BUDGET)
         self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]', BUDGET)
-        stage = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        legacy = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        stage = block('resource "aws_budgets_budget" "fcvm_fleet_stage_daily"', BUDGET)
         prod = block('resource "aws_budgets_budget" "fcvm_fleet_prod_daily"', BUDGET)
-        self.assertIn('name         = "fcvm-fleet-daily"', stage)
+        self.assertIn('name         = "fcvm-fleet-daily"', legacy)
+        self.assertIn('name   = "TagKeyValue"', legacy)
+        self.assertNotRegex(legacy, r"(?m)^  (?:filter_expression|metrics)\b")
+        self.assertIn('name         = "fcvm-fleet-stage-daily"', stage)
+        self.assertIn("var.fcvm_fleet_prod_enabled ? [] : [80, 100]", legacy)
+        self.assertIn("var.fcvm_fleet_prod_enabled ? [80, 100] : []", stage)
+        self.assertIn("fcvm_fleet_stage_budget = var.fcvm_fleet_prod_enabled ? aws_budgets_budget.fcvm_fleet_stage_daily : aws_budgets_budget.fcvm_fleet_daily", BUDGET)
+        self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", prod), ["80", "100"])
+        self.assertEqual(prod.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+        for budget in (legacy, stage):
+            self.assertIn("threshold                 = notification.value", budget)
         self.assertIn('name         = "${local.fcvm_fleet_prod_stack.prefix}-daily"', prod)
         self.assertIn("count        = local.fcvm_fleet_prod\n", prod)
         for budget in (stage, prod):
@@ -823,8 +834,7 @@ class SpendBackstopTests(unittest.TestCase):
             self.assertEqual(purpose, ("Purpose", "local.fcvm_fleet_budget_purposes"))
             self.assertEqual(fleet[0], "Fleet")
             self.assertEqual(budget.count("    and {\n"), 2)
-            self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", budget), ["80", "100"])
-            self.assertEqual(budget.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+            self.assertIn("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns", budget)
             self.assertIn("depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]", budget)
         # Prod counts Fleet=prod; staging counts what carries no other stack's Fleet tag, untagged instances included.
         fleet_values = lambda b: re.findall(r'key\s+= "Fleet"\n\s+values\s+= (\S+)\n', b)
@@ -859,7 +869,7 @@ class SpendBackstopTests(unittest.TestCase):
         self.assertNotIn('Resource = "*"', grant)
         # Each stack: its own budget, decision record and coordinator role; prod's only while its switch is on.
         stacks = BUDGET.split("fcvm_fleet_spend_cap_stacks = concat(", 1)[1].split("\n  )\n", 1)[0]
-        for line in ("budget    = aws_budgets_budget.fcvm_fleet_daily.name",
+        for line in ("budget    = local.fcvm_fleet_stage_budget.name",
                      "state_key = aws_s3_object.fcvm_fleet_spend_cap_state.key",
                      "role_arn  = aws_iam_role.fcvm_fleet_coordinator_task.arn",
                      "[for i, b in aws_budgets_budget.fcvm_fleet_prod_daily : {",
@@ -1133,6 +1143,9 @@ class RegistryTests(unittest.TestCase):
         policy = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator"')
         self.assertIn('tagPatternList = [local.fcvm_fleet_coordinator_tag]', policy)
         protected, rolling = policy.split('description  = "Keep the 20 newest images"', 1)
+        bootstrap, stage_only = protected.split('var.fcvm_fleet_prod_enabled ? [] : [', 1)
+        self.assertIn('tagPatternList = [local.fcvm_fleet_coordinator_tag]', bootstrap)
+        self.assertIn("rulePriority = 2", stage_only)
         self.assertIn('rulePriority = 1', protected)
         self.assertRegex(protected, r'\bcountNumber\s*=\s*1\b')
         self.assertIn('rulePriority = 2', protected)
@@ -1913,6 +1926,8 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("target_group_arn = aws_lb_target_group.fcvm_fleet_prod_dns[0].arn", svc)
         self.assertIn("subnets          = local.fcvm_fleet_prod_dns_subnets", svc)
         self.assertRegex(svc, r"depends_on = \[[^\]]*aws_lb_listener\.fcvm_fleet_prod_dns")
+        self.assertRegex(svc, r"depends_on = \[[^\]]*aws_iam_role_policy_attachment\.fcvm_fleet_prod_coordinator_execution,")
+        self.assertRegex(svc, r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}")
         ptr = block('resource "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_release"', PROD)
         self.assertIn('name     = "/fcvm-fleet/prod/coordinator-image"', ptr)
         self.assertIn("ignore_changes = [value]", ptr)
@@ -2015,6 +2030,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("Environment=FLEET_TLS_SECRET=%s", cond)
         self.assertIn("'${var.tile_tls_secret}'", cond)
         self.assertIn("systemctl restart --no-block fcvm-fleet-tls.service", cond)
+        self.assertIn("ExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service", cond)
 
 
 if __name__ == "__main__":

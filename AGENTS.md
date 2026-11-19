@@ -1848,11 +1848,15 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
   and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
   including copies on host or tile disks and in backups. Production activation depends on completing #922.
-- **Staging certificate cutover.** Already-created pool tiles retain their original boot configuration. On a wake,
-  an old tile may spend up to 600 seconds waiting for renderer health before the coordinator replaces it. The cold
-  launch takes additional time. Once the new certificate is issued, verify a fresh tile and host serve frames on
-  IPv4 and IPv6 under `tiles-stage.fcvm.dev`. Verify users of the legacy `slot-<n>.fcvm.dev` and
-  `ec2-<n>.fcvm.dev` names have migrated before retiring the old credentials.
+- **Staging certificate cutover.** Before switching the coordinator and renderer roles, check that deployed viewers
+  and direct integrations use the published launch names under `tiles-stage.fcvm.dev`. The old certificate covers
+  both namespaces, so consumers can migrate first. Clients pinned to `slot-<n>.fcvm.dev` or `ec2-<n>.fcvm.dev`
+  will fail TLS against a new renderer even if they supply their own address. An empty parent DNS record list alone
+  cannot rule out those clients.
+  Already-created pool tiles retain their original boot configuration. On a wake, an old tile may spend up to
+  600 seconds waiting for renderer health before the coordinator replaces it. The cold launch takes additional
+  time. Wait for issuance, then verify a fresh tile and host serve frames on IPv4 and IPv6. Retire the old
+  certificate and DNS credentials separately as tracked in #922.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
   terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
@@ -1901,6 +1905,20 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   that creates it. The $750/day backstop (`fcvm-fleet-budget.tf`) is per stack: staging's budget counts host and tile
   spend not tagged `Fleet=prod`, prod's (`fcvm-fleet-prod-daily`) spend tagged `Fleet=prod`, and the one reconciler
   blocks each stack's coordinator for its own budget only (`Fleet` is an active cost allocation tag for this).
+  Before production, the original `fcvm-fleet-daily` still drives staging's deny and alerts. The separate
+  `fcvm-fleet-stage-daily` collects scoped billing data in parallel. Before lifting the production guard in #922,
+  verify that its latest three complete UTC billing days have actuals matching staging's host and tile charges.
+  Activation switches the worker and its 80%/100% alerts together, keeping the original decision record. The
+  old budget retains its history with notifications disabled. Keep it through the rollback window.
+- **Production teardown.** While the production stack is still enabled, use a reviewed Terraform change to deny
+  `ec2:RunInstances`, `ec2:CreateFleet` and `ec2:StartInstances` on the production coordinator role. Keep this
+  deny independent of the daily budget reconciler. Let viewers disconnect and put the fleet to sleep. Inventory
+  production hosts and tiles in us-east-1 by VPC and `Fleet=prod`, including stopped pool tiles. For the approved
+  teardown, cancel their persistent Spot requests before terminating the instances. Wait for EC2 to show no open or
+  active production Spot requests, no nonterminated instances in the production VPC, and no worker ENIs in its subnets.
+  Preserve the coordinator, its grants and image digests until these checks pass. Then remove the production ECS
+  service's `prevent_destroy` guard in the reviewed teardown change, disable the stack and inspect the full plan.
+  Staging's shared ECR repository resumes its 20-image limit when production is disabled.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)

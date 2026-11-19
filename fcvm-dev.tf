@@ -8,7 +8,7 @@
 #   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else. Staging runtime
 #                                        roles lose the read grant. The coordinator uses tiles-stage.fcvm.dev and answers
 #                                        its own DNS-01 record (--tls-scope subzone, fcvm-fleet.tf). It stays so that a
-#                                        revert to the zone certificate works; delete it once that is no longer wanted.
+#                                        revert to the zone certificate works. Retire the token at Cloudflare under #922.
 #   fcvm-fleet/coordinator-tunnel-token  the connector token of tunnel fcvm-fleet-coordinator, for the cloudflared container
 #                                        in the coordinator's Fargate task (TUNNEL_TOKEN)
 #   fcvm-fleet/agent-access-token        the Access service token the GPU hosts' agents present at /agent (client_id,

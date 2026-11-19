@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -362,6 +363,20 @@ class StackTests(unittest.TestCase):
         with patch("builtins.print"):
             with self.assertRaisesRegex(RuntimeError, "fleet-daily"):
                 self.run_all()
+        self.assertEqual(self.fleet.attached.get("prod-coordinator"), {ENV["POLICY_ARN"]})
+
+    def test_stalled_stage_request_leaves_time_to_reconcile_production(self):
+        original_read = self.fleet.describe_budget_performance_history
+        def delayed(**request):
+            if request["BudgetName"] == "fleet-daily":
+                time.sleep(1)
+            return original_read(**request)
+
+        self.fleet.describe_budget_performance_history = delayed
+        self.fleet.pages["fleet-prod-daily"] = [cost(DAY - timedelta(days=1), "900")]
+        with self.assertRaisesRegex(RuntimeError, "fleet-daily"), patch("builtins.print"):
+            cap.reconcile_all(STACKS_ENV, self.fleet, self.fleet, self.fleet, DAY,
+                              remaining_ms=lambda: 1200)
         self.assertEqual(self.fleet.attached.get("prod-coordinator"), {ENV["POLICY_ARN"]})
 
     def test_stacks_are_read_from_the_environment_and_none_is_an_error(self):
