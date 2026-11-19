@@ -323,7 +323,7 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_dns_token" {
   name                    = "fcvm-fleet/cloudflare-dns-token"
   description             = "Cloudflare token: DNS Write on fcvm.dev only (ejc3/aws fcvm-dev.tf)"
   recovery_window_in_days = 7
-  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/cloudflare-dns-token" }
+  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/cloudflare-dns-token", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_secretsmanager_secret_version" "fcvm_fleet_dns_token" {
@@ -337,7 +337,7 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_coordinator_tunnel" {
   name                    = "fcvm-fleet/coordinator-tunnel-token"
   description             = "Connector token for the fcvm-fleet-coordinator Cloudflare tunnel only (ejc3/aws fcvm-dev.tf); key TUNNEL_TOKEN"
   recovery_window_in_days = 7
-  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/coordinator-tunnel-token" }
+  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/coordinator-tunnel-token", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_secretsmanager_secret_version" "fcvm_fleet_coordinator_tunnel" {
@@ -351,7 +351,7 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_agent_access" {
   name                    = "fcvm-fleet/agent-access-token"
   description             = "Cloudflare Access service token the fleet's agents present at /agent (ejc3/aws fcvm-dev.tf); keys client_id, client_secret"
   recovery_window_in_days = 7
-  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/agent-access-token" }
+  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/agent-access-token", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_secretsmanager_secret_version" "fcvm_fleet_agent_access" {
