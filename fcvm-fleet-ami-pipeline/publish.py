@@ -551,11 +551,14 @@ class Publisher:
             self.clients[key] = boto3.client(service, **options)
         return self.clients[key]
 
-    def load(self, name, fleet=False):
-        response = self.client("ssm", fleet).get_parameter(Name=name, WithDecryption=False)
-        raw = response["Parameter"]["Value"]
+    def load_versioned(self, name, fleet=False):
+        parameter = self.client("ssm", fleet).get_parameter(Name=name, WithDecryption=False)["Parameter"]
+        raw = parameter["Value"]
         need(len(raw.encode()) <= 4000, "publication metadata exceeds its fixed bound")
-        return json.loads(raw)
+        return json.loads(raw), parameter.get("Version")
+
+    def load(self, name, fleet=False):
+        return self.load_versioned(name, fleet)[0]
 
     def save(self, name, value, fleet=False):
         raw = encoded(value)
@@ -2034,18 +2037,23 @@ class ProdPublisher(Publisher):
     def asleep(self):
         """None while prod is asleep, else the reason it is not."""
         now = datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc)
+        start = now.replace(second=0, microsecond=0) - datetime.timedelta(seconds=self.QUIET_SECONDS)
         result = self.client("cloudwatch", True, self.env["METRICS_REGION"]).get_metric_data(
             MetricDataQueries=[{"Id": "power", "ReturnData": True, "MetricStat": {
                 "Metric": {"Namespace": "FCVM/Fleet", "MetricName": "Power",
                            "Dimensions": [{"Name": "Fleet", "Value": self.env["METRIC_FLEET"]}]},
                 "Period": 60, "Stat": "Maximum"}}],
-            StartTime=now - datetime.timedelta(seconds=self.QUIET_SECONDS), EndTime=now,
+            StartTime=start, EndTime=now,
             ScanBy="TimestampDescending")["MetricDataResults"]
         values = result[0].get("Values", []) if len(result) == 1 and result[0].get("Id") == "power" else []
         if len(result) != 1 or result[0].get("StatusCode") != "Complete" or not values:
             return "no-power-data"
         if any(value != 0 for value in values):
             return "awake"
+        stamps = result[0].get("Timestamps", [])
+        required = {start + datetime.timedelta(seconds=i) for i in range(0, self.QUIET_SECONDS, 60)}
+        if len(stamps) != len(values) or not required.issubset(stamps):
+            return "no-power-data"
         arguments = {"Filters": [{"Name": "tag:aws:ec2launchtemplate:id", "Values": sorted(t["id"] for t in self.templates)},
                                  {"Name": "instance-state-name", "Values": ["pending", "running"]}]}
         for _ in range(20):
@@ -2072,10 +2080,11 @@ class ProdPublisher(Publisher):
         return self.gate_receipt(live), self.gate_record(), live
 
     def prod(self):
-        before = self.load(self.env["RELEASE_PARAMETER"], True)
+        before, version = self.load_versioned(self.env["RELEASE_PARAMETER"], True)
         need(before.get("version") == 1 and before.get("guard_sha256") == self.env["GUARD_SHA256"]
-             and type(before.get("generation")) is int, "prod release schema is incompatible")
-        return before
+             and type(before.get("generation")) is int and type(version) is int and version > 0,
+             "prod release schema is incompatible")
+        return before, version
 
     def status(self):
         live, verified, _ = self.stage()
@@ -2085,11 +2094,12 @@ class ProdPublisher(Publisher):
         when = written.get("LastModifiedDate")
         need(isinstance(when, datetime.datetime) and when.utcoffset() is not None, "the gate record has no write time")
         return {"status": "ok", "stage": live, "verified": verified, "stage_verified": live == verified,
-                "verified_at": int(when.timestamp()), "prod": self.gate_receipt(self.prod()),
+                "verified_at": int(when.timestamp()), "prod": self.gate_receipt(self.prod()[0]),
                 "asleep": reason is None, "reason": reason}
 
-    def attempt(self, identity):
-        """A fresh build id for this transition: a rolled-back attempt never replays its versions."""
+    def attempt(self, action, receipt, pointer_version):
+        """Retries share a predecessor; returning to the same AMIs after rollback has a new pointer version."""
+        identity = f"{action}:{pointer_version}:{digest(encoded(receipt))}"
         for number in range(1, self.ATTEMPTS + 1):
             self.build_id = f"{identity}:{number}"
             prior = self.prior_transaction()
@@ -2146,7 +2156,7 @@ class ProdPublisher(Publisher):
         live, verified, stage = self.stage()
         if not (receipt == verified == live):
             return {"status": "refused", "reason": "the receipt is not the gate-verified release staging runs"}
-        before = self.prod()
+        before, pointer_version = self.prod()
         if self.gate_receipt(before) == receipt and self.images(before) == self.images(stage):
             return {"status": "unchanged", **receipt}
         reason = self.asleep()
@@ -2154,7 +2164,7 @@ class ProdPublisher(Publisher):
             return {"status": "held", "reason": reason}
         need(stage.get("version") == 1 and stage.get("guard_sha256") == self.env["GUARD_SHA256"]
              and SHA.fullmatch(str(stage.get("source_sha", ""))), "staging release schema is incompatible")
-        self.attempt("promote-prod:" + digest(encoded(receipt)))
+        self.attempt("promote-prod", receipt, pointer_version)
 
         def fence():
             self.asleep_fence()
@@ -2164,7 +2174,7 @@ class ProdPublisher(Publisher):
         return {"status": "promoted", **receipt}
 
     def rollback_prod(self, receipt):
-        before = self.prod()
+        before, pointer_version = self.prod()
         previous = before.get("previous")
         current = self.gate_receipt(before)
         if current != receipt:
@@ -2178,7 +2188,7 @@ class ProdPublisher(Publisher):
         reason = self.asleep()
         if reason:
             return {"status": "held", "reason": reason}
-        self.attempt("rollback-prod:" + digest(encoded(receipt)))
+        self.attempt("rollback-prod", receipt, pointer_version)
         after = self.move(before, previous, self.asleep_fence)
         return {"status": "rolled_back", **self.gate_receipt(after)}
 

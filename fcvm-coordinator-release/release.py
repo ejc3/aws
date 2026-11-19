@@ -126,18 +126,24 @@ def held(cloudwatch, now=None):
     """None when ActiveViewers{Fleet=<METRIC_FLEET>} was 0 over the last QUIET_SECONDS, else the
     `held` result. No datapoint holds too: a coordinator that reports nothing proves nothing."""
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    start = now.replace(second=0, microsecond=0) - datetime.timedelta(seconds=QUIET_SECONDS)
     result = cloudwatch.get_metric_data(
         MetricDataQueries=[{"Id": "viewers", "ReturnData": True, "MetricStat": {
             "Metric": {"Namespace": os.environ["METRICS_NAMESPACE"], "MetricName": "ActiveViewers",
                        "Dimensions": [{"Name": "Fleet", "Value": os.environ["METRIC_FLEET"]}]},
             "Period": 60, "Stat": "Maximum"}}],
-        StartTime=now - datetime.timedelta(seconds=QUIET_SECONDS), EndTime=now,
+        StartTime=start, EndTime=now,
         ScanBy="TimestampDescending")["MetricDataResults"]
     values = result[0].get("Values", []) if len(result) == 1 and result[0].get("Id") == "viewers" else []
     if len(result) != 1 or result[0].get("StatusCode") != "Complete" or not values:
         return {"status": "held", "reason": "no-viewer-data"}
     if any(not isinstance(v, (int, float)) or v != 0 for v in values):
         return {"status": "held", "reason": "viewers"}
+    # Require every completed minute, and count any reported viewers in the current minute too.
+    stamps = result[0].get("Timestamps", [])
+    required = {start + datetime.timedelta(seconds=i) for i in range(0, QUIET_SECONDS, 60)}
+    if len(stamps) != len(values) or not required.issubset(stamps):
+        return {"status": "held", "reason": "no-viewer-data"}
     return None
 
 

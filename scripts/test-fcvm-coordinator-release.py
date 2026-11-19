@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Offline release tests: image-only changes, backend-lock ownership and rollback."""
 import copy
+import datetime
 import importlib.util
 import json
 import os
@@ -273,7 +274,7 @@ class ProdAWS(AWS):
     def __init__(self):
         super().__init__()
         self.old["taskDefinition"]["family"] = PROD_OLD
-        self.viewers = [0.0, 0.0, 0.0]
+        self.viewers = [0.0] * 5
         self.metric_status = "Complete"
         self.metric_reads = 0
         self.history = [self.image]
@@ -285,9 +286,11 @@ class ProdAWS(AWS):
         query = kwargs["MetricDataQueries"][0]["MetricStat"]
         assert query["Metric"] == {"Namespace": "FCVM/Fleet", "MetricName": "ActiveViewers",
                                    "Dimensions": [{"Name": "Fleet", "Value": "prod"}]}, query
-        assert query["Stat"] == "Maximum" and (kwargs["EndTime"] - kwargs["StartTime"]).total_seconds() == 300
+        assert query["Stat"] == "Maximum" and 300 <= (kwargs["EndTime"] - kwargs["StartTime"]).total_seconds() < 360
         self.metric_reads += 1
-        return {"MetricDataResults": [{"Id": "viewers", "StatusCode": self.metric_status, "Values": list(self.viewers)}]}
+        stamps = [kwargs["StartTime"] + datetime.timedelta(minutes=i) for i in range(len(self.viewers))]
+        return {"MetricDataResults": [{"Id": "viewers", "StatusCode": self.metric_status,
+                                       "Values": list(self.viewers), "Timestamps": stamps}]}
 
     def get_parameter(self, **kwargs):
         name = kwargs["Name"]
@@ -337,7 +340,7 @@ class ProdReleaseTests(unittest.TestCase):
         self.assertIsNone(self.aws.lock)
 
     def test_no_viewer_data_holds_the_release(self):
-        for values, status in (([], "Complete"), ([0.0], "PartialData")):
+        for values, status in (([], "Complete"), ([0.0], "Complete"), ([0.0], "PartialData")):
             with self.subTest(values=values, status=status):
                 self.setUp()
                 self.aws.viewers, self.aws.metric_status = values, status

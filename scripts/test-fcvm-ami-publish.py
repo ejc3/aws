@@ -49,20 +49,22 @@ class ParameterAlreadyExists(Exception):
 class SSM:
     def __init__(self):
         self.values = {}
+        self.versions = {}
 
     def get_parameter(self, Name, WithDecryption):
         assert WithDecryption is False
         if Name not in self.values:
             raise ParameterNotFound()
-        return {"Parameter": {"Value": MODULE.encoded(self.values[Name]),
+        return {"Parameter": {"Value": MODULE.encoded(self.values[Name]), "Version": self.versions.get(Name, 1),
                               "LastModifiedDate": datetime.datetime(2026, 11, 19, tzinfo=datetime.timezone.utc)}}
 
     def put_parameter(self, Name, Type, Value, Overwrite):
         assert Type == "String" and type(Overwrite) is bool
         if not Overwrite and Name in self.values:
             raise ParameterAlreadyExists()
+        self.versions[Name] = self.versions.get(Name, int(Name in self.values)) + 1
         self.values[Name] = json.loads(Value)
-        return {"Version": 1}
+        return {"Version": self.versions[Name]}
 
 
 class DDB:
@@ -3561,15 +3563,17 @@ class PublisherTests(unittest.TestCase):
 
 class CloudWatch:
     def __init__(self):
-        self.power = [0.0, 0.0, 0.0]
+        self.power = [0.0] * 5
         self.status = "Complete"
 
     def get_metric_data(self, MetricDataQueries, StartTime, EndTime, ScanBy):
         stat = MetricDataQueries[0]["MetricStat"]
         assert stat["Metric"] == {"Namespace": "FCVM/Fleet", "MetricName": "Power",
                                   "Dimensions": [{"Name": "Fleet", "Value": "prod"}]}
-        assert stat["Stat"] == "Maximum" and (EndTime - StartTime).total_seconds() == 300
-        return {"MetricDataResults": [{"Id": "power", "StatusCode": self.status, "Values": list(self.power)}]}
+        assert stat["Stat"] == "Maximum" and 300 <= (EndTime - StartTime).total_seconds() < 360
+        stamps = [StartTime + datetime.timedelta(minutes=i) for i in range(len(self.power))]
+        return {"MetricDataResults": [{"Id": "power", "StatusCode": self.status,
+                                       "Values": list(self.power), "Timestamps": stamps}]}
 
 
 class ProdPublisherTests(unittest.TestCase):
@@ -3700,7 +3704,7 @@ class ProdPublisherTests(unittest.TestCase):
         self.assertEqual(self.fleet_ssm.values["/prod/release"], self.prod_before)
         self.assertIsNone(self.ddb.item)
         self.ec2.modify_launch_template = real
-        self.cloudwatch.power = [0.0]
+        self.cloudwatch.power = [0.0] * 5
         self.assertEqual(self.promote()["status"], "promoted")
         self.assertEqual(self.defaults(self.prod_ids), [self.new["host"]] + [self.new["tile"]] * 3)
 
@@ -3716,7 +3720,7 @@ class ProdPublisherTests(unittest.TestCase):
         rollback = {"action": "rollback-prod", "receipt": self.receipt}
         self.cloudwatch.power = [2.0]
         self.assertEqual(self.publisher().prod_event(rollback), {"status": "held", "reason": "awake"})
-        self.cloudwatch.power = [0.0]
+        self.cloudwatch.power = [0.0] * 5
         self.assertEqual(self.publisher().prod_event(rollback),
                          {"status": "rolled_back", "generation": 11, "build_id": "factory:old"})
         self.assertEqual(self.defaults(self.prod_ids), [self.old["host"]] + [self.old["tile"]] * 3)
@@ -3733,6 +3737,20 @@ class ProdPublisherTests(unittest.TestCase):
             "status": "ok", "stage": self.receipt, "verified": self.receipt, "stage_verified": True,
             "verified_at": int(datetime.datetime(2026, 11, 19, tzinfo=datetime.timezone.utc).timestamp()),
             "prod": {"generation": 11, "build_id": "factory:old"}, "asleep": True, "reason": None})
+
+    def test_repeated_promotions_and_rollbacks_get_fresh_journals(self):
+        rollback = {"action": "rollback-prod", "receipt": self.receipt}
+        for _ in range(3):
+            self.assertEqual(self.promote()["status"], "promoted")
+            self.assertEqual(self.promote()["status"], "unchanged")
+            self.assertEqual(self.publisher().prod_event(rollback)["status"], "rolled_back")
+            self.assertEqual(self.publisher().prod_event(rollback)["status"], "unchanged")
+        self.assertEqual(len(self.ec2.created), 6 * len(self.prod_ids))
+
+    def test_one_zero_power_sample_is_insufficient_for_asleep(self):
+        self.cloudwatch.power = [0.0]
+        self.assertEqual(self.promote(), {"status": "held", "reason": "no-power-data"})
+        self.assertFalse(self.ec2.created)
 
     def test_the_prod_function_never_reads_the_staging_bundle(self):
         import tempfile
