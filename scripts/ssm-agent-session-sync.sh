@@ -9,7 +9,7 @@
 #
 # Why a step and not user_data: the jumpboxes ignore user_data changes and take no downloaded script as
 # root, so a running one converges only through an explicit, reviewed step like this. The files travel
-# base64-encoded from this repository, so nothing is fetched on the box. A running watcher is restarted only
+# gzip-compressed before base64 encoding to fit the SSM command payload. A running watcher is restarted only
 # when its unit or policy changed; a new script is picked up by the watcher itself (it re-executes).
 set -euo pipefail
 iid=$1 region=$2
@@ -24,10 +24,11 @@ for _ in $(seq 1 60); do
 done
 [ "$ping" = Online ] || { echo "ssm-agent-session-sync: $iid is not registered with SSM after 10 minutes" >&2; exit 1; }
 
-script=$(base64 -w0 "$here/agent-session-sync.py")
-seeder=$(base64 -w0 "$here/codex-seed-thread.py")
-active=$(base64 -w0 "$here/agent-active-dirs.py")
-unit=$(base64 -w0 "$here/agent-session-sync@.service")
+encode() { gzip -nc -- "$1" | base64 -w0; }
+script=$(encode "$here/agent-session-sync.py")
+seeder=$(encode "$here/codex-seed-thread.py")
+active=$(encode "$here/agent-active-dirs.py")
+unit=$(encode "$here/agent-session-sync@.service")
 # Files are replaced ATOMICALLY (a half-written script must never be what a running watcher re-executes), and
 # only when they differ. A changed SCRIPT needs no restart: the watcher re-executes itself when its own file
 # is replaced. A changed UNIT or POLICY (the environment of a running process) does, so the watcher is
@@ -36,10 +37,10 @@ unit=$(base64 -w0 "$here/agent-session-sync@.service")
 read -r -d '' remote <<REMOTE || true
 set -e
 t=\$(mktemp -d); trap 'rm -rf "\$t"' EXIT
-echo $script | base64 -d > "\$t/script"
-echo $seeder | base64 -d > "\$t/seeder"
-echo $active | base64 -d > "\$t/active"
-echo $unit | base64 -d > "\$t/unit"
+echo $script | base64 -d | gzip -dc > "\$t/script"
+echo $seeder | base64 -d | gzip -dc > "\$t/seeder"
+echo $active | base64 -d | gzip -dc > "\$t/active"
+echo $unit | base64 -d | gzip -dc > "\$t/unit"
 printf '[Service]\nEnvironment="ASS_ARGS=%s"\n' '$ASS_ARGS' > "\$t/policy"
 restart=0
 put() { cmp -s "\$1" "\$2" && return 1; install -m "\$3" "\$1" "\$2.new" && mv -f "\$2.new" "\$2"; }
