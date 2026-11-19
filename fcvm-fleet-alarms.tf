@@ -48,6 +48,24 @@ locals {
       ok          = false
       description = "The coordinator failed to renew or store the fleet's wildcard certificate (fcvm-fleet/tls-wildcard). Hosts and tiles read it at boot; when it expires, every viewer connection fails TLS. Read /ecs/fcvm-fleet-coordinator."
     }
+    "fcvm-fleet-state-write-lost" = {
+      metric = "StateWriteLost"
+      # store.rs: the conditional write of state.json got 412, so another coordinator owns the object. This one writes
+      # nothing more.
+      pattern     = "\"FLEET_STATE_WRITE_LOST\""
+      periods     = 1
+      ok          = false
+      description = "The coordinator's conditional write of its state object got 412: another coordinator has written state.json since this one read it, and this one has stopped writing. Check for a second running coordinator task or a stale one, then read /ecs/fcvm-fleet-coordinator for FLEET_STATE_WRITE_LOST."
+    }
+    "fcvm-fleet-state-unreadable" = {
+      metric = "StateUnreadable"
+      # store.rs: state.json would not parse; the coordinator resumed from an earlier S3 version, so changes stored after
+      # that version are lost.
+      pattern     = "\"FLEET_STATE_UNREADABLE\""
+      periods     = 1
+      ok          = false
+      description = "The stored state.json would not parse. The coordinator resumed from an earlier version of the object, or failed to start if none parses. Changes stored after that version are lost. Read /ecs/fcvm-fleet-coordinator for FLEET_STATE_UNREADABLE and list the object's versions in the fcvm-fleet-coordinator-state bucket."
+    }
     "fcvm-fleet-tunnel-down" = {
       metric = "TunnelConnectionErrors"
       # cloudflared: a tunnel connection failed and is being retried. One dropped connection of four recovers in seconds

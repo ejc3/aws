@@ -52,6 +52,9 @@ class BoxTests(unittest.TestCase):
         self.assertRegex(self.instance, r"delete_on_termination\s+=\s+false")
         self.assertRegex(self.instance, r"encrypted\s+=\s+true")
 
+    def test_online_storage_converges_without_disabling_existing_swap(self):
+        subprocess.run(["bash", str(ROOT / "scripts/test-nextjs-root-and-swap.sh")], check=True)
+
     def test_bootstrap_fetches_its_own_script(self):
         self.assertIn("--bucket ejc3-dev-scripts --key user-data/nextjs-ct.sh", self.instance)
         self.assertIn('key          = "user-data/nextjs-ct.sh"', CT_USER_DATA)
