@@ -79,7 +79,12 @@ class DevBoundaryTests(unittest.TestCase):
             self.assertIn('Resource  = aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn', statement)
         self.assertIn('ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) }', statements[0])
         self.assertRegex(statements[1], r'ArnEquals\s*= \{ "aws:PrincipalArn" = aws_iam_role\.dev_server\.arn \}')
-        self.assertIn('ArnNotEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn }', statements[1])
+        self.assertIn('StringNotEqualsIfExists = { "aws:userid" = try(local.browser_run_arm_userids[0], "no-fcvm-arm-instance") }',
+                      statements[1])
+        self.assertNotIn("ec2:SourceInstanceARN", policy)  # Secrets Manager rejects this EC2-specific key.
+        userids = (ROOT / "browser-run.tf").read_text()
+        self.assertRegex(userids, r'browser_run_arm_userids\s*= \[for instance in aws_instance\.firecracker_dev : '
+                                  r'"\$\{aws_iam_role\.dev_server\.unique_id\}:\$\{instance\.id\}"\]')
 
 
 class GitHubBoundaryTests(unittest.TestCase):

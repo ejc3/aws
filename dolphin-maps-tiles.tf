@@ -117,8 +117,10 @@ resource "aws_secretsmanager_secret_policy" "dolphin_maps_tiles_upload" {
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn
       Condition = {
-        ArnEquals    = { "aws:PrincipalArn" = aws_iam_role.dev_server.arn }
-        ArnNotEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn }
+        # Secrets Manager accepts global condition keys here. EC2 alone assumes this role and names the session
+        # after its instance. When the ARM host is disabled, no role session can match the fallback.
+        ArnEquals               = { "aws:PrincipalArn" = aws_iam_role.dev_server.arn }
+        StringNotEqualsIfExists = { "aws:userid" = try(local.browser_run_arm_userids[0], "no-fcvm-arm-instance") }
       }
     }]
   })
