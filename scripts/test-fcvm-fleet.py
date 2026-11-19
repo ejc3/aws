@@ -1146,6 +1146,15 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("required  = true", api)
         self.assertIn("required  = true", direct)
 
+    def test_the_coordinator_forces_sleep_at_a_750_dollar_daily_spend_ceiling(self):
+        # Owner, 2026-11-18: $750 a day at the Spot price, forced sleep. The meter reads DescribeInstances and
+        # DescribeSpotPriceHistory, which the task role already has under ec2:Describe*.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)]', cmd)
+        self.assertRegex(TF, r"fcvm_fleet_daily_spend_ceiling_usd\s*=\s*750\n")
+        self.assertIn('"--sleep-when-idle"', cmd)
+        self.assertIn('Action   = ["ec2:Describe*"]', TF)
+
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the
         # task role may invoke, through the profile in the fleet account and the foundation model it routes to.
