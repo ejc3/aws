@@ -1699,6 +1699,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn('["--dns-subzone", local.fcvm_fleet_prod_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_prod_names_ns)', cmd)
         self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_prod_daily_spend_usd)]', cmd)
         self.assertIn("fcvm_fleet_prod_daily_spend_usd = 750", PROD)
+        self.assertIn('fcvm_fleet_prod_f6_args = ["--awake-hosts", "2", "--host-spread", "az", "--tls-scope", "subzone"]', PROD)
         self.assertIn("local.fcvm_fleet_prod_f6_args,", cmd)
         self.assertNotIn("--warm-hours", cmd)
         self.assertIn('"--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_prod_broadcast[0].name', cmd)

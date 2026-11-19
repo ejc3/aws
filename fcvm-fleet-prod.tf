@@ -40,8 +40,9 @@ locals {
   # Owner, 2026-11-18: $750 a day, metered at the Spot price; the coordinator sleeps the fleet at the ceiling.
   fcvm_fleet_prod_daily_spend_usd = 750
   # The coordinator flags of ejc3/fcvm "F6" (fleet coord: N awake hosts across zones, subzone-only certificate), which
-  # are not on fcvm main yet; set in this PR's last commit.
-  fcvm_fleet_prod_f6_args = []
+  # are not on fcvm main yet: an image without them refuses the arguments and does not start. Two awake GPU hosts in
+  # us-east-1, each launched into an availability zone no live host is in; the certificate for the subzone only.
+  fcvm_fleet_prod_f6_args = ["--awake-hosts", "2", "--host-spread", "az", "--tls-scope", "subzone"]
 
   # The prod region module, as a map so nothing below indexes an empty tuple while the stack is off.
   fcvm_fleet_prod_regional = { for m in module.fcvm_fleet_prod_east1 : local.fcvm_fleet_prod_region => m }
