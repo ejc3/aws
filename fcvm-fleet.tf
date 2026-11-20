@@ -90,6 +90,11 @@ locals {
   # The bootstrap image, before main-only CI's first release. Active releases are
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
+  # The most the fleet may spend in one UTC day (owner, 2026-11-18: $750 a day, metered at the Spot price, with forced
+  # sleep). The coordinator's meter (--daily-spend-usd, ejc3/fcvm#1960) puts the fleet to sleep at the ceiling. The AWS
+  # budget action from #905 (fcvm-fleet-budget.tf) stays as the backstop. The meter needs no new IAM: it calls
+  # ec2:DescribeInstances and ec2:DescribeSpotPriceHistory, both under the task role's ec2:Describe*.
+  fcvm_fleet_daily_spend_ceiling_usd = 750
   # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max       = 8
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
@@ -205,6 +210,7 @@ locals {
     "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent.aud],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
+    ["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)],
     # The stack's Fleet tag: on every tile and host it launches, and the only instances it lists, sweeps, admits an agent
     # from and meters (ejc3/fcvm src/cli/args.rs, --fleet-name). The task role's scope policy holds it to the same tag.
     ["--fleet-name", local.fcvm_fleet_stage.fleet],
