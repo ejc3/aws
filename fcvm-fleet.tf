@@ -61,6 +61,29 @@ variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
 }
 
 locals {
+  # The fleet's stacks in this account, keyed by the Fleet tag that scopes each one (ejc3/fcvm fleet production plan,
+  # invariant I2). Staging is the only stack today; the production stack (fcvm.dev) adds an entry with the same keys
+  # and its own coordinator, roles, templates and secrets. Staging's values are the names its resources already have,
+  # so routing them through this map renames nothing.
+  # - fleet: the Fleet tag on every instance, spot request and launch template the stack owns, on its roles, task and
+  #   secrets, and the coordinator's --fleet-name (it tags its launches with it and lists only instances that carry it).
+  # - prefix: its launch templates' names (modules/fcvm-fleet-region, name_prefix).
+  # - tls_secret, state_key: its certificate secret and its state object in the shared state bucket.
+  # - untagged_spot_requests: the stack has persistent spot requests from before the pool template tagged them Fleet
+  #   (staging's stopped pool tiles), which aws_iam_policy.fcvm_fleet_stack_scope lets it cancel. A new stack has none.
+  fcvm_fleet_stacks = {
+    stage = {
+      fleet                  = "stage"
+      prefix                 = "fcvm-fleet"
+      tls_secret             = "fcvm-fleet/tls-wildcard"
+      state_key              = "state.json"
+      untagged_spot_requests = true
+    }
+  }
+  fcvm_fleet_stage = local.fcvm_fleet_stacks.stage
+  # Each stack's coordinator task role, which its scope policy is attached to.
+  fcvm_fleet_stack_coordinator_roles = { stage = aws_iam_role.fcvm_fleet_coordinator_task.name }
+
   # The two switches (see the header).
   fcvm_fleet_hosts_enabled       = true
   fcvm_fleet_coordinator_enabled = true
@@ -175,13 +198,24 @@ locals {
   # all of them arrive with the Worker's CF-Connecting-IP; the coordinator then keys such a request by the viewer address
   # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
   # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
+  # --access-team-domain and the audiences (ejc3/fcvm c74ee76): the coordinator verifies each Access JWT itself, not only
+  # the connector. /live takes the API application's tokens (the owner, CI, the Worker) and the page application's
+  # (fleet-api-direct-stage); the viewer address then counts only for a verified service token. /agent answers 403
+  # without the agents' service token. No Turnstile here: every staging viewer passes Access and so counts as verified.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    ["--access-team-domain", trimprefix(local.browser_manager_issuer, "https://"),
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud,
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_site_stage.aud,
+    "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent.aud],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
     ["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)],
-    ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "fcvm-fleet-tile-x86_64", "--ec2-on-demand-template", "fcvm-fleet-tile-on-demand-x86_64"],
-    local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "fcvm-fleet-tile-pool-x86_64"] : [],
+    # The stack's Fleet tag: on every tile and host it launches, and the only instances it lists, sweeps, admits an agent
+    # from and meters (ejc3/fcvm src/cli/args.rs, --fleet-name). The task role's scope policy holds it to the same tag.
+    ["--fleet-name", local.fcvm_fleet_stage.fleet],
+    ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "${local.fcvm_fleet_stage.prefix}-tile-x86_64", "--ec2-on-demand-template", "${local.fcvm_fleet_stage.prefix}-tile-on-demand-x86_64"],
+    local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "${local.fcvm_fleet_stage.prefix}-tile-pool-x86_64"] : [],
     ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
     # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
@@ -303,6 +337,35 @@ resource "aws_s3_bucket_versioning" "fcvm_fleet_private" {
   }
 }
 
+# The coordinator rewrites state.json on every change, up to about once a second, so versioning adds up to ~86,000
+# noncurrent versions a day. Keep every version younger than 7 days and, past that, the newest 100, for recovering an
+# earlier state when the current one will not parse; S3 expires a noncurrent version only when both limits are passed.
+# S3 filters by prefix. Other keys (including the spending guard) keep their independent version history.
+resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {
+      prefix = "state.json"
+    }
+    noncurrent_version_expiration {
+      noncurrent_days           = 7
+      newer_noncurrent_versions = 100
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.fcvm_fleet_private]
+}
+
 resource "aws_s3_bucket_public_access_block" "fcvm_fleet_private" {
   for_each                = { assets = aws_s3_bucket.fcvm_fleet_assets.id, state = aws_s3_bucket.fcvm_fleet_coordinator_state.id }
   provider                = aws.fcvm_fleet
@@ -337,10 +400,10 @@ resource "aws_s3_bucket_ownership_controls" "fcvm_fleet_private" {
 # The wildcard certificate for fcvm.dev (JSON: cert, key), set out of band. Hosts and tiles read it at boot.
 resource "aws_secretsmanager_secret" "fcvm_fleet_tls" {
   provider                = aws.fcvm_fleet
-  name                    = "fcvm-fleet/tls-wildcard"
+  name                    = local.fcvm_fleet_stage.tls_secret
   description             = "Wildcard TLS certificate for the fleet zone (JSON: cert, key). Value set out of band; see fcvm-fleet.tf."
   recovery_window_in_days = 7
-  tags                    = { Name = "fcvm-fleet/tls-wildcard", Project = "fcvm-fleet" }
+  tags                    = { Name = local.fcvm_fleet_stage.tls_secret, Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 # ------------------------------------------------------------------------------------------------ instance roles
@@ -351,7 +414,7 @@ resource "aws_iam_role" "fcvm_fleet_host" {
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
-  tags = { Name = "fcvm-fleet-host" }
+  tags = { Name = "fcvm-fleet-host", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 # The certificate, the agents' Access service token and the release artifacts; nothing else (no EC2, no other S3).
@@ -391,7 +454,7 @@ resource "aws_iam_role" "fcvm_fleet_tile" {
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
-  tags = { Name = "fcvm-fleet-tile" }
+  tags = { Name = "fcvm-fleet-tile", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_iam_role_policy" "fcvm_fleet_tile" {
@@ -431,6 +494,8 @@ resource "aws_iam_instance_profile" "fcvm_fleet_tile" {
 
 # ------------------------------------------------------------------------------------------------ the three regions
 module "fcvm_fleet_east2" {
+  fleet                     = local.fcvm_fleet_stage.fleet
+  name_prefix               = local.fcvm_fleet_stage.prefix
   ip_options_bootstrap      = local.linux_ip_options_bootstrap
   ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                    = "./modules/fcvm-fleet-region"
@@ -451,6 +516,8 @@ module "fcvm_fleet_east2" {
 }
 
 module "fcvm_fleet_west2" {
+  fleet                     = local.fcvm_fleet_stage.fleet
+  name_prefix               = local.fcvm_fleet_stage.prefix
   ip_options_bootstrap      = local.linux_ip_options_bootstrap
   ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                    = "./modules/fcvm-fleet-region"
@@ -471,6 +538,8 @@ module "fcvm_fleet_west2" {
 }
 
 module "fcvm_fleet_east1" {
+  fleet                         = local.fcvm_fleet_stage.fleet
+  name_prefix                   = local.fcvm_fleet_stage.prefix
   ip_options_bootstrap          = local.linux_ip_options_bootstrap
   ip_options_guard_sha256       = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   source                        = "./modules/fcvm-fleet-region"
@@ -751,6 +820,7 @@ resource "aws_iam_role" "fcvm_fleet_coordinator_execution" {
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
+  tags = { Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_execution" {
@@ -781,6 +851,7 @@ resource "aws_iam_role" "fcvm_fleet_coordinator_task" {
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ecs-tasks.amazonaws.com" }, Action = "sts:AssumeRole" }]
   })
+  tags = { Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 # Its state object; the fleet secrets; GPU hosts and EC2 tiles from their templates only, tagged at launch, and terminated
@@ -796,7 +867,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Sid      = "StateObject"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}" # FLEET_STATE_KEY
       },
       {
         # Without ListBucket, S3 answers a read of a missing object with 403, which the coordinator must treat as an error;
@@ -1026,6 +1097,40 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
   })
 }
 
+# Keep version recovery in a managed policy: the task role's inline policies are near IAM's 10,240-character limit.
+resource "aws_iam_policy" "fcvm_fleet_state_recovery" {
+  provider    = aws.fcvm_fleet
+  name        = "fcvm-fleet-coordinator-state-recovery"
+  description = "Read earlier versions of the staging coordinator's state object."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # When state.json does not parse, the coordinator reads an earlier version of that one object (GetObject with a versionId).
+        Sid      = "StateObjectEarlierVersions"
+        Effect   = "Allow"
+        Action   = "s3:GetObjectVersion"
+        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json" # FLEET_STATE_KEY
+      },
+      {
+        # ListObjectVersions with prefix=state.json authorizes as s3:ListBucketVersions on the bucket; the condition keeps
+        # the listing to the state key.
+        Sid       = "StateObjectVersionList"
+        Effect    = "Allow"
+        Action    = "s3:ListBucketVersions"
+        Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
+        Condition = { StringEquals = { "s3:prefix" = "state.json" } } # FLEET_STATE_KEY
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_state_recovery" {
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_state_recovery.arn
+}
+
 # The existing coordinator role is near its aggregate inline policy limit.
 # Keep the Java grant separate. CreateFleet authorizes template resources via
 # RunInstances; the group must come from the Virginia x86 template, not an override.
@@ -1054,6 +1159,74 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java" {
   count      = length(aws_iam_policy.fcvm_fleet_coordinator_java)
   role       = aws_iam_role.fcvm_fleet_coordinator_task.name
   policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn
+}
+
+# Each stack's coordinator acts only on its own stack (ejc3/fcvm fleet production plan, invariant I2): the task role's
+# grants above reach any fleet instance by its Purpose tag, and these denies add the stack's Fleet tag, on the instance
+# a call acts on and on the instance a launch creates. Every coordinator image since ejc3/fcvm 8c96e28e (tiles) and
+# b5c06293 (hosts) tags its launches Fleet=<--fleet-name>, and every instance it acts on it found by that tag. A separate
+# managed policy, because the inline policy is at its aggregate size limit.
+resource "aws_iam_policy" "fcvm_fleet_stack_scope" {
+  for_each    = local.fcvm_fleet_stacks
+  provider    = aws.fcvm_fleet
+  name        = "fcvm-fleet-${each.key}-scope"
+  description = "The ${each.key} fleet coordinator may launch, start, stop, retag, terminate and cancel only what is tagged Fleet=${each.value.fleet}"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # StringNotEquals also holds for an instance with no Fleet tag, so an untagged instance is out of reach too.
+        Sid       = "OnlyThisStacksInstances"
+        Effect    = "Deny"
+        Action    = ["ec2:TerminateInstances", "ec2:StopInstances", "ec2:StartInstances"]
+        Resource  = "arn:aws:ec2:*:*:instance/*"
+        Condition = { StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet } }
+      },
+      {
+        # The pool's retags (FleetPool, FleetTile). Tags a launch writes are the launch's, checked below.
+        Sid      = "RetagOnlyThisStacksInstances"
+        Effect   = "Deny"
+        Action   = ["ec2:CreateTags", "ec2:DeleteTags"]
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet }
+          Null            = { "ec2:CreateAction" = "true" }
+        }
+      },
+      {
+        # Tiles (RunInstances) and hosts (CreateFleet, whose instances are authorized as RunInstances).
+        Sid       = "LaunchOnlyThisStacksInstances"
+        Effect    = "Deny"
+        Action    = "ec2:RunInstances"
+        Resource  = "arn:aws:ec2:*:*:instance/*"
+        Condition = { StringNotEquals = { "aws:RequestTag/Fleet" = each.value.fleet } }
+      },
+      {
+        # A pool tile's persistent spot request is cancelled before its instance is terminated. The pool template tags
+        # new requests with the stack; a stack with requests from before that (untagged_spot_requests) may still cancel
+        # an untagged one, never one tagged for another stack.
+        Sid      = "CancelOnlyThisStacksSpotRequests"
+        Effect   = "Deny"
+        Action   = "ec2:CancelSpotInstanceRequests"
+        Resource = "arn:aws:ec2:*:*:spot-instances-request/*"
+        Condition = merge(
+          { StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet } },
+          [for _ in(each.value.untagged_spot_requests ? [1] : []) : { Null = { "ec2:ResourceTag/Fleet" = "false" } }]...
+        )
+      },
+    ]
+  })
+  tags = { Fleet = each.value.fleet }
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_stack_scope" {
+  for_each   = local.fcvm_fleet_stack_coordinator_roles
+  provider   = aws.fcvm_fleet
+  role       = each.value
+  policy_arn = aws_iam_policy.fcvm_fleet_stack_scope[each.key].arn
+  # The launch deny reads the Fleet tag of the launch request, which includes the template's instance tags: attach it
+  # only once every template carries the stack's tag.
+  depends_on = [module.fcvm_fleet_east2, module.fcvm_fleet_west2, module.fcvm_fleet_east1]
 }
 
 resource "aws_security_group" "fcvm_fleet_coordinator" {
@@ -1123,7 +1296,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
   # The release function changes only the image and records its digest in the
   # release parameter. Track that revision without ignoring infrastructure drift.
   track_latest = true
-  tags         = { Project = "fcvm-fleet" }
+  tags         = { Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
 
   runtime_platform {
     operating_system_family = "LINUX"
@@ -1149,7 +1322,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]
       environment = [
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
-        { name = "FLEET_STATE_KEY", value = "state.json" },
+        { name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
         { name = "FLEET_HOST_TEMPLATES", value = join(",", local.fcvm_fleet_host_templates) },
         { name = "FLEET_HOST_SUBNETS", value = join(",", local.fcvm_fleet_host_subnets) },
@@ -1244,6 +1417,8 @@ resource "aws_ecs_service" "fcvm_fleet_coordinator" {
     container_port   = local.fcvm_fleet_dns_port
   }
   health_check_grace_period_seconds = 60
+
+  tags = { Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 output "fcvm_fleet_infra" {

@@ -22,6 +22,9 @@
 #   g4dn.metal, and a spot launch there failed with InvalidFleetConfiguration (2026-10-24).
 # - EC2 tiles: a launch template per architecture (g4dn.xlarge, g5g.xlarge) with one IPv6 address; no group, since the
 #   coordinator launches and terminates tiles itself (its task role is limited to these templates).
+# - Stack: every template, and every instance and spot request one launches, is tagged Fleet = var.fleet. A stack's
+#   coordinator may act only on instances and spot requests that carry its own Fleet tag (fcvm-fleet.tf,
+#   aws_iam_policy.fcvm_fleet_stack_scope).
 
 terraform {
   required_providers {
@@ -30,6 +33,16 @@ terraform {
       version = "~> 6.0"
     }
   }
+}
+
+variable "fleet" {
+  description = "The fleet stack these templates launch for: the Fleet tag on every instance, spot request and template, which scopes the stack's coordinator (fcvm-fleet.tf, local.fcvm_fleet_stacks)"
+  type        = string
+}
+
+variable "name_prefix" {
+  description = "The stack's name prefix: its launch templates are <prefix>-host-<arch>, <prefix>-tile-<arch>, <prefix>-tile-on-demand-<arch> and <prefix>-tile-pool-<arch>"
+  type        = string
 }
 
 variable "cidr_block" {
@@ -492,7 +505,7 @@ resource "aws_launch_template" "host" {
   depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
   update_default_version = true
   for_each               = toset(local.host_archs)
-  name                   = "fcvm-fleet-host-${each.key}"
+  name                   = "${var.name_prefix}-host-${each.key}"
   description            = "fcvm fleet GPU host, ${each.key} (${local.host_types[each.key]}): the fleet AMI, a delegated IPv6 /80, IMDSv2 hop 1"
   image_id               = var.gpu_amis[each.key]
   instance_type          = local.host_types[each.key]
@@ -538,10 +551,10 @@ resource "aws_launch_template" "host" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = { Name = "fcvm-fleet-host", Purpose = "fcvm-fleet-host" }
+    tags          = { Name = "fcvm-fleet-host", Purpose = "fcvm-fleet-host", Fleet = var.fleet }
   }
 
-  tags = { Name = "fcvm-fleet-host-${each.key}" }
+  tags = { Name = "${var.name_prefix}-host-${each.key}", Fleet = var.fleet }
 
   lifecycle {
     ignore_changes = [description]
@@ -614,7 +627,7 @@ resource "aws_launch_template" "tile" {
   depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
   update_default_version = true
   for_each               = toset(local.tile_archs)
-  name                   = "fcvm-fleet-tile-${each.key}"
+  name                   = "${var.name_prefix}-tile-${each.key}"
   description            = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): launched by the coordinator"
   image_id               = var.tile_amis[each.key]
   instance_type          = local.tile_types[each.key]
@@ -658,10 +671,10 @@ resource "aws_launch_template" "tile" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile", Fleet = var.fleet }
   }
 
-  tags = { Name = "fcvm-fleet-tile-${each.key}" }
+  tags = { Name = "${var.name_prefix}-tile-${each.key}", Fleet = var.fleet }
 
   lifecycle {
     ignore_changes = [description]
@@ -675,7 +688,7 @@ resource "aws_launch_template" "tile_on_demand" {
   depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
   update_default_version = true
   for_each               = toset(local.tile_archs)
-  name                   = "fcvm-fleet-tile-on-demand-${each.key}"
+  name                   = "${var.name_prefix}-tile-on-demand-${each.key}"
   description            = "fcvm fleet EC2 comparison tile on demand, ${each.key} (${local.tile_types[each.key]}): the coordinator's fallback"
   image_id               = var.tile_amis[each.key]
   instance_type          = local.tile_types[each.key]
@@ -711,10 +724,10 @@ resource "aws_launch_template" "tile_on_demand" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile", Fleet = var.fleet }
   }
 
-  tags = { Name = "fcvm-fleet-tile-on-demand-${each.key}" }
+  tags = { Name = "${var.name_prefix}-tile-on-demand-${each.key}", Fleet = var.fleet }
 
   lifecycle {
     ignore_changes = [description]
@@ -731,7 +744,7 @@ resource "aws_launch_template" "tile_pool" {
   depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
   update_default_version = true
   for_each               = toset(local.tile_archs)
-  name                   = "fcvm-fleet-tile-pool-${each.key}"
+  name                   = "${var.name_prefix}-tile-pool-${each.key}"
   description            = "fcvm fleet EC2 comparison tile, ${each.key} (${local.tile_types[each.key]}): persistent spot, stopped between wakes"
   image_id               = var.tile_amis[each.key]
   instance_type          = local.tile_types[each.key]
@@ -775,15 +788,15 @@ resource "aws_launch_template" "tile_pool" {
 
   tag_specifications {
     resource_type = "instance"
-    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile", Fleet = var.fleet }
   }
 
   tag_specifications {
     resource_type = "spot-instances-request"
-    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }
+    tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile", Fleet = var.fleet }
   }
 
-  tags = { Name = "fcvm-fleet-tile-pool-${each.key}" }
+  tags = { Name = "${var.name_prefix}-tile-pool-${each.key}", Fleet = var.fleet }
 
   lifecycle {
     ignore_changes = [description]

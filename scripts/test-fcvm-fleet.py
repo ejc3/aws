@@ -880,10 +880,28 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn(":latest", td)
 
 
+class StateBucketLifecycleTests(unittest.TestCase):
+    def test_noncurrent_state_versions_expire_after_a_week_keeping_the_newest_hundred(self):
+        life = block('resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state"')
+        self.assertIn("bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id", life)
+        rules = re.findall(r"^  rule \{\n(.*?)^  \}$", life, re.M | re.S)
+        self.assertEqual(len(rules), 2)
+        versions, uploads = rules
+        self.assertIn('id     = "expire-old-state-versions"', versions)
+        self.assertRegex(versions, r'filter \{\s*prefix = "state\.json"\s*\}')
+        self.assertRegex(versions, r"noncurrent_days\s+= 7\n")
+        self.assertRegex(versions, r"newer_noncurrent_versions = 100\n")
+        self.assertIn("filter {}", uploads)
+        self.assertRegex(uploads, r"abort_incomplete_multipart_upload \{\s*days_after_initiation = 1\s*\}")
+        self.assertNotIn("noncurrent_version_expiration", uploads)
+        self.assertNotRegex(life, r"(?m)^\s*expiration \{", "the current state object must never expire")
+
+
 class SecretTests(unittest.TestCase):
     def test_only_the_certificate_container_is_created_here(self):
-        names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= "([^"]+)"', TF, re.S)
-        self.assertEqual(names, ["fcvm-fleet/tls-wildcard"])
+        names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
+        self.assertEqual(names, ["local.fcvm_fleet_stage.tls_secret"])
+        self.assertRegex(TF, r'\btls_secret\s+= "fcvm-fleet/tls-wildcard"')
         self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
 
     def test_hosts_and_tiles_read_only_what_they_need(self):
@@ -922,7 +940,7 @@ class CoordinatorLaunchSplit(unittest.TestCase):
         self.assertNotIn('"ec2:LaunchTemplate"', spot)
 
     def test_state_object_secrets_and_spot_role(self):
-        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', self.TF)
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}"', self.TF)
         secrets = self.stmt("FleetSecrets")
         self.assertIn('cloudflare-dns-token', secrets)
         self.assertIn('tls-wildcard', secrets)
@@ -1005,8 +1023,8 @@ class CoordinatorScaleStateAndFallback(unittest.TestCase):
         spot = block('resource "aws_launch_template" "tile"', MOD)
         self.assertNotIn("instance_market_options", od)
         self.assertIn("instance_market_options", spot)
-        self.assertRegex(od, r'name\s*=\s*"fcvm-fleet-tile-on-demand-\$\{each\.key\}"')
-        self.assertIn('tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile" }', od)
+        self.assertRegex(od, r'name\s*=\s*"\$\{var\.name_prefix\}-tile-on-demand-\$\{each\.key\}"')
+        self.assertIn('tags          = { Name = "fcvm-fleet-tile", Purpose = "fcvm-fleet-tile", Fleet = var.fleet }', od)
         for part in ("iam_instance_profile", "http_tokens                 = \"required\"", "ipv6_address_count          = 1"):
             self.assertIn(part, od, part)
         self.assertIn("[for t in aws_launch_template.tile_on_demand : t.arn]", block('output "tile_template_arns"', MOD))
@@ -1053,7 +1071,7 @@ class TilePool(unittest.TestCase):
             self.assertNotIn('Resource = "*"', s)
 
     def test_the_coordinator_gets_the_pool_flags_only_behind_the_switch(self):
-        self.assertIn('local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "fcvm-fleet-tile-pool-x86_64"] : []', self.TF)
+        self.assertIn('local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "${local.fcvm_fleet_stage.prefix}-tile-pool-x86_64"] : []', self.TF)
 
 
 class ModuleDependencies(unittest.TestCase):
@@ -1134,8 +1152,9 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
     def test_the_coordinator_takes_forwarded_viewer_addresses_only_behind_required_access(self):
-        # The coordinator reads x-fleet-viewer-ip on a service-token request without verifying the JWT itself; the
-        # tunnel connector's access.required is what does.
+        # The coordinator honours x-fleet-viewer-ip only for a service token whose JWT it verifies itself
+        # (test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits); the tunnel connector's access.required
+        # stays in front of it.
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
         self.assertIn('"--access-viewer-address"', cmd)
         dev = (ROOT / "fcvm-dev.tf").read_text()
@@ -1145,6 +1164,31 @@ class StageWallTests(unittest.TestCase):
         api, direct = tunnel.split("hostname = local.fcvm_dev_direct_stage_host", 1)
         self.assertIn("required  = true", api)
         self.assertIn("required  = true", direct)
+
+    def test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits(self):
+        # ejc3/fcvm c74ee76 (fleet/PROTOCOL.md, --access-team-domain): the coordinator checks each Access JWT's
+        # signature, issuer, audience and expiry itself. /live takes the viewer applications' audiences, /agent only
+        # the agents' application, so a token for one is never accepted on the other.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        app = "cloudflare_zero_trust_access_application"
+        self.assertIn('"--access-team-domain", trimprefix(local.browser_manager_issuer, "https://")', cmd)
+        live = re.findall(r'"--access-aud", (\S+?\.aud)\b', cmd)
+        agent = re.findall(r'"--agent-access-aud", (\S+?\.aud)\b', cmd)
+        self.assertEqual(sorted(live), [f"{app}.fcvm_dev_api_stage.aud", f"{app}.fcvm_dev_site_stage.aud"], cmd)
+        self.assertEqual(agent, [f"{app}.fcvm_dev_agent.aud"], cmd)
+        # Every audience the tunnel connector admits to the coordinator is one the coordinator verifies, on the side
+        # its route serves: a new Access application in front of the coordinator needs its flag here too.
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
+        tunnel = tunnel[:tunnel.index("\n}\n")]
+        admitted = [a.strip() for tags in re.findall(r"aud_tag\s*=\s*\[([^\]]*)\]", tunnel) for a in tags.split(",")]
+        self.assertEqual(sorted(admitted), sorted(live + agent))
+        # The team the tokens are checked against is the team the connector names.
+        teams = set(re.findall(r'team_name\s*=\s*"([^"]+)"', tunnel))
+        issuer = re.search(r'browser_manager_issuer\s*=\s*"([^"]+)"', (ROOT / "browser-manager.tf").read_text()).group(1)
+        self.assertEqual({f"https://{t}.cloudflareaccess.com" for t in teams}, {issuer})
+        # Staging viewers all pass Access, so they count as verified; Turnstile is the production stack's.
+        self.assertNotIn("--turnstile", cmd)
 
     def test_the_coordinator_forces_sleep_at_a_750_dollar_daily_spend_ceiling(self):
         # Owner, 2026-11-18: $750 a day at the Spot price, forced sleep. The meter reads DescribeInstances and
@@ -1404,6 +1448,168 @@ class BroadcastTests(unittest.TestCase):
             "aws_secretsmanager_secret_version.fcvm_fleet_broadcast",
             "aws_iam_role_policy_attachment.fcvm_fleet_coordinator_broadcast",
         })
+
+
+class StackScopeTests(unittest.TestCase):
+    """Staging is one stack of the fleet, scoped by its Fleet tag, so a second stack (production, fcvm.dev) in the same
+    account can be added beside it: no staging credential may launch, stop, start, retag, terminate or cancel what
+    another stack's coordinator launched, and the reverse (ejc3/fcvm fleet production plan, invariant I2)."""
+
+    def stacks(self):
+        return TF.split("fcvm_fleet_stacks = {", 1)[1].split("\n  }\n", 1)[0]
+
+    def scope(self):
+        return block('resource "aws_iam_policy" "fcvm_fleet_stack_scope"')
+
+    def deny(self, sid):
+        pol = self.scope()
+        parts = re.split(r'Sid +="%s"' % sid, pol.replace('= "', '="'), maxsplit=1)
+        self.assertEqual(len(parts), 2, sid)
+        # Without terraform fmt's alignment, so an assertion reads "Key = value".
+        return re.sub(r"(\w) +=", r"\1 =", parts[1].split("\n      },", 1)[0].replace('="', '= "'))
+
+    def test_the_stage_stack_keeps_the_names_staging_already_has(self):
+        stage = self.stacks().split("stage = {", 1)[1].split("\n    }", 1)[0]
+        self.assertRegex(stage, r'\bfleet\s+= "stage"')
+        self.assertRegex(stage, r'\bprefix\s+= "fcvm-fleet"')
+        self.assertRegex(stage, r'\btls_secret\s+= "fcvm-fleet/tls-wildcard"')
+        self.assertRegex(stage, r'\bstate_key\s+= "state.json"')
+        self.assertRegex(stage, r"\buntagged_spot_requests\s+= true")
+        self.assertIn("fcvm_fleet_stage = local.fcvm_fleet_stacks.stage", TF)
+        tls = block('resource "aws_secretsmanager_secret" "fcvm_fleet_tls"')
+        self.assertRegex(tls, r"\bname\s+= local\.fcvm_fleet_stage\.tls_secret\n")
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}"',
+                      block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
+        self.assertIn('{ name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key }',
+                      block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"'))
+
+    def test_the_coordinator_is_given_its_stack_as_its_fleet_name(self):
+        # ejc3/fcvm src/cli/args.rs: --fleet-name (FLEET_NAME, default "stage") is the Fleet tag the coordinator sets on
+        # every tile (RunInstances) and host (CreateFleet) it launches and filters DescribeInstances by: the sweep, the
+        # agent identity check and the spend meter's listing and Fleet metric dimension.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--fleet-name", local.fcvm_fleet_stage.fleet]', cmd)
+        for template in ("tile", "tile-on-demand", "tile-pool"):
+            self.assertIn('"${local.fcvm_fleet_stage.prefix}-%s-x86_64"' % template, cmd)
+        self.assertNotIn('"fcvm-fleet-tile', cmd)
+
+    def test_every_launch_template_tags_what_it_launches_with_the_stack(self):
+        for name in ("east2", "west2", "east1"):
+            mod = block('module "fcvm_fleet_%s"' % name)
+            self.assertRegex(mod, r"\n  fleet\s+= local\.fcvm_fleet_stage\.fleet\n", name)
+            self.assertRegex(mod, r"\n  name_prefix\s+= local\.fcvm_fleet_stage\.prefix\n", name)
+        for kind, purpose in (("host", "host"), ("tile", "tile"), ("tile_on_demand", "tile"), ("tile_pool", "tile")):
+            lt = block('resource "aws_launch_template" "%s"' % kind, MOD)
+            specs = re.findall(r"  tag_specifications \{\n(.*?)\n  \}", lt, re.S)
+            self.assertEqual(len(specs), 2 if kind == "tile_pool" else 1, kind)
+            for spec in specs:
+                self.assertIn('Purpose = "fcvm-fleet-%s", Fleet = var.fleet }' % purpose, spec)
+            self.assertRegex(lt, r'\n  name\s+= "\$\{var\.name_prefix\}-%s-\$\{each\.key\}"' % kind.replace("_", "-"))
+            self.assertIn('tags = { Name = "${var.name_prefix}-%s-${each.key}", Fleet = var.fleet }' % kind.replace("_", "-"), lt)
+
+    def test_the_coordinator_touches_only_its_own_stacks_instances(self):
+        pol = self.scope()
+        self.assertRegex(pol, r"\n  for_each\s+= local\.fcvm_fleet_stacks\n")
+        self.assertEqual(len(re.findall(r'Effect\s+= "Deny"', pol)), 4, pol)
+        self.assertNotRegex(pol, r'Effect\s+= "Allow"')
+        touch = self.deny("OnlyThisStacksInstances")
+        self.assertIn('Action = ["ec2:TerminateInstances", "ec2:StopInstances", "ec2:StartInstances"]', touch)
+        self.assertIn('Resource = "arn:aws:ec2:*:*:instance/*"', touch)
+        # StringNotEquals is true for an instance with no Fleet tag: a staging credential cannot act on it either.
+        self.assertIn('Condition = { StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet } }', touch)
+        retag = self.deny("RetagOnlyThisStacksInstances")
+        self.assertIn('Action = ["ec2:CreateTags", "ec2:DeleteTags"]', retag)
+        self.assertIn('StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet }', retag)
+        # Tags written by a launch are the launch's (LaunchOnlyThisStacksInstances), not a retag.
+        self.assertIn('Null = { "ec2:CreateAction" = "true" }', retag)
+        launch = self.deny("LaunchOnlyThisStacksInstances")
+        self.assertIn('Action = "ec2:RunInstances"', launch)
+        self.assertIn('Resource = "arn:aws:ec2:*:*:instance/*"', launch)
+        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Fleet" = each.value.fleet } }', launch)
+        cancel = self.deny("CancelOnlyThisStacksSpotRequests")
+        self.assertIn('Action = "ec2:CancelSpotInstanceRequests"', cancel)
+        self.assertIn('Resource = "arn:aws:ec2:*:*:spot-instances-request/*"', cancel)
+        self.assertIn('{ StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet } }', cancel)
+        # The pool's persistent spot requests from before the pool template tagged them Fleet: only a stack that has
+        # them (untagged_spot_requests) may cancel an untagged one; a request tagged for another stack is always denied.
+        self.assertIn('[for _ in(each.value.untagged_spot_requests ? [1] : []) : { Null = { "ec2:ResourceTag/Fleet" = "false" } }]...',
+                      cancel)
+
+    def test_the_scope_policy_is_attached_to_the_stacks_coordinator_after_its_templates_tag_the_stack(self):
+        att = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_stack_scope"')
+        self.assertRegex(att, r"\n  for_each\s+= local\.fcvm_fleet_stack_coordinator_roles\n")
+        self.assertIn("role       = each.value", att)
+        self.assertIn("policy_arn = aws_iam_policy.fcvm_fleet_stack_scope[each.key].arn", att)
+        self.assertIn("fcvm_fleet_stack_coordinator_roles = { stage = aws_iam_role.fcvm_fleet_coordinator_task.name }", TF)
+        # The deny on launches must not take effect before the templates carry the Fleet tag.
+        self.assertRegex(att, r"depends_on = \[module\.fcvm_fleet_east2, module\.fcvm_fleet_west2, module\.fcvm_fleet_east1\]")
+        # The coordinator's inline policy is at its size limit: the scope adds nothing to it.
+        self.assertNotIn('/Fleet"', block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
+
+    def test_what_the_stack_owns_carries_its_fleet_tag(self):
+        for header in ('resource "aws_iam_role" "fcvm_fleet_host"', 'resource "aws_iam_role" "fcvm_fleet_tile"',
+                       'resource "aws_iam_role" "fcvm_fleet_coordinator_execution"',
+                       'resource "aws_iam_role" "fcvm_fleet_coordinator_task"',
+                       'resource "aws_secretsmanager_secret" "fcvm_fleet_tls"',
+                       'resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"',
+                       'resource "aws_ecs_service" "fcvm_fleet_coordinator"'):
+            self.assertRegex(block(header), r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet", header)
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        for name in ("fcvm_fleet_dns_token", "fcvm_fleet_coordinator_tunnel", "fcvm_fleet_agent_access"):
+            self.assertRegex(block('resource "aws_secretsmanager_secret" "%s"' % name, dev),
+                             r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet", name)
+        bc = (ROOT / "fcvm-fleet-broadcast.tf").read_text()
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_broadcast"', bc),
+                         r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet")
+
+
+class StateVersionRecoveryTests(unittest.TestCase):
+    """ejc3/fcvm#1951: the coordinator reads an earlier version of state.json when the current one does not parse, and
+    logs two markers that page through the fleet's alert path."""
+    def test_the_role_reads_versions_of_the_state_object_and_lists_versions_of_its_bucket_only(self):
+        recovery = block('resource "aws_iam_policy" "fcvm_fleet_state_recovery"')
+        self.assertEqual(re.findall(r'Action\s+= "([^"]+)"', recovery), ["s3:GetObjectVersion", "s3:ListBucketVersions"])
+        get, listing = recovery.split('Sid       = "StateObjectVersionList"')
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/state.json"', get)
+        self.assertIn("Resource  = aws_s3_bucket.fcvm_fleet_coordinator_state.arn\n", listing)
+        self.assertIn('"s3:prefix" = "state.json"', listing)
+        self.assertNotIn("*", recovery)
+
+    def test_state_recovery_is_attached_without_using_the_roles_inline_policy_quota(self):
+        inline = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        for action in ('"s3:GetObjectVersion"', '"s3:ListBucketVersions"'):
+            self.assertNotIn(action, inline)
+            self.assertEqual(TF.count(action), 1)
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_state_recovery"')
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_coordinator_task.name", attachment)
+        self.assertIn("policy_arn = aws_iam_policy.fcvm_fleet_state_recovery.arn", attachment)
+
+    def test_both_state_markers_alarm_into_the_on_demand_alarms_forwarder(self):
+        for name, metric, marker in (("fcvm-fleet-state-write-lost", "StateWriteLost", "FLEET_STATE_WRITE_LOST"),
+                                     ("fcvm-fleet-state-unreadable", "StateUnreadable", "FLEET_STATE_UNREADABLE")):
+            entry = ALARMS.split(f'"{name}" = {{', 1)[1].split("\n    }", 1)[0]
+            self.assertIn(f'metric = "{metric}"', entry)
+            self.assertIn('pattern     = "\\"%s\\""' % marker, entry)
+            self.assertIn("periods     = 1", entry)
+            revision, source = (ROOT / "scripts/fixtures/fcvm-coordinator-log-lines.txt").read_text().split("\n", 1)
+            self.assertIn('"%s"' % marker, source, f"{marker} is missing from ejc3/fcvm at {revision}")
+            self.assertIn(f'"{name}"', ALARMS.split("fcvm_fleet_health_alarm_names", 1)[0])
+        # The shared resources give each entry the on-demand alarm's namespace, forwarder, 5-minute Sum >= 1 and
+        # not-breaching treatment of missing data.
+        alarm = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_health_logs"', ALARMS)
+        for line in ('comparison_operator = "GreaterThanOrEqualToThreshold"', 'statistic           = "Sum"',
+                     "period              = 300", "threshold           = 1", 'treat_missing_data  = "notBreaching"',
+                     "alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]"):
+            self.assertIn(line, alarm)
+        metric_filter = block('resource "aws_cloudwatch_log_metric_filter" "fcvm_fleet_health"', ALARMS)
+        self.assertIn('namespace     = "FCVM/Fleet"', metric_filter)
+        self.assertIn("log_group_name = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name", metric_filter)
+        on_demand = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_on_demand_launches"')
+        self.assertIn("alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]", on_demand)
+        # The forwarder is allowed to be invoked by, and publishes for, every alarm of the map.
+        self.assertIn("values(local.fcvm_fleet_health_alarm_arns)", TF)
+        self.assertIn("for_each       = local.fcvm_fleet_health_alarm_arns",
+                      block('resource "aws_lambda_permission" "fcvm_fleet_health_alarms"', ALARMS))
 
 
 if __name__ == "__main__":
