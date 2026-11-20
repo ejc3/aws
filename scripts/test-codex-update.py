@@ -20,8 +20,39 @@ CODE = re.sub(r"(?m)^\s*#.*$", "", TF)   # comments may say "root" and "restart"
 
 class CodexUpdateTests(unittest.TestCase):
     def test_the_installer_runs_as_ubuntu_not_root(self):
-        self.assertRegex(CODE, r"runuser -u ubuntu -- env HOME=/home/ubuntu [^\n]*\\\n\s+sh -c 'cd /home/ubuntu && curl -fsSL https://chatgpt.com/codex/install.sh \| sh'")
-        self.assertNotRegex(CODE, r"curl[^\n]*\|\s*(sudo )?(ba)?sh(?!')", "no piping a download into a root shell")
+        self.assertIn("after=$(runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin sh -eu <<'CODEX_INSTALL'", TF)
+        self.assertNotRegex(CODE, r"curl[^\n]*\|\s*(sudo )?(ba)?sh")
+
+    def test_incomplete_download_bad_installer_and_unusable_cli_fail_delivery(self):
+        start = "sh -eu <<'CODEX_INSTALL'\n"
+        setup = textwrap.dedent(TF.split(start, 1)[1].split("    CODEX_INSTALL\n", 1)[0])
+        self.assertIn(') || { echo "codex update FAILED (download, installer, or version check)" >&2; exit 1; }', TF)
+        with tempfile.TemporaryDirectory() as folder:
+            home = Path(folder)
+            cli = home / ".local/bin/codex"
+            cli.parent.mkdir(parents=True)
+            def shell_file(path, code):
+                path.write_text("#!/bin/sh\n" + code + "\n")
+                path.chmod(0o755)
+            shell_file(cli, 'echo "codex-cli 1.2.3"')
+            shell_file(home / "curl", """while [ "$1" != "-o" ]; do shift; done
+printf '%s' "$MOCK_INSTALLER" > "$2"
+exit "$MOCK_DOWNLOAD_STATUS" """)
+            for status, installer in [(1, "touch ran"), (0, ""), (0, "exit 5"), (0, "rm -f .local/bin/codex")]:
+                with self.subTest(status=status, installer=installer):
+                    env = dict(os.environ, HOME=folder, PATH=f"{folder}:/usr/bin:/bin",
+                               MOCK_INSTALLER=installer, MOCK_DOWNLOAD_STATUS=str(status))
+                    result = subprocess.run(["sh", "-eu"], input=setup, text=True, env=env, capture_output=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse((home / "ran").exists(), "an incomplete installer ran")
+            env.update(MOCK_INSTALLER=":", MOCK_DOWNLOAD_STATUS="0")
+            for reported, ok in [("", False), ("invalid", False), ("codex-cli 1.2.3", True)]:
+                with self.subTest(reported=reported):
+                    shell_file(cli, f'echo "{reported}"')
+                    result = subprocess.run(["sh", "-eu"], input=setup, text=True, env=env, capture_output=True)
+                    self.assertEqual(result.returncode == 0, ok)
+                    if ok:
+                        self.assertEqual(result.stdout.strip(), reported)
 
     def test_it_refreshes_but_never_restarts(self):
         for word in ("systemctl", "codex-restart --restart", "remote-control stop", "kill", "reboot"):

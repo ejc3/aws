@@ -12,7 +12,7 @@
 # HOW. One weekly SSM State Manager association per enabled host: Run Command on a schedule, no key on disk, no
 # service on the box, and the permitted admin -> box direction. The installer runs as ubuntu,
 # never as root (the jumpboxes must not host a root service that re-runs a downloaded script,
-# dev-selfupdate.tf), and writes only under ~/.codex and ~/.local/bin. The same command installs
+# dev-selfupdate.tf). Its per-user shell adjustment only selects the managed Codex tools. The same command installs
 # /usr/local/bin/codex-restart, so the jumpboxes have it too (the dev boxes get it at boot,
 # dev-selfupdate.tf).
 #
@@ -32,28 +32,36 @@ locals {
   )
 
   codex_update_commands = <<-CMD
-    set -u
+    set -eu
     echo ${base64encode(file("${path.module}/scripts/codex-restart.sh"))} | base64 -d > /usr/local/bin/codex-restart.new
-    chmod 755 /usr/local/bin/codex-restart.new && mv -f /usr/local/bin/codex-restart.new /usr/local/bin/codex-restart
+    chmod 755 /usr/local/bin/codex-restart.new
+    mv -f /usr/local/bin/codex-restart.new /usr/local/bin/codex-restart
     # As ubuntu, from a directory it can read: from elsewhere the installer dies in `find` after
     # creating releases/ but before current/ (codex-remote-control.tf).
-    before=$(runuser -u ubuntu -- /home/ubuntu/.local/bin/codex --version 2>/dev/null | head -1)
-    runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin \
-      sh -c 'cd /home/ubuntu && curl -fsSL https://chatgpt.com/codex/install.sh | sh' >/dev/null 2>&1 \
-      || { echo "codex update FAILED (installer)"; exit 1; }
-    # An SSH command reads .zshenv, not .zshrc. Correct a shadowing global npm install only for ubuntu.
+    before=$(runuser -u ubuntu -- /home/ubuntu/.local/bin/codex --version 2>/dev/null) || before=""
+    after=$(runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin sh -eu <<'CODEX_INSTALL'
+    cd "$HOME"
+    installer=$(mktemp)
+    trap 'rm -f -- "$installer"' EXIT
+    curl -fsSL -o "$installer" https://chatgpt.com/codex/install.sh
+    test -s "$installer"
+    sh "$installer" >/dev/null
+    version=$("$HOME/.local/bin/codex" --version)
+    printf '%s\n' "$version" | grep -Ex 'codex-cli [0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?'
+    CODEX_INSTALL
+    ) || { echo "codex update FAILED (download, installer, or version check)" >&2; exit 1; }
+    # Noninteractive zsh reads .zshenv. Give ubuntu the managed command when it is missing or a system npm copy wins.
     runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin sh -eu <<'CODEX_ZSH_PATH' || exit 1
     codex_bin="$HOME/.codex/packages/standalone/current/bin"
     if command -v zsh >/dev/null && [ -x "$codex_bin/codex" ]; then
-      if zsh -c '[[ "$(whence -p codex)" -ef /usr/bin/codex && ! /usr/bin/codex -ef "$HOME/.local/bin/codex" ]]'; then
-        line='if [[ -x "$HOME/.codex/packages/standalone/current/bin/codex" && "$(whence -p codex)" -ef /usr/bin/codex ]]; then path=("$HOME/.codex/packages/standalone/current/bin" $path); fi'
+      if zsh -c '! whence -p codex >/dev/null || [[ "$(whence -p codex)" -ef /usr/bin/codex && ! /usr/bin/codex -ef "$HOME/.local/bin/codex" ]]'; then
+        line='if [[ -x "$HOME/.codex/packages/standalone/current/bin/codex" ]] && { ! whence -p codex >/dev/null || [[ "$(whence -p codex)" -ef /usr/bin/codex ]]; }; then path=("$HOME/.codex/packages/standalone/current/bin" $path); fi'
         if ! grep -Fqx -- "$line" "$HOME/.zshenv" 2>/dev/null; then
           printf '\n%s\n' "$line" >> "$HOME/.zshenv"
         fi
       fi
     fi
     CODEX_ZSH_PATH
-    after=$(runuser -u ubuntu -- /home/ubuntu/.local/bin/codex --version 2>/dev/null | head -1)
     echo "codex: $${before:-none} -> $${after:-none}. A running daemon keeps its old binary until: codex-restart --restart"
   CMD
 }
