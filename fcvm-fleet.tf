@@ -102,6 +102,11 @@ locals {
   # The bootstrap image, before main-only CI's first release. Active releases are
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
+  # The most the fleet may spend in one UTC day (owner, 2026-11-18: $750 a day, metered at the Spot price, with forced
+  # sleep). The coordinator's meter (--daily-spend-usd, ejc3/fcvm#1960) puts the fleet to sleep at the ceiling. The AWS
+  # budget action from #905 (fcvm-fleet-budget.tf) stays as the backstop. The meter needs no new IAM: it calls
+  # ec2:DescribeInstances and ec2:DescribeSpotPriceHistory, both under the task role's ec2:Describe*.
+  fcvm_fleet_daily_spend_ceiling_usd = 750
   # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max       = 8
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
@@ -205,10 +210,19 @@ locals {
   # all of them arrive with the Worker's CF-Connecting-IP; the coordinator then keys such a request by the viewer address
   # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
   # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
+  # --access-team-domain and the audiences (ejc3/fcvm c74ee76): the coordinator verifies each Access JWT itself, not only
+  # the connector. /live takes the API application's tokens (the owner, CI, the Worker) and the page application's
+  # (fleet-api-direct-stage); the viewer address then counts only for a verified service token. /agent answers 403
+  # without the agents' service token. No Turnstile here: every staging viewer passes Access and so counts as verified.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    ["--access-team-domain", trimprefix(local.browser_manager_issuer, "https://"),
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud,
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_site_stage.aud,
+    "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent.aud],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
+    ["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)],
     # The stack's Fleet tag: on every tile and host it launches, and the only instances it lists, sweeps, admits an agent
     # from and meters (ejc3/fcvm src/cli/args.rs, --fleet-name). The task role's scope policy holds it to the same tag.
     ["--fleet-name", local.fcvm_fleet_stage.fleet],
@@ -333,6 +347,35 @@ resource "aws_s3_bucket_versioning" "fcvm_fleet_private" {
   versioning_configuration {
     status = "Enabled"
   }
+}
+
+# The coordinator rewrites state.json on every change, up to about once a second, so versioning adds up to ~86,000
+# noncurrent versions a day. Keep every version younger than 7 days and, past that, the newest 100, for recovering an
+# earlier state when the current one will not parse; S3 expires a noncurrent version only when both limits are passed.
+# S3 filters by prefix. Other keys (including the spending guard) keep their independent version history.
+resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {
+      prefix = "state.json"
+    }
+    noncurrent_version_expiration {
+      noncurrent_days           = 7
+      newer_noncurrent_versions = 100
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.fcvm_fleet_private]
 }
 
 resource "aws_s3_bucket_public_access_block" "fcvm_fleet_private" {
@@ -619,7 +662,7 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
 # execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
-# cannot change under it; the bootstrap image and the 20 newest are kept.
+# cannot change under it. While staging is the only consumer, retain the bootstrap image and 20 newest.
 resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
   provider             = aws.fcvm_fleet
   name                 = "fcvm-fleet/coordinator"
@@ -636,7 +679,7 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
   provider   = aws.fcvm_fleet
   repository = aws_ecr_repository.fcvm_fleet_coordinator.name
   policy = jsonencode({
-    rules = [{
+    rules = concat([{
       # A higher-priority tag match excludes the immutable bootstrap image from
       # the rolling rule, even after many releases. Exactly one image has this tag.
       rulePriority = 1
@@ -648,12 +691,13 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
         countNumber    = 1
       }
       action = { type = "expire" }
-      }, {
+      }], var.fcvm_fleet_prod_enabled ? [] : [{
+      # Production can still run or roll back to an older staging digest. ECR cannot read its pointers.
       rulePriority = 2
       description  = "Keep the 20 newest images"
       selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
       action       = { type = "expire" }
-    }]
+    }])
   })
 }
 

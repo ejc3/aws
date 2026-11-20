@@ -1893,6 +1893,20 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   that creates it. The $750/day backstop (`fcvm-fleet-budget.tf`) is per stack: staging's budget counts host and tile
   spend not tagged `Fleet=prod`, prod's (`fcvm-fleet-prod-daily`) spend tagged `Fleet=prod`, and the one reconciler
   blocks each stack's coordinator for its own budget only (`Fleet` is an active cost allocation tag for this).
+  Before production, the original `fcvm-fleet-daily` still drives staging's deny and alerts. The separate
+  `fcvm-fleet-stage-daily` collects scoped billing data in parallel. Before lifting the production guard in #922,
+  verify that its latest three complete UTC billing days have actuals matching staging's host and tile charges.
+  Activation switches the worker and its 80%/100% alerts together, keeping the original decision record. The
+  old budget retains its history with notifications disabled. Keep it through the rollback window.
+- **Production teardown.** While the production stack is still enabled, use a reviewed Terraform change to deny
+  `ec2:RunInstances`, `ec2:CreateFleet` and `ec2:StartInstances` on the production coordinator role. Keep this
+  deny independent of the daily budget reconciler. Let viewers disconnect and put the fleet to sleep. Inventory
+  production hosts and tiles in us-east-1 by VPC and `Fleet=prod`, including stopped pool tiles. For the approved
+  teardown, cancel their persistent Spot requests before terminating the instances. Wait for EC2 to show no open or
+  active production Spot requests, no nonterminated instances in the production VPC, and no worker ENIs in its subnets.
+  Preserve the coordinator, its grants and image digests until these checks pass. Then remove the production ECS
+  service's `prevent_destroy` guard in the reviewed teardown change, disable the stack and inspect the full plan.
+  Staging's shared ECR repository resumes its 20-image limit when production is disabled.
 - Not yet covered: security monitoring like the Dolphin account's.
 
 ### The astryx account (astryx-account.tf)

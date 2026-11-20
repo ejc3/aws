@@ -326,6 +326,15 @@ class RetryAndRemovalTests(Base):
 
 
 class CostTests(Base):
+    def test_filesystem_uuid_is_resolved_once_for_repositories_on_the_same_mount(self):
+        first = make_repo(self.home, "first")
+        second = make_repo(self.home, "second")
+        with mock.patch.object(ass, "filesystem_uuid", return_value="disk-A") as resolve:
+            self.scan()
+        self.assertEqual(resolve.call_count, 1)
+        self.assertIn(resolve.call_args.args[0], [str(first / ".git"), str(second / ".git")])
+        self.assertEqual([self.state.known[str(p)]["fs_uuid"] for p in (first, second)], ["disk-A", "disk-A"])
+
     def test_a_handled_repo_costs_no_deeper_check(self):
         self.scan()
         make_repo(self.home, "fresh")
@@ -440,6 +449,35 @@ class RebootTests(Base):
         self.active = []
         self.scan(now=2000, state=self.state_for("boot-B"))
         self.assertEqual(self.launcher.calls, [], "no session activity in 30 days: not reopened")
+
+    def test_legacy_device_renumbering_on_reboot_restores_only_the_active_claude_window(self):
+        idle = make_repo(self.home, "idle", marked=False)
+        self.scan(now=1010)
+        self.launcher.calls.clear()
+        self.active = [str(self.fresh)]
+        for repo in (self.fresh, idle):
+            st = (repo / ".git").stat()
+            entry = self.state.known[str(repo)]
+            entry["id"] = [st.st_dev + 1, st.st_ino]
+            entry.pop("fs_uuid", None)  # state written by the deployed watcher before the reboot
+        self.state.save()
+
+        self.scan(now=2000, state=self.state_for("boot-B"))
+        self.assertEqual(self.launcher.calls, [("claude", str(self.fresh))])
+        self.launcher.calls.clear()
+        self.scan(now=2100, state=self.state_for("boot-B"))
+        self.assertEqual(self.launcher.calls, [], "migration survives a same-boot service restart")
+
+    def test_a_replacement_clone_is_new_even_when_the_filesystem_was_renumbered_during_upgrade(self):
+        entry = self.state.known[str(self.fresh)]
+        entry.pop("fs_uuid", None)
+        entry["id"][0] += 1
+        self.state.save()
+        self.fresh.rename(Path(self.tmp) / "old-checkout")  # keep the old inode allocated
+        replacement = make_repo(self.home, self.fresh.name, marked=False)
+        self.assertNotEqual(entry["id"][1], (replacement / ".git").stat().st_ino)
+        self.scan(now=2000, state=self.state_for("boot-B"))
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(replacement)), ("codex", str(replacement))])
 
     def test_an_active_folder_that_is_not_allowed_is_not_launched(self):
         other = make_repo(self.home, "theirs", origin="https://github.com/someone-else/x", marked=False)
@@ -1286,6 +1324,40 @@ class ReplacementCloneTests(Base):
         self.assertIsNotNone(entry.get("id"), "the identity is recorded when the repo is first seen")
         entry["id"] = [entry["id"][0], entry["id"][1] + 7]                # what a replacement clone would look like
         self.scan(now=1010)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(self.repo)), ("codex", str(self.repo))])
+
+    def test_a_filesystem_uuid_survives_renumbering_but_distinguishes_disks_with_matching_inodes(self):
+        repo = str(self.repo)
+        self.state.known[repo].pop("fs_uuid", None)
+        with mock.patch.object(ass, "filesystem_uuid", return_value="disk-A"):
+            self.scan(now=1010)
+            self.assertEqual(self.launcher.calls, [])
+            entry = self.state.known[repo]
+            self.assertEqual(entry["fs_uuid"], "disk-A")
+            entry["id"][0] += 1
+            self.state.save()
+            state = ass.State(self.state.path, boot_id="next-boot")
+            self.scan(now=2000, state=state)
+            self.assertEqual(self.launcher.calls, [])
+        with mock.patch.object(ass, "filesystem_uuid", return_value="disk-B"):
+            self.scan(now=2100, state=state)
+        self.assertEqual(sorted(self.launcher.calls), [("claude", repo), ("codex", repo)])
+
+    def test_temporary_uuid_lookup_failure_preserves_the_last_verified_uuid(self):
+        entry = self.state.known[str(self.repo)]
+        entry["fs_uuid"] = "disk-A"
+        with mock.patch.object(ass, "filesystem_uuid", return_value=None):
+            self.scan(now=1010)
+        self.assertEqual(self.launcher.calls, [])
+        self.assertEqual(ass.State(self.state.path).known[str(self.repo)]["fs_uuid"], "disk-A")
+
+    def test_missing_uuid_still_detects_a_different_device_on_the_same_boot(self):
+        entry = self.state.known[str(self.repo)]
+        entry.pop("fs_uuid", None)
+        entry["id"][0] += 1
+        self.state.save()
+        with mock.patch.object(ass, "filesystem_uuid", return_value=None):
+            self.scan(now=1010, state=ass.State(self.state.path, boot_id=self.state.boot_id))
         self.assertEqual(sorted(self.launcher.calls), [("claude", str(self.repo)), ("codex", str(self.repo))])
 
     def test_ordinary_git_activity_does_not_make_a_checkout_new(self):
