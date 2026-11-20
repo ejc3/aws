@@ -179,6 +179,65 @@ class AuditTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not a SHA-256"):
             self.check({"v1": gone}, expect=["abc"])
 
+    def bundle(self, name, content):
+        path = self.directory / (name + ".pem")
+        path.write_text(content)
+        return path
+
+    def test_public_chain_completes_an_independent_inventory_only_with_real_revocation(self):
+        stored = self.leaf("stored", ["*.fcvm.dev"])
+        missing = self.leaf("public", ["*.fcvm.dev", "stage.fcvm.dev"])
+        # Build the independent manifest from the original DER using hashlib, outside the audit parser.
+        import hashlib
+        import ssl
+        digest = hashlib.sha256(ssl.PEM_cert_to_DER_cert((self.directory / "public.crt").read_text())).hexdigest()
+        expected = [self.fp(stored), digest]
+        supplement = self.bundle("public-proof", missing["cert"])
+        self.crl(revoke=["stored"])
+        self.assertFalse(self.check({"v1": stored}, expect=expected)[0])
+        passed, output = self.check({"v1": stored}, expect=expected, public_chains=[supplement])
+        self.assertFalse(passed)
+        self.assertIn("not revoked: serial", output)
+        self.crl(revoke=["public"])
+        passed, output = self.check({"v1": stored}, expect=expected, public_chains=[supplement])
+        self.assertTrue(passed, output)
+        self.assertIn("source public chain", output)
+        self.assertIn("versions 1 key stored", output)
+        self.assertNotIn("PRIVATE KEY", output)
+        # The local bundle cannot erase an unexpected held certificate.
+        self.assertFalse(self.check({"v1": stored}, expect=[digest], public_chains=[supplement])[0])
+
+    def test_public_chain_must_be_in_scope_expected_and_distinct_from_held_certificates(self):
+        doc = self.leaf("public", ["*.fcvm.dev"])
+        other = self.leaf("subzone", ["*.tiles-stage.fcvm.dev"])
+        supplied = self.bundle("supplied", doc["cert"])
+        for name, versions, paths, selected, error in [
+            ("wrong pin", {}, [supplied], [self.fp(other)], "not in the expected set"),
+            ("missing pin", {}, [supplied], ["0" * 64], "not in the expected set"),
+            ("duplicate file", {}, [supplied, supplied], [self.fp(doc)], "duplicate"),
+            ("duplicate of stored", {"v": doc}, [supplied], [self.fp(doc)], "duplicate"),
+            ("out of scope", {}, [self.bundle("subzone-bundle", other["cert"])], [self.fp(other)], "outside the audit scope"),
+        ]:
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, error):
+                self.check(versions, expect=selected, public_chains=paths)
+        self.assertEqual(self.requests, [])
+
+    def test_public_chain_rejects_extra_material_and_requires_a_trusted_chain_before_fetching(self):
+        cert = self.leaf("public", ["*.fcvm.dev"])
+        expected = [self.fp(cert)]
+        leaf = (self.directory / "public.crt").read_text()
+        wrong = self.leaf("other", ["*.fcvm.dev"])
+        for name, content in [("key", cert["cert"] + cert["key"]), ("trailing text", cert["cert"] + "junk"),
+                              ("leaf only", leaf), ("second leaf", cert["cert"] + audit.chain(wrong["cert"])[0]),
+                              ("bad base64", cert["cert"] + "-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----")]:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                self.check({}, expect=expected, public_chains=[self.bundle("bad", content)])
+        incomplete = self.bundle("untrusted", leaf + (self.directory / "int1.crt").read_text())
+        self.no_status({}, "the certificate does not verify", expect=expected, public_chains=[incomplete])
+        self.assertFalse(self.requests)
+        with self.assertRaisesRegex(ValueError, "too large"):
+            self.check({}, expect=expected, public_chains=[self.bundle("oversize", "A" * 300000)])
+
     def test_revoked_at_the_leaf_passes_and_not_listed_fails(self):
         gone, live = self.leaf("gone", ["*.fcvm.dev"]), self.leaf("live", ["fcvm.dev"])
         self.crl(revoke=["gone"])
