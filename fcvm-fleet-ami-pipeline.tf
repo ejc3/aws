@@ -340,6 +340,9 @@ data "archive_file" "fcvm_ami_publish" {
       RENDERER_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_renderer_release)
       POTATO_AMI_JSON   = jsonencode(local.fcvm_ami_reviewed_potato_release)
       HOST_FIX_AMI_JSON = jsonencode(local.fcvm_ami_reviewed_potato_host_fix)
+      # Prod's image pointer (fcvm-fleet-prod-ci.tf): retention keeps its images and its previous ones. Absent while
+      # the prod stack is off, which retention reads as no prod release.
+      PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
     })
     filename = "publisher-config.json"
   }
@@ -723,6 +726,8 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
       Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:spot-instances-request/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_ami_region } } },
     { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    # Read only: retention keeps prod's images (fcvm-fleet-prod-ci.tf). Only the prod release function writes it.
+    { Effect = "Allow", Action = "ssm:GetParameter", Resource = "arn:aws:ssm:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:parameter${local.fcvm_prod_ami_release_parameter}" },
     { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
       Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_release_regions } } },

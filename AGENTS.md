@@ -1844,18 +1844,23 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   only, IMDSv2 hop 1) the coordinator launches from itself; EC2 tile launch templates (g4dn.xlarge, g5g.xlarge) the
   coordinator launches itself; the coordinator as one Fargate service (coordinator plus cloudflared) in ECS cluster
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/stage/tls` secret, which the
-  coordinator issues and renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`). The tunnel token and agent
+  coordinator renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`). The tunnel token and agent
   Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
   and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
   including copies on host or tile disks and in backups. Production activation depends on completing #922.
-- **Staging certificate cutover.** Before switching the coordinator and renderer roles, check that deployed viewers
+- **Staging certificate cutover.** First apply only the staging certificate container and its resource policy. With the
+  fleet administration role, lego v4.17.4 and the existing parent-zone ACME CNAME, run
+  `python3 scripts/fcvm-stage-certificate.py --issue`. It bootstraps the stage wildcard with a fresh key, retains the
+  old scene token, verifies the chain and matching keys and labels the verified version. The coordinator requires a
+  populated certificate on startup. The Terraform cutover reads version metadata only. Run
+  `python3 scripts/fcvm-stage-certificate.py` to verify it again before planning. Check that deployed viewers
   and direct integrations use the published launch names under `tiles-stage.fcvm.dev`. The old certificate covers
   both namespaces, so consumers can migrate first. Clients pinned to `slot-<n>.fcvm.dev` or `ec2-<n>.fcvm.dev`
   will fail TLS against a new renderer even if they supply their own address. An empty parent DNS record list alone
   cannot rule out those clients.
   Already-created pool tiles retain their original boot configuration. On a wake, an old tile may spend up to
   600 seconds waiting for renderer health before the coordinator replaces it. The cold launch takes additional
-  time. Wait for issuance, then verify a fresh tile and host serve frames on IPv4 and IPv6. Retire the old
+  time. Verify a fresh tile and host serve frames on IPv4 and IPv6 after the cutover. Retire the old
   certificate and DNS credentials separately as tracked in #922.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are

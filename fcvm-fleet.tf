@@ -76,7 +76,7 @@ locals {
     stage = {
       fleet                  = "stage"
       prefix                 = "fcvm-fleet"
-      tls_secret             = "fcvm-fleet/stage/tls"
+      tls_secret             = local.fcvm_fleet_stage_tls_name
       state_key              = "state.json"
       untagged_spot_requests = true
     }
@@ -103,6 +103,11 @@ locals {
   # The bootstrap image, before main-only CI's first release. Active releases are
   # digest-pinned in /fcvm-fleet/stage/coordinator-image (fcvm-fleet-ci.tf).
   fcvm_fleet_coordinator_tag = "bdaa0003"
+  # The most the fleet may spend in one UTC day (owner, 2026-11-18: $750 a day, metered at the Spot price, with forced
+  # sleep). The coordinator's meter (--daily-spend-usd, ejc3/fcvm#1960) puts the fleet to sleep at the ceiling. The AWS
+  # budget action from #905 (fcvm-fleet-budget.tf) stays as the backstop. The meter needs no new IAM: it calls
+  # ec2:DescribeInstances and ec2:DescribeSpotPriceHistory, both under the task role's ec2:Describe*.
+  fcvm_fleet_daily_spend_ceiling_usd = 750
   # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
   fcvm_fleet_on_demand_max       = 8
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
@@ -123,7 +128,7 @@ locals {
 
   # Secrets of the fleet, all in us-east-2: the certificate is created here, the Cloudflare-fed two by fcvm-dev.tf.
   fcvm_fleet_secret_arn = {
-    "tls"                      = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
+    "tls"                      = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_arn
     "agent-access-token"       = aws_secretsmanager_secret.fcvm_fleet_agent_access.arn
     "coordinator-tunnel-token" = aws_secretsmanager_secret.fcvm_fleet_coordinator_tunnel.arn
   }
@@ -176,7 +181,7 @@ locals {
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
-    "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_stage_tls.name}",
+    "--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}",
     "--secret-region ${local.fcvm_fleet_home_region}",
     "--host-from-imds",
     "--image localhost/fcvm-renderer:fleet",
@@ -205,10 +210,19 @@ locals {
   # all of them arrive with the Worker's CF-Connecting-IP; the coordinator then keys such a request by the viewer address
   # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
   # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
+  # --access-team-domain and the audiences (ejc3/fcvm c74ee76): the coordinator verifies each Access JWT itself, not only
+  # the connector. /live takes the API application's tokens (the owner, CI, the Worker) and the page application's
+  # (fleet-api-direct-stage); the viewer address then counts only for a verified service token. /agent answers 403
+  # without the agents' service token. No Turnstile here: every staging viewer passes Access and so counts as verified.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    ["--access-team-domain", trimprefix(local.browser_manager_issuer, "https://"),
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud,
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_site_stage.aud,
+    "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent.aud],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
+    ["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)],
     # The stack's Fleet tag: on every tile and host it launches, and the only instances it lists, sweeps, admits an agent
     # from and meters (ejc3/fcvm src/cli/args.rs, --fleet-name). The task role's scope policy holds it to the same tag.
     ["--fleet-name", local.fcvm_fleet_stage.fleet],
@@ -217,7 +231,7 @@ locals {
     # The certificate covers *.tiles-stage.fcvm.dev alone (--tls-scope subzone, ejc3/fcvm#1973, src/fleet/coord/cert.rs):
     # its DNS-01 record is answered by the coordinator's own subzone server, so it holds no Cloudflare token (the flag
     # refuses --dns-token-secret), and the EC2 tiles' health names are ec2-<n>.tiles-stage.fcvm.dev.
-    ["--dns-zone", "fcvm.dev", "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_stage_tls.name, "--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region],
+    ["--dns-zone", "fcvm.dev", "--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, "--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region],
     # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
@@ -338,6 +352,35 @@ resource "aws_s3_bucket_versioning" "fcvm_fleet_private" {
   }
 }
 
+# The coordinator rewrites state.json on every change, up to about once a second, so versioning adds up to ~86,000
+# noncurrent versions a day. Keep every version younger than 7 days and, past that, the newest 100, for recovering an
+# earlier state when the current one will not parse; S3 expires a noncurrent version only when both limits are passed.
+# S3 filters by prefix. Other keys (including the spending guard) keep their independent version history.
+resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {
+      prefix = "state.json"
+    }
+    noncurrent_version_expiration {
+      noncurrent_days           = 7
+      newer_noncurrent_versions = 100
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.fcvm_fleet_private]
+}
+
 resource "aws_s3_bucket_public_access_block" "fcvm_fleet_private" {
   for_each                = { assets = aws_s3_bucket.fcvm_fleet_assets.id, state = aws_s3_bucket.fcvm_fleet_coordinator_state.id }
   provider                = aws.fcvm_fleet
@@ -377,41 +420,6 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_tls" {
   description             = "Wildcard TLS certificate for the fleet zone (JSON: cert, key). Value set out of band; see fcvm-fleet.tf."
   recovery_window_in_days = 7
   tags                    = { Name = "fcvm-fleet/tls-wildcard", Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
-}
-
-# *.tiles-stage.fcvm.dev only (JSON: cert, key, scene_token). No value here: the coordinator issues the first certificate
-# when the secret has none and adds the renderers' scene token (ejc3/fcvm src/fleet/coord/cert.rs, scene_token.rs), as
-# prod's (fcvm-fleet-prod.tf). Hosts read it through the agent's --tls-secret, tiles through FLEET_TLS_SECRET
-# (modules/fcvm-fleet-region, tile_tls_secret).
-resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls" {
-  provider                = aws.fcvm_fleet
-  name                    = local.fcvm_fleet_stage.tls_secret
-  description             = "Wildcard TLS certificate for *.tiles-stage.fcvm.dev, the staging fleet's launch names (JSON: cert, key, scene_token). Issued and renewed by the staging coordinator; see fcvm-fleet.tf."
-  recovery_window_in_days = 7
-  tags                    = { Name = local.fcvm_fleet_stage.tls_secret, Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
-}
-
-# Whatever any other identity's IAM policy says, only staging's coordinator, hosts and tiles (and the role Terraform
-# applies through) read or write it: no prod role holds a staging key.
-resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls" {
-  provider   = aws.fcvm_fleet
-  secret_arn = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Sid       = "OnlyTheStagingStackAndTerraform"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
-      Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
-      Condition = { ArnNotEquals = { "aws:PrincipalArn" = [
-        aws_iam_role.fcvm_fleet_coordinator_task.arn,
-        aws_iam_role.fcvm_fleet_host.arn,
-        aws_iam_role.fcvm_fleet_tile.arn,
-        local.fcvm_fleet_access_role_arn,
-      ] } }
-    }]
-  })
 }
 
 # ------------------------------------------------------------------------------------------------ instance roles
@@ -514,7 +522,7 @@ module "fcvm_fleet_east2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
-  tile_tls_secret           = aws_secretsmanager_secret.fcvm_fleet_stage_tls.name
+  tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-east-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -537,7 +545,7 @@ module "fcvm_fleet_west2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
-  tile_tls_secret           = aws_secretsmanager_secret.fcvm_fleet_stage_tls.name
+  tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-west-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -562,7 +570,7 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
-  tile_tls_secret               = aws_secretsmanager_secret.fcvm_fleet_stage_tls.name
+  tile_tls_secret               = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   # Keep potato mode for the current host, the retained rollback images and the publisher's us-east-1 copy of each
   # reviewed build-region host (fcvm-fleet-ami-release.tf), once it exists.
   potato_host_amis = concat([
@@ -807,8 +815,8 @@ resource "aws_lambda_function" "fcvm_fleet_on_demand_notify" {
   memory_size      = 128
   environment {
     variables = {
-      # This alarm and the coordinator's health alarms (fcvm-fleet-alarms.tf).
-      ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], values(local.fcvm_fleet_health_alarm_arns)))
+      # This alarm, the coordinator's health alarms (fcvm-fleet-alarms.tf) and prod's (fcvm-fleet-prod-alarms.tf).
+      ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], values(local.fcvm_fleet_health_alarm_arns), values(local.fcvm_fleet_prod_alarm_arns)))
       TOPIC_ARNS = jsonencode(local.fcvm_fleet_alert_topic_arns)
     }
   }

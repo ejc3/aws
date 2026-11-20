@@ -15,6 +15,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-fleet.tf").read_text()
+STAGE_CERT = (ROOT / "fcvm-fleet-stage-cert.tf").read_text()
 DNS = (ROOT / "fcvm-fleet-dns.tf").read_text()
 ALARMS = (ROOT / "fcvm-fleet-alarms.tf").read_text() if (ROOT / "fcvm-fleet-alarms.tf").exists() else ""
 BUDGET = (ROOT / "fcvm-fleet-budget.tf").read_text() if (ROOT / "fcvm-fleet-budget.tf").exists() else ""
@@ -663,7 +664,7 @@ class OnDemandFallbackTests(unittest.TestCase):
         self.assertIn('threshold           = 1', alarm)
         self.assertIn('alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]', alarm)
         self.assertIn('ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], '
-                      'values(local.fcvm_fleet_health_alarm_arns)))', TF)
+                      'values(local.fcvm_fleet_health_alarm_arns), values(local.fcvm_fleet_prod_alarm_arns)))', TF)
         for region in ('east2', 'west2', 'east1'):
             self.assertIn('module.fcvm_fleet_%s.alert_topic_arns' % region, TF)
         # A launch-event counter returning to zero says nothing about whether the host is still charging.
@@ -936,11 +937,44 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn(":latest", td)
 
 
+class StateBucketLifecycleTests(unittest.TestCase):
+    def test_noncurrent_state_versions_expire_after_a_week_keeping_the_newest_hundred(self):
+        life = block('resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state"')
+        self.assertIn("bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id", life)
+        rules = re.findall(r"^  rule \{\n(.*?)^  \}$", life, re.M | re.S)
+        self.assertEqual(len(rules), 2)
+        versions, uploads = rules
+        self.assertIn('id     = "expire-old-state-versions"', versions)
+        self.assertRegex(versions, r'filter \{\s*prefix = "state\.json"\s*\}')
+        self.assertRegex(versions, r"noncurrent_days\s+= 7\n")
+        self.assertRegex(versions, r"newer_noncurrent_versions = 100\n")
+        self.assertIn("filter {}", uploads)
+        self.assertRegex(uploads, r"abort_incomplete_multipart_upload \{\s*days_after_initiation = 1\s*\}")
+        self.assertNotIn("noncurrent_version_expiration", uploads)
+        self.assertNotRegex(life, r"(?m)^\s*expiration \{", "the current state object must never expire")
+
+
 class SecretTests(unittest.TestCase):
+    def test_stage_tls_bootstrap_allows_only_stage_roles_and_terraform(self):
+        staging = STAGE_CERT
+        self.assertIn('fcvm_fleet_stage_tls_name = "fcvm-fleet/stage/tls"', staging)
+        self.assertNotIn('resource "aws_secretsmanager_secret_version"', staging)
+        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', staging)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Principal = "*"', policy)
+        self.assertIn('Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn', policy)
+        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
+        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = \[(.*?)\]', policy, re.S)
+        self.assertIsNotNone(roles)
+        self.assertEqual(set(re.findall(r"[\w.]+", roles[1])), {
+            "aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
+            "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn",
+        })
+
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
-        self.assertEqual(names, ['"fcvm-fleet/tls-wildcard"', "local.fcvm_fleet_stage.tls_secret"])
-        self.assertRegex(TF, r'\btls_secret\s+= "fcvm-fleet/stage/tls"')
+        self.assertEqual(names, ['"fcvm-fleet/tls-wildcard"'])
+        self.assertRegex(TF, r'\btls_secret\s+= local\.fcvm_fleet_stage_tls_name')
         self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
 
     def test_hosts_and_tiles_read_only_what_they_need(self):
@@ -1170,7 +1204,7 @@ class StageWallTests(unittest.TestCase):
         args = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ])\n", 1)[0]
         for a in ['"--dial wss://${local.fcvm_dev_agent_path}"',
                   '"--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}"',
-                  '"--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_stage_tls.name}"',
+                  '"--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}"',
                   '"--secret-region ${local.fcvm_fleet_home_region}"',
                   '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone ${local.fcvm_fleet_names_zone}"', '"--phones 2"']:
             self.assertIn(a, args)
@@ -1194,8 +1228,9 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
     def test_the_coordinator_takes_forwarded_viewer_addresses_only_behind_required_access(self):
-        # The coordinator reads x-fleet-viewer-ip on a service-token request without verifying the JWT itself; the
-        # tunnel connector's access.required is what does.
+        # The coordinator honours x-fleet-viewer-ip only for a service token whose JWT it verifies itself
+        # (test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits); the tunnel connector's access.required
+        # stays in front of it.
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
         self.assertIn('"--access-viewer-address"', cmd)
         dev = (ROOT / "fcvm-dev.tf").read_text()
@@ -1205,6 +1240,40 @@ class StageWallTests(unittest.TestCase):
         api, direct = tunnel.split("hostname = local.fcvm_dev_direct_stage_host", 1)
         self.assertIn("required  = true", api)
         self.assertIn("required  = true", direct)
+
+    def test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits(self):
+        # ejc3/fcvm c74ee76 (fleet/PROTOCOL.md, --access-team-domain): the coordinator checks each Access JWT's
+        # signature, issuer, audience and expiry itself. /live takes the viewer applications' audiences, /agent only
+        # the agents' application, so a token for one is never accepted on the other.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        app = "cloudflare_zero_trust_access_application"
+        self.assertIn('"--access-team-domain", trimprefix(local.browser_manager_issuer, "https://")', cmd)
+        live = re.findall(r'"--access-aud", (\S+?\.aud)\b', cmd)
+        agent = re.findall(r'"--agent-access-aud", (\S+?\.aud)\b', cmd)
+        self.assertEqual(sorted(live), [f"{app}.fcvm_dev_api_stage.aud", f"{app}.fcvm_dev_site_stage.aud"], cmd)
+        self.assertEqual(agent, [f"{app}.fcvm_dev_agent.aud"], cmd)
+        # Every audience the tunnel connector admits to the coordinator is one the coordinator verifies, on the side
+        # its route serves: a new Access application in front of the coordinator needs its flag here too.
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
+        tunnel = tunnel[:tunnel.index("\n}\n")]
+        admitted = [a.strip() for tags in re.findall(r"aud_tag\s*=\s*\[([^\]]*)\]", tunnel) for a in tags.split(",")]
+        self.assertEqual(sorted(admitted), sorted(live + agent))
+        # The team the tokens are checked against is the team the connector names.
+        teams = set(re.findall(r'team_name\s*=\s*"([^"]+)"', tunnel))
+        issuer = re.search(r'browser_manager_issuer\s*=\s*"([^"]+)"', (ROOT / "browser-manager.tf").read_text()).group(1)
+        self.assertEqual({f"https://{t}.cloudflareaccess.com" for t in teams}, {issuer})
+        # Staging viewers all pass Access, so they count as verified; Turnstile is the production stack's.
+        self.assertNotIn("--turnstile", cmd)
+
+    def test_the_coordinator_forces_sleep_at_a_750_dollar_daily_spend_ceiling(self):
+        # Owner, 2026-11-18: $750 a day at the Spot price, forced sleep. The meter reads DescribeInstances and
+        # DescribeSpotPriceHistory, which the task role already has under ec2:Describe*.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)]', cmd)
+        self.assertRegex(TF, r"fcvm_fleet_daily_spend_ceiling_usd\s*=\s*750\n")
+        self.assertIn('"--sleep-when-idle"', cmd)
+        self.assertIn('Action   = ["ec2:Describe*"]', TF)
 
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the
@@ -1318,7 +1387,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertIn('["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), '
                       '"--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"]', cmd)
         # The certificate is the subzone's, its DNS-01 record answered by this server (StageSubzoneCertificateTests).
-        self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_stage_tls.name, "--tls-scope", "subzone"', cmd)
+        self.assertIn('"--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, "--tls-scope", "subzone"', cmd)
 
 
 class DnsTests(unittest.TestCase):
@@ -1478,13 +1547,13 @@ class StackScopeTests(unittest.TestCase):
         stage = self.stacks().split("stage = {", 1)[1].split("\n    }", 1)[0]
         self.assertRegex(stage, r'\bfleet\s+= "stage"')
         self.assertRegex(stage, r'\bprefix\s+= "fcvm-fleet"')
-        self.assertRegex(stage, r'\btls_secret\s+= "fcvm-fleet/stage/tls"')
+        self.assertRegex(stage, r'\btls_secret\s+= local\.fcvm_fleet_stage_tls_name')
         self.assertRegex(stage, r'\bstate_key\s+= "state.json"')
         self.assertRegex(stage, r"\buntagged_spot_requests\s+= true")
         self.assertIn("fcvm_fleet_stage = local.fcvm_fleet_stacks.stage", TF)
         # The zone certificate's secret keeps its name; staging's subzone certificate is the stack's.
         self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_tls"'), r'\bname\s+= "fcvm-fleet/tls-wildcard"\n')
-        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"'), r"\bname\s+= local\.fcvm_fleet_stage\.tls_secret\n")
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"', STAGE_CERT), r"\bname\s+= local\.fcvm_fleet_stage_tls_name\n")
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}"',
                       block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
         self.assertIn('{ name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key }',
@@ -1640,7 +1709,7 @@ class StageSubzoneCertificateTests(unittest.TestCase):
 
     def test_the_coordinator_orders_the_subzone_certificate_with_no_cloudflare_token(self):
         cmd = tf_code(self.cmd())
-        self.assertIn('["--dns-zone", "fcvm.dev", "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_stage_tls.name, '
+        self.assertIn('["--dns-zone", "fcvm.dev", "--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, '
                       '"--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region]', cmd)
         for gone in ("--dns-token-secret", "--dns-zone-id", "fcvm_fleet_dns_token", "fcvm_fleet_tls.name"):
             self.assertNotIn(gone, cmd)
@@ -1652,7 +1721,7 @@ class StageSubzoneCertificateTests(unittest.TestCase):
         self.assertNotIn("fcvm_fleet_dns_token", tf_code(TF))
         self.assertNotIn('"cloudflare-dns-token"', TF)
         self.assertNotIn('"tls-wildcard"', TF)
-        self.assertIn('"tls"                      = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn', TF)
+        self.assertIn('"tls"                      = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_arn', TF)
         for role in ("fcvm_fleet_host", "fcvm_fleet_tile", "fcvm_fleet_coordinator_task"):
             policy = tf_code(block(f'resource "aws_iam_role_policy" "{role}"'))
             self.assertNotIn("fcvm_fleet_tls.", policy, role)
@@ -1660,17 +1729,17 @@ class StageSubzoneCertificateTests(unittest.TestCase):
 
     def test_hosts_and_tiles_are_pointed_at_the_subzone_certificate(self):
         args = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ])\n", 1)[0]
-        self.assertIn('"--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_stage_tls.name}"', args)
+        self.assertIn('"--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}"', args)
         self.assertIn('"--frame-zone ${local.fcvm_fleet_names_zone}"', args)
         self.assertNotIn("--frame-zone fcvm.dev", args)
         for name in ("east2", "west2", "east1"):
             self.assertRegex(block('module "fcvm_fleet_%s"' % name),
-                             r"\n  tile_tls_secret\s+= aws_secretsmanager_secret\.fcvm_fleet_stage_tls\.name\n", name)
+                             r"\n  tile_tls_secret\s+= data\.aws_secretsmanager_secret_versions\.fcvm_fleet_stage_tls\.secret_name\n", name)
 
     def test_the_subzone_secret_is_staging_only(self):
-        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"'),
-                         r'\bname\s+= local\.fcvm_fleet_stage\.tls_secret\n')
-        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"')
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"', STAGE_CERT),
+                         r'\bname\s+= local\.fcvm_fleet_stage_tls_name\n')
+        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT)
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
         principals = policy.split('"aws:PrincipalArn" = [', 1)[1].split("]", 1)[0]
@@ -1678,8 +1747,11 @@ class StageSubzoneCertificateTests(unittest.TestCase):
                          ["aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
                           "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn"])
         self.assertNotIn("prod", policy)
-        # No value in Terraform: the coordinator issues it.
-        self.assertNotIn("fcvm_fleet_stage_tls.id", TF)
+        # Empty or unverified secrets must block every consumer, including targeted template or role plans.
+        guard = block('data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls"', STAGE_CERT)
+        self.assertIn('for label in ["AWSCURRENT", "FLEET_STAGE_TLS_BOOTSTRAPPED"]', guard)
+        self.assertIn('contains(version.version_stages, label)', guard)
+        self.assertNotIn('aws_secretsmanager_secret.fcvm_fleet_stage_tls.', TF)
 
     def test_the_coordinator_may_ask_ivs_about_the_staging_channel_only(self):
         policy = block('resource "aws_iam_policy" "fcvm_fleet_coordinator_broadcast_live"')
