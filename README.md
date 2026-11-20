@@ -814,6 +814,15 @@ are provisioned by Terraform, with no manual CI setup. If CI releases between a 
 plan and its apply, an apply-time parameter-version check rejects the stale plan; run
 a fresh plan. This check also detects a release attempt that rolled back to the same image.
 
+Before enabling production on fcvm.dev, audit staging's legacy parent-zone certificates against
+an independent Certificate Transparency inventory. Run `scripts/fcvm-parent-wildcard-audit.py
+--check --expect <fingerprints...>` with the fleet administration role. For each expected leaf
+missing from Secrets Manager, add `--public-chain <file.pem>` with its public leaf followed by its
+intermediates. Each distinct leaf must have fresh revocation proof from the issuer's signed CRL.
+After the staging cutover and approval, a different ACME account can request revocation by proving
+control of every identifier on the certificate, including when the original signing key was lost.
+[Let's Encrypt revocation guidance](https://letsencrypt.org/docs/revoking/)
+
 The wall's broadcast switch is in `fcvm-fleet-broadcast.tf`. It admits 500 direct-stream
 seats and serves later viewers through a private Amazon IVS channel with signed playback
 tokens. Enable it only after both GPU image pins are deployed and scene authentication

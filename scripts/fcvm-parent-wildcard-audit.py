@@ -8,7 +8,9 @@ before production is exposed. This script only reads: it changes no secret, send
 and revokes nothing. Revoking them is a separate, approved step under #922, after staging has
 verifiably stopped serving them.
 
-Run with the staging fleet administration role.
+Run with the staging fleet administration role. After cutover and approval, a different ACME account
+with valid authorizations for every identifier on an old certificate can request revocation even
+when its original private key is missing. See the operator guidance in README.md.
 
 - No flag: list every distinct certificate in the versions of `fcvm-fleet/tls-wildcard` that names
   something in fcvm.dev outside `tiles-stage.fcvm.dev` and `tiles.fcvm.dev`, with its serial,
@@ -18,18 +20,19 @@ Run with the staging fleet administration role.
   With --expect, also say which expected certificates the secret does not hold.
 - --check --expect SHA256 [SHA256 ...]: prove every expected certificate revoked. The expected set
   is the independent inventory, the SHA-256 fingerprints of the Certificate Transparency entries
-  for these names (#922), so a secret that has lost a version cannot pass on a subset: an expected
-  certificate the secret does not hold, or a held one outside the expected set, fails the check by
-  name. For each certificate: the certificate and its intermediates come from a writable
-  secret, so before any request the certificate must verify through its stored intermediates
-  (untrusted) to a root in this host's trust store. The CRL it names must be a Let's Encrypt CRL
+  for these names (#922). Every held parent-zone leaf and every public supplement must be in that
+  set, and every fingerprint in the set must have evidence. For a missing leaf, repeat
+  --public-chain FILE once per leaf. Each local file contains only its leaf and intermediate PEM
+  certificates, with the leaf first (256 KiB maximum). Omit leaves already supplied or held in the
+  secret. Never derive --expect from the files submitted as proof. Each leaf must verify through
+  the untrusted intermediates to a root in this host's trust store before fetching its Let's Encrypt CRL
   endpoint (`http://<issuer>.c.lencr.org/<n>.crl`); the fetch follows no redirect and reads at
   most 8 MiB. OpenSSL then verifies the certificate again with that CRL (`verify -crl_check`),
   which decides the CRL's issuer, signature, freshness and issuing-distribution-point scope.
   Only a run whose one error is "certificate revoked" at depth 0 proves revocation; a clean
   verify means not revoked, and any other error, a failed or timed-out fetch included, is no
   status for that certificate and the next one is checked. Exits non-zero unless every expected
-  certificate is held and proven revoked and nothing else is held.
+  certificate is proven revoked and the inventory matches exactly.
 """
 
 import argparse
@@ -39,6 +42,7 @@ import json
 import os
 from pathlib import Path
 import re
+import stat
 import subprocess
 import tempfile
 import urllib.error
@@ -52,6 +56,8 @@ PARENT = "fcvm.dev"
 USER_AGENT = "ejc3-aws-fcvm-wildcard-audit/1"
 # Let's Encrypt's intermediates' CRL endpoints, the only URLs --check fetches.
 LETS_ENCRYPT_CRL = r"http://[a-z0-9]+\.c\.lencr\.org/[0-9]+\.crl"
+MAX_PUBLIC_CHAIN_BYTES = 256 << 10
+PUBLIC_CERT = re.compile(r"-----BEGIN CERTIFICATE-----\r?\n(?:[a-zA-Z0-9+/=]+\r?\n)+-----END CERTIFICATE-----")
 MAX_CRL_BYTES = 8 << 20
 # openssl verify's X509_V_ERR_CERT_REVOKED.
 CERT_REVOKED = "23"
@@ -187,25 +193,61 @@ def collect(secrets):
     return list(found.values())
 
 
+def public_certificate(path):
+    """Read one bounded, local, certificate-only PEM bundle. Its intermediates are never trust anchors."""
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as stream:
+        checked(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), "a public chain must be a regular file")
+        raw = stream.read(MAX_PUBLIC_CHAIN_BYTES + 1)
+    checked(len(raw) <= MAX_PUBLIC_CHAIN_BYTES, "public chain file is too large")
+    try:
+        pem = raw.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise ValueError("public chain must contain ASCII PEM certificates") from error
+    certs = PUBLIC_CERT.findall(pem)
+    checked(len(certs) >= 2 and not PUBLIC_CERT.sub("", pem).strip(),
+            "public chain requires only PEM certificates: leaf first, then intermediates")
+    leaf, *intermediates = [c + "\n" for c in certs]
+    try:
+        info = fields(leaf)
+        checked(not re.search(r"\bCA:TRUE\b", openssl(["x509", "-noout", "-ext", "basicConstraints"], leaf)),
+                "a public chain must begin with an end-entity certificate")
+        san = names(leaf)
+        checked(any(outside_subzones(n) for n in san), "public certificate is outside the audit scope")
+        for ca in intermediates:
+            constraints = openssl(["x509", "-noout", "-ext", "basicConstraints"], ca)
+            checked(re.search(r"\bCA:TRUE\b", constraints), "a public chain contains another leaf instead of an intermediate")
+    except subprocess.CalledProcessError as error:
+        raise ValueError("invalid X.509 certificate in public chain") from error
+    return dict(info, cert=leaf, intermediates=intermediates, names=san, versions=[], key=False)
+
+
 def fingerprint(text):
     value = text.replace(":", "").lower()
     checked(re.fullmatch(r"[0-9a-f]{64}", value), "an expected fingerprint is not a SHA-256 hex digest")
     return value
 
 
-def run(secrets, directory, check=False, now=None, expect=(), **proof):
+def run(secrets, directory, check=False, now=None, expect=(), public_chains=(), **proof):
     """List, or with `check` prove every expected certificate revoked. Returns whether the run passed:
-    a listing always does; a check only when `expect` is not empty, the secret holds exactly the
-    expected certificates and every one is proven revoked. `proof` passes crl_status's trust,
+    a valid listing always does; a check passes only if the secret and optional pinned public
+    evidence cover precisely the expected certificates and every leaf is proven revoked. `proof` passes crl_status's trust,
     crl_url, max_bytes and timeout (tests)."""
     expected = {fingerprint(e) for e in expect}
     checked(expected or not check, "--check needs --expect: the SHA-256 fingerprints of the known certificates")
     certificates = collect(secrets)
     print(f"{len(certificates)} certificate(s) for names outside the fleet subzones in {LEGACY}")
     held = {c["sha256"] for c in certificates}
+    checked(expected or not public_chains, "--public-chain needs an independent --expect inventory")
+    for path in public_chains:
+        extra = public_certificate(path)
+        digest = extra["sha256"]
+        checked(digest in expected, f"public certificate sha256 {digest} is not in the expected set")
+        checked(digest not in held, f"duplicate certificate sha256 {digest} is already held or supplied")
+        held.add(digest)
+        certificates.append(extra)
     passed = True
     for missing in sorted(expected - held):
-        print(f"NO STATUS: expected certificate sha256 {missing} is not in {LEGACY}; nothing here can prove it revoked")
+        print(f"NO STATUS: expected certificate sha256 {missing} is not in {LEGACY} or any supplied public chain")
         passed = False
     for c in certificates:
         if expected and c["sha256"] not in expected:
@@ -213,6 +255,8 @@ def run(secrets, directory, check=False, now=None, expect=(), **proof):
             passed = False
         label = (f"serial {c['serial']} sha256 {c['sha256']} expires {c['not_after']} names {' '.join(c['names'])} "
                  f"versions {len(c['versions'])} key {'stored' if c['key'] else 'MISSING'}")
+        if not c["versions"]:
+            label += " source public chain"
         if not check:
             print(label)
             continue
@@ -233,11 +277,18 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true", help="prove every expected certificate revoked from its CRL")
     parser.add_argument("--expect", nargs="+", default=(), metavar="SHA256",
                         help="the known certificates' SHA-256 fingerprints (required with --check)")
+    parser.add_argument("--public-chain", action="append", default=[], type=Path, metavar="FILE",
+                        help="local leaf and intermediate PEMs for one expected certificate missing from the secret; repeatable")
     arguments = parser.parse_args()
+    if arguments.public_chain and not arguments.expect:
+        parser.error("--public-chain needs an independent --expect inventory")
     if arguments.check and not arguments.expect:
         parser.error("--check needs --expect: the SHA-256 fingerprints of the known certificates")
     os.umask(0o077)
     with tempfile.TemporaryDirectory(dir=os.getenv("XDG_RUNTIME_DIR") or "/dev/shm") as workspace:
-        ok = run(boto3.client("secretsmanager", region_name=REGION), Path(workspace), arguments.check,
-                 expect=arguments.expect)
+        try:
+            ok = run(boto3.client("secretsmanager", region_name=REGION), Path(workspace), arguments.check,
+                     expect=arguments.expect, public_chains=arguments.public_chain)
+        except (OSError, ValueError) as error:
+            parser.exit(1, f"audit failed: {error}\n")
     raise SystemExit(0 if ok else 1)
