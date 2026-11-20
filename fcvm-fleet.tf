@@ -331,6 +331,35 @@ resource "aws_s3_bucket_versioning" "fcvm_fleet_private" {
   }
 }
 
+# The coordinator rewrites state.json on every change, up to about once a second, so versioning adds up to ~86,000
+# noncurrent versions a day. Keep every version younger than 7 days and, past that, the newest 100, for recovering an
+# earlier state when the current one will not parse; S3 expires a noncurrent version only when both limits are passed.
+# S3 filters by prefix. Other keys (including the spending guard) keep their independent version history.
+resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  rule {
+    id     = "expire-old-state-versions"
+    status = "Enabled"
+    filter {
+      prefix = "state.json"
+    }
+    noncurrent_version_expiration {
+      noncurrent_days           = 7
+      newer_noncurrent_versions = 100
+    }
+  }
+  rule {
+    id     = "abort-incomplete-multipart-uploads"
+    status = "Enabled"
+    filter {}
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 1
+    }
+  }
+  depends_on = [aws_s3_bucket_versioning.fcvm_fleet_private]
+}
+
 resource "aws_s3_bucket_public_access_block" "fcvm_fleet_private" {
   for_each                = { assets = aws_s3_bucket.fcvm_fleet_assets.id, state = aws_s3_bucket.fcvm_fleet_coordinator_state.id }
   provider                = aws.fcvm_fleet

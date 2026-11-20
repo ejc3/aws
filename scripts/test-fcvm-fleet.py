@@ -880,6 +880,23 @@ class CoordinatorTests(unittest.TestCase):
         self.assertNotIn(":latest", td)
 
 
+class StateBucketLifecycleTests(unittest.TestCase):
+    def test_noncurrent_state_versions_expire_after_a_week_keeping_the_newest_hundred(self):
+        life = block('resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state"')
+        self.assertIn("bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id", life)
+        rules = re.findall(r"^  rule \{\n(.*?)^  \}$", life, re.M | re.S)
+        self.assertEqual(len(rules), 2)
+        versions, uploads = rules
+        self.assertIn('id     = "expire-old-state-versions"', versions)
+        self.assertRegex(versions, r'filter \{\s*prefix = "state\.json"\s*\}')
+        self.assertRegex(versions, r"noncurrent_days\s+= 7\n")
+        self.assertRegex(versions, r"newer_noncurrent_versions = 100\n")
+        self.assertIn("filter {}", uploads)
+        self.assertRegex(uploads, r"abort_incomplete_multipart_upload \{\s*days_after_initiation = 1\s*\}")
+        self.assertNotIn("noncurrent_version_expiration", uploads)
+        self.assertNotRegex(life, r"(?m)^\s*expiration \{", "the current state object must never expire")
+
+
 class SecretTests(unittest.TestCase):
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
