@@ -193,8 +193,16 @@ locals {
   # all of them arrive with the Worker's CF-Connecting-IP; the coordinator then keys such a request by the viewer address
   # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
   # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
+  # --access-team-domain and the audiences (ejc3/fcvm c74ee76): the coordinator verifies each Access JWT itself, not only
+  # the connector. /live takes the API application's tokens (the owner, CI, the Worker) and the page application's
+  # (fleet-api-direct-stage); the viewer address then counts only for a verified service token. /agent answers 403
+  # without the agents' service token. No Turnstile here: every staging viewer passes Access and so counts as verified.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
+    ["--access-team-domain", trimprefix(local.browser_manager_issuer, "https://"),
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud,
+      "--access-aud", cloudflare_zero_trust_access_application.fcvm_dev_site_stage.aud,
+    "--agent-access-aud", cloudflare_zero_trust_access_application.fcvm_dev_agent.aud],
     # Sleeping is implied by the host templates; the flag keeps an image from before ejc3/fcvm#1257 sleeping too.
     ["--sleep-when-idle"],
     # The stack's Fleet tag: on every tile and host it launches, and the only instances it lists, sweeps, admits an agent
