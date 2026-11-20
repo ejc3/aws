@@ -300,6 +300,19 @@ resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release" {
   }
 }
 
+ephemeral "aws_ssm_parameter" "fcvm_fleet_prod_ami_release_guard" {
+  provider        = aws.fcvm_fleet_east1
+  count           = local.fcvm_fleet_prod
+  arn             = aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition     = self.version == aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].version
+      error_message = "The Fleet AMI release changed after planning; create a fresh plan."
+    }
+  }
+}
+
 # ------------------------------------------------------------------------------------------------ hosts and tiles
 module "fcvm_fleet_prod_east1" {
   count                   = local.fcvm_fleet_prod
@@ -312,10 +325,9 @@ module "fcvm_fleet_prod_east1" {
   cidr_block              = local.fcvm_fleet_prod_cidr
   gpu_amis                = local.fcvm_fleet_prod_host_amis
   tile_amis               = local.fcvm_fleet_prod_tile_amis
-  # Known at plan time although the pointer is created in the same apply.
+
   ami_release_guarded           = true
-  ami_release_parameter_arn     = aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn
-  ami_release_parameter_version = aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].version
+  ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_fleet_prod_ami_release_guard[*].version)
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   # Prod's alarms are their own PR (plan A5); the fcvm-fleet-alerts topic stays staging's.
   alert_topic     = false

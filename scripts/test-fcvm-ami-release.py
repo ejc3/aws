@@ -26,15 +26,26 @@ class ReleaseContracts(unittest.TestCase):
         cls.module = (ROOT / "modules/fcvm-fleet-region/main.tf").read_text()
         cls.release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
         cls.fleet = (ROOT / "fcvm-fleet.tf").read_text()
+        cls.prod = (ROOT / "fcvm-fleet-prod.tf").read_text()
 
     def test_each_template_rechecks_the_release_at_apply_time(self):
-        guard = block(self.module, 'ephemeral "aws_ssm_parameter"', "ami_release_guard")
-        self.assertIn("self.version == var.ami_release_parameter_version", guard)
-        self.assertIn("with_decryption = false", guard)
+        for source, name, count, arn, version in (
+            (self.release, "fcvm_ami_release_guard", "var.fcvm_ami_pipeline_enabled ? 1 : 0",
+             "aws_ssm_parameter.fcvm_ami_release.arn", "data.aws_ssm_parameter.fcvm_ami_release[0].version"),
+            (self.prod, "fcvm_fleet_prod_ami_release_guard", "local.fcvm_fleet_prod",
+             "aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn", "aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].version"),
+        ):
+            with self.subTest(guard=name):
+                guard = block(source, 'ephemeral "aws_ssm_parameter"', name)
+                for key, expected in (("count", count), ("arn", arn), ("with_decryption", "false"),
+                                      ("condition", "self.version == " + version)):
+                    self.assertRegex(guard, rf"{key}\s*=\s*{re.escape(expected)}\s*\n")
+        self.assertNotIn('ephemeral "aws_ssm_parameter"', self.module)
+        self.assertRegex(block(self.module, "variable", "ami_release_parameter_version"), r"ephemeral\s*=\s*true")
         for name in ("host", "tile", "tile_on_demand", "tile_pool"):
             with self.subTest(template=name):
                 template = block(self.module, 'resource "aws_launch_template"', name)
-                self.assertRegex(template, r"depends_on\s*=\s*\[ephemeral\.aws_ssm_parameter\.ami_release_guard\]")
+                self.assertRegex(template, r"depends_on\s*=\s*\[var\.ami_release_parameter_version\]")
                 self.assertRegex(template, r"update_default_version\s*=\s*true")
                 ignored = re.findall(r"\bignore_changes\s*=\s*([^\n]+)", template)
                 self.assertEqual([value.strip() for value in ignored], ["[description]"])
@@ -43,9 +54,12 @@ class ReleaseContracts(unittest.TestCase):
         for module in ("fcvm_fleet_east1", "fcvm_fleet_east2", "fcvm_fleet_west2"):
             body = block(self.fleet, "module", module)
             self.assertNotIn("depends_on", body)
+        self.assertNotIn("depends_on", block(self.prod, "module", "fcvm_fleet_prod_east1"))
         east = block(self.fleet, "module", "fcvm_fleet_east1")
-        self.assertIn("aws_ssm_parameter.fcvm_ami_release.arn", east)
-        self.assertIn("data.aws_ssm_parameter.fcvm_ami_release[0].version", east)
+        self.assertIn("one(ephemeral.aws_ssm_parameter.fcvm_ami_release_guard[*].version)", east)
+        self.assertRegex(east, r"ami_release_guarded\s*=\s*var.fcvm_ami_pipeline_enabled")
+        for region in ("fcvm_fleet_east2", "fcvm_fleet_west2"):
+            self.assertNotIn("ami_release_guarded", block(self.fleet, "module", region))
 
     def test_bootstrap_pointer_has_no_launch_template_dependency_cycle(self):
         pointer = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_release")
