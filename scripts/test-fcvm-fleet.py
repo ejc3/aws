@@ -808,9 +808,20 @@ class SpendBackstopTests(unittest.TestCase):
     def test_the_daily_budget_is_750_on_each_stacks_tagged_instances_only(self):
         self.assertIn("fcvm_fleet_daily_budget_usd = 750", BUDGET)
         self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]', BUDGET)
-        stage = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        legacy = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
+        stage = block('resource "aws_budgets_budget" "fcvm_fleet_stage_daily"', BUDGET)
         prod = block('resource "aws_budgets_budget" "fcvm_fleet_prod_daily"', BUDGET)
-        self.assertIn('name         = "fcvm-fleet-daily"', stage)
+        self.assertIn('name         = "fcvm-fleet-daily"', legacy)
+        self.assertIn('name   = "TagKeyValue"', legacy)
+        self.assertNotRegex(legacy, r"(?m)^  (?:filter_expression|metrics)\b")
+        self.assertIn('name         = "fcvm-fleet-stage-daily"', stage)
+        self.assertIn("var.fcvm_fleet_prod_enabled ? [] : [80, 100]", legacy)
+        self.assertIn("var.fcvm_fleet_prod_enabled ? [80, 100] : []", stage)
+        self.assertIn("fcvm_fleet_stage_budget = var.fcvm_fleet_prod_enabled ? aws_budgets_budget.fcvm_fleet_stage_daily : aws_budgets_budget.fcvm_fleet_daily", BUDGET)
+        self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", prod), ["80", "100"])
+        self.assertEqual(prod.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+        for budget in (legacy, stage):
+            self.assertIn("threshold                 = notification.value", budget)
         self.assertIn('name         = "${local.fcvm_fleet_prod_stack.prefix}-daily"', prod)
         self.assertIn("count        = local.fcvm_fleet_prod\n", prod)
         for budget in (stage, prod):
@@ -823,8 +834,7 @@ class SpendBackstopTests(unittest.TestCase):
             self.assertEqual(purpose, ("Purpose", "local.fcvm_fleet_budget_purposes"))
             self.assertEqual(fleet[0], "Fleet")
             self.assertEqual(budget.count("    and {\n"), 2)
-            self.assertEqual(re.findall(r"threshold\s+= (\d+)\n", budget), ["80", "100"])
-            self.assertEqual(budget.count("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns"), 2)
+            self.assertIn("subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns", budget)
             self.assertIn("depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]", budget)
         # Prod counts Fleet=prod; staging counts what carries no other stack's Fleet tag, untagged instances included.
         fleet_values = lambda b: re.findall(r'key\s+= "Fleet"\n\s+values\s+= (\S+)\n', b)
@@ -859,7 +869,7 @@ class SpendBackstopTests(unittest.TestCase):
         self.assertNotIn('Resource = "*"', grant)
         # Each stack: its own budget, decision record and coordinator role; prod's only while its switch is on.
         stacks = BUDGET.split("fcvm_fleet_spend_cap_stacks = concat(", 1)[1].split("\n  )\n", 1)[0]
-        for line in ("budget    = aws_budgets_budget.fcvm_fleet_daily.name",
+        for line in ("budget    = local.fcvm_fleet_stage_budget.name",
                      "state_key = aws_s3_object.fcvm_fleet_spend_cap_state.key",
                      "role_arn  = aws_iam_role.fcvm_fleet_coordinator_task.arn",
                      "[for i, b in aws_budgets_budget.fcvm_fleet_prod_daily : {",
@@ -876,6 +886,13 @@ class SpendBackstopTests(unittest.TestCase):
         trust = block('resource "aws_iam_role" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', trust)
         worker = block('resource "aws_lambda_function" "fcvm_fleet_budget_action"', BUDGET)
+        # The previous Lambda revision may still run after AWS updates the environment.
+        for key, resource in {
+            "BUDGET_NAME": "aws_budgets_budget.fcvm_fleet_daily.name",
+            "STATE_KEY": "aws_s3_object.fcvm_fleet_spend_cap_state.key",
+            "ROLE_NAME": "aws_iam_role.fcvm_fleet_coordinator_task.name",
+        }.items():
+            self.assertRegex(worker, rf"(?m)^      {key} += {re.escape(resource)}$")
         self.assertIn("reserved_concurrent_executions = 1", worker)
         self.assertIn('expire    = "cron(0 0 * * ? *)"', BUDGET)
         self.assertIn('reconcile = "cron(2/5 * * * ? *)"', BUDGET)
@@ -917,6 +934,23 @@ class CoordinatorTests(unittest.TestCase):
         self.assertRegex(td, r'secrets\s+= \[\{ name = "TUNNEL_TOKEN", valueFrom = local\.fcvm_fleet_tunnel_token_ref \}\]')
         self.assertEqual(len(re.findall(r"readonlyRootFilesystem\s*=\s*true", td)), 2)
         self.assertNotIn(":latest", td)
+
+
+class StateBucketLifecycleTests(unittest.TestCase):
+    def test_noncurrent_state_versions_expire_after_a_week_keeping_the_newest_hundred(self):
+        life = block('resource "aws_s3_bucket_lifecycle_configuration" "fcvm_fleet_coordinator_state"')
+        self.assertIn("bucket   = aws_s3_bucket.fcvm_fleet_coordinator_state.id", life)
+        rules = re.findall(r"^  rule \{\n(.*?)^  \}$", life, re.M | re.S)
+        self.assertEqual(len(rules), 2)
+        versions, uploads = rules
+        self.assertIn('id     = "expire-old-state-versions"', versions)
+        self.assertRegex(versions, r'filter \{\s*prefix = "state\.json"\s*\}')
+        self.assertRegex(versions, r"noncurrent_days\s+= 7\n")
+        self.assertRegex(versions, r"newer_noncurrent_versions = 100\n")
+        self.assertIn("filter {}", uploads)
+        self.assertRegex(uploads, r"abort_incomplete_multipart_upload \{\s*days_after_initiation = 1\s*\}")
+        self.assertNotIn("noncurrent_version_expiration", uploads)
+        self.assertNotRegex(life, r"(?m)^\s*expiration \{", "the current state object must never expire")
 
 
 class SecretTests(unittest.TestCase):
@@ -1126,6 +1160,9 @@ class RegistryTests(unittest.TestCase):
         policy = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator"')
         self.assertIn('tagPatternList = [local.fcvm_fleet_coordinator_tag]', policy)
         protected, rolling = policy.split('description  = "Keep the 20 newest images"', 1)
+        bootstrap, stage_only = protected.split('var.fcvm_fleet_prod_enabled ? [] : [', 1)
+        self.assertIn('tagPatternList = [local.fcvm_fleet_coordinator_tag]', bootstrap)
+        self.assertIn("rulePriority = 2", stage_only)
         self.assertIn('rulePriority = 1', protected)
         self.assertRegex(protected, r'\bcountNumber\s*=\s*1\b')
         self.assertIn('rulePriority = 2', protected)
@@ -1174,8 +1211,9 @@ class StageWallTests(unittest.TestCase):
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
     def test_the_coordinator_takes_forwarded_viewer_addresses_only_behind_required_access(self):
-        # The coordinator reads x-fleet-viewer-ip on a service-token request without verifying the JWT itself; the
-        # tunnel connector's access.required is what does.
+        # The coordinator honours x-fleet-viewer-ip only for a service token whose JWT it verifies itself
+        # (test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits); the tunnel connector's access.required
+        # stays in front of it.
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
         self.assertIn('"--access-viewer-address"', cmd)
         dev = (ROOT / "fcvm-dev.tf").read_text()
@@ -1185,6 +1223,40 @@ class StageWallTests(unittest.TestCase):
         api, direct = tunnel.split("hostname = local.fcvm_dev_direct_stage_host", 1)
         self.assertIn("required  = true", api)
         self.assertIn("required  = true", direct)
+
+    def test_the_coordinator_verifies_the_access_tokens_the_tunnel_admits(self):
+        # ejc3/fcvm c74ee76 (fleet/PROTOCOL.md, --access-team-domain): the coordinator checks each Access JWT's
+        # signature, issuer, audience and expiry itself. /live takes the viewer applications' audiences, /agent only
+        # the agents' application, so a token for one is never accepted on the other.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        app = "cloudflare_zero_trust_access_application"
+        self.assertIn('"--access-team-domain", trimprefix(local.browser_manager_issuer, "https://")', cmd)
+        live = re.findall(r'"--access-aud", (\S+?\.aud)\b', cmd)
+        agent = re.findall(r'"--agent-access-aud", (\S+?\.aud)\b', cmd)
+        self.assertEqual(sorted(live), [f"{app}.fcvm_dev_api_stage.aud", f"{app}.fcvm_dev_site_stage.aud"], cmd)
+        self.assertEqual(agent, [f"{app}.fcvm_dev_agent.aud"], cmd)
+        # Every audience the tunnel connector admits to the coordinator is one the coordinator verifies, on the side
+        # its route serves: a new Access application in front of the coordinator needs its flag here too.
+        dev = (ROOT / "fcvm-dev.tf").read_text()
+        tunnel = dev[dev.index('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"'):]
+        tunnel = tunnel[:tunnel.index("\n}\n")]
+        admitted = [a.strip() for tags in re.findall(r"aud_tag\s*=\s*\[([^\]]*)\]", tunnel) for a in tags.split(",")]
+        self.assertEqual(sorted(admitted), sorted(live + agent))
+        # The team the tokens are checked against is the team the connector names.
+        teams = set(re.findall(r'team_name\s*=\s*"([^"]+)"', tunnel))
+        issuer = re.search(r'browser_manager_issuer\s*=\s*"([^"]+)"', (ROOT / "browser-manager.tf").read_text()).group(1)
+        self.assertEqual({f"https://{t}.cloudflareaccess.com" for t in teams}, {issuer})
+        # Staging viewers all pass Access, so they count as verified; Turnstile is the production stack's.
+        self.assertNotIn("--turnstile", cmd)
+
+    def test_the_coordinator_forces_sleep_at_a_750_dollar_daily_spend_ceiling(self):
+        # Owner, 2026-11-18: $750 a day at the Spot price, forced sleep. The meter reads DescribeInstances and
+        # DescribeSpotPriceHistory, which the task role already has under ec2:Describe*.
+        cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_daily_spend_ceiling_usd)]', cmd)
+        self.assertRegex(TF, r"fcvm_fleet_daily_spend_ceiling_usd\s*=\s*750\n")
+        self.assertIn('"--sleep-when-idle"', cmd)
+        self.assertIn('Action   = ["ec2:Describe*"]', TF)
 
     def test_the_coordinator_checks_viewer_words_with_haiku_it_may_invoke(self):
         # The default, --text-check none, refuses every viewer word. The model the command names is the one the
@@ -1843,6 +1915,8 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("target_group_arn = aws_lb_target_group.fcvm_fleet_prod_dns[0].arn", svc)
         self.assertIn("subnets          = local.fcvm_fleet_prod_dns_subnets", svc)
         self.assertRegex(svc, r"depends_on = \[[^\]]*aws_lb_listener\.fcvm_fleet_prod_dns")
+        self.assertRegex(svc, r"depends_on = \[[^\]]*aws_iam_role_policy_attachment\.fcvm_fleet_prod_coordinator_execution,")
+        self.assertRegex(svc, r"lifecycle\s*\{\s*prevent_destroy\s*=\s*true\s*\}")
         ptr = block('resource "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_release"', PROD)
         self.assertIn('name     = "/fcvm-fleet/prod/coordinator-image"', ptr)
         self.assertIn("ignore_changes = [value]", ptr)
@@ -1942,6 +2016,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("Environment=FLEET_TLS_SECRET=%s", cond)
         self.assertIn("'${var.tile_tls_secret}'", cond)
         self.assertIn("systemctl restart --no-block fcvm-fleet-tls.service", cond)
+        self.assertIn("ExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service", cond)
 
 
 if __name__ == "__main__":

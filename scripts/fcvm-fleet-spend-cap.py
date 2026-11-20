@@ -2,6 +2,8 @@
 
 import json
 import os
+import signal
+from contextlib import contextmanager
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 
@@ -90,18 +92,46 @@ def stacks(env):
     """Each fleet stack's settings for reconcile(): its budget, decision record and coordinator role (STACKS, a JSON
     list), with the account, limit, bucket and deny policy they share."""
     shared = {key: env[key] for key in ("ACCOUNT_ID", "LIMIT_USD", "STATE_BUCKET", "POLICY_ARN")}
+    # During rollback, the old environment can arrive before the old handler.
+    if "STACKS" not in env:
+        return [{**shared, **{key: env[key] for key in ("BUDGET_NAME", "STATE_KEY", "ROLE_NAME")}}]
     listed = json.loads(env["STACKS"])
     if not listed:
         raise ValueError("No fleet stack to reconcile")
     return [{**shared, "BUDGET_NAME": s["budget"], "STATE_KEY": s["state_key"], "ROLE_NAME": s["role"]} for s in listed]
 
 
-def reconcile_all(env, budgets, s3, iam, now, expiry_only=False):
+@contextmanager
+def stack_deadline(remaining_ms, stack_count):
+    if remaining_ms is None:
+        yield
+        return
+
+    # Leave one second to report failures, and divide the remaining Lambda time fairly.
+    seconds = (remaining_ms() / 1000 - 1) / stack_count
+    if seconds <= 0:
+        raise TimeoutError("Insufficient time to reconcile a fleet budget")
+
+    def expired(signum, frame):
+        raise TimeoutError("Fleet budget reconciliation exceeded its share of the Lambda timeout")
+
+    prior_handler = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, prior_handler)
+
+
+def reconcile_all(env, budgets, s3, iam, now, expiry_only=False, remaining_ms=None):
     """Reconcile every stack; one stack's failure does not skip the next one's, and the run still fails."""
     failed = []
-    for stack in stacks(env):
+    listed = stacks(env)
+    for i, stack in enumerate(listed):
         try:
-            reconcile(stack, budgets, s3, iam, now, expiry_only=expiry_only)
+            with stack_deadline(remaining_ms, len(listed) - i):
+                reconcile(stack, budgets, s3, iam, now, expiry_only=expiry_only)
         except Exception as error:  # noqa: BLE001 - reported, then raised below
             print(json.dumps({"event": "spend_cap_failed", "budget": stack["BUDGET_NAME"], "error": type(error).__name__}))
             failed.append(stack["BUDGET_NAME"])
@@ -111,6 +141,10 @@ def reconcile_all(env, budgets, s3, iam, now, expiry_only=False):
 
 def handler(event, context):
     import boto3
+    from botocore.config import Config
 
-    reconcile_all(os.environ, boto3.client("budgets", region_name="us-east-1"), boto3.client("s3"),
-                  boto3.client("iam"), lambda: datetime.now(UTC), expiry_only=event == {"action": "expire"})
+    config = Config(connect_timeout=2, read_timeout=4, retries={"total_max_attempts": 1})
+    reconcile_all(os.environ, boto3.client("budgets", region_name="us-east-1", config=config),
+                  boto3.client("s3", config=config), boto3.client("iam", config=config),
+                  lambda: datetime.now(UTC), expiry_only=event == {"action": "expire"},
+                  remaining_ms=context.get_remaining_time_in_millis)

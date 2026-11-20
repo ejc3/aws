@@ -35,8 +35,8 @@ server; with no server yet it waits rather than own one), and seed a Codex threa
 turn can take minutes, the thread itself exists at once). Claude and Codex are tracked separately, so
 a Codex that is not logged in yet does not hold up Claude and is retried.
 
-COST. Per tick: one listing and one stat per entry in the roots. Anything already handled is skipped
-before any deeper check, so an idle box does almost nothing. Separately, the watcher retires
+COST. Each scan checks directory entries and resolves one UUID per filesystem containing a Git directory.
+Anything already handled is skipped before inspecting its Git history. Separately, the watcher retires
 unused unattended Claude windows after two days in linked worktrees or one week elsewhere.
 """
 import argparse
@@ -258,17 +258,39 @@ def refresh_owners(cfg):
     return not first
 
 
-def repo_identity(path):
-    """[device, inode] of the checkout's .git directory: stable while the checkout lives (git never replaces
-    the directory itself), different for a replacement clone at the same path."""
+def filesystem_uuid(git):
+    """UUID of the filesystem holding the Git admin directory, if the OS exposes one."""
+    try:
+        out = subprocess.run(["findmnt", "-n", "-o", "UUID", "-T", git],
+                             capture_output=True, text=True, check=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out.stdout.strip().lower() or None
+
+
+def repo_identity(path, volumes):
+    """Keep the numeric device for same-boot fallback; only the UUID can follow a disk across boots."""
     git, _ = git_dirs(path)
     if git is None:
-        return None
+        return None, None
     try:
         st = os.stat(git)
     except OSError:
-        return None
-    return [st.st_dev, st.st_ino]
+        return None, None
+    if st.st_dev not in volumes:
+        volumes[st.st_dev] = filesystem_uuid(git)
+    return [st.st_dev, st.st_ino], volumes[st.st_dev]
+
+
+def checkout_replaced(entry, ident, fs_uuid):
+    previous = entry.get("id")
+    if previous is None or ident is None:
+        return False
+    if previous[1] != ident[1]:
+        return True
+    if fs_uuid and entry.get("fs_uuid"):
+        return fs_uuid != entry["fs_uuid"]
+    return previous[0] is not None and previous[0] != ident[0]
 
 
 # ----------------------------------------------------- unattended Claude session retirement
@@ -800,6 +822,12 @@ class State:
                 self.known = {}
         # An older state file has no boot id: not evidence of a reboot.
         self.rebooted = bool(saved) and bool(self.boot_id) and saved != self.boot_id
+        if not saved or saved != self.boot_id:
+            # Device numbers in existing/legacy state cannot identify a mount from another boot.
+            # Keep its inode, any UUID, and launch history even if the Git dir can't be statted this tick.
+            for entry in self.known.values():
+                if entry.get("id") is not None:
+                    entry["id"][0] = None
 
     def save(self):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
@@ -855,37 +883,37 @@ def scan_once(cfg, state, launcher, now=None):
         elif getattr(launcher, "cheap_retry", {}).get("claude"):
             tried.pop(path, None)             # no tmux server yet: cheap to look again next tick
 
+    volumes = {}  # one UUID lookup per filesystem per scan, including when lookup is unavailable
     for path in found:
         entry = state.known.get(path)
-        ident = None
-        if entry is not None:
-            # The same PATH is not the same checkout: a clone deleted and replaced between two ticks keeps its
-            # pathname. Compare the identity recorded when it was first seen.
-            ident = repo_identity(path)
-            if entry.get("id") is None:
-                entry["id"] = ident           # recorded by an older version
-            elif ident is not None and entry["id"] != ident:
-                log("checkout replaced at %s; treating it as new" % path)
-                del state.known[path]
-                entry = None
+        ident, fs_uuid = repo_identity(path, volumes)
+        if entry is not None and checkout_replaced(entry, ident, fs_uuid):
+            log("checkout replaced at %s; treating it as new" % path)
+            del state.known[path]
+            entry = None
+        if entry is not None and ident is not None:
+            entry["id"] = ident
+            if fs_uuid:
+                entry["fs_uuid"] = fs_uuid
         if entry is not None and entry.get("ignored"):
             # Not this account's: remembered, so adding an owner later does not launch every old clone. A repo
             # that appeared AFTER the first run is looked at again when the allowed owners change.
             if not (owners_changed and not entry.get("seeded") and is_allowed(path, owners, repos) and is_finished(path)):
                 continue
-            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}, "id": entry.get("id")}
+            entry.pop("ignored")
+            entry.update(claude=False, codex=False, tried={})
             log("new repository (its owner is allowed now): %s" % path)
         if entry is None:
-            ident = repo_identity(path)
             if not is_finished(path):
                 continue                      # a clone still running: looked at again next tick
+            entry = state.known[path] = {"id": ident, "fs_uuid": fs_uuid}
             if not is_allowed(path, owners, repos):
-                state.known[path] = {"ignored": True, "seeded": adopting, "id": ident}
+                entry.update(ignored=True, seeded=adopting)
                 continue
             if adopting:
-                state.known[path] = {"claude": True, "codex": True, "seeded": True, "id": ident}
+                entry.update(claude=True, codex=True, seeded=True)
                 continue
-            entry = state.known[path] = {"claude": False, "codex": False, "tried": {}, "id": ident}
+            entry.update(claude=False, codex=False, tried={})
             log("new repository: %s" % path)
         if entry.get("claude") and entry.get("codex"):
             continue
