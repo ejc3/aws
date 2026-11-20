@@ -434,12 +434,12 @@ systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
 # ---------------------------------------------------------------- base packages
 # An automatic needrestart of the nspawn units ended every user's sessions on Nov 20.
 # Keep these units listed for operator maintenance when host libraries are upgraded.
-install -d -m 0755 /etc/needrestart/conf.d
-cat > /etc/needrestart/conf.d/nextjs-containers.conf.new <<'NEEDRESTART'
+install -d -m 0755 /etc/needrestart/conf.d || exit 1
+cat > /etc/needrestart/conf.d/nextjs-containers.conf.new <<'NEEDRESTART' || exit 1
 $nrconf{override_rc}{qr(^systemd-(?:nspawn@.+|machined)\.service$)} = 0;
 $nrconf{override_cont}{qr(^(?:${join("|", local.nextjs_users)})$)} = 0;
 NEEDRESTART
-mv -f /etc/needrestart/conf.d/nextjs-containers.conf.new /etc/needrestart/conf.d/nextjs-containers.conf
+mv -f /etc/needrestart/conf.d/nextjs-containers.conf.new /etc/needrestart/conf.d/nextjs-containers.conf || exit 1
 
 # An install of an already present package can upgrade it. Leave upgrades to host
 # maintenance; routine synchronization needs only missing or unconfigured prerequisites.

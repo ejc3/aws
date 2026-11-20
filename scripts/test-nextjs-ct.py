@@ -165,7 +165,7 @@ class FirstBootTests(unittest.TestCase):
     def test_aws_cli_install_failure_stops_setup(self):
         self.assertIn('ERROR: the AWS CLI did not install"; exit 1', self.script)
 
-    def run_package_setup(self, missing="", apt_status=0):
+    def run_package_setup(self, missing="", apt_status=0, failed_move=False):
         section = self.script.split("# ---------------------------------------------------------------- base packages\n", 1)[1]
         section = section.split("${local.linux_ip_options_setup}", 1)[0].replace("$${", "${")
         section = section.replace('${join("|", local.nextjs_users)}', 'colin|new-user')
@@ -175,8 +175,10 @@ class FirstBootTests(unittest.TestCase):
             section = section.replace("/etc/needrestart/conf.d", str(conf))
             scripts = {
                 "dpkg-query": 'case "$3" in "$MISSING") echo unpacked ;; *) echo installed ;; esac',
-                "apt-get": 'test -s "$CONF" || exit 99\necho "$*" >> "$LOG"\nexit "$APT_STATUS"',
+                "apt-get": 'echo "$*" >> "$LOG"\ntest -s "$CONF" || exit 99\nexit "$APT_STATUS"',
             }
+            if failed_move:
+                scripts["mv"] = "exit 1"
             for name, code in scripts.items():
                 path = root / name
                 path.write_text("#!/bin/sh\n" + code + "\n")
@@ -185,7 +187,7 @@ class FirstBootTests(unittest.TestCase):
             config = conf / "nextjs-containers.conf"
             env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", MISSING=missing,
                        APT_STATUS=str(apt_status), LOG=str(log), CONF=str(config))
-            result = subprocess.run(["bash", "-ec", section], env=env, capture_output=True, text=True)
+            result = subprocess.run(["bash", "-uo", "pipefail", "-c", section], env=env, capture_output=True, text=True)
             return result, log.read_text().splitlines() if log.exists() else [], config.read_text() if config.exists() else ""
 
     def test_config_refresh_with_installed_packages_leaves_apt_idle(self):
@@ -213,6 +215,11 @@ exit 5 unless 'new-user' =~ /$guest/ && 'colin' =~ /$guest/ && 'unmanaged' !~ /$
                 self.assertEqual(calls, ["-o DPkg::Lock::Timeout=600 update",
                                          "-o DPkg::Lock::Timeout=600 install -y nftables"])
                 self.assertEqual(result.returncode, 1 if apt_status else 0, result.stderr)
+
+    def test_failed_guard_install_stops_setup_before_apt(self):
+        result, calls, _ = self.run_package_setup("nftables", failed_move=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
 
     def test_etag_is_recorded_only_after_health(self):
         health = self.script.index("/usr/local/sbin/nextjs-ct-health || {")
