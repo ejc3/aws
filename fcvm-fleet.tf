@@ -62,9 +62,9 @@ variable "fcvm_fleet_extra_ipv4_viewer_ports_enabled" {
 
 locals {
   # The fleet's stacks in this account, keyed by the Fleet tag that scopes each one (ejc3/fcvm fleet production plan,
-  # invariant I2). Staging is the only stack today; the production stack (fcvm.dev) adds an entry with the same keys
-  # and its own coordinator, roles, templates and secrets. Staging's values are the names its resources already have,
-  # so routing them through this map renames nothing.
+  # invariant I2): staging, and production (fcvm.dev, fcvm-fleet-prod.tf), whose resources exist only while
+  # var.fcvm_fleet_prod_enabled. Staging's values are the names its resources already have, so routing them through
+  # this map renames nothing.
   # - fleet: the Fleet tag on every instance, spot request and launch template the stack owns, on its roles, task and
   #   secrets, and the coordinator's --fleet-name (it tags its launches with it and lists only instances that carry it).
   # - prefix: its launch templates' names (modules/fcvm-fleet-region, name_prefix).
@@ -79,10 +79,22 @@ locals {
       state_key              = "state.json"
       untagged_spot_requests = true
     }
+    prod = {
+      fleet                  = "prod"
+      prefix                 = "fcvm-fleet-prod"
+      tls_secret             = "fcvm-fleet/prod/tls"
+      state_key              = "prod/state.json"
+      untagged_spot_requests = false
+    }
   }
   fcvm_fleet_stage = local.fcvm_fleet_stacks.stage
+  # The stacks that exist: production only while its switch is on.
+  fcvm_fleet_stacks_enabled = { for k, s in local.fcvm_fleet_stacks : k => s if k != "prod" || var.fcvm_fleet_prod_enabled }
   # Each stack's coordinator task role, which its scope policy is attached to.
-  fcvm_fleet_stack_coordinator_roles = { stage = aws_iam_role.fcvm_fleet_coordinator_task.name }
+  fcvm_fleet_stack_coordinator_roles = merge(
+    { stage = aws_iam_role.fcvm_fleet_coordinator_task.name },
+    { for r in aws_iam_role.fcvm_fleet_prod_coordinator_task : "prod" => r.name },
+  )
 
   # The two switches (see the header).
   fcvm_fleet_hosts_enabled       = true
@@ -650,7 +662,7 @@ resource "aws_iam_service_linked_role" "fcvm_fleet_spot" {
 # ------------------------------------------------------------------------------------------------ the coordinator's image
 # The coordinator's container image (fcvm's fleet/coord, ARM64), pushed from fcvm-arm through fcvm-fleet-terraform; the task's
 # execution role pulls it (AmazonECSTaskExecutionRolePolicy). Tags are fcvm commits and immutable, so a running task's image
-# cannot change under it; the bootstrap image and the 20 newest are kept.
+# cannot change under it. While staging is the only consumer, retain the bootstrap image and 20 newest.
 resource "aws_ecr_repository" "fcvm_fleet_coordinator" {
   provider             = aws.fcvm_fleet
   name                 = "fcvm-fleet/coordinator"
@@ -667,7 +679,7 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
   provider   = aws.fcvm_fleet
   repository = aws_ecr_repository.fcvm_fleet_coordinator.name
   policy = jsonencode({
-    rules = [{
+    rules = concat([{
       # A higher-priority tag match excludes the immutable bootstrap image from
       # the rolling rule, even after many releases. Exactly one image has this tag.
       rulePriority = 1
@@ -679,12 +691,13 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_coordinator" {
         countNumber    = 1
       }
       action = { type = "expire" }
-      }, {
+      }], var.fcvm_fleet_prod_enabled ? [] : [{
+      # Production can still run or roll back to an older staging digest. ECR cannot read its pointers.
       rulePriority = 2
       description  = "Keep the 20 newest images"
       selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 20 }
       action       = { type = "expire" }
-    }]
+    }])
   })
 }
 
@@ -1167,7 +1180,7 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java" {
 # b5c06293 (hosts) tags its launches Fleet=<--fleet-name>, and every instance it acts on it found by that tag. A separate
 # managed policy, because the inline policy is at its aggregate size limit.
 resource "aws_iam_policy" "fcvm_fleet_stack_scope" {
-  for_each    = local.fcvm_fleet_stacks
+  for_each    = local.fcvm_fleet_stacks_enabled
   provider    = aws.fcvm_fleet
   name        = "fcvm-fleet-${each.key}-scope"
   description = "The ${each.key} fleet coordinator may launch, start, stop, retag, terminate and cancel only what is tagged Fleet=${each.value.fleet}"
@@ -1226,7 +1239,7 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_stack_scope" {
   policy_arn = aws_iam_policy.fcvm_fleet_stack_scope[each.key].arn
   # The launch deny reads the Fleet tag of the launch request, which includes the template's instance tags: attach it
   # only once every template carries the stack's tag.
-  depends_on = [module.fcvm_fleet_east2, module.fcvm_fleet_west2, module.fcvm_fleet_east1]
+  depends_on = [module.fcvm_fleet_east2, module.fcvm_fleet_west2, module.fcvm_fleet_east1, module.fcvm_fleet_prod_east1]
 }
 
 resource "aws_security_group" "fcvm_fleet_coordinator" {

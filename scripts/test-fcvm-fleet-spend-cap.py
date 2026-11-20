@@ -3,6 +3,7 @@
 import importlib.util
 import io
 import json
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -278,6 +279,116 @@ class SpendCapTests(unittest.TestCase):
         self.assertFalse(self.iam.changes)
         self.sync(clock)
         self.assertFalse(self.iam.changes)
+
+
+class Fleet:
+    """Budgets, S3 and IAM for several stacks at once, keyed by budget, state key and role."""
+
+    def __init__(self):
+        self.pages = {}
+        self.states = {}
+        self.attached = {}
+        self.broken_budgets = set()
+
+    def describe_budget_performance_history(self, *, AccountId, BudgetName, TimePeriod, MaxResults, NextToken=None):
+        if BudgetName in self.broken_budgets:
+            raise ConnectionError("billing outage")
+        return {"BudgetPerformanceHistory": {
+            "BudgetName": BudgetName, "BudgetType": "COST", "TimeUnit": "DAILY",
+            "BudgetedAndActualAmountsList": self.pages.get(BudgetName, []),
+        }}
+
+    def get_object(self, *, Bucket, Key):
+        state = self.states.setdefault(Key, {"blocked_on": "", "billed_days": []})
+        return {"Body": io.BytesIO(json.dumps(state).encode())}
+
+    def put_object(self, *, Bucket, Key, Body, **kwargs):
+        self.states[Key] = json.loads(Body)
+        return {}
+
+    def get_paginator(self, name):
+        return self
+
+    def paginate(self, *, RoleName):
+        yield {"AttachedPolicies": [{"PolicyArn": arn} for arn in self.attached.get(RoleName, set())]}
+
+    def attach_role_policy(self, *, RoleName, PolicyArn):
+        self.attached.setdefault(RoleName, set()).add(PolicyArn)
+
+    def detach_role_policy(self, *, RoleName, PolicyArn):
+        self.attached[RoleName].discard(PolicyArn)
+
+
+STACKS_ENV = {
+    **ENV,
+    "STATE_KEY": "spend-cap/daily.json", "ROLE_NAME": "stage-coordinator",
+    "STACKS": json.dumps([
+        {"budget": "fleet-daily", "state_key": "spend-cap/daily.json", "role": "stage-coordinator"},
+        {"budget": "fleet-prod-daily", "state_key": "spend-cap/prod-daily.json", "role": "prod-coordinator"},
+    ]),
+}
+
+
+class StackTests(unittest.TestCase):
+    """fcvm-fleet-budget.tf: each fleet stack has its own budget, decision record and coordinator role."""
+
+    def setUp(self):
+        self.fleet = Fleet()
+
+    def run_all(self, now=DAY, expiry_only=False):
+        cap.reconcile_all(STACKS_ENV, self.fleet, self.fleet, self.fleet, now, expiry_only=expiry_only)
+
+    def test_current_worker_reconciles_staging_with_previous_configuration(self):
+        self.fleet.pages[ENV["BUDGET_NAME"]] = [cost(DAY - timedelta(days=1))]
+        cap.reconcile_all(ENV, self.fleet, self.fleet, self.fleet, DAY)
+        self.assertEqual(self.fleet.attached, {ENV["ROLE_NAME"]: {ENV["POLICY_ARN"]}})
+        self.assertEqual(self.fleet.states[ENV["STATE_KEY"]]["blocked_on"], DAY.date().isoformat())
+
+    def test_one_stacks_overage_blocks_only_that_stacks_coordinator(self):
+        self.fleet.pages["fleet-prod-daily"] = [cost(DAY - timedelta(days=1), "751")]
+        self.fleet.pages["fleet-daily"] = [cost(DAY - timedelta(days=1), "12.40")]
+        self.run_all()
+        self.assertEqual(self.fleet.attached.get("prod-coordinator"), {ENV["POLICY_ARN"]})
+        self.assertFalse(self.fleet.attached.get("stage-coordinator"))
+        self.assertEqual(self.fleet.states["spend-cap/prod-daily.json"]["blocked_on"], DAY.date().isoformat())
+        self.assertEqual(self.fleet.states["spend-cap/daily.json"]["blocked_on"], "")
+        # At the next UTC midnight the block lifts, with no billing read.
+        self.fleet.broken_budgets = {"fleet-daily", "fleet-prod-daily"}
+        self.run_all(DAY + timedelta(days=1), expiry_only=True)
+        self.assertFalse(self.fleet.attached["prod-coordinator"])
+
+    def test_a_failing_stack_does_not_skip_the_next_and_the_run_still_fails(self):
+        self.fleet.broken_budgets = {"fleet-daily"}
+        self.fleet.pages["fleet-prod-daily"] = [cost(DAY - timedelta(days=1), "900")]
+        with patch("builtins.print"):
+            with self.assertRaisesRegex(RuntimeError, "fleet-daily"):
+                self.run_all()
+        self.assertEqual(self.fleet.attached.get("prod-coordinator"), {ENV["POLICY_ARN"]})
+
+    def test_stalled_stage_request_leaves_time_to_reconcile_production(self):
+        original_read = self.fleet.describe_budget_performance_history
+        def delayed(**request):
+            if request["BudgetName"] == "fleet-daily":
+                time.sleep(1)
+            return original_read(**request)
+
+        self.fleet.describe_budget_performance_history = delayed
+        self.fleet.pages["fleet-prod-daily"] = [cost(DAY - timedelta(days=1), "900")]
+        with self.assertRaisesRegex(RuntimeError, "fleet-daily"), patch("builtins.print"):
+            cap.reconcile_all(STACKS_ENV, self.fleet, self.fleet, self.fleet, DAY,
+                              remaining_ms=lambda: 1200)
+        self.assertEqual(self.fleet.attached.get("prod-coordinator"), {ENV["POLICY_ARN"]})
+
+    def test_stacks_are_read_from_the_environment_and_none_is_an_error(self):
+        listed = cap.stacks(STACKS_ENV)
+        self.assertEqual([(s["BUDGET_NAME"], s["STATE_KEY"], s["ROLE_NAME"]) for s in listed], [
+            ("fleet-daily", "spend-cap/daily.json", "stage-coordinator"),
+            ("fleet-prod-daily", "spend-cap/prod-daily.json", "prod-coordinator"),
+        ])
+        for s in listed:
+            self.assertEqual((s["ACCOUNT_ID"], s["LIMIT_USD"], s["POLICY_ARN"]), (ENV["ACCOUNT_ID"], "750", ENV["POLICY_ARN"]))
+        with self.assertRaises(ValueError):
+            cap.stacks({**STACKS_ENV, "STACKS": "[]"})
 
 
 if __name__ == "__main__":

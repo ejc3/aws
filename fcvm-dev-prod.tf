@@ -32,6 +32,13 @@ variable "fcvm_fleet_prod_enabled" {
   description = "Create the production fcvm fleet's Cloudflare resources (tunnel, Access, Turnstile) and their fleet secrets"
   type        = bool
   default     = false
+
+  # Both the Cloudflare routes and AWS resources use this input, including on targeted plans.
+  # Remove this guard only after the old DNS tokens and wildcard certificates have been retired.
+  validation {
+    condition     = !var.fcvm_fleet_prod_enabled
+    error_message = "Production is blocked until staging and developer credentials can no longer control fcvm.dev DNS or authenticate production names. Complete ejc3/aws#922 before enabling it."
+  }
 }
 
 locals {

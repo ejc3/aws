@@ -24,7 +24,9 @@
 #   coordinator launches and terminates tiles itself (its task role is limited to these templates).
 # - Stack: every template, and every instance and spot request one launches, is tagged Fleet = var.fleet. A stack's
 #   coordinator may act only on instances and spot requests that carry its own Fleet tag (fcvm-fleet.tf,
-#   aws_iam_policy.fcvm_fleet_stack_scope).
+#   aws_iam_policy.fcvm_fleet_stack_scope). The network's names and security groups carry var.name_prefix too, so a second
+#   stack's instance of this module (fcvm-fleet-prod.tf) gets its own VPC beside staging's in the same region. For the
+#   staging prefix, fcvm-fleet, every name renders as it did before the prefix existed.
 
 terraform {
   required_providers {
@@ -77,10 +79,39 @@ variable "ami_release_parameter_version" {
   default     = 0
 }
 
+# Whether the templates follow a release pointer, known at plan time even while the pointer's ARN is not (a stack whose
+# pointer is created in the same apply, fcvm-fleet-prod.tf). Null: whenever ami_release_parameter_arn is set, as before.
+variable "ami_release_guarded" {
+  description = "The templates follow ami_release_parameter_arn (null: whenever it is set)"
+  type        = bool
+  default     = null
+}
+
+variable "alert_topic" {
+  description = "Create the fcvm-fleet-alerts topic and its email subscription here; only staging's regions have one"
+  type        = bool
+  default     = true
+}
+
+variable "tile_tls_secret" {
+  description = "The certificate secret tiles read (FLEET_TLS_SECRET of fcvm-fleet-tls.service); empty keeps the tile AMI's default, fcvm-fleet/tls-wildcard"
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = can(regex("^[A-Za-z0-9/_+=.@-]*$", var.tile_tls_secret))
+    error_message = "tile_tls_secret must be a plain Secrets Manager secret name."
+  }
+}
+
+locals {
+  release_guarded = var.ami_release_guarded != null ? var.ami_release_guarded : var.ami_release_parameter_arn != ""
+}
+
 # Re-open at apply time under the backend lock. A release after planning must
 # invalidate the saved plan, while AZ discovery remains a plan-time operation.
 ephemeral "aws_ssm_parameter" "ami_release_guard" {
-  count           = var.ami_release_parameter_arn != "" ? 1 : 0
+  count           = local.release_guarded ? 1 : 0
   arn             = var.ami_release_parameter_arn
   with_decryption = false
   lifecycle {
@@ -227,7 +258,7 @@ data "aws_ami" "guarded" {
     values = [var.ip_options_guard_sha256]
   }
   dynamic "filter" {
-    for_each = var.ami_release_parameter_arn != "" ? [true] : []
+    for_each = local.release_guarded ? [true] : []
     content {
       name   = "tag:FleetImageValidated"
       values = ["true"]
@@ -341,7 +372,7 @@ locals {
     fi
     unset token boot_ami
     %{endif~}
-    %{~if var.ami_release_parameter_arn != ""~}
+    %{~if local.release_guarded~}
     # The factory publisher can change ImageId while retaining this bootstrap.
     # An unlisted image can run a mode only if it has both that mode's image in
     # root's Podman store and the flag in its installed agent. Windows needs more
@@ -381,10 +412,20 @@ locals {
     %{endif~}
   EOT
   )
+  # A stack with its own certificate (fcvm-fleet-prod.tf) points the tile's certificate fetcher at it (ejc3/fcvm
+  # fleet/ami/tile/fetch-cert.py reads FLEET_TLS_SECRET). The fetcher starts before cloud-init and retries every 5 s, and
+  # the tile's role may read only its own stack's secret, so a fetch of the AMI's default fails until this drop-in
+  # restarts it. Empty (staging) renders the user data byte for byte as before.
   tile_user_data = base64encode(<<-EOT
     #!/bin/bash
     set -eu
     ${var.ip_options_bootstrap}
+    %{if var.tile_tls_secret != ""~}
+    install -d -m 0755 /etc/systemd/system/fcvm-fleet-tls.service.d
+    printf '[Service]\nEnvironment=FLEET_TLS_SECRET=%s\nExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service\n' '${var.tile_tls_secret}' > /etc/systemd/system/fcvm-fleet-tls.service.d/10-fleet-stack.conf
+    systemctl daemon-reload
+    systemctl restart --no-block fcvm-fleet-tls.service
+    %{endif~}
   EOT
   )
 }
@@ -395,12 +436,12 @@ resource "aws_vpc" "this" {
   assign_generated_ipv6_cidr_block = true
   enable_dns_support               = true
   enable_dns_hostnames             = true
-  tags                             = { Name = "fcvm-fleet-${local.region}" }
+  tags                             = { Name = "${var.name_prefix}-${local.region}" }
 }
 
 resource "aws_internet_gateway" "this" {
   vpc_id = aws_vpc.this.id
-  tags   = { Name = "fcvm-fleet-${local.region}" }
+  tags   = { Name = "${var.name_prefix}-${local.region}" }
 }
 
 resource "aws_subnet" "public" {
@@ -412,7 +453,7 @@ resource "aws_subnet" "public" {
   assign_ipv6_address_on_creation                = true
   map_public_ip_on_launch                        = true
   enable_resource_name_dns_aaaa_record_on_launch = true
-  tags                                           = { Name = "fcvm-fleet-${each.key}" }
+  tags                                           = { Name = "${var.name_prefix}-${each.key}" }
 }
 
 resource "aws_route_table" "public" {
@@ -425,7 +466,7 @@ resource "aws_route_table" "public" {
     ipv6_cidr_block = "::/0"
     gateway_id      = aws_internet_gateway.this.id
   }
-  tags = { Name = "fcvm-fleet-${local.region}" }
+  tags = { Name = "${var.name_prefix}-${local.region}" }
 }
 
 resource "aws_route_table_association" "public" {
@@ -438,7 +479,7 @@ resource "aws_route_table_association" "public" {
 # User data alone is too late for the first listener or a stopped-pool resume.
 resource "aws_security_group" "fleet" {
   depends_on  = [data.aws_ami.guarded]
-  name        = "fcvm-fleet"
+  name        = var.name_prefix
   description = "fcvm fleet hosts and tiles: TCP 443 in from anywhere, nothing else in"
   vpc_id      = aws_vpc.this.id
 
@@ -468,17 +509,17 @@ resource "aws_security_group" "fleet" {
     ipv6_cidr_blocks = ["::/0"]
   }
 
-  tags = { Name = "fcvm-fleet" }
+  tags = { Name = var.name_prefix }
 }
 
 # Host-only, never the shared HTTPS security group. The main Fleet group
 # already supplies egress; there is no need for this extra group to grant it.
 resource "aws_security_group" "minecraft_java" {
   count       = var.minecraft_java_access == null ? 0 : 1
-  name        = "fcvm-fleet-minecraft-java"
+  name        = "${var.name_prefix}-minecraft-java"
   description = "Fleet host IPv6 Minecraft Java joins"
   vpc_id      = aws_vpc.this.id
-  tags        = { Name = "fcvm-fleet-minecraft-java" }
+  tags        = { Name = "${var.name_prefix}-minecraft-java" }
 }
 
 resource "aws_vpc_security_group_ingress_rule" "minecraft_java" {
@@ -497,7 +538,7 @@ resource "aws_flow_log" "this" {
   log_destination_type     = "s3"
   log_destination          = var.flow_log_destination
   max_aggregation_interval = 600
-  tags                     = { Name = "fcvm-fleet-${local.region}-flow-log", BucketPolicy = var.flow_log_bucket_policy_id }
+  tags                     = { Name = "${var.name_prefix}-${local.region}-flow-log", BucketPolicy = var.flow_log_bucket_policy_id }
 }
 
 # ------------------------------------------------------------------------------------------------ GPU hosts
@@ -570,7 +611,7 @@ resource "aws_launch_template" "host" {
 # Preserve the existing topic and confirmed email subscription at their original Terraform addresses. The coordinator's
 # accepted-launch alarm replaces the obsolete Auto Scaling metric; a narrowly scoped Lambda publishes here through SNS.
 resource "aws_sns_topic" "alerts" {
-  count = length(local.host_archs) > 0 ? 1 : 0
+  count = var.alert_topic && length(local.host_archs) > 0 ? 1 : 0
   name  = "fcvm-fleet-alerts"
 }
 
@@ -616,7 +657,7 @@ resource "aws_sns_topic_policy" "alerts" {
 }
 
 resource "aws_sns_topic_subscription" "alerts_email" {
-  count     = length(local.host_archs) > 0 ? 1 : 0
+  count     = length(aws_sns_topic.alerts)
   topic_arn = aws_sns_topic.alerts[0].arn
   protocol  = "email"
   endpoint  = var.alert_email

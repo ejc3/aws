@@ -1,6 +1,8 @@
 # fcvm-fleet-budget.tf
 #
-# A spending ceiling for the public fleet: $750 a day (owner, 2026-11-18), on the fleet's GPU hosts and EC2 tiles.
+# A spending ceiling for each fleet stack: $750 a day (owner, 2026-11-18), on the stack's GPU hosts and EC2 tiles. Staging
+# and, while var.fcvm_fleet_prod_enabled, production (fcvm-fleet-prod.tf) each have their own budget, their own decision
+# record and their own coordinator role the block is attached to, so one stack's spend never blocks the other.
 #
 # This is the BACKSTOP. The primary enforcement is the coordinator sleeping the fleet from its own instance-hour
 # estimate, which is fcvm's work (ejc3/fcvm, separately). AWS Budgets reads billing data, which AWS updates up to three
@@ -8,23 +10,50 @@
 # overrun late in a UTC day may only be seen the next day. It cannot be the only limit.
 #
 # - Scope: costs tagged Purpose=fcvm-fleet-host or Purpose=fcvm-fleet-tile, the tags every host and tile launch template
-#   puts on its instance (modules/fcvm-fleet-region). The gpubox test hosts (Purpose=fcvm-fleet-gpubox) and the AMI
+#   puts on its instance (modules/fcvm-fleet-region), split by the Fleet tag every template also puts there: prod's
+#   budget counts Fleet=prod, staging's everything else (so an instance without a Fleet tag still counts against
+#   staging, as before the split). The gpubox test hosts (Purpose=fcvm-fleet-gpubox) and the AMI
 #   builders (fcvm-fleet-ami-build) run in the same account, so an account-wide budget would stop the wall for their
 #   spend. Not counted: the coordinator's Fargate task, the DNS load balancer, S3, Bedrock and the hosts' and tiles'
 #   untagged EBS volumes, together a few dollars a day.
-# - Purpose must be an active cost allocation tag, which only the management account can set; it applies to every member
-#   account. Tags count only for costs after activation, and activation takes up to 24 hours.
+# - Purpose and Fleet must be active cost allocation tags, which only the management account can set; it applies to every
+#   member account. Tags count only for costs after activation, and activation takes up to 24 hours: prod's budget sees
+#   nothing until Fleet is active, which is why Fleet is activated here, before prod is switched on.
 # - At $600 and $750, notify the fleet topic. Daily budgets evaluate completed UTC days and do not support
 #   native budget actions. The reconciler reads the latest three complete UTC billing periods. A previously
 #   unseen daily actual at or above $750 blocks new launches through detection day's next UTC midnight.
 #   Stop, terminate and describe remain available. Intraday control belongs to the coordinator.
-# - One serialized worker owns the deny attachment. The midnight reset checks its durable decision without
-#   reading billing; the five-minute reconciliation also releases an expired deny after delivery or IAM outages.
-#   Recorded billed days prevent duplicate or delayed messages from extending the block.
+# - One serialized worker owns the deny attachments, one stack after another (STACKS). The midnight reset checks each
+#   stack's durable decision without reading billing; the five-minute reconciliation also releases an expired deny after
+#   delivery or IAM outages. Recorded billed days prevent duplicate or delayed messages from extending the block. A stack
+#   whose reconciliation fails does not stop the next one's; the run then fails, which the unhealthy alarm sees.
 
 locals {
   fcvm_fleet_daily_budget_usd = 750
   fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]
+  # The Fleet tags of the stacks other than staging: staging's budget counts what carries none of them.
+  fcvm_fleet_budget_other_fleets = [for k, s in local.fcvm_fleet_stacks : s.fleet if k != "stage"]
+  # Keep enforcing the existing budget while the new stage-only budget accumulates billing history.
+  fcvm_fleet_stage_budget = var.fcvm_fleet_prod_enabled ? aws_budgets_budget.fcvm_fleet_stage_daily : aws_budgets_budget.fcvm_fleet_daily
+  # What the worker reconciles: each existing stack's budget, decision record and coordinator role.
+  fcvm_fleet_spend_cap_stacks = concat(
+    [{
+      fleet     = local.fcvm_fleet_stage.fleet
+      budget    = local.fcvm_fleet_stage_budget.name
+      budget_id = local.fcvm_fleet_stage_budget.arn
+      state_key = aws_s3_object.fcvm_fleet_spend_cap_state.key
+      role      = aws_iam_role.fcvm_fleet_coordinator_task.name
+      role_arn  = aws_iam_role.fcvm_fleet_coordinator_task.arn
+    }],
+    [for i, b in aws_budgets_budget.fcvm_fleet_prod_daily : {
+      fleet     = local.fcvm_fleet_prod_stack.fleet
+      budget    = b.name
+      budget_id = b.arn
+      state_key = aws_s3_object.fcvm_fleet_prod_spend_cap_state[i].key
+      role      = aws_iam_role.fcvm_fleet_prod_coordinator_task[i].name
+      role_arn  = aws_iam_role.fcvm_fleet_prod_coordinator_task[i].arn
+    }],
+  )
 }
 
 resource "aws_ce_cost_allocation_tag" "purpose" {
@@ -37,6 +66,8 @@ resource "aws_ce_cost_allocation_tag" "purpose" {
   }
 }
 
+# Preserve the budget's original legacy API representation and all its history. The pinned
+# provider would retain CostTypes/CostFilters when adding Metrics/FilterExpression in place.
 resource "aws_budgets_budget" "fcvm_fleet_daily" {
   provider     = aws.fcvm_fleet
   name         = "fcvm-fleet-daily"
@@ -48,6 +79,118 @@ resource "aws_budgets_budget" "fcvm_fleet_daily" {
   cost_filter {
     name   = "TagKeyValue"
     values = [for p in local.fcvm_fleet_budget_purposes : format("user:Purpose$%s", p)]
+  }
+
+  dynamic "notification" {
+    for_each = var.fcvm_fleet_prod_enabled ? [] : [80, 100]
+    content {
+      comparison_operator       = "GREATER_THAN"
+      threshold                 = notification.value
+      threshold_type            = "PERCENTAGE"
+      notification_type         = "ACTUAL"
+      subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(local.fcvm_fleet_alert_topic_arns) > 0
+      error_message = "The fleet's daily budget needs the fcvm-fleet-alerts topic, which exists only in a region with a GPU host template."
+    }
+  }
+
+  depends_on = [aws_ce_cost_allocation_tag.purpose]
+}
+
+# Start collecting scoped history before the production cutover. Only one staging budget
+# sends notifications or drives the worker at a time, and both share the existing decision key.
+resource "aws_budgets_budget" "fcvm_fleet_stage_daily" {
+  provider     = aws.fcvm_fleet
+  name         = "fcvm-fleet-stage-daily"
+  budget_type  = "COST"
+  limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
+  # A filter expression takes its metric explicitly; unblended cost is what the budget's default cost types measured.
+  metrics = ["UnblendedCost"]
+
+  # Purpose host or tile, and not another stack's Fleet tag.
+  filter_expression {
+    and {
+      tags {
+        key           = "Purpose"
+        values        = local.fcvm_fleet_budget_purposes
+        match_options = ["EQUALS"]
+      }
+    }
+    and {
+      not {
+        tags {
+          key           = "Fleet"
+          values        = local.fcvm_fleet_budget_other_fleets
+          match_options = ["EQUALS"]
+        }
+      }
+    }
+  }
+
+  dynamic "notification" {
+    for_each = var.fcvm_fleet_prod_enabled ? [80, 100] : []
+    content {
+      comparison_operator       = "GREATER_THAN"
+      threshold                 = notification.value
+      threshold_type            = "PERCENTAGE"
+      notification_type         = "ACTUAL"
+      subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
+    }
+  }
+
+  lifecycle {
+    precondition {
+      condition     = length(local.fcvm_fleet_alert_topic_arns) > 0
+      error_message = "The fleet's daily budget needs the fcvm-fleet-alerts topic, which exists only in a region with a GPU host template."
+    }
+  }
+
+  depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]
+}
+
+resource "aws_ce_cost_allocation_tag" "fleet" {
+  tag_key = "Fleet"
+  status  = "Active"
+
+  lifecycle {
+    # The provider deactivates this tag for every account in the organization on deletion.
+    prevent_destroy = true
+  }
+}
+
+# Production's: Purpose host or tile, and Fleet=prod.
+resource "aws_budgets_budget" "fcvm_fleet_prod_daily" {
+  count        = local.fcvm_fleet_prod
+  provider     = aws.fcvm_fleet
+  name         = "${local.fcvm_fleet_prod_stack.prefix}-daily"
+  budget_type  = "COST"
+  limit_amount = tostring(local.fcvm_fleet_daily_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "DAILY"
+  metrics      = ["UnblendedCost"]
+
+  filter_expression {
+    and {
+      tags {
+        key           = "Purpose"
+        values        = local.fcvm_fleet_budget_purposes
+        match_options = ["EQUALS"]
+      }
+    }
+    and {
+      tags {
+        key           = "Fleet"
+        values        = [local.fcvm_fleet_prod_stack.fleet]
+        match_options = ["EQUALS"]
+      }
+    }
   }
 
   notification {
@@ -66,6 +209,8 @@ resource "aws_budgets_budget" "fcvm_fleet_daily" {
     subscriber_sns_topic_arns = local.fcvm_fleet_alert_topic_arns
   }
 
+  tags = local.fcvm_fleet_prod_tags
+
   lifecycle {
     precondition {
       condition     = length(local.fcvm_fleet_alert_topic_arns) > 0
@@ -73,10 +218,11 @@ resource "aws_budgets_budget" "fcvm_fleet_daily" {
     }
   }
 
-  depends_on = [aws_ce_cost_allocation_tag.purpose]
+  depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]
 }
 
-# Attached to the coordinator's task role only by the daily billing reconciler. A deny wins over the role's own grants.
+# Attached to a stack's coordinator task role only by the daily billing reconciler, for that stack's budget. A deny
+# wins over the role's own grants.
 resource "aws_iam_policy" "fcvm_fleet_spend_cap" {
   provider    = aws.fcvm_fleet
   name        = "fcvm-fleet-spend-cap"
@@ -102,6 +248,18 @@ resource "aws_s3_object" "fcvm_fleet_spend_cap_state" {
   lifecycle {
     ignore_changes  = [content]
     prevent_destroy = true
+  }
+}
+
+resource "aws_s3_object" "fcvm_fleet_prod_spend_cap_state" {
+  count        = local.fcvm_fleet_prod
+  provider     = aws.fcvm_fleet
+  bucket       = aws_s3_bucket.fcvm_fleet_coordinator_state.id
+  key          = "spend-cap/${local.fcvm_fleet_prod_stack.fleet}-daily.json"
+  content      = jsonencode({ blocked_on = "", billed_days = [] })
+  content_type = "application/json"
+  lifecycle {
+    ignore_changes = [content]
   }
 }
 
@@ -132,29 +290,29 @@ resource "aws_iam_role_policy" "fcvm_fleet_budget_action" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "CapTheCoordinator"
+        Sid       = "CapTheCoordinators"
         Effect    = "Allow"
         Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]
-        Resource  = aws_iam_role.fcvm_fleet_coordinator_task.arn
+        Resource  = [for s in local.fcvm_fleet_spend_cap_stacks : s.role_arn]
         Condition = { ArnEquals = { "iam:PolicyARN" = aws_iam_policy.fcvm_fleet_spend_cap.arn } }
       },
       {
         Sid      = "CheckAttachment"
         Effect   = "Allow"
         Action   = "iam:ListAttachedRolePolicies"
-        Resource = aws_iam_role.fcvm_fleet_coordinator_task.arn
+        Resource = [for s in local.fcvm_fleet_spend_cap_stacks : s.role_arn]
       },
       {
-        Sid      = "ReadFleetBudget"
+        Sid      = "ReadFleetBudgets"
         Effect   = "Allow"
         Action   = "budgets:ViewBudget"
-        Resource = aws_budgets_budget.fcvm_fleet_daily.arn
+        Resource = [for s in local.fcvm_fleet_spend_cap_stacks : s.budget_id]
       },
       {
         Sid      = "RememberDailyDecisions"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${aws_s3_object.fcvm_fleet_spend_cap_state.key}"
+        Resource = [for s in local.fcvm_fleet_spend_cap_stacks : "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${s.state_key}"]
       },
       {
         Sid      = "LogReconciliation"
@@ -188,13 +346,17 @@ resource "aws_lambda_function" "fcvm_fleet_budget_action" {
   reserved_concurrent_executions = 1
   environment {
     variables = {
+      # AWS updates $LATEST's environment separately from its code. Keep the previous
+      # worker's single-stack settings so it continues protecting staging during that interval.
       ACCOUNT_ID   = local.fcvm_fleet_account_id
       BUDGET_NAME  = aws_budgets_budget.fcvm_fleet_daily.name
-      LIMIT_USD    = tostring(local.fcvm_fleet_daily_budget_usd)
-      STATE_BUCKET = aws_s3_bucket.fcvm_fleet_coordinator_state.id
       STATE_KEY    = aws_s3_object.fcvm_fleet_spend_cap_state.key
       ROLE_NAME    = aws_iam_role.fcvm_fleet_coordinator_task.name
+      LIMIT_USD    = tostring(local.fcvm_fleet_daily_budget_usd)
+      STATE_BUCKET = aws_s3_bucket.fcvm_fleet_coordinator_state.id
       POLICY_ARN   = aws_iam_policy.fcvm_fleet_spend_cap.arn
+      # scripts/fcvm-fleet-spend-cap.py, stacks(): one budget, decision record and coordinator role per stack.
+      STACKS = jsonencode([for s in local.fcvm_fleet_spend_cap_stacks : { budget = s.budget, state_key = s.state_key, role = s.role }])
     }
   }
   depends_on = [aws_iam_role_policy.fcvm_fleet_budget_action]
@@ -269,10 +431,10 @@ resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_spend_cap_unhealthy" {
 output "fcvm_fleet_budget" {
   description = "The fleet's daily spend backstop (fcvm-fleet-budget.tf)"
   value = {
-    budget       = aws_budgets_budget.fcvm_fleet_daily.name
+    budgets      = { for s in local.fcvm_fleet_spend_cap_stacks : s.fleet => s.budget }
     limit_usd    = local.fcvm_fleet_daily_budget_usd
     cap_policy   = aws_iam_policy.fcvm_fleet_spend_cap.name
-    applies_to   = aws_iam_role.fcvm_fleet_coordinator_task.name
+    applies_to   = { for s in local.fcvm_fleet_spend_cap_stacks : s.fleet => s.role }
     tag_purposes = local.fcvm_fleet_budget_purposes
   }
 }
