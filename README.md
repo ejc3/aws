@@ -910,11 +910,17 @@ SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude'
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
 daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
 box, `fcvm-claude-rc.service` starts remote-control sessions at boot for the user's
-active repositories under `/home/ubuntu`. “Active” means t-claude was used for that
-repository on this host during the preceding 30 days, its local Git checkout has moved
-during that period, or its worktree has uncommitted changes. Only `github.com/ejc3/*`
-checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
-interactive launch attaches to the same work when run from that repository root.
+active repositories under `/home/ubuntu`. A human prompt or a `claude-interactive`
+marker in the preceding 30 days qualifies a checkout from an allowed origin.
+The launcher uses the normal path-derived `t-claude` session so a later interactive
+launch attaches to the same work when run from that repository root.
+
+`agent-session-sync` also notices new clones and marked linked worktrees as they
+appear. It records the Git directory's inode and filesystem UUID in `known.json`,
+so an EBS device number changing on boot preserves the checkout's launch history.
+When upgrading older state or using a filesystem without a UUID, the first scan
+after a reboot preserves a known checkout with the same inode. Subsequent scans
+can also compare device numbers within that boot.
 
 An automatically opened Claude Remote Control window in a linked Git worktree closes after
 48 hours if its transcript is still blank and the worktree has no recorded conversation.
