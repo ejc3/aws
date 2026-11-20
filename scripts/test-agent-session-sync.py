@@ -3,6 +3,7 @@
 Offline: real git repositories in a temp directory and a fake launcher."""
 import importlib.util
 import base64
+import fcntl
 import gzip
 import json
 import os
@@ -10,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from unittest import mock
 from pathlib import Path
 
@@ -99,6 +101,131 @@ class FirstRunTests(Base):
         self.assertFalse(again.first_run)
         self.scan(now=1100, state=again)
         self.assertEqual(self.launcher.calls, [])
+
+
+class GhStackLockTests(Base):
+    names = ("gh-stack.lock", "gh-stack-operation.lock")
+
+    def legacy_state(self, old_boot, current_boot, known=None):
+        path = Path(self.state.path)
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({"known": known or {}, "clones": True, "boot_id": old_boot}))
+        return ass.State(str(path), boot_id=current_boot)
+
+    def test_a_new_clone_waits_for_each_exclusive_holder_and_starts_once_after_release(self):
+        self.scan()
+        for name in self.names:
+            with self.subTest(lock=name):
+                repo = make_repo(self.home, name, marked=False)
+                lock = repo / ".git" / name
+                with lock.open("w") as owner:
+                    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.scan()
+                    self.assertNotIn(str(repo), self.state.known)
+                self.launcher.calls.clear()
+                self.scan()
+                self.scan()
+                self.assertTrue(lock.exists())
+                self.assertEqual(self.launcher.calls, [("claude", str(repo)), ("codex", str(repo))])
+
+    def test_other_lock_files_still_block_an_unlocked_stack_checkout(self):
+        self.scan()
+        repo = make_repo(self.home, "locked")
+        for name in self.names:
+            (repo / ".git" / name).touch()
+        for name in ("index.lock", "another-tool.lock"):
+            with self.subTest(lock=name):
+                lock = repo / ".git" / name
+                lock.touch()
+                self.scan()
+                self.assertEqual(self.launcher.calls, [])
+                lock.unlink()
+        self.scan()
+        self.assertEqual(self.launcher.calls, [("claude", str(repo)), ("codex", str(repo))])
+
+    def test_linked_worktree_defers_to_its_common_stack_operation_lock(self):
+        main = make_repo(self.home, "main")
+        self.scan()
+        worktree = self.home / "marked"
+        git(main, "worktree", "add", "-q", "-b", "feature", str(worktree))
+        mark(worktree)
+        with (main / ".git" / self.names[1]).open("w") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.scan()
+            self.assertEqual(self.launcher.calls, [])
+        self.scan()
+        self.assertEqual(self.launcher.calls, [("claude", str(worktree)), ("codex", str(worktree))])
+
+    def test_nonregular_advisory_lock_is_treated_as_busy(self):
+        repo = make_repo(self.home, "special")
+        lock = repo / ".git" / self.names[0]
+        lock.symlink_to(repo / "f")
+        self.assertFalse(ass.is_finished(repo))
+        lock.unlink()
+        os.mkfifo(lock)
+        self.assertFalse(ass.is_finished(repo))
+        lock.unlink()
+        lock.mkdir()
+        self.assertFalse(ass.is_finished(repo))
+
+    def test_upgrade_seeds_only_previously_blocked_clones_including_held_then_released(self):
+        self.state = self.legacy_state("A", "A")
+        idle = make_repo(self.home, "idle", marked=False)
+        held = make_repo(self.home, "held", marked=False)
+        sibling = make_repo(self.home, "ordinary-new", marked=False)
+        (idle / ".git" / self.names[0]).touch()
+        with (held / ".git" / self.names[1]).open("w") as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.scan()
+            for repo in (idle, held):
+                self.assertTrue(self.state.known[str(repo)]["seeded"])
+            self.assertEqual(self.started(), [str(sibling)])
+            self.state = ass.State(self.state.path, boot_id="A")
+        self.launcher.calls.clear()
+        self.scan()
+        self.assertEqual(self.launcher.calls, [])
+        new = make_repo(self.home, "after-upgrade", marked=False)
+        (new / ".git" / self.names[0]).touch()
+        self.scan()
+        self.assertEqual(self.launcher.calls, [("claude", str(new)), ("codex", str(new))])
+
+    def test_upgrade_preserves_existing_pending_launch_and_detects_a_known_replacement(self):
+        pending = make_repo(self.home, "pending")
+        replaced = make_repo(self.home, "replaced")
+        (pending / ".git" / self.names[0]).touch()
+        ident, uuid = ass.repo_identity(replaced, {})
+        Path(replaced).rename(self.tmp + "/saved")
+        make_repo(self.home, "replaced")
+        (replaced / ".git" / self.names[1]).touch()
+        self.state = self.legacy_state("A", "A", {
+            str(pending): {"claude": True, "codex": False},
+            str(replaced): {"id": ident, "fs_uuid": uuid, "claude": True, "codex": True},
+        })
+        self.scan()
+        self.assertCountEqual(self.launcher.calls, [
+            ("codex", str(pending)), ("claude", str(replaced)), ("codex", str(replaced))])
+
+    def test_boot_restores_only_the_checkout_with_a_recent_human_prompt_during_adoption(self):
+        self.state = self.legacy_state("A", "B")
+        route = make_repo(self.home, "route", marked=False)
+        idle = make_repo(self.home, "idle", marked=False)
+        for repo in (route, idle):
+            for name in self.names:
+                (repo / ".git" / name).touch()
+        project = self.home / ".claude/projects/route"
+        project.mkdir(parents=True)
+        prompt = {"type": "user", "cwd": str(route), "origin": {"kind": "human"},
+                  "timestamp": datetime.now(timezone.utc).isoformat(),
+                  "message": {"role": "user", "content": "show the route"}}
+        (project / "session.jsonl").write_text(json.dumps(prompt, separators=(",", ":")) + "\n")
+        tool = Path(__file__).with_name("agent-active-dirs.py")
+        self.cfg["active_dirs"] = lambda cfg: ass.run_active_dirs(str(tool), cfg["home"])
+        with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": str(self.home / ".claude")}):
+            self.scan()
+            self.scan()
+        self.assertEqual(self.launcher.calls, [("claude", str(route))])
+        for repo in (route, idle):
+            self.assertTrue(self.state.known[str(repo)]["seeded"])
 
 
 class WhatIsNotNewTests(Base):
@@ -412,6 +539,65 @@ class WiringTests(unittest.TestCase):
         import re as _re
         interval = float(_re.search(r'"--interval", type=float, default=([0-9.]+)', text).group(1))
         self.assertLessEqual(interval, 5.0, "scan + ~1s launch must stay well under 15s")
+
+
+class MetalCheckoutPolicyTests(Base):
+    def test_live_upgrade_preserves_ignored_clones_and_only_restores_recent_maps_on_reboot(self):
+        url = "https://github.com/dolphin-labs-hq/dolphin-maps.git"
+        dirs = {key: make_repo(self.home, key, origin=url, marked=False)
+                for key in ("route", "route-idle", "route-retired")}
+        other = make_repo(self.home, "other", origin="https://github.com/dolphin-labs-hq/unapproved")
+        policy = Path(self.tmp, "metal-repos")
+        args = ["--once", "--home", str(self.home), "--owner", "ejc3", "--repo", "dolphin-labs-hq/dolphin-labs"]
+        current_boot = "before"
+        active = [str(dirs["route"]), str(dirs["route-retired"]), str(other)]
+
+        def tick(*extra):
+            with mock.patch.object(ass, "METAL_REPOS_FILE", str(policy), create=True), \
+                    mock.patch.object(ass, "current_boot_id", return_value=current_boot), \
+                    mock.patch.object(ass, "Launcher", return_value=self.launcher), \
+                    mock.patch.object(ass.ClaudeRetirement, "tick"), \
+                    mock.patch.object(ass, "run_active_dirs", return_value=active):
+                self.assertEqual(ass.main(args + list(extra)), 0)
+
+        tick()
+        # Another ignored clone arrived after the watcher's first scan (the real route-* history).
+        make_repo(self.home, "route-historical", origin=url, marked=False)
+        tick()
+        self.assertFalse(self.launcher.calls)
+        policy.write_text("dolphin-labs-hq/dolphin-labs\ndolphin-labs-hq/dolphin-maps\n")
+        Path(ass.retirement_marker(str(dirs["route-retired"]), str(self.home))).touch()
+        tick()  # previous watcher argv, same boot, new root-owned file
+        self.assertFalse(self.launcher.calls)
+        current_boot = "after"
+        tick()
+        self.assertEqual(self.launcher.calls, [("claude", str(dirs["route"]))])
+        self.launcher.calls.clear()
+        tick()
+        self.assertFalse(self.launcher.calls)
+        fresh = make_repo(self.home, "new-map", origin=url, marked=False)
+        tick()
+        self.assertEqual(sorted(self.launcher.calls), [("claude", str(fresh)), ("codex", str(fresh))])
+
+        # Admin policy remains unchanged even if a metal policy file is present.
+        self.launcher.calls.clear()
+        current_boot = "admin"
+        tick("--require-clone-marker")
+        self.assertFalse(self.launcher.calls)
+
+    def test_unrelated_gh_login_does_not_release_old_ignored_collaboration_clones(self):
+        self.cfg.update(owners_extra=["ejc3"], owners_sig=ass.owners_signature(str(self.home)))
+        self.scan()
+        url = "git@github.com:dolphin-labs-hq/dolphin-maps.git"
+        old = make_repo(self.home, "route-historical", origin=url, marked=False)
+        self.scan(now=1005)
+        self.assertTrue(self.state.known[str(old)]["ignored"])
+        self.cfg["repos"] = {"dolphin-labs-hq/dolphin-maps"}
+        gh = self.home / ".config" / "gh"
+        gh.mkdir(parents=True)
+        (gh / "hosts.yml").write_text("github.com:\n    user: another-account\n")
+        self.scan(now=1010)
+        self.assertFalse(self.launcher.calls)
 
 
 class RebootTests(Base):

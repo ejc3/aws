@@ -59,6 +59,7 @@ ORIGIN_FORMS = [
     re.compile(r"^git@github\.com:([^/]+)/([^/]+?)(?:\.git)?$"),
     re.compile(r"^ssh://git@github\.com/([^/]+)/([^/]+?)(?:\.git)?$"),
 ]
+METAL_REPOS_FILE = "/usr/local/lib/fcvm/claude-collaboration-repos"
 NEVER_REPOS = {"claude-code-history", "claude-code-sync"}
 RETRY_SECONDS = 60
 
@@ -144,8 +145,36 @@ def is_linked_worktree(git, common):
     return git is not None and os.path.realpath(git) != os.path.realpath(common)
 
 
-def is_finished(path):
+STACK_LOCKS = ("gh-stack.lock", "gh-stack-operation.lock")
+
+
+def stack_lock_idle(path):
+    """gh-stack leaves its files in place and takes an exclusive flock while working."""
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return False
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return False
+            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            return True
+        finally:
+            os.close(fd)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
+def previously_stack_blocked(path):
+    """The old watcher checked for any *.lock only in this checkout's own Git dir."""
     git, _ = git_dirs(path)
+    return git is not None and any(os.path.lexists(os.path.join(git, name)) for name in STACK_LOCKS)
+
+
+def is_finished(path):
+    git, common = git_dirs(path)
     if git is None:
         return False
     try:
@@ -154,22 +183,39 @@ def is_finished(path):
         return False
     if "HEAD" not in names or "index" not in names:
         return False
-    if any(n.endswith(".lock") for n in names):
+    if any(n.endswith(".lock") and n not in STACK_LOCKS for n in names):
+        return False
+    if any(not stack_lock_idle(os.path.join(git, n)) for n in STACK_LOCKS if n in names):
+        return False
+    if common != git and any(not stack_lock_idle(os.path.join(common, n)) for n in STACK_LOCKS):
         return False
     r = subprocess.run(["git", "-C", path, "rev-parse", "-q", "--verify", "HEAD"],
                        capture_output=True, text=True, timeout=20)
     return r.returncode == 0
 
 
-def is_allowed(path, owners, repos):
-    _, common = git_dirs(path)
-    origin = parse_origin(read_origin(common)) if common else None
+def metal_repos():
+    """Root-owned exact GitHub names, installed only on fcvm metal."""
+    try:
+        with open(METAL_REPOS_FILE, encoding="utf-8") as fh:
+            return {line.strip() for line in fh if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def allowed_origin(url, owners, repos):
+    origin = parse_origin(url)
     if not origin:
         return False
     owner, repo = origin
     if repo in NEVER_REPOS:
         return False
     return owner.lower() in owners or "%s/%s" % (owner, repo) in repos
+
+
+def is_allowed(path, owners, repos):
+    _, common = git_dirs(path)
+    return allowed_origin(read_origin(common), owners, repos) if common else False
 
 
 def candidates(roots, require_clone_marker=False):
@@ -806,6 +852,7 @@ class State:
         # True once the state was written by a version that launches every clone. An older file lacks it:
         # its first scan here records the unmarked checkouts already present instead of launching them.
         self.clones = self.first_run
+        self.stack_locks_adopted = False
         # After a reboot: the active folders still to launch, and those launched this boot (trust is kept for them).
         self.boot = {"pending": [], "launched": [], "tried": {}}
         self.boot_id = current_boot_id() if boot_id is None else boot_id
@@ -818,6 +865,7 @@ class State:
                 self.boot.update(data.get("boot") or {})
                 saved = data.get("boot_id")
                 self.clones = bool(data.get("clones"))
+                self.stack_locks_adopted = bool(data.get("stack_locks_adopted"))
             except (OSError, ValueError):
                 self.known = {}
         # An older state file has no boot id: not evidence of a reboot.
@@ -833,7 +881,8 @@ class State:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path), prefix=".known.")
         with os.fdopen(fd, "w") as fh:
-            json.dump({"known": self.known, "boot_id": self.boot_id, "boot": self.boot, "clones": self.clones},
+            json.dump({"known": self.known, "boot_id": self.boot_id, "boot": self.boot, "clones": self.clones,
+                       "stack_locks_adopted": self.stack_locks_adopted},
                       fh, indent=1, sort_keys=True)
         os.replace(tmp, self.path)
 
@@ -886,6 +935,9 @@ def scan_once(cfg, state, launcher, now=None):
     volumes = {}  # one UUID lookup per filesystem per scan, including when lookup is unavailable
     for path in found:
         entry = state.known.get(path)
+        # The old presence check hid these clones. Record even a held lock now so its later release
+        # cannot make a historical checkout new. A known path that was replaced is genuinely new.
+        seed_stack = entry is None and not state.stack_locks_adopted and previously_stack_blocked(path)
         ident, fs_uuid = repo_identity(path, volumes)
         if entry is not None and checkout_replaced(entry, ident, fs_uuid):
             log("checkout replaced at %s; treating it as new" % path)
@@ -898,19 +950,20 @@ def scan_once(cfg, state, launcher, now=None):
         if entry is not None and entry.get("ignored"):
             # Not this account's: remembered, so adding an owner later does not launch every old clone. A repo
             # that appeared AFTER the first run is looked at again when the allowed owners change.
-            if not (owners_changed and not entry.get("seeded") and is_allowed(path, owners, repos) and is_finished(path)):
+            # An unrelated gh login must not wake historical clones admitted by a new exact repo policy.
+            if not (owners_changed and not entry.get("seeded") and is_allowed(path, owners, set()) and is_finished(path)):
                 continue
             entry.pop("ignored")
             entry.update(claude=False, codex=False, tried={})
             log("new repository (its owner is allowed now): %s" % path)
         if entry is None:
-            if not is_finished(path):
+            if not seed_stack and not is_finished(path):
                 continue                      # a clone still running: looked at again next tick
             entry = state.known[path] = {"id": ident, "fs_uuid": fs_uuid}
             if not is_allowed(path, owners, repos):
-                entry.update(ignored=True, seeded=adopting)
+                entry.update(ignored=True, seeded=adopting or seed_stack)
                 continue
-            if adopting:
+            if adopting or seed_stack:
                 entry.update(claude=True, codex=True, seeded=True)
                 continue
             entry.update(claude=False, codex=False, tried={})
@@ -943,6 +996,7 @@ def scan_once(cfg, state, launcher, now=None):
         log("adopted the checkouts already present; from now on every new clone gets a session")
     state.first_run = False
     state.clones = True
+    state.stack_locks_adopted = True
     keep_trust(cfg["home"], [p for p, e in state.known.items() if e.get("claude") and not e.get("seeded")]
                + list(state.boot.get("launched", [])), state)
     state.save()
@@ -1113,11 +1167,14 @@ def build_config(args):
     home = args.home or os.path.expanduser("~")
     roots = args.root or [os.path.join(home, "*"), os.path.join(home, "src", "*")]
     state_dir = args.state_dir or os.path.join(home, ".local", "state", "agent-session-sync")
+    repos = set(args.repo or [])
+    if not args.require_clone_marker:
+        repos.update(metal_repos())
     return {
         "home": home, "roots": roots, "state_dir": state_dir,
         "require_clone_marker": args.require_clone_marker,
         "owners": allowed_owners(home, args.owner or []), "owners_extra": list(args.owner or []),
-        "owners_sig": owners_signature(home), "repos": set(args.repo or []),
+        "owners_sig": owners_signature(home), "repos": repos,
         "tmux": args.tmux, "t_claude_arg": args.t_claude, "codex_seed": args.codex_seed,
         "active_dirs": lambda cfg, tool=args.active_dirs: run_active_dirs(tool, cfg["home"]),
     }
@@ -1161,10 +1218,14 @@ def main(argv):
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--retire-claude-only", action="store_true",
                     help="retire unused Claude windows without discovering or starting repositories")
+    ap.add_argument("--check-metal-origin", metavar="URL",
+                    help="check the metal interactive and boot launchers' GitHub origin policy")
     ap.add_argument("--check-claude-rc", metavar="PATH",
                     help="exit nonzero if automatic Claude Remote Control is retired for this checkout")
     args = ap.parse_args(argv)
     home = args.home or os.path.expanduser("~")
+    if args.check_metal_origin is not None:
+        return int(not allowed_origin(args.check_metal_origin, {"ejc3"}, metal_repos()))
     if args.check_claude_rc is not None:
         return int(claude_retired(args.check_claude_rc, home))
     state = None

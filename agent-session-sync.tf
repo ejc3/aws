@@ -37,9 +37,8 @@ AGENTRETIREUNIT
 systemctl daemon-reload
 INSTALL
 
-  # What the ubuntu account is allowed to start sessions for on the metal boxes and the jumpboxes:
-  # ejc3's own repositories (its gh login is added automatically) and ONE collaboration repository by
-  # exact name, never an organisation wildcard (the same gate fcvm-claude-rc uses at boot).
+  # Baseline for ubuntu on the metal boxes and jumpboxes. The metal-only bootstrap installs its
+  # additional named collaborations in the root-owned claude-collaboration-repos file.
   agent_session_sync_ubuntu_args = "--owner ejc3 --repo dolphin-labs-hq/dolphin-labs"
   # An allowed origin does not approve its hooks running with jumpbox administrator credentials.
   agent_session_sync_admin_args = "${local.agent_session_sync_ubuntu_args} --require-clone-marker"

@@ -757,8 +757,8 @@ qualifies), shared with nextjs-dev's `agents-start` and with `agent-session-sync
 reads the prompt's origin Claude Code records (`origin.kind: human`), so SDK-injected turns, background
 task notices and settings commands broadcast to every window (`/model`) do not count. A folder nobody
 prompted stays closed at the next boot; linked worktrees count as their own folders, subagent worktrees
-under `.claude/worktrees/` never do. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
-uses t-claude's default path-derived sessions. t-claude follows its `main` branch, so the unit
+under `.claude/worktrees/` never do. The launcher uses path-derived sessions under `/home/ubuntu` for
+`github.com/ejc3/*` and the exact GitHub projects in the root-owned metal policy described below. t-claude follows its `main` branch, so the unit
 is guarded by an integrity check (`zsh -n` on the installed file) rather than a fixed hash,
 and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
 copies them.
@@ -1138,7 +1138,9 @@ scan plus about a second.
   "clone is fine, I just don't want one for every internal worktree that agents create"). A linked worktree
   of one, wherever it lives, counts only when marked for interactive use: `claude-interactive` in its git
   directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`); a subagent worktree under
-  `.claude/worktrees/` never counts. The checkout must be finished (no `*.lock`, the index exists). The
+  `.claude/worktrees/` never counts. The checkout must have a valid HEAD and index. Git operation locks block discovery; the two
+  persistent gh-stack lock files only block it while exclusively held. On upgrade the watcher records
+  older checkouts made visible by this distinction so their resting locks do not trigger new sessions. The
   first run only records what exists and launches nothing, and so does the first scan of a state file from
   before every clone counted (no `clones` key), so the upgrade does not open a session in every old clone.
 - **The admin jumpboxes require explicit approval for new clones.** Both jumpboxes set `--require-clone-marker`
@@ -1147,7 +1149,10 @@ scan plus about a second.
   the collaboration repository, does not authorize its startup hooks to run with administrator credentials.
 - **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
   `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
-  also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.
+  also gets `dolphin-labs-hq/dolphin-labs` by exact name. On metal,
+  `/usr/local/lib/fcvm/claude-collaboration-repos` allows `dolphin-labs-hq/dolphin-labs` and
+  `dolphin-labs-hq/dolphin-maps` for the interactive marker, boot launcher and watcher. The same
+  per-directory activity and retirement rules apply to each checkout of those repositories.
 - **What it never does.** Own the user's tmux server (it waits for `claude-rc@<user>` or the boot launcher
   to have made it), start a window for an account that is not logged in, or take a session down when it is
   restarted (`KillMode=process`). Claude and Codex are tracked separately, so Codex not being logged in
