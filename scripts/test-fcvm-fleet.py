@@ -954,6 +954,22 @@ class StateBucketLifecycleTests(unittest.TestCase):
 
 
 class SecretTests(unittest.TestCase):
+    def test_stage_tls_bootstrap_allows_only_stage_roles_and_terraform(self):
+        staging = (ROOT / "fcvm-fleet-stage-cert.tf").read_text()
+        self.assertIn('fcvm_fleet_stage_tls_name = "fcvm-fleet/stage/tls"', staging)
+        self.assertNotIn("aws_secretsmanager_secret_version", staging)
+        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', staging)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Principal = "*"', policy)
+        self.assertIn('Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn', policy)
+        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
+        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = \[(.*?)\]', policy, re.S)
+        self.assertIsNotNone(roles)
+        self.assertEqual(set(re.findall(r"[\w.]+", roles[1])), {
+            "aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
+            "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn",
+        })
+
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
         self.assertEqual(names, ["local.fcvm_fleet_stage.tls_secret"])
