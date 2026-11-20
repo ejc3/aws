@@ -2,8 +2,14 @@
 """Read-only Terraform external checks before the first production fleet AMI pointer is created."""
 import json
 import os
+import re
 import subprocess
 import sys
+
+
+# The fleet account service control policy permits EC2 only in these regions.
+FLEET_REGIONS = ("us-east-1", "us-east-2", "us-west-2")
+IMAGE_ID = re.compile(r"ami-[0-9a-f]{17}")
 
 
 def require(ok, message):
@@ -11,7 +17,42 @@ def require(ok, message):
         raise ValueError(message)
 
 
-def check_images(client, account, region, release, regions, copies=None):
+def validate_image_id(value):
+    require(isinstance(value, str) and IMAGE_ID.fullmatch(value), "invalid fleet AMI ID")
+
+
+def release_catalogs(release, region):
+    previous = release["previous"]
+    require(previous is not None or release["generation"] == 0, "the release has no rollback manifest")
+    catalogs = []
+    for manifest, field in ((release, "images"), (previous, "previous_images")):
+        if manifest is None:
+            continue
+        for kind in ("host", "tile"):
+            catalog = manifest[kind + "_amis"]
+            require(isinstance(catalog, dict) and region in catalog, "missing fleet release region")
+            for where, arches in catalog.items():
+                require(where in FLEET_REGIONS, "unsupported fleet AMI region")
+                require(isinstance(arches, dict) and arches, "missing regional AMI catalog")
+                for image_id in arches.values():
+                    validate_image_id(image_id)
+            require("x86_64" in catalog[region], "missing x86_64 release AMI")
+            catalogs.append((field, kind, catalog))
+    return catalogs
+
+
+def validate_copies(copies, catalogs, region, regions):
+    for field, kind, catalog in catalogs:
+        expected = copies[field]
+        require(isinstance(expected, dict) and set(expected) == {region, *regions},
+                f"{field} does not cover all release copy regions")
+        for pair in expected.values():
+            require(isinstance(pair, dict) and set(pair) == {"host", "tile"}, f"{field} needs both host and tile AMIs")
+            validate_image_id(pair[kind])
+        require(expected[region][kind] == catalog[region]["x86_64"], f"{field} does not match the {kind} release in {region}")
+
+
+def check_images(client, account, region, catalogs, regions, copies):
     """Describe every named image in its own region; copied pairs must connect to the matching release."""
     images = {}
 
@@ -25,35 +66,27 @@ def check_images(client, account, region, release, regions, copies=None):
             images[key] = rows[0]
         return images[key]
 
-    previous = release["previous"]
-    require(previous is not None or release["generation"] == 0, "the release has no rollback manifest")
-    for manifest, field in ((release, "images"), (previous, "previous_images")):
-        if manifest is None:
+    for field, kind, catalog in catalogs:
+        for where, arches in catalog.items():
+            for arch, image_id in arches.items():
+                require(image(where, image_id)["Architecture"] == arch,
+                        f"{kind} AMI {image_id} is not {arch} in {where}")
+        if copies is None:
             continue
-        for kind in ("host", "tile"):
-            catalog = manifest[kind + "_amis"]
-            east = catalog[region]["x86_64"]
-            for where, arches in catalog.items():
-                for arch, image_id in arches.items():
-                    require(image(where, image_id)["Architecture"] == arch,
-                            f"{kind} AMI {image_id} is not {arch} in {where}")
-            if copies is None:
-                continue
-            expected = copies[field]
-            require(expected[region][kind] == east, f"{field} does not match the {kind} release in {region}")
-            require(set(expected) == {region, *regions}, f"{field} does not cover all release copy regions")
-            source = image(region, east)
-            for where in regions:
-                target_id = expected[where][kind]
-                target = image(where, target_id)
-                require(target["Architecture"] == "x86_64" and (
-                    (target.get("SourceImageRegion"), target.get("SourceImageId")) == (region, east) or
-                    (source.get("SourceImageRegion"), source.get("SourceImageId")) == (where, target_id)),
-                    f"{field} {kind} in {where} is not linked to the release AMI in {region}")
+        east = catalog[region]["x86_64"]
+        source = image(region, east)
+        for where in regions:
+            target_id = copies[field][where][kind]
+            target = image(where, target_id)
+            require(target["Architecture"] == "x86_64" and (
+                (target.get("SourceImageRegion"), target.get("SourceImageId")) == (region, east) or
+                (source.get("SourceImageRegion"), source.get("SourceImageId")) == (where, target_id)),
+                f"{field} {kind} in {where} is not linked to the release AMI in {region}")
 
 
 def run(mode, query, client):
     region = query["region"]
+    require(region in FLEET_REGIONS, "unsupported fleet AMI region")
     if mode == "present":
         ssm = client("ssm", region)
         try:
@@ -65,6 +98,10 @@ def run(mode, query, client):
     if query["when"] == "existing":
         return {"verified": "true"}  # Terraform ignores value after creation and forbids replacement.
     release = json.loads(query["release"])
+    regions = json.loads(query["copy_regions"])
+    require(isinstance(regions, list) and all(r in FLEET_REGIONS and r != region for r in regions)
+            and len(regions) == len(set(regions)), "invalid fleet AMI copy regions")
+    catalogs = release_catalogs(release, region)
     copies = None
     if query["stage"]:
         ssm = client("ssm", region)
@@ -74,7 +111,8 @@ def run(mode, query, client):
         copies = json.loads(ssm.get_parameter(Name=query["stage"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
         require(copies["version"] == 1 and all(copies[k] == release[k] for k in ("generation", "source_sha", "build_id")),
                 "regional AMI copies do not match the planned staging release")
-    check_images(client, query["role"].split(":")[4], region, release, json.loads(query["copy_regions"]), copies)
+        validate_copies(copies, catalogs, region, regions)
+    check_images(client, query["role"].split(":")[4], region, catalogs, regions, copies)
     return {"verified": "true"}
 
 

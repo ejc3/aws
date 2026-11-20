@@ -17,9 +17,11 @@ SPEC.loader.exec_module(seed)
 class FirstSeedTests(unittest.TestCase):
     def setUp(self):
         self.region, self.copy = "us-east-1", "us-west-2"
+        def image_id(n, kind, west=False):
+            return f"ami-{n * 4 + (kind == 'tile') * 2 + west:017x}"
         def manifest(n):
             return {"generation": n, "source_sha": str(n), "build_id": str(n),
-                    **{k + "_amis": {self.region: {"x86_64": k + str(n)}} for k in ("host", "tile")}}
+                    **{k + "_amis": {self.region: {"x86_64": image_id(n, k)}} for k in ("host", "tile")}}
         self.release = {**manifest(23), "previous": manifest(22)}
         self.record = {k: self.release[k] for k in ("generation", "source_sha", "build_id")}
         self.record["version"] = 1
@@ -27,16 +29,16 @@ class FirstSeedTests(unittest.TestCase):
         for n, field in ((23, "images"), (22, "previous_images")):
             self.record[field] = {self.region: {}, self.copy: {}}
             for kind in ("host", "tile"):
-                name = kind + str(n)
-                for region, image in ((self.region, name), (self.copy, name + "-west")):
+                name, west = image_id(n, kind), image_id(n, kind, west=True)
+                for region, image in ((self.region, name), (self.copy, west)):
                     self.record[field][region][kind] = image
                     self.rows[region, image] = {"ImageId": image, "OwnerId": "123", "State": "available",
                                                 "Public": False, "Architecture": "x86_64"}
                 # Test both possible directions of an EC2 CopyImage link.
                 if kind == "host":
-                    self.rows[self.region, name].update(SourceImageRegion=self.copy, SourceImageId=name + "-west")
+                    self.rows[self.region, name].update(SourceImageRegion=self.copy, SourceImageId=west)
                 else:
-                    self.rows[self.copy, name + "-west"].update(SourceImageRegion=self.region, SourceImageId=name)
+                    self.rows[self.copy, west].update(SourceImageRegion=self.region, SourceImageId=name)
         self.query = {"when": "apply", "role": "arn:aws:iam::123:role/fleet", "region": self.region,
                       "prod": "/prod", "stage": "/release", "version": "24", "release": json.dumps(self.release),
                       "copy_regions": json.dumps([self.copy])}
@@ -63,8 +65,9 @@ class FirstSeedTests(unittest.TestCase):
         self.assertCountEqual(self.described, self.rows.keys())
 
     def test_unavailable_rollback_source_fails_closed(self):
-        self.rows[self.copy, "host22-west"]["State"] = "deregistered"
-        with self.assertRaisesRegex(ValueError, "host22-west"):
+        previous = self.record["previous_images"][self.copy]["host"]
+        self.rows[self.copy, previous]["State"] = "deregistered"
+        with self.assertRaisesRegex(ValueError, previous):
             seed.run("verify", self.query, self.client)
 
     def test_changed_stage_version_fails_even_if_the_manifest_matches(self):
@@ -78,7 +81,7 @@ class FirstSeedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "do not match"):
             seed.run("verify", self.query, self.client)
         self.record["build_id"] = self.release["build_id"]
-        self.rows[self.copy, "tile22-west"]["SourceImageId"] = "other"
+        self.rows[self.copy, self.record["previous_images"][self.copy]["tile"]]["SourceImageId"] = "other"
         with self.assertRaisesRegex(ValueError, "not linked"):
             seed.run("verify", self.query, self.client)
 
@@ -90,7 +93,44 @@ class FirstSeedTests(unittest.TestCase):
         result = seed.run("verify", {**self.query, "stage": "", "release": json.dumps(bootstrap)},
                           lambda service, region: self.client(service, region) if service == "ec2" else self.fail(service))
         self.assertEqual(result, {"verified": "true"})
-        self.assertCountEqual(self.described, [(self.region, "host23"), (self.region, "tile23")])
+        self.assertCountEqual(self.described, [(self.region, x) for x in self.record["images"][self.region].values()])
+
+    def test_invalid_planned_ids_and_region_arguments_never_invoke_aws(self):
+        for image in ("--version", "ami-short", "ami-" + "A" * 17):
+            with self.subTest(image=image):
+                release = json.loads(self.query["release"])
+                release["previous"]["tile_amis"][self.region]["x86_64"] = image
+                client = Mock(side_effect=AssertionError("invalid ID reached a client"))
+                with self.assertRaisesRegex(ValueError, "AMI ID"):
+                    seed.run("verify", {**self.query, "release": json.dumps(release)}, client)
+                client.assert_not_called()
+        for invalid in ("--version", "us-west-1"):
+            release = json.loads(self.query["release"])
+            release["previous"]["tile_amis"][invalid] = release["previous"]["tile_amis"][self.region]
+            for patch in ({"release": json.dumps(release)}, {"region": invalid},
+                          {"copy_regions": json.dumps([self.copy, invalid])}):
+                with self.subTest(region=invalid, field=next(iter(patch))):
+                    client = Mock(side_effect=AssertionError("invalid region reached a client"))
+                    with self.assertRaisesRegex(ValueError, "region"):
+                        seed.run("verify", {**self.query, **patch}, client)
+                    client.assert_not_called()
+
+    def test_malformed_remote_rollback_copy_never_starts_an_ec2_lookup(self):
+        rollback = self.record["previous_images"]
+        for altered, error in (({**rollback, self.copy: {**rollback[self.copy], "tile": "--version"}}, "AMI ID"),
+                               ({**rollback, "us-west-1": rollback[self.copy]}, "region")):
+            with self.subTest(error=error):
+                self.record["previous_images"] = altered
+                client = Mock(wraps=self.client)
+                with self.assertRaisesRegex(ValueError, error):
+                    seed.run("verify", self.query, client)
+                client.assert_called_once_with("ssm", self.region)
+                self.assertEqual(self.described, [])
+
+    def test_seed_verifier_and_fleet_account_allow_the_same_regions(self):
+        policy = (ROOT / "fcvm-fleet-account.tf").read_text()
+        regions = re.search(r"fcvm_fleet_regions\s*=\s*(\[[^\]]+\])", policy).group(1)
+        self.assertCountEqual(seed.FLEET_REGIONS, json.loads(regions))
 
     def test_present_propagates_denied_read_and_only_absence_enables_the_seed_check(self):
         class Missing(Exception):
