@@ -15,12 +15,16 @@ Run with the staging fleet administration role.
   expiry, names, how many versions hold it, and whether the key stored with it is its key (a
   revocation signed with the certificate's own key, RFC 8555 section 7.6, needs it: the
   coordinator used a new ACME account for every order and kept none).
-- --check: prove each one revoked from the CRL it names. The CRL counts only when it is signed by
-  the certificate's issuer (the intermediate stored with it, which must itself have signed the
-  certificate), is current (thisUpdate not in the future, nextUpdate not
-  passed) and, when it carries an issuing distribution point, names the URL it came from.
-  Anything else is no status, never a pass. Exits non-zero unless every certificate is proven
-  revoked.
+- --check: prove each one revoked. The certificate and its intermediates come from a writable
+  secret, so before any request the certificate must verify through its stored intermediates
+  (untrusted) to a root in this host's trust store. The CRL it names must be a Let's Encrypt CRL
+  endpoint (`http://<issuer>.c.lencr.org/<n>.crl`); the fetch follows no redirect and reads at
+  most 8 MiB. OpenSSL then verifies the certificate again with that CRL (`verify -crl_check`),
+  which decides the CRL's issuer, signature, freshness and issuing-distribution-point scope.
+  Only a run whose one error is "certificate revoked" at depth 0 proves revocation; a clean
+  verify means not revoked, and any other error is no status. Exits non-zero unless the
+  inventory is not empty and every certificate is proven revoked: an empty inventory cannot
+  prove the known certificates revoked.
 """
 
 import argparse
@@ -40,7 +44,11 @@ LEGACY = "fcvm-fleet/tls-wildcard"
 SUBZONES = ("tiles-stage.fcvm.dev", "tiles.fcvm.dev")
 PARENT = "fcvm.dev"
 USER_AGENT = "ejc3-aws-fcvm-wildcard-audit/1"
-CLOCK_SKEW = dt.timedelta(minutes=5)
+# Let's Encrypt's intermediates' CRL endpoints, the only URLs --check fetches.
+LETS_ENCRYPT_CRL = r"http://[a-z0-9]+\.c\.lencr\.org/[0-9]+\.crl"
+MAX_CRL_BYTES = 8 << 20
+# openssl verify's X509_V_ERR_CERT_REVOKED.
+CERT_REVOKED = "23"
 
 
 def checked(condition, message):
@@ -85,55 +93,62 @@ def key_matches(cert, key_pem):
     return public == openssl(["x509", "-noout", "-pubkey"], cert)
 
 
-def fetch(url):
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch(url, max_bytes):
+    """GET `url` with no redirect followed and at most `max_bytes` read: (status, body or None)."""
+    opener = urllib.request.build_opener(NoRedirect)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=30) as response:
-            return response.status, response.read()
+        with opener.open(req, timeout=30) as response:
+            body = response.read(max_bytes + 1)
+            return response.status, (body if len(body) <= max_bytes else None)
     except urllib.error.HTTPError as error:
         return error.code, b""
 
 
-def crl_time(text, field):
-    value = re.search(field + r"=(.+)", text)
-    checked(value and value.group(1).strip() != "NONE", f"the CRL has no {field}")
-    return dt.datetime.strptime(value.group(1).strip(), "%b %d %H:%M:%S %Y %Z").replace(tzinfo=dt.timezone.utc)
+def verify(leaf_pem, bundle_pem, trust, at, crl_pem=None):
+    """openssl verify of the leaf through the untrusted bundle: the (error, depth) pairs it reports."""
+    result = subprocess.run(["openssl", "verify", "-attime", str(int(at.timestamp())),
+                             *(["-CAfile", str(trust)] if trust else []), "-untrusted", str(bundle_pem),
+                             *(["-crl_check", "-CRLfile", str(crl_pem)] if crl_pem else []), str(leaf_pem)],
+                            capture_output=True, text=True)
+    errors = re.findall(r"error (\d+) at (\d+) depth lookup", result.stdout + result.stderr)
+    if result.returncode == 0 and not errors:
+        return []
+    return errors or [("unknown", "?")]
 
 
-def crl_status(cert, issuer, directory, now=None):
-    """'revoked' or 'not revoked', from the CRL the certificate names, after proving that CRL is
-    signed by the certificate's issuer, is current and covers the URL it came from.
-    Raises ValueError when no such proof is possible: that is no status, never a pass."""
+def crl_status(cert, intermediates, directory, now=None, trust=None, crl_url=LETS_ENCRYPT_CRL,
+               max_bytes=MAX_CRL_BYTES):
+    """'revoked' or 'not revoked' for `cert`, from the CRL it names. Raises ValueError when no proof
+    is possible: that is no status, never a pass. `trust` is a CA file to use instead of this
+    host's trust store (tests)."""
     now = now or dt.datetime.now(dt.timezone.utc)
+    checked(intermediates, "the secret version stores no intermediate")
+    leaf_pem, bundle_pem = directory / "leaf.pem", directory / "bundle.pem"
+    leaf_pem.write_text(cert)
+    bundle_pem.write_text("".join(intermediates))
+    # The stored chain is untrusted until it reaches a root this host trusts; nothing is fetched first.
+    checked(not verify(leaf_pem, bundle_pem, trust, now),
+            "the certificate does not verify through its stored intermediates to a trusted root")
     url = re.search(r"URI:(\S+)", openssl(["x509", "-noout", "-ext", "crlDistributionPoints"], cert))
     checked(url, "the certificate names no CRL")
-    url = url.group(1)
-    leaf_pem, issuer_pem = directory / "leaf.pem", directory / "issuer.pem"
-    leaf_pem.write_text(cert)
-    issuer_pem.write_text(issuer)
-    # The stored intermediate must be the certificate's issuer, or a CRL it signed proves nothing.
-    signed = subprocess.run(["openssl", "verify", "-partial_chain", "-no_check_time", "-CAfile", str(issuer_pem),
-                             str(leaf_pem)], capture_output=True, text=True)
-    checked(signed.returncode == 0, "the stored intermediate did not sign the certificate")
-    status, body = fetch(url)
-    checked(status == 200 and body, "the CRL did not download")
-    crl = directory / "crl.der"
-    crl.write_bytes(body)
-    # openssl finds the signer in -CAfile by the CRL's issuer name, so a CRL naming another issuer, or
-    # signed by another key under the issuer's name, fails here.
-    proof = subprocess.run(["openssl", "crl", "-inform", "DER", "-in", str(crl), "-CAfile", str(issuer_pem), "-noout"],
-                           capture_output=True, text=True)
-    checked(proof.returncode == 0 and "verify OK" in proof.stdout + proof.stderr,
-            "the CRL is not signed by the certificate's issuer")
-    meta = openssl(["crl", "-inform", "DER", "-in", str(crl), "-noout", "-lastupdate", "-nextupdate"], None)
-    checked(crl_time(meta, "lastUpdate") <= now + CLOCK_SKEW, "the CRL's thisUpdate is in the future")
-    checked(crl_time(meta, "nextUpdate") > now, "the CRL is stale (nextUpdate has passed)")
-    text = openssl(["crl", "-inform", "DER", "-in", str(crl), "-noout", "-text"], None)
-    idp = re.search(r"X509v3 Issuing Distribution Point:.*?URI:(\S+)", text, re.S)
-    checked(not idp or idp.group(1) == url, "the CRL covers another distribution point")
-    serial = fields(cert)["serial"]
-    listed = any(re.sub(r"\s", "", m).upper() == serial for m in re.findall(r"Serial Number:\s*([0-9A-Fa-f]+)", text))
-    return "revoked" if listed else "not revoked"
+    checked(re.fullmatch(crl_url, url.group(1)), "the certificate's CRL is not at an approved CRL endpoint")
+    status, body = fetch(url.group(1), max_bytes)
+    checked(status == 200, "the CRL did not download")
+    checked(body is not None, "the CRL is larger than the fetch bound")
+    crl_pem = directory / "crl.pem"
+    crl_pem.write_text(openssl(["crl", "-inform", "DER", "-outform", "PEM"], body, text=False).decode())
+    errors = verify(leaf_pem, bundle_pem, trust, now, crl_pem)
+    if not errors:
+        return "not revoked"
+    checked(errors == [(CERT_REVOKED, "0")],
+            "openssl verify -crl_check: " + ", ".join(f"error {e} at depth {d}" for e, d in errors))
+    return "revoked"
 
 
 def collect(secrets):
@@ -154,18 +169,23 @@ def collect(secrets):
         if not any(outside_subzones(n) for n in names(cert)):
             continue
         info = fields(cert)
-        entry = found.setdefault(info["sha256"], dict(info, cert=cert, issuer=certs[1] if len(certs) > 1 else None,
+        entry = found.setdefault(info["sha256"], dict(info, cert=cert, intermediates=certs[1:],
                                                       names=names(cert), versions=[], key=False))
         entry["versions"].append(version)
         entry["key"] |= key_matches(cert, doc.get("key", ""))
     return list(found.values())
 
 
-def run(secrets, directory, check=False, now=None):
-    """List, or with `check` prove each certificate revoked. Returns whether the run passed:
-    a listing always does, a check only when every certificate is proven revoked."""
+def run(secrets, directory, check=False, now=None, **proof):
+    """List, or with `check` prove each certificate revoked. Returns whether the run passed: a
+    listing always does, a check only when there is at least one certificate and every one is
+    proven revoked. `proof` passes crl_status's trust, crl_url and max_bytes (tests)."""
     certificates = collect(secrets)
     print(f"{len(certificates)} certificate(s) for names outside the fleet subzones in {LEGACY}")
+    if check and not certificates:
+        print(f"NO STATUS: {LEGACY} holds no certificate for a name outside the fleet subzones, so this run "
+              "cannot prove the known certificates (#922 inventory) revoked")
+        return False
     passed = True
     for c in certificates:
         label = (f"serial {c['serial']} expires {c['not_after']} names {' '.join(c['names'])} "
@@ -175,8 +195,7 @@ def run(secrets, directory, check=False, now=None):
             continue
         with tempfile.TemporaryDirectory(dir=directory) as d:
             try:
-                checked(c["issuer"], "the secret version stores no issuer certificate")
-                state = crl_status(c["cert"], c["issuer"], Path(d), now)
+                state = crl_status(c["cert"], c["intermediates"], Path(d), now, **proof)
             except (ValueError, subprocess.CalledProcessError) as error:
                 state = f"NO STATUS ({error})"
         passed &= state == "revoked"
