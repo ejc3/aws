@@ -9,7 +9,7 @@
 # gets is filtered by its version, so an old client does not see new models). nextjs-dev already
 # refreshes every account daily in its own updater (nextjs-user-data.tf) and is not touched here.
 #
-# HOW. A weekly SSM State Manager association: Run Command on a schedule, no key on disk, no
+# HOW. One weekly SSM State Manager association per enabled host: Run Command on a schedule, no key on disk, no
 # service on the box, and the permitted admin -> box direction. The installer runs as ubuntu,
 # never as root (the jumpboxes must not host a root service that re-runs a downloaded script,
 # dev-selfupdate.tf), and writes only under ~/.codex and ~/.local/bin. The same command installs
@@ -20,15 +20,15 @@
 # started with, and restarting interrupts turns, so applying an update is a decision:
 # `codex-restart` shows running vs installed per account, `codex-restart --restart` applies it.
 #
-# A box that is stopped on Monday (the x86 spot box often is) misses that run; it catches up at
-# the next one, or by running the same installer by hand.
+# A stopped Spot host cannot occupy another host’s delivery slot or suppress its execution history.
+# State Manager can reconcile a missed schedule once that host comes online.
 
 locals {
-  codex_update_instances = concat(
-    var.enable_jumpbox ? [aws_instance.jumpbox[0].id] : [],
-    var.enable_jumpbox_2 ? [aws_instance.jumpbox_2[0].id] : [],
-    var.enable_firecracker_instance ? [aws_instance.firecracker_dev[0].id] : [],
-    var.enable_x86_dev_instance ? [aws_instance.x86_dev[0].id] : [],
+  codex_update_instances = merge(
+    var.enable_jumpbox ? { jumpbox = aws_instance.jumpbox[0].id } : {},
+    var.enable_jumpbox_2 ? { jumpbox-2 = aws_instance.jumpbox_2[0].id } : {},
+    var.enable_firecracker_instance ? { fcvm-metal-arm = aws_instance.firecracker_dev[0].id } : {},
+    var.enable_x86_dev_instance ? { fcvm-metal-x86 = aws_instance.x86_dev[0].id } : {},
   )
 
   codex_update_commands = <<-CMD
@@ -41,23 +41,41 @@ locals {
     runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin \
       sh -c 'cd /home/ubuntu && curl -fsSL https://chatgpt.com/codex/install.sh | sh' >/dev/null 2>&1 \
       || { echo "codex update FAILED (installer)"; exit 1; }
+    # An SSH command reads .zshenv, not .zshrc. Correct a shadowing global npm install only for ubuntu.
+    runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin sh -eu <<'CODEX_ZSH_PATH' || exit 1
+    codex_bin="$HOME/.codex/packages/standalone/current/bin"
+    if command -v zsh >/dev/null && [ -x "$codex_bin/codex" ]; then
+      if zsh -c '[[ "$(whence -p codex)" -ef /usr/bin/codex && ! /usr/bin/codex -ef "$HOME/.local/bin/codex" ]]'; then
+        line='if [[ -x "$HOME/.codex/packages/standalone/current/bin/codex" && "$(whence -p codex)" -ef /usr/bin/codex ]]; then path=("$HOME/.codex/packages/standalone/current/bin" $path); fi'
+        if ! grep -Fqx -- "$line" "$HOME/.zshenv" 2>/dev/null; then
+          printf '\n%s\n' "$line" >> "$HOME/.zshenv"
+        fi
+      fi
+    fi
+    CODEX_ZSH_PATH
     after=$(runuser -u ubuntu -- /home/ubuntu/.local/bin/codex --version 2>/dev/null | head -1)
     echo "codex: $${before:-none} -> $${after:-none}. A running daemon keeps its old binary until: codex-restart --restart"
   CMD
 }
 
+# Keep the existing association and its history on the primary jumpbox.
+moved {
+  from = aws_ssm_association.codex_update[0]
+  to   = aws_ssm_association.codex_update["jumpbox"]
+}
+
 resource "aws_ssm_association" "codex_update" {
-  count = length(local.codex_update_instances) > 0 ? 1 : 0
+  for_each = local.codex_update_instances
 
   name                = "AWS-RunShellScript"
-  association_name    = "codex-update"
+  association_name    = each.key == "jumpbox" ? "codex-update" : "codex-update-${each.key}"
   schedule_expression = "cron(0 9 ? * MON *)"
   max_concurrency     = "1"
   max_errors          = "1"
 
   targets {
     key    = "InstanceIds"
-    values = local.codex_update_instances
+    values = [each.value]
   }
 
   parameters = {
