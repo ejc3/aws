@@ -15,6 +15,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-fleet.tf").read_text()
+STAGE_CERT = (ROOT / "fcvm-fleet-stage-cert.tf").read_text()
 DNS = (ROOT / "fcvm-fleet-dns.tf").read_text()
 ALARMS = (ROOT / "fcvm-fleet-alarms.tf").read_text() if (ROOT / "fcvm-fleet-alarms.tf").exists() else ""
 BUDGET = (ROOT / "fcvm-fleet-budget.tf").read_text() if (ROOT / "fcvm-fleet-budget.tf").exists() else ""
@@ -961,9 +962,9 @@ class StateBucketLifecycleTests(unittest.TestCase):
 
 class SecretTests(unittest.TestCase):
     def test_stage_tls_bootstrap_allows_only_stage_roles_and_terraform(self):
-        staging = (ROOT / "fcvm-fleet-stage-cert.tf").read_text()
+        staging = STAGE_CERT
         self.assertIn('fcvm_fleet_stage_tls_name = "fcvm-fleet/stage/tls"', staging)
-        self.assertNotIn("aws_secretsmanager_secret_version", staging)
+        self.assertNotIn('resource "aws_secretsmanager_secret_version"', staging)
         policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', staging)
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('Principal = "*"', policy)
@@ -978,16 +979,16 @@ class SecretTests(unittest.TestCase):
 
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
-        self.assertEqual(names, ["local.fcvm_fleet_stage.tls_secret"])
-        self.assertRegex(TF, r'\btls_secret\s+= "fcvm-fleet/tls-wildcard"')
+        self.assertEqual(names, ['"fcvm-fleet/tls-wildcard"'])
+        self.assertRegex(TF, r'\btls_secret\s+= local\.fcvm_fleet_stage_tls_name')
         self.assertNotIn('resource "aws_secretsmanager_secret_version"', TF)
 
     def test_hosts_and_tiles_read_only_what_they_need(self):
         host = block('resource "aws_iam_role_policy" "fcvm_fleet_host"')
-        self.assertIn('Resource = [local.fcvm_fleet_secret_arn["tls-wildcard"], local.fcvm_fleet_secret_arn["agent-access-token"]]', host)
+        self.assertIn('Resource = [local.fcvm_fleet_secret_arn["tls"], local.fcvm_fleet_secret_arn["agent-access-token"]]', host)
         self.assertNotIn("ec2:", host)
         tile = block('resource "aws_iam_role_policy" "fcvm_fleet_tile"')
-        self.assertIn('Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]', tile)
+        self.assertIn('Resource = local.fcvm_fleet_secret_arn["tls"]', tile)
 
 
 
@@ -1020,8 +1021,8 @@ class CoordinatorLaunchSplit(unittest.TestCase):
     def test_state_object_secrets_and_spot_role(self):
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}"', self.TF)
         secrets = self.stmt("FleetSecrets")
-        self.assertIn('cloudflare-dns-token', secrets)
-        self.assertIn('tls-wildcard', secrets)
+        self.assertNotIn('cloudflare-dns-token', secrets)
+        self.assertIn('Resource = [local.fcvm_fleet_secret_arn["tls"]]', secrets)
         self.assertNotIn('coordinator-tunnel-token', secrets)
         self.assertNotIn('agent-access-token', secrets)
         self.assertIn('aws_service_name = "spot.amazonaws.com"', self.TF)
@@ -1209,9 +1210,9 @@ class StageWallTests(unittest.TestCase):
         args = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ])\n", 1)[0]
         for a in ['"--dial wss://${local.fcvm_dev_agent_path}"',
                   '"--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}"',
-                  '"--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}"',
+                  '"--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}"',
                   '"--secret-region ${local.fcvm_fleet_home_region}"',
-                  '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone fcvm.dev"', '"--phones 2"']:
+                  '"--host-from-imds"', '"--ipv6-prefix-from-imds"', '"--frame-zone ${local.fcvm_fleet_names_zone}"', '"--phones 2"']:
             self.assertIn(a, args)
         self.assertEqual(len(re.findall(r"host_agent_args\s*=\s*local\.fcvm_fleet_host_agent_args\b", TF)), 3)
 
@@ -1228,7 +1229,7 @@ class StageWallTests(unittest.TestCase):
         self.assertIn('["--sleep-when-idle"]', cmd)
         self.assertIn('"--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"', cmd)
         self.assertIn('"--ec2-regions", "us-east-1"', cmd)
-        self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
+        self.assertNotIn("--dns-token-secret", tf_code(cmd))
         task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn("command   = local.fcvm_fleet_coordinator_running ? local.fcvm_fleet_coordinator_command : null", task)
 
@@ -1391,9 +1392,8 @@ class SlotV4Tests(unittest.TestCase):
         self.assertNotIn("--dns-nameservers", cmd)
         self.assertIn('["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), '
                       '"--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"]', cmd)
-        # The certificate renewal still needs the zone's DNS token.
-        self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name', cmd)
-        self.assertIn('"--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name', cmd)
+        # The certificate is the subzone's, its DNS-01 record answered by this server (StageSubzoneCertificateTests).
+        self.assertIn('"--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, "--tls-scope", "subzone"', cmd)
 
 
 class DnsTests(unittest.TestCase):
@@ -1553,12 +1553,13 @@ class StackScopeTests(unittest.TestCase):
         stage = self.stacks().split("stage = {", 1)[1].split("\n    }", 1)[0]
         self.assertRegex(stage, r'\bfleet\s+= "stage"')
         self.assertRegex(stage, r'\bprefix\s+= "fcvm-fleet"')
-        self.assertRegex(stage, r'\btls_secret\s+= "fcvm-fleet/tls-wildcard"')
+        self.assertRegex(stage, r'\btls_secret\s+= local\.fcvm_fleet_stage_tls_name')
         self.assertRegex(stage, r'\bstate_key\s+= "state.json"')
         self.assertRegex(stage, r"\buntagged_spot_requests\s+= true")
         self.assertIn("fcvm_fleet_stage = local.fcvm_fleet_stacks.stage", TF)
-        tls = block('resource "aws_secretsmanager_secret" "fcvm_fleet_tls"')
-        self.assertRegex(tls, r"\bname\s+= local\.fcvm_fleet_stage\.tls_secret\n")
+        # The zone certificate's secret keeps its name; staging's subzone certificate is the stack's.
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_tls"'), r'\bname\s+= "fcvm-fleet/tls-wildcard"\n')
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"', STAGE_CERT), r"\bname\s+= local\.fcvm_fleet_stage_tls_name\n")
         self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${local.fcvm_fleet_stage.state_key}"',
                       block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
         self.assertIn('{ name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key }',
@@ -1702,6 +1703,72 @@ PROD = (ROOT / "fcvm-fleet-prod.tf").read_text() if (ROOT / "fcvm-fleet-prod.tf"
 PROD_DNS = (ROOT / "fcvm-fleet-prod-dns.tf").read_text() if (ROOT / "fcvm-fleet-prod-dns.tf").exists() else ""
 PROD_BC = (ROOT / "fcvm-fleet-prod-broadcast.tf").read_text() if (ROOT / "fcvm-fleet-prod-broadcast.tf").exists() else ""
 DEV_PROD = (ROOT / "fcvm-dev-prod.tf").read_text()
+
+
+
+class StageSubzoneCertificateTests(unittest.TestCase):
+    """Staging's coordinator takes the subzone-only certificate (ejc3/fcvm#1973): *.tiles-stage.fcvm.dev in a secret of its
+    own, its DNS-01 record answered by its own DNS server, no Cloudflare token; and BroadcastLive's IVS read (#1974)."""
+
+    def cmd(self):
+        return TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+
+    def test_the_coordinator_orders_the_subzone_certificate_with_no_cloudflare_token(self):
+        cmd = tf_code(self.cmd())
+        self.assertIn('["--dns-zone", "fcvm.dev", "--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, '
+                      '"--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region]', cmd)
+        for gone in ("--dns-token-secret", "--dns-zone-id", "fcvm_fleet_dns_token", "fcvm_fleet_tls.name"):
+            self.assertNotIn(gone, cmd)
+        self.assertEqual(re.search(r'fcvm_fleet_names_zone = "([^"]+)"', DNS)[1], "tiles-stage.fcvm.dev")
+        # --tls-scope subzone needs --dns-subzone (ejc3/fcvm cert.rs, tls_plan).
+        self.assertIn('"--dns-subzone", local.fcvm_fleet_names_zone', cmd)
+
+    def test_no_staging_role_reads_the_dns_token_or_the_zone_certificate(self):
+        self.assertNotIn("fcvm_fleet_dns_token", tf_code(TF))
+        self.assertNotIn('"cloudflare-dns-token"', TF)
+        self.assertNotIn('"tls-wildcard"', TF)
+        self.assertIn('"tls"                      = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_arn', TF)
+        for role in ("fcvm_fleet_host", "fcvm_fleet_tile", "fcvm_fleet_coordinator_task"):
+            policy = tf_code(block(f'resource "aws_iam_role_policy" "{role}"'))
+            self.assertNotIn("fcvm_fleet_tls.", policy, role)
+            self.assertNotIn("cloudflare", policy.lower().replace("cloudflared", ""), role)
+
+    def test_hosts_and_tiles_are_pointed_at_the_subzone_certificate(self):
+        args = TF.split("fcvm_fleet_host_agent_args = join(", 1)[1].split("\n  ])\n", 1)[0]
+        self.assertIn('"--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}"', args)
+        self.assertIn('"--frame-zone ${local.fcvm_fleet_names_zone}"', args)
+        self.assertNotIn("--frame-zone fcvm.dev", args)
+        for name in ("east2", "west2", "east1"):
+            self.assertRegex(block('module "fcvm_fleet_%s"' % name),
+                             r"\n  tile_tls_secret\s+= data\.aws_secretsmanager_secret_versions\.fcvm_fleet_stage_tls\.secret_name\n", name)
+
+    def test_the_subzone_secret_is_staging_only(self):
+        self.assertRegex(block('resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls"', STAGE_CERT),
+                         r'\bname\s+= local\.fcvm_fleet_stage_tls_name\n')
+        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT)
+        self.assertIn('Effect    = "Deny"', policy)
+        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
+        principals = policy.split('"aws:PrincipalArn" = [', 1)[1].split("]", 1)[0]
+        self.assertEqual(re.findall(r"[\w.\[\]]+(?=,)", principals),
+                         ["aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
+                          "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn"])
+        self.assertNotIn("prod", policy)
+        # Empty or unverified secrets must block every consumer, including targeted template or role plans.
+        guard = block('data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls"', STAGE_CERT)
+        self.assertIn('for label in ["AWSCURRENT", "FLEET_STAGE_TLS_BOOTSTRAPPED"]', guard)
+        self.assertIn('contains(version.version_stages, label)', guard)
+        self.assertNotIn('aws_secretsmanager_secret.fcvm_fleet_stage_tls.', TF)
+
+    def test_the_coordinator_may_ask_ivs_about_the_staging_channel_only(self):
+        policy = block('resource "aws_iam_policy" "fcvm_fleet_coordinator_broadcast_live"')
+        self.assertIn("count       = length(aws_ivs_channel.fcvm_fleet_broadcast)", policy)
+        self.assertIn('Action   = "ivs:GetStream"', policy)
+        self.assertIn("Resource = aws_ivs_channel.fcvm_fleet_broadcast[0].arn", policy)
+        attach = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_broadcast_live"')
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_coordinator_task.name", attach)
+        self.assertNotIn("ivs:", block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"'))
+        # The broadcast secret names the channel whose stream the metric asks about.
+        self.assertIn("channel_arn      = aws_ivs_channel.fcvm_fleet_broadcast[0].arn", (ROOT / "fcvm-fleet-broadcast.tf").read_text())
 
 
 def tf_code(text):
@@ -2004,7 +2071,9 @@ class ProdStackTests(unittest.TestCase):
         self.assertRegex(live, r'Action\s+= "ivs:GetStream"\n')
         self.assertRegex(live, r"Resource\s+= channel\.arn\n")
         self.assertEqual(re.findall(r'"ivs:[^"]*"', tf_code(PROD)), ['"ivs:GetStream"'])
-        self.assertNotIn("ivs:", tf_code(TF) + tf_code(PROD_BC))
+        self.assertNotIn("ivs:", tf_code(PROD_BC))
+        # Staging's GetStream is its own policy, on its own channel (StageSubzoneCertificateTests).
+        self.assertEqual(re.findall(r'"ivs:[^"]*"', tf_code(TF)), ['"ivs:GetStream"'])
 
     # ------------------------------------------------------------------------------------------- staging unchanged
     def test_the_region_module_renders_stagings_names_as_before(self):
@@ -2017,14 +2086,15 @@ class ProdStackTests(unittest.TestCase):
                      '  name  = "fcvm-fleet-alerts"'):
             self.assertIn(line + "\n", staged)
         self.assertNotIn('"fcvm-fleet-${local.region}"', MOD)
-        # Staging keeps its topic and certificate defaults. Only an explicitly guarded region requires published images.
+        # Staging keeps its default alert topic. All regions use the staging TLS secret; only east1 guards AMI releases.
         self.assertRegex(block('variable "alert_topic"', MOD), r"default\s+= true")
         self.assertRegex(block('variable "tile_tls_secret"', MOD), r'default\s+= ""')
         self.assertRegex(block('variable "ami_release_guarded"', MOD), r"default\s+= false")
         for name in ("east2", "west2", "east1"):
             mod = block('module "fcvm_fleet_%s"' % name)
-            for arg in ("alert_topic", "tile_tls_secret"):
-                self.assertNotIn(arg, mod)
+            self.assertNotIn("alert_topic", mod)
+            self.assertIn("tile_tls_secret", mod)
+            self.assertEqual("ami_release_guarded" in mod, name == "east1")
         self.assertIn("count = var.alert_topic && length(local.host_archs) > 0 ? 1 : 0", MOD)
         # Nothing is moved: no staging address changes.
         for text in (TF, MOD, PROD, PROD_DNS, PROD_BC):

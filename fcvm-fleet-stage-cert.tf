@@ -33,3 +33,21 @@ resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls" {
     }]
   })
 }
+
+# All staging runtime consumers use this lookup's name or ARN. The independent bootstrap checks the actual PEM,
+# its key, trust chain, expiry, and scene token before attaching the seed label. Renewal moves AWSCURRENT and
+# preserves the original labeled version. Terraform reads only version metadata, never a certificate or key.
+data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls" {
+  provider  = aws.fcvm_fleet
+  secret_id = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
+
+  lifecycle {
+    postcondition {
+      condition = alltrue([
+        for label in ["AWSCURRENT", "FLEET_STAGE_TLS_BOOTSTRAPPED"] :
+        anytrue([for version in self.versions : contains(version.version_stages, label)])
+      ])
+      error_message = "Bootstrap and verify the staging wildcard with scripts/fcvm-stage-certificate.py before switching the fleet."
+    }
+  }
+}

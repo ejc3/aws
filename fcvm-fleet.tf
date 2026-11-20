@@ -69,14 +69,15 @@ locals {
   # - fleet: the Fleet tag on every instance, spot request and launch template the stack owns, on its roles, task and
   #   secrets, and the coordinator's --fleet-name (it tags its launches with it and lists only instances that carry it).
   # - prefix: its launch templates' names (modules/fcvm-fleet-region, name_prefix).
-  # - tls_secret, state_key: its certificate secret and its state object in the shared state bucket.
+  # - tls_secret, state_key: its certificate secret and its state object in the shared state bucket. Each stack's
+  #   certificate covers its launch names' subzone only (--tls-scope subzone, ejc3/fcvm#1973).
   # - untagged_spot_requests: the stack has persistent spot requests from before the pool template tagged them Fleet
   #   (staging's stopped pool tiles), which aws_iam_policy.fcvm_fleet_stack_scope lets it cancel. A new stack has none.
   fcvm_fleet_stacks = {
     stage = {
       fleet                  = "stage"
       prefix                 = "fcvm-fleet"
-      tls_secret             = "fcvm-fleet/tls-wildcard"
+      tls_secret             = local.fcvm_fleet_stage_tls_name
       state_key              = "state.json"
       untagged_spot_requests = true
     }
@@ -126,10 +127,9 @@ locals {
 
   fcvm_fleet_cidrs = { "us-east-2" = "10.20.0.0/16", "us-west-2" = "10.21.0.0/16", "us-east-1" = "10.22.0.0/16" }
 
-  # Secrets of the fleet, all in us-east-2: tls-wildcard is created here, the Cloudflare-fed three by fcvm-dev.tf.
+  # Secrets of the fleet, all in us-east-2: the certificate is created here, the Cloudflare-fed two by fcvm-dev.tf.
   fcvm_fleet_secret_arn = {
-    "tls-wildcard"             = aws_secretsmanager_secret.fcvm_fleet_tls.arn
-    "cloudflare-dns-token"     = aws_secretsmanager_secret.fcvm_fleet_dns_token.arn
+    "tls"                      = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_arn
     "agent-access-token"       = aws_secretsmanager_secret.fcvm_fleet_agent_access.arn
     "coordinator-tunnel-token" = aws_secretsmanager_secret.fcvm_fleet_coordinator_tunnel.arn
   }
@@ -138,7 +138,7 @@ locals {
 
   # The host agent's arguments (fcvm fleet/PROTOCOL.md, "Agent", "Running it"): it dials the coordinator through Access with
   # the agents' service token, names the host by its instance id, runs each slot's renderer VM routed at an address of the
-  # host's delegated /80, reports it as slot-<n>.fcvm.dev, and hands the renderers the wildcard certificate. The secrets
+  # host's delegated /80, reports it as slot-<n>.tiles-stage.fcvm.dev, and hands the renderers the subzone certificate. The secrets
   # are in the home region, not the host's.
   # The IPv4 path to a GPU host's tiles: its one public IPv4 address, each place's TLS forwarded on its own port. Every port
   # a viewer connects to is declared once, in ejc3/fcvm fleet/published-ports.json, copied here byte for byte as
@@ -182,14 +182,14 @@ locals {
   fcvm_fleet_host_agent_args = join(" ", concat([
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
-    "--tls-secret ${aws_secretsmanager_secret.fcvm_fleet_tls.name}",
+    "--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}",
     "--secret-region ${local.fcvm_fleet_home_region}",
     "--host-from-imds",
     "--image localhost/fcvm-renderer:fleet",
     "--base-port 20100",
     "--publish-ip 0.0.0.0",
     "--ipv6-prefix-from-imds",
-    "--frame-zone fcvm.dev",
+    "--frame-zone ${local.fcvm_fleet_names_zone}",
     "--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}",
     "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
@@ -229,7 +229,10 @@ locals {
     ["--fleet-name", local.fcvm_fleet_stage.fleet],
     ["--ec2", "aws", "--ec2-tiles", "8", "--ec2-regions", "us-east-1", "--ec2-template", "${local.fcvm_fleet_stage.prefix}-tile-x86_64", "--ec2-on-demand-template", "${local.fcvm_fleet_stage.prefix}-tile-on-demand-x86_64"],
     local.fcvm_fleet_tile_pool ? ["--ec2-pool", "8", "--ec2-pool-template", "${local.fcvm_fleet_stage.prefix}-tile-pool-x86_64"] : [],
-    ["--dns-zone", "fcvm.dev", "--dns-token-secret", aws_secretsmanager_secret.fcvm_fleet_dns_token.name, "--dns-zone-id", var.fcvm_dev_zone_id, "--tls-secret", aws_secretsmanager_secret.fcvm_fleet_tls.name, "--secrets-region", local.fcvm_fleet_home_region],
+    # The certificate covers *.tiles-stage.fcvm.dev alone (--tls-scope subzone, ejc3/fcvm#1973, src/fleet/coord/cert.rs):
+    # its DNS-01 record is answered by the coordinator's own subzone server, so it holds no Cloudflare token (the flag
+    # refuses --dns-token-secret), and the EC2 tiles' health names are ec2-<n>.tiles-stage.fcvm.dev.
+    ["--dns-zone", "fcvm.dev", "--tls-secret", data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name, "--tls-scope", "subzone", "--secrets-region", local.fcvm_fleet_home_region],
     # Launch names are served by the coordinator itself, from the subzone fcvm-fleet-dns.tf delegates to it.
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
@@ -410,13 +413,14 @@ resource "aws_s3_bucket_ownership_controls" "fcvm_fleet_private" {
 }
 
 # ------------------------------------------------------------------------------------------------ the TLS certificate
-# The wildcard certificate for fcvm.dev (JSON: cert, key), set out of band. Hosts and tiles read it at boot.
+# Staging runtime roles no longer read or renew this legacy zone certificate. A rollback can reuse it while valid.
+# Removing the read grants leaves previously issued keys usable. Production cutover tracks their retirement in #922.
 resource "aws_secretsmanager_secret" "fcvm_fleet_tls" {
   provider                = aws.fcvm_fleet
-  name                    = local.fcvm_fleet_stage.tls_secret
+  name                    = "fcvm-fleet/tls-wildcard"
   description             = "Wildcard TLS certificate for the fleet zone (JSON: cert, key). Value set out of band; see fcvm-fleet.tf."
   recovery_window_in_days = 7
-  tags                    = { Name = local.fcvm_fleet_stage.tls_secret, Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
+  tags                    = { Name = "fcvm-fleet/tls-wildcard", Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 # ------------------------------------------------------------------------------------------------ instance roles
@@ -442,7 +446,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_host" {
         Sid      = "ReadTheCertificateAndTheAgentToken"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = [local.fcvm_fleet_secret_arn["tls-wildcard"], local.fcvm_fleet_secret_arn["agent-access-token"]]
+        Resource = [local.fcvm_fleet_secret_arn["tls"], local.fcvm_fleet_secret_arn["agent-access-token"]]
       },
       {
         Sid      = "ReadReleaseArtifacts"
@@ -480,7 +484,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_tile" {
       Sid      = "ReadTheCertificate"
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
-      Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]
+      Resource = local.fcvm_fleet_secret_arn["tls"]
     }]
   })
 }
@@ -519,6 +523,7 @@ module "fcvm_fleet_east2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-east-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -541,6 +546,7 @@ module "fcvm_fleet_west2" {
   hosts_enabled             = local.fcvm_fleet_hosts_enabled
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
+  tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   slot_tls_ports            = local.fcvm_fleet_ipv4_viewer_ports["us-west-2"]
   windows_count             = local.fcvm_fleet_host_windows
   minecraft_count           = local.fcvm_fleet_host_minecraft
@@ -565,6 +571,7 @@ module "fcvm_fleet_east1" {
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
+  tile_tls_secret               = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
   # Keep potato mode for the current host, the retained rollback images and the publisher's us-east-1 copy of each
   # reviewed build-region host (fcvm-fleet-ami-release.tf), once it exists.
   potato_host_amis = concat([
@@ -892,19 +899,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
         Resource = aws_s3_bucket.fcvm_fleet_coordinator_state.arn
       },
       {
-        # The DNS token (the ACME challenge, and one sweep of launch names written to fcvm.dev before the subzone) and the
-        # wildcard certificate it issues and renews. Not the
-        # tunnel token (cloudflared gets it through the execution role) nor the agents' Access token.
+        # The certificate it issues and renews. No Cloudflare token (--tls-scope subzone). Not the tunnel token
+        # (cloudflared gets it through the execution role) nor the agents' Access token.
         Sid      = "FleetSecrets"
         Effect   = "Allow"
         Action   = "secretsmanager:GetSecretValue"
-        Resource = [local.fcvm_fleet_secret_arn["cloudflare-dns-token"], local.fcvm_fleet_secret_arn["tls-wildcard"]]
+        Resource = [local.fcvm_fleet_secret_arn["tls"]]
       },
       {
         Sid      = "StoreTheIssuedCertificate"
         Effect   = "Allow"
         Action   = "secretsmanager:PutSecretValue"
-        Resource = local.fcvm_fleet_secret_arn["tls-wildcard"]
+        Resource = local.fcvm_fleet_secret_arn["tls"]
       },
       {
         # The viewer word check (--text-check bedrock): Claude Haiku 5.5 through the US inference profile, which routes
@@ -1148,6 +1154,32 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_state_recovery" {
 # The existing coordinator role is near its aggregate inline policy limit.
 # Keep the Java grant separate. CreateFleet authorizes template resources via
 # RunInstances; the group must come from the Virginia x86 template, not an override.
+# BroadcastLive (ejc3/fcvm#1974, src/fleet/coord/metrics.rs): the coordinator asks IVS every pass whether the channel its
+# broadcast secret names (channel_arn) is live; without GetStream the metric always reads 0. Staging's channel only. A
+# managed policy, because the task role's inline policies are near IAM's size limit.
+resource "aws_iam_policy" "fcvm_fleet_coordinator_broadcast_live" {
+  count       = length(aws_ivs_channel.fcvm_fleet_broadcast)
+  provider    = aws.fcvm_fleet
+  name        = "fcvm-fleet-coordinator-broadcast-live"
+  description = "The staging coordinator asks IVS whether the staging broadcast channel is live."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AskWhetherTheStagingBroadcastIsLive"
+      Effect   = "Allow"
+      Action   = "ivs:GetStream"
+      Resource = aws_ivs_channel.fcvm_fleet_broadcast[0].arn
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_broadcast_live" {
+  count      = length(aws_iam_policy.fcvm_fleet_coordinator_broadcast_live)
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_coordinator_broadcast_live[0].arn
+}
+
 resource "aws_iam_policy" "fcvm_fleet_coordinator_java" {
   provider    = aws.fcvm_fleet
   count       = length(module.fcvm_fleet_east1.host_minecraft_java_security_group_arns)
