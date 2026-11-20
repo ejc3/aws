@@ -1575,6 +1575,15 @@ Available if a task needs them; neither needs a key on disk.
   Cloudflare also checks the primary ARM Elastic IPv4 and host IPv6. Run the hosted Quick Actions on fcvm-arm
   with the token in the benchmark process environment. Keep it out of argv, logs, files and commits.
   Browser usage is billable. Rotate with `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
+- **fcvm.dev DNS propagation tests**, metal boxes. `fcvm-dns-test-token` (us-west-1) is a Cloudflare token with DNS Read
+  and DNS Write on the fcvm.dev zone and nothing else (`fcvm-dns-test.tf`), usable only from the dev fleet's subnets
+  (IPv6) and the metal boxes' Elastic IPs, and it expires 90 days after its date was last set. It is for creating,
+  timing and deleting short-lived test records. The token can edit any record in the zone; the box touches only names
+  under `dnstest-*.fcvm.dev`, and never the coordinator's (`slot-*`, `ec2-*`, `_acme-challenge*`), `stage` or
+  `fleet-api-stage`. Readable by dev-server-role (through `assume-constellation-terraform`) and admins.
+  `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id fcvm-dns-test-token
+  --query SecretString --output text)`; never onto a command line, into a file in a repo or a commit. Renew by moving
+  `fcvm_dns_test_token_expires_on` forward and applying.
 - **The claw-master dashboard, as an agent**, metal boxes and the owner's nextjs-ct container. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
   (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:

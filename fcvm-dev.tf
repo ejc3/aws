@@ -5,6 +5,10 @@
 # registration and is managed here. What lives on Cloudflare is built here, because Cloudflare credentials stay on the
 # jumpboxes; what the fleet reads is written into the fcvm-fleet account (fcvm-fleet-account.tf):
 #
+#   fcvm-fleet/cloudflare-dns-token      a token that may edit DNS records in fcvm.dev and nothing else. Staging runtime
+#                                        roles lose the read grant. The coordinator uses tiles-stage.fcvm.dev and answers
+#                                        its own DNS-01 record (--tls-scope subzone, fcvm-fleet.tf). It stays so that a
+#                                        revert to the zone certificate works. Retire the token at Cloudflare under #922.
 #   fcvm-fleet/coordinator-tunnel-token  the connector token of tunnel fcvm-fleet-coordinator, for the cloudflared container
 #                                        in the coordinator's Fargate task (TUNNEL_TOKEN)
 #   fcvm-fleet/agent-access-token        the Access service token the GPU hosts' agents present at /agent (client_id,
@@ -39,6 +43,7 @@ locals {
   fcvm_fleet_coordinator_port = 8080
   # Agents dial wss://<api host>/agent (ARCHITECTURE.md, "Coordinator").
   fcvm_dev_agent_path = "${local.fcvm_dev_api_stage_hostname}/agent"
+  dns_write           = "4755a26eedb94da69e1066d98aa820be" # Cloudflare's "DNS Write" permission group (zone scope)
 }
 
 # ------------------------------------------------------------------------------------------------ the zone
@@ -69,8 +74,17 @@ resource "cloudflare_zone_setting" "fcvm_dev_min_tls" {
   value      = "1.2"
 }
 
-# No token here may write DNS in fcvm.dev (ejc3/aws#922): staging's coordinator answers its own DNS-01 records in
-# tiles-stage.fcvm.dev (--tls-scope subzone), and only the jumpbox's Terraform credentials change this zone.
+# ------------------------------------------------------------------------------------------------ the DNS token
+resource "cloudflare_account_token" "fcvm_fleet_dns" {
+  provider   = cloudflare.token_minter
+  account_id = var.cloudflare_account_id
+  name       = "fcvm-fleet-dns-fcvm-dev"
+  policies = [{
+    effect            = "allow"
+    permission_groups = [{ id = local.dns_write }]
+    resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.fcvm_dev_zone_id}" = "*" })
+  }]
+}
 
 # ------------------------------------------------------------------------------------------------ Access
 resource "cloudflare_zero_trust_access_policy" "fcvm_dev_stage_owner" {
@@ -304,6 +318,20 @@ data "cloudflare_zero_trust_tunnel_cloudflared_token" "fcvm_fleet_coordinator" {
 }
 
 # ------------------------------------------------------------------------------------------------ into the fleet account
+resource "aws_secretsmanager_secret" "fcvm_fleet_dns_token" {
+  provider                = aws.fcvm_fleet
+  name                    = "fcvm-fleet/cloudflare-dns-token"
+  description             = "Cloudflare token: DNS Write on fcvm.dev only (ejc3/aws fcvm-dev.tf)"
+  recovery_window_in_days = 7
+  tags                    = { Managed = "ejc3/aws", Name = "fcvm-fleet/cloudflare-dns-token", Fleet = local.fcvm_fleet_stage.fleet }
+}
+
+resource "aws_secretsmanager_secret_version" "fcvm_fleet_dns_token" {
+  provider      = aws.fcvm_fleet
+  secret_id     = aws_secretsmanager_secret.fcvm_fleet_dns_token.id
+  secret_string = cloudflare_account_token.fcvm_fleet_dns.value
+}
+
 resource "aws_secretsmanager_secret" "fcvm_fleet_coordinator_tunnel" {
   provider                = aws.fcvm_fleet
   name                    = "fcvm-fleet/coordinator-tunnel-token"
@@ -345,6 +373,7 @@ output "fcvm_dev" {
     api_stage_aud      = cloudflare_zero_trust_access_application.fcvm_dev_api_stage.aud
     agent_aud          = cloudflare_zero_trust_access_application.fcvm_dev_agent.aud
     secrets = {
+      dns_token          = aws_secretsmanager_secret.fcvm_fleet_dns_token.name
       coordinator_tunnel = aws_secretsmanager_secret.fcvm_fleet_coordinator_tunnel.name
       agent_access       = aws_secretsmanager_secret.fcvm_fleet_agent_access.name
     }

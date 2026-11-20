@@ -1642,7 +1642,7 @@ class StackScopeTests(unittest.TestCase):
                        'resource "aws_ecs_service" "fcvm_fleet_coordinator"'):
             self.assertRegex(block(header), r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet", header)
         dev = (ROOT / "fcvm-dev.tf").read_text()
-        for name in ("fcvm_fleet_coordinator_tunnel", "fcvm_fleet_agent_access"):
+        for name in ("fcvm_fleet_dns_token", "fcvm_fleet_coordinator_tunnel", "fcvm_fleet_agent_access"):
             self.assertRegex(block('resource "aws_secretsmanager_secret" "%s"' % name, dev),
                              r"\n  tags\s+= \{[^\n]*Fleet = local\.fcvm_fleet_stage\.fleet", name)
         bc = (ROOT / "fcvm-fleet-broadcast.tf").read_text()

@@ -244,6 +244,12 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Action   = "secretsmanager:GetSecretValue"
       Resource = aws_secretsmanager_secret.abliteration_api_key.arn
       }, {
+      # The fcvm.dev DNS propagation test token (fcvm-dns-test.tf): read only, no instance pin, as the line above.
+      Sid      = "ReadTheFcvmDnsTestToken"
+      Effect   = "Allow"
+      Action   = "secretsmanager:GetSecretValue"
+      Resource = aws_secretsmanager_secret.fcvm_dns_test_token.arn
+      }, {
       # fcvm-arm ubuntu's Cloudflare Access tokens for `ssh mini` and `ssh ci-mac` (mini-ssh.tf, mac-vms.tf), its instance only.
       Sid    = "ReadTheMiniSshTokens"
       Effect = "Allow"
