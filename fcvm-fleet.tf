@@ -18,10 +18,11 @@
 #   spot quota), so one g4dn.metal: $4.76-5.44 an hour spot there on 2026-10-22. A region and architecture without an AMI
 #   gets no template.
 #   ON-DEMAND FALLBACK: when spot is refused for capacity the coordinator launches the host on demand in the same pass
-#   (modules/fcvm-fleet-region, "GPU hosts"), at most local.fcvm_fleet_on_demand_max = 8 on-demand hosts across the fleet
-#   (owner, 2026-10-24: "Up to 8 on-demand max"; FLEET_HOST_ON_DEMAND_MAX). A g4dn.metal on demand is $7.824 an hour in
-#   us-east-1, so 8 is $62.59 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is 384 vCPU, 4 hosts at 96
-#   each, less any on-demand EC2 tiles (4 vCPU each); launches beyond the quota fail.
+#   (modules/fcvm-fleet-region, "GPU hosts"), at most local.fcvm_fleet_on_demand_max = 2 on-demand hosts per stack
+#   (owner, 2026-11-18: two awake GPU hosts cover a spot shortage; FLEET_HOST_ON_DEMAND_MAX). A g4dn.metal on demand is
+#   $7.824 an hour in us-east-1, so 2 is $15.65 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is
+#   local.fcvm_fleet_on_demand_g_vcpus (fcvm-fleet-account.tf), shared with the on-demand EC2 tiles (4 vCPU each), the
+#   gpubox test hosts and the AMI builders; other workloads can exhaust the regional quota before a coordinator reaches its cap.
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
 #   month; 4 vCPU and 8 GB, about $115, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
@@ -107,8 +108,8 @@ locals {
   # budget action from #905 (fcvm-fleet-budget.tf) stays as the backstop. The meter needs no new IAM: it calls
   # ec2:DescribeInstances and ec2:DescribeSpotPriceHistory, both under the task role's ec2:Describe*.
   fcvm_fleet_daily_spend_ceiling_usd = 750
-  # Most on-demand GPU hosts across the fleet (the coordinator's cap; owner, 2026-10-24: "Up to 8 on-demand max").
-  fcvm_fleet_on_demand_max       = 8
+  # Maximum on-demand GPU hosts per coordinator, across all its regions (two awake hosts for Spot fallback).
+  fcvm_fleet_on_demand_max       = 2
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
   fcvm_fleet_alert_topic_arns    = concat(module.fcvm_fleet_east2.alert_topic_arns, module.fcvm_fleet_west2.alert_topic_arns, module.fcvm_fleet_east1.alert_topic_arns)
   # The coordinator's host launches (fcvm fleet coord, FLEET_HOST_TEMPLATES and FLEET_HOST_SUBNETS, ejc3/fcvm#1257): every

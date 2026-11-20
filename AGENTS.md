@@ -1861,9 +1861,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   Infrastructure still changes only through Terraform from a jumpbox.
 - **GPU hosts** (ejc3/fcvm#1257): no auto scaling group. The coordinator launches each host itself, spot first (an instant
   EC2 Fleet over the region's host templates and host subnets, `FLEET_HOST_TEMPLATES`, `FLEET_HOST_SUBNETS`), on demand
-  in the same pass when spot is refused for capacity, at most `local.fcvm_fleet_on_demand_max` = 8 on-demand hosts across
-  the fleet (owner, 2026-10-24: "Up to 8 on-demand max"; `FLEET_HOST_ON_DEMAND_MAX`), and terminates every host while
-  the fleet sleeps. The us-east-1 on-demand G and VT quota (L-DB2E81BA, 384 vCPU) fits 4 g4dn.metal. Accepted on-demand
+  in the same pass when spot is refused for capacity. Each coordinator caps its on-demand GPU hosts at two across
+  all its regions (`local.fcvm_fleet_on_demand_max`, exposed as `FLEET_HOST_ON_DEMAND_MAX`) and terminates its hosts
+  while its fleet sleeps. The us-east-1 on-demand G and VT quota (L-DB2E81BA; `local.fcvm_fleet_on_demand_g_vcpus`
+  in `fcvm-fleet-account.tf`) is shared with other GPU workloads in the account. Accepted on-demand
   launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
   `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
   notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
