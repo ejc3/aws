@@ -70,7 +70,7 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_broadcast" {
   name                    = "fcvm-fleet/broadcast"
   description             = "The wall's IVS broadcast: ingest URL with stream key, playback URL, channel ARN, playback private key (JSON). Written by fcvm-fleet-broadcast.tf."
   recovery_window_in_days = 7
-  tags                    = { Name = "fcvm-fleet/broadcast", Project = "fcvm-fleet" }
+  tags                    = { Name = "fcvm-fleet/broadcast", Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
 resource "aws_secretsmanager_secret_version" "fcvm_fleet_broadcast" {
