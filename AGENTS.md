@@ -1198,8 +1198,10 @@ with, so after `current` moves to a new release nothing changes until the daemon
 restart interrupts the turns it is running. On 2026-09-30 fcvm-arm's daemon (started Sep 28) still ran
 0.154.0 with 0.159.2 installed, and the model list a client gets is filtered by its version.
 
-- **Refresh is automatic.** `codex-update.tf`: a weekly SSM association re-runs the installer as
-  `ubuntu` on both jumpboxes and both metal boxes (a stopped spot box catches up at its next run).
+- **Refresh is automatic.** `codex-update.tf`: a dedicated weekly SSM association re-runs the installer as
+  `ubuntu` on each jumpbox and metal box. A stopped metal box catches up when it comes online. Every host has
+  its own delivery and status. If noninteractive zsh cannot find Codex or selects the system npm install, the updater sets
+  ubuntu’s zsh to search the managed Codex package’s bin directory first.
   nextjs-dev refreshes every account daily in its own updater and restarts them there.
 - **Claude Code updates daily too.** `claude-update.tf`: an SSM association at 08:00 UTC runs `claude update` as ubuntu on
   both jumpboxes, fcvm-metal-arm and fcvm-metal-x86 (the nextjs-ct containers are outside it: their own nightly `agent-update` covers them).
