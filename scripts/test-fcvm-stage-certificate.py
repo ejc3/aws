@@ -66,16 +66,19 @@ class CertificateTests(unittest.TestCase):
         def run(args, **kw):
             if args[0] != "lego":
                 return self.run(args, **kw)
+            self.assertEqual(args[args.index("--email") + 1], "ops@example.org")
             self.assertEqual(args[args.index("--domains"):], ["--domains", "*." + cert.ZONE, "run"])
             output = self.directory / "certificates"
             output.mkdir()
             for suffix, field in [("key", "key"), ("crt", "cert")]:
                 (output / ("_." + cert.ZONE + "." + suffix)).write_text(self.leaf[field])
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
 
         secrets.put_secret_value.side_effect = put
         with self.assertRaisesRegex(ValueError, "empty secret"):
             cert.bootstrap(secrets, self.directory, False)
-        with mock.patch.object(cert.subprocess, "check_output", return_value="_acme-challenge.fcvm.dev."), \
+        with mock.patch.dict(os.environ, {"ACME_EMAIL": "ops@example.org"}), \
+                mock.patch.object(cert.subprocess, "check_output", return_value="_acme-challenge.fcvm.dev."), \
                 mock.patch.object(cert.subprocess, "run", side_effect=run):
             cert.bootstrap(secrets, self.directory, True)
             cert.bootstrap(secrets, self.directory, True)

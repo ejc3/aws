@@ -1848,8 +1848,9 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
   and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
   including copies on host or tile disks and in backups. Production activation depends on completing #922.
-- **Staging certificate cutover.** First apply only the staging certificate container and its resource policy. With the
-  fleet administration role, lego v4.17.4 and the existing parent-zone ACME CNAME, run
+- **Staging certificate cutover.** First apply only the staging certificate container and its resource policy. On the jumpbox,
+  set `ACME_EMAIL` from the `owner` field of the management account's `people/addresses` secret, then assume the
+  fleet administration role. With lego v4.17.4 and the existing parent-zone ACME CNAME, run
   `python3 scripts/fcvm-stage-certificate.py --issue`. It bootstraps the stage wildcard with a fresh key, retains the
   old scene token, verifies the chain and matching keys and labels the verified version. The coordinator requires a
   populated certificate on startup. The Terraform cutover reads version metadata only. Run

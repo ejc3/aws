@@ -77,12 +77,17 @@ def bootstrap(secrets, directory, issue):
     cname = subprocess.check_output(["dig", "+short", "CNAME", "_acme-challenge." + ZONE], text=True).strip()
     checked(cname == "_acme-challenge.fcvm.dev.", "staging ACME CNAME does not delegate to the legacy issuer")
     # Use exactly one ACME identifier. The legacy issuer also requests the parent apex.
+    email = os.environ.get("ACME_EMAIL")
+    checked(email, "set ACME_EMAIL from the existing operator contact before issuing")
     token = secrets.get_secret_value(SecretId="fcvm-fleet/cloudflare-dns-token")["SecretString"]
-    subprocess.run(["lego", "--accept-tos", "--email", "acme@fcvm.dev", "--path", str(directory),
+    result = subprocess.run(["lego", "--accept-tos", "--email", email, "--path", str(directory),
                     "--server", "https://acme-v02.api.letsencrypt.org/directory", "--dns", "cloudflare",
                     "--dns.resolvers", "1.1.1.1:53", "--key-type", "ec256", "--domains", "*." + ZONE, "run"],
                    env={"PATH": os.environ["PATH"], "HOME": str(directory), "CLOUDFLARE_DNS_API_TOKEN": token,
-                        "CLOUDFLARE_PROPAGATION_TIMEOUT": "300"}, check=True)
+                        "CLOUDFLARE_PROPAGATION_TIMEOUT": "300"}, capture_output=True, text=True)
+    if result.returncode:
+        diagnostic = (result.stderr or result.stdout).replace(email, "[contact]").replace(token, "[credential]")
+        raise RuntimeError("staging certificate issuance failed: " + diagnostic)
     cert_dir = directory / "certificates"
     cert = (cert_dir / ("_." + ZONE + ".crt")).read_text()
     doc = {"cert": cert, "key": (cert_dir / ("_." + ZONE + ".key")).read_text(), "domains": ["*." + ZONE],
