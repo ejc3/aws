@@ -60,6 +60,21 @@ data "aws_ssm_parameter" "fcvm_ami_release" {
   }
 }
 
+# Keep apply-time guards in the root. Terraform 1.10.3 cannot expand an ephemeral inside an
+# absent module instance. Only the launch templates depend on the verified version.
+ephemeral "aws_ssm_parameter" "fcvm_ami_release_guard" {
+  provider        = aws.fcvm_fleet_east1
+  count           = var.fcvm_ami_pipeline_enabled ? 1 : 0
+  arn             = aws_ssm_parameter.fcvm_ami_release.arn
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition     = self.version == data.aws_ssm_parameter.fcvm_ami_release[0].version
+      error_message = "The Fleet AMI release changed after planning; create a fresh plan."
+    }
+  }
+}
+
 locals {
   # SSM marks every value sensitive, including this explicitly non-secret image
   # manifest. Only the AMI maps are declassified so resource keys stay usable.
