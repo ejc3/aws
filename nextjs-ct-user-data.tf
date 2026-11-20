@@ -432,10 +432,28 @@ systemctl daemon-reload
 systemctl enable --now setup-sync.timer >/dev/null 2>&1 || true
 
 # ---------------------------------------------------------------- base packages
-# Required: a failure stops the run, so setup-sync does not record a half-done setup and retries.
-apt-get -o DPkg::Lock::Timeout=600 update || true
-apt-get -o DPkg::Lock::Timeout=600 install -y curl git jq unzip python3 rsync systemd-container debootstrap nftables earlyoom \
-  || { echo "ERROR: required packages did not install"; exit 1; }
+# An automatic needrestart of the nspawn units ended every user's sessions on Nov 20.
+# Keep these units listed for operator maintenance when host libraries are upgraded.
+install -d -m 0755 /etc/needrestart/conf.d || exit 1
+cat > /etc/needrestart/conf.d/nextjs-containers.conf.new <<'NEEDRESTART' || exit 1
+$nrconf{override_rc}{qr(^systemd-(?:nspawn@.+|machined)\.service$)} = 0;
+$nrconf{override_cont}{qr(^(?:${join("|", local.nextjs_users)})$)} = 0;
+NEEDRESTART
+mv -f /etc/needrestart/conf.d/nextjs-containers.conf.new /etc/needrestart/conf.d/nextjs-containers.conf || exit 1
+
+# An install of an already present package can upgrade it. Leave upgrades to host
+# maintenance; routine synchronization needs only missing or unconfigured prerequisites.
+missing=()
+for package in curl git jq unzip python3 rsync systemd-container debootstrap nftables earlyoom; do
+  if [ "$(dpkg-query -W -f='$${db:Status-Status}' "$package" 2>/dev/null)" != installed ]; then
+    missing+=("$package")
+  fi
+done
+if (( $${#missing[@]} )); then
+  apt-get -o DPkg::Lock::Timeout=600 update || true
+  apt-get -o DPkg::Lock::Timeout=600 install -y "$${missing[@]}" \
+    || { echo "ERROR: required packages did not install"; exit 1; }
+fi
 ${local.linux_ip_options_setup}
 if ! command -v aws >/dev/null 2>&1; then
   curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o /tmp/awscliv2.zip \

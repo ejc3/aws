@@ -162,12 +162,64 @@ class FirstBootTests(unittest.TestCase):
         self.assertLess(timer, self.script.index("apt-get"))
         self.assertLess(self.script.index("${local.nextjs_ct_install_files}"), timer)
 
-    def test_required_packages_fail_the_run(self):
-        install = next(l for l in self.script.splitlines() if "systemd-container" in l)
-        follow = self.script.split(install, 1)[1].splitlines()[1]
-        self.assertIn("exit 1", follow)
-        self.assertNotIn("WARNING", follow)
+    def test_aws_cli_install_failure_stops_setup(self):
         self.assertIn('ERROR: the AWS CLI did not install"; exit 1', self.script)
+
+    def run_package_setup(self, missing="", apt_status=0, failed_move=False):
+        section = self.script.split("# ---------------------------------------------------------------- base packages\n", 1)[1]
+        section = section.split("${local.linux_ip_options_setup}", 1)[0].replace("$${", "${")
+        section = section.replace('${join("|", local.nextjs_users)}', 'colin|new-user')
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conf = root / "conf.d"
+            section = section.replace("/etc/needrestart/conf.d", str(conf))
+            scripts = {
+                "dpkg-query": 'case "$3" in "$MISSING") echo unpacked ;; *) echo installed ;; esac',
+                "apt-get": 'echo "$*" >> "$LOG"\ntest -s "$CONF" || exit 99\nexit "$APT_STATUS"',
+            }
+            if failed_move:
+                scripts["mv"] = "exit 1"
+            for name, code in scripts.items():
+                path = root / name
+                path.write_text("#!/bin/sh\n" + code + "\n")
+                path.chmod(0o755)
+            log = root / "apt.log"
+            config = conf / "nextjs-containers.conf"
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", MISSING=missing,
+                       APT_STATUS=str(apt_status), LOG=str(log), CONF=str(config))
+            result = subprocess.run(["bash", "-uo", "pipefail", "-c", section], env=env, capture_output=True, text=True)
+            return result, log.read_text().splitlines() if log.exists() else [], config.read_text() if config.exists() else ""
+
+    def test_config_refresh_with_installed_packages_leaves_apt_idle(self):
+        result, calls, guard = self.run_package_setup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [])
+        # Exercise the Perl regex as needrestart does against real unit names.
+        check = guard + """
+my ($pattern) = keys %{$nrconf{override_rc}};
+exit 1 unless defined($pattern) && $nrconf{override_rc}{$pattern} == 0;
+for my $unit (qw(systemd-nspawn@colin.service systemd-nspawn@new-user.service systemd-machined.service)) {
+    exit 2 unless $unit =~ /$pattern/;
+}
+exit 3 if 'ssh.service' =~ /$pattern/;
+my ($guest) = keys %{$nrconf{override_cont}};
+exit 4 unless defined($guest) && $nrconf{override_cont}{$guest} == 0;
+exit 5 unless 'new-user' =~ /$guest/ && 'colin' =~ /$guest/ && 'unmanaged' !~ /$guest/;
+"""
+        subprocess.run(["perl", "-e", check], check=True)
+
+    def test_only_unconfigured_packages_go_to_apt_and_failure_stops_setup(self):
+        for apt_status in (0, 12):
+            with self.subTest(apt_status=apt_status):
+                result, calls, _ = self.run_package_setup("nftables", apt_status)
+                self.assertEqual(calls, ["-o DPkg::Lock::Timeout=600 update",
+                                         "-o DPkg::Lock::Timeout=600 install -y nftables"])
+                self.assertEqual(result.returncode, 1 if apt_status else 0, result.stderr)
+
+    def test_failed_guard_install_stops_setup_before_apt(self):
+        result, calls, _ = self.run_package_setup("nftables", failed_move=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(calls, [])
 
     def test_etag_is_recorded_only_after_health(self):
         health = self.script.index("/usr/local/sbin/nextjs-ct-health || {")
