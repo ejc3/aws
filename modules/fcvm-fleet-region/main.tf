@@ -67,24 +67,17 @@ variable "ip_options_guard_sha256" {
   type        = string
 }
 
-variable "ami_release_parameter_arn" {
-  description = "Regional non-secret release pointer, empty while automatic publishing is disabled"
-  type        = string
-  default     = ""
-}
-
 variable "ami_release_parameter_version" {
-  description = "Release version read by the administration plan"
+  description = "Ephemeral version from the stack's release guard; only launch templates await it"
   type        = number
-  default     = 0
+  ephemeral   = true
+  default     = null
 }
 
-# Whether the templates follow a release pointer, known at plan time even while the pointer's ARN is not (a stack whose
-# pointer is created in the same apply, fcvm-fleet-prod.tf). Null: whenever ami_release_parameter_arn is set, as before.
 variable "ami_release_guarded" {
-  description = "The templates follow ami_release_parameter_arn (null: whenever it is set)"
+  description = "Require published images to have passed fleet validation"
   type        = bool
-  default     = null
+  default     = false
 }
 
 variable "alert_topic" {
@@ -101,24 +94,6 @@ variable "tile_tls_secret" {
   validation {
     condition     = can(regex("^[A-Za-z0-9/_+=.@-]*$", var.tile_tls_secret))
     error_message = "tile_tls_secret must be a plain Secrets Manager secret name."
-  }
-}
-
-locals {
-  release_guarded = var.ami_release_guarded != null ? var.ami_release_guarded : var.ami_release_parameter_arn != ""
-}
-
-# Re-open at apply time under the backend lock. A release after planning must
-# invalidate the saved plan, while AZ discovery remains a plan-time operation.
-ephemeral "aws_ssm_parameter" "ami_release_guard" {
-  count           = local.release_guarded ? 1 : 0
-  arn             = var.ami_release_parameter_arn
-  with_decryption = false
-  lifecycle {
-    postcondition {
-      condition     = self.version == var.ami_release_parameter_version
-      error_message = "The Fleet AMI release changed after planning; create a fresh plan."
-    }
   }
 }
 
@@ -258,7 +233,7 @@ data "aws_ami" "guarded" {
     values = [var.ip_options_guard_sha256]
   }
   dynamic "filter" {
-    for_each = local.release_guarded ? [true] : []
+    for_each = var.ami_release_guarded ? [true] : []
     content {
       name   = "tag:FleetImageValidated"
       values = ["true"]
@@ -372,7 +347,7 @@ locals {
     fi
     unset token boot_ami
     %{endif~}
-    %{~if local.release_guarded~}
+    %{~if var.ami_release_guarded~}
     # The factory publisher can change ImageId while retaining this bootstrap.
     # An unlisted image can run a mode only if it has both that mode's image in
     # root's Podman store and the flag in its installed agent. Windows needs more
@@ -543,7 +518,7 @@ resource "aws_flow_log" "this" {
 
 # ------------------------------------------------------------------------------------------------ GPU hosts
 resource "aws_launch_template" "host" {
-  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  depends_on             = [var.ami_release_parameter_version]
   update_default_version = true
   for_each               = toset(local.host_archs)
   name                   = "${var.name_prefix}-host-${each.key}"
@@ -665,7 +640,7 @@ resource "aws_sns_topic_subscription" "alerts_email" {
 
 # ------------------------------------------------------------------------------------------------ EC2 tiles
 resource "aws_launch_template" "tile" {
-  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  depends_on             = [var.ami_release_parameter_version]
   update_default_version = true
   for_each               = toset(local.tile_archs)
   name                   = "${var.name_prefix}-tile-${each.key}"
@@ -726,7 +701,7 @@ resource "aws_launch_template" "tile" {
 # (fcvm fleet coord --ec2-on-demand-template fcvm-fleet-tile-on-demand-<arch>). Everything but the market is the spot
 # template's.
 resource "aws_launch_template" "tile_on_demand" {
-  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  depends_on             = [var.ami_release_parameter_version]
   update_default_version = true
   for_each               = toset(local.tile_archs)
   name                   = "${var.name_prefix}-tile-on-demand-${each.key}"
@@ -782,7 +757,7 @@ resource "aws_launch_template" "tile_on_demand" {
 # persistent request before terminating its instance, or the request launches a replacement) is limited to tiles'.
 # Everything else is the spot template's.
 resource "aws_launch_template" "tile_pool" {
-  depends_on             = [ephemeral.aws_ssm_parameter.ami_release_guard]
+  depends_on             = [var.ami_release_parameter_version]
   update_default_version = true
   for_each               = toset(local.tile_archs)
   name                   = "${var.name_prefix}-tile-pool-${each.key}"

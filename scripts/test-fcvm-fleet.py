@@ -101,10 +101,7 @@ class NetworkTests(unittest.TestCase):
         self.assertRegex(admitted, r'owners\s*=\s*\["self"\]')
         validated = re.search(r'  dynamic "filter" \{\n.*?\n  \}', admitted, re.S)
         self.assertIsNotNone(validated)
-        self.assertRegex(validated.group(), r'for_each\s*=\s*local\.release_guarded \? \[true\] : \[\]')
-        # Guarded whenever a release pointer is named, or when the caller says so before the pointer's ARN is known.
-        self.assertIn('release_guarded = var.ami_release_guarded != null ? var.ami_release_guarded : var.ami_release_parameter_arn != ""', MOD)
-        self.assertIn("count           = local.release_guarded ? 1 : 0", block('ephemeral "aws_ssm_parameter" "ami_release_guard"', MOD))
+        self.assertRegex(validated.group(), r'for_each\s*=\s*var\.ami_release_guarded \? \[true\] : \[\]')
         self.assertEqual(dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]', validated.group())),
                          {"tag:FleetImageValidated": '"true"'})
         filters = dict(re.findall(r'name\s*=\s*"([^"]+)"\s+values\s*=\s*\[([^\]]+)\]',
@@ -519,8 +516,8 @@ class HostTests(unittest.TestCase):
         # Feed the actual fallback shell fake read-only probes, using a non-default
         # Minecraft count to verify it still comes from the port allocation's input.
         fallback = MOD.split('    unset token boot_ami\n    %{endif~}\n', 1)[1].split("    printf 'FLEET_AGENT_ARGS", 1)[0]
-        self.assertIn('    %{~if local.release_guarded~}\n', fallback)
-        fallback = fallback.replace('    %{~if local.release_guarded~}\n', '').replace('    %{endif~}\n', '')
+        self.assertIn('    %{~if var.ami_release_guarded~}\n', fallback)
+        fallback = fallback.replace('    %{~if var.ami_release_guarded~}\n', '').replace('    %{endif~}\n', '')
         with tempfile.TemporaryDirectory() as temp:
             fixtures = Path(temp)
             windows_env = fixtures / 'windows.env'
@@ -1808,7 +1805,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("gpu_amis                = local.fcvm_fleet_prod_host_amis", mod)
         self.assertIn("tile_amis               = local.fcvm_fleet_prod_tile_amis", mod)
         self.assertIn("ami_release_guarded           = true", mod)
-        self.assertIn("ami_release_parameter_arn     = aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn", mod)
+        self.assertIn("ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_fleet_prod_ami_release_guard[*].version)", mod)
         self.assertIn('name        = "/fcvm-fleet/prod/ami-release"', block('resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release"', PROD))
         release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
         self.assertIn("fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates", release)
@@ -2020,13 +2017,13 @@ class ProdStackTests(unittest.TestCase):
                      '  name  = "fcvm-fleet-alerts"'):
             self.assertIn(line + "\n", staged)
         self.assertNotIn('"fcvm-fleet-${local.region}"', MOD)
-        # The new inputs default to what staging had, and no staging region sets them.
+        # Staging keeps its topic and certificate defaults. Only an explicitly guarded region requires published images.
         self.assertRegex(block('variable "alert_topic"', MOD), r"default\s+= true")
         self.assertRegex(block('variable "tile_tls_secret"', MOD), r'default\s+= ""')
-        self.assertRegex(block('variable "ami_release_guarded"', MOD), r"default\s+= null")
+        self.assertRegex(block('variable "ami_release_guarded"', MOD), r"default\s+= false")
         for name in ("east2", "west2", "east1"):
             mod = block('module "fcvm_fleet_%s"' % name)
-            for arg in ("alert_topic", "tile_tls_secret", "ami_release_guarded"):
+            for arg in ("alert_topic", "tile_tls_secret"):
                 self.assertNotIn(arg, mod)
         self.assertIn("count = var.alert_topic && length(local.host_archs) > 0 ? 1 : 0", MOD)
         # Nothing is moved: no staging address changes.

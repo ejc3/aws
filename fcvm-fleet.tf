@@ -560,8 +560,8 @@ module "fcvm_fleet_east1" {
   cidr_block                    = local.fcvm_fleet_cidrs["us-east-1"]
   gpu_amis                      = lookup(local.fcvm_active_host_amis, "us-east-1", {})
   tile_amis                     = lookup(local.fcvm_active_tile_amis, "us-east-1", {})
-  ami_release_parameter_arn     = var.fcvm_ami_pipeline_enabled ? aws_ssm_parameter.fcvm_ami_release.arn : ""
-  ami_release_parameter_version = var.fcvm_ami_pipeline_enabled ? data.aws_ssm_parameter.fcvm_ami_release[0].version : 0
+  ami_release_guarded           = var.fcvm_ami_pipeline_enabled
+  ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_ami_release_guard[*].version)
   hosts_enabled                 = local.fcvm_fleet_hosts_enabled
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
