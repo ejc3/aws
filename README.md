@@ -580,6 +580,13 @@ call tagged them at creation; older unmarked snapshots remain for separate revie
 release configuration (templates and reviewed pairs) ships in its code bundle as
 `publisher-config.json`, not in its environment.
 
+The first production AMI seed runs under Terraform's backend lock. Before writing the pointer,
+the enabling apply rechecks the planned staging release version and describes the current and
+rollback AMIs, including their linked regional copies, using AWS CLI v2 on the jumpbox. If staging
+advanced, plan again. If a regional copy is missing, finish staging replication before replanning.
+Production's pointer is protected against replacement. The publisher and build-region collector
+preserve its active and rollback images after staging moves on.
+
 To copy the active release on demand, invoke the publisher below. If copies are pending,
 invoke it again after they become available:
 `aws lambda invoke --region us-west-1 --function-name fcvm-fleet-ami-publish --cli-binary-format raw-in-base64-out --payload '{"action":"replicate-active-release"}' out.json`.
