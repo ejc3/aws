@@ -59,7 +59,7 @@ class GuardrailTests(unittest.TestCase):
                           "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
             if f.name in {"fcvm-fleet-alarms.tf", "fcvm-fleet-budget.tf", "fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf",
-                          "fcvm-fleet-prod-broadcast.tf"}:
+                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf"}:
                 # Fleet-owned: every resource that names the fleet account is created inside it.
                 for r in re.finditer(r'^resource "\w+" "\w+" \{\n.*?^\}', f.read_text(), re.S | re.M):
                     if "local.fcvm_fleet_account_id" in r.group():

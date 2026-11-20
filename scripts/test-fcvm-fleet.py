@@ -663,7 +663,7 @@ class OnDemandFallbackTests(unittest.TestCase):
         self.assertIn('threshold           = 1', alarm)
         self.assertIn('alarm_actions       = [aws_lambda_function.fcvm_fleet_on_demand_notify.arn]', alarm)
         self.assertIn('ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], '
-                      'values(local.fcvm_fleet_health_alarm_arns)))', TF)
+                      'values(local.fcvm_fleet_health_alarm_arns), values(local.fcvm_fleet_prod_alarm_arns)))', TF)
         for region in ('east2', 'west2', 'east1'):
             self.assertIn('module.fcvm_fleet_%s.alert_topic_arns' % region, TF)
         # A launch-event counter returning to zero says nothing about whether the host is still charging.

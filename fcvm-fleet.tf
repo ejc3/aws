@@ -808,8 +808,8 @@ resource "aws_lambda_function" "fcvm_fleet_on_demand_notify" {
   memory_size      = 128
   environment {
     variables = {
-      # This alarm and the coordinator's health alarms (fcvm-fleet-alarms.tf).
-      ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], values(local.fcvm_fleet_health_alarm_arns)))
+      # This alarm, the coordinator's health alarms (fcvm-fleet-alarms.tf) and prod's (fcvm-fleet-prod-alarms.tf).
+      ALARM_ARNS = jsonencode(concat([local.fcvm_fleet_on_demand_alarm_arn], values(local.fcvm_fleet_health_alarm_arns), values(local.fcvm_fleet_prod_alarm_arns)))
       TOPIC_ARNS = jsonencode(local.fcvm_fleet_alert_topic_arns)
     }
   }
