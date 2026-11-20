@@ -125,6 +125,7 @@ class PemsTests(unittest.TestCase):
                                             "aws_secretsmanager_secret.balldontlie.arn"),
             "PutTheDrivesReadToken": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                       "aws_secretsmanager_secret.dolphin_maps_drives_read.arn"),
+            "ReadTheTilesUpload": ({"secretsmanager:GetSecretValue"}, "aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn"),
             "PutTheMusicKitKey": ({"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"},
                                  "aws_secretsmanager_secret.dolphin_maps_musickit.arn"),
         }
@@ -134,6 +135,9 @@ class PemsTests(unittest.TestCase):
             self.assertNotIn(sid, actual)
             actions = re.search(r"actions\s+= \[([^\]]+)\]", statement).group(1)
             resource = re.search(r"resources\s+= \[([^\]]+)\]", statement).group(1)
+            if sid == "ReadTheTilesUpload":
+                self.assertRegex(statement, r'condition\s*\{\s*test\s*= "ArnEquals"\s*variable = "ec2:SourceInstanceARN"\s*'
+                                            r'values\s*= \[local\.constellation_applier_instance_arn\]\s*\}')
             actual[sid] = (set(re.findall(r'"([^"]+)"', actions)), resource)
         # Sharing the policy must not turn the MusicKit or drives-token write grants into read grants, or broaden a resource.
         self.assertEqual(actual, expected)

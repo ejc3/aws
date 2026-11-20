@@ -58,6 +58,14 @@ class GuardrailTests(unittest.TestCase):
             if f.name in {"fcvm-fleet-account.tf", "fcvm-fleet.tf",
                           "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
+            if f.name in {"fcvm-fleet-alarms.tf", "fcvm-fleet-budget.tf", "fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf",
+                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf"}:
+                # Fleet-owned: every resource that names the fleet account is created inside it.
+                for r in re.finditer(r'^resource "\w+" "\w+" \{\n.*?^\}', f.read_text(), re.S | re.M):
+                    if "local.fcvm_fleet_account_id" in r.group():
+                        self.assertRegex(r.group(), r"(?m)^  provider\s+= aws\.fcvm_fleet(_\w+)?$", f.name)
+                self.assertNotIn("aws_organizations_account.fcvm_fleet", f.read_text(), f.name)
+                continue
             text = f.read_text()
             self.assertNotIn("aws_organizations_account.fcvm_fleet", text, f.name)
             self.assertNotIn("local.fcvm_fleet_account_id", text, f.name)

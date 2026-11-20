@@ -500,6 +500,15 @@ an ordinary Terraform apply never allocates a billed Mac host.
 
 ## Fleet
 
+The staging fleet alerts at $600 and $750 of daily GPU host and tile charges. AWS Budgets
+reports completed UTC days, so the billing figures can arrive after an overage. Every five
+minutes the spend guard checks the last three complete days. The first time a day's bill
+reaches $750 it blocks new coordinator launches and starts for the rest of the UTC day
+when it was detected. Already running hosts can still stop or terminate. At midnight the
+guard releases the restriction without querying billing. If AWS is unavailable, the next
+successful check reconciles it. Duplicate and late notifications cannot extend a processed
+bill's restriction. The guard's logs are in `/aws/lambda/fcvm-fleet-spend-cap` in us-east-2.
+
 The GPU demonstration Fleet's x86 host and tile AMIs have a continuous image factory
 in `fcvm-fleet-ami-pipeline.tf`. Successful `ejc3/fcvm` main CI requests immutable
 source builds; routine changes batch for six hours from the first queued request,
@@ -756,7 +765,7 @@ also lists the copy in `windows_host_amis`.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1a`, persistent Spot `m8gd.metal-24xl` | 1,000 GiB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 96-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 700 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 900 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup; 16 GiB host swap | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
@@ -901,13 +910,21 @@ SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude'
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
 daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
 box, `fcvm-claude-rc.service` starts remote-control sessions at boot for the user's
-active repositories under `/home/ubuntu`. “Active” means t-claude was used for that
-repository on this host during the preceding 30 days, its local Git checkout has moved
-during that period, or its worktree has uncommitted changes. Only `github.com/ejc3/*`
-checkouts qualify. The launcher uses the normal path-derived `t-claude` session so a later
-interactive launch attaches to the same work when run from that repository root.
+active repositories under `/home/ubuntu`. A human prompt or a `claude-interactive`
+marker in the preceding 30 days qualifies a checkout from an allowed origin.
+The launcher uses the normal path-derived `t-claude` session so a later interactive
+launch attaches to the same work when run from that repository root.
 
-Claude Remote Control windows opened automatically are retired after seven days without a message.
+`agent-session-sync` also notices new clones and marked linked worktrees as they
+appear. It records the Git directory's inode and filesystem UUID in `known.json`,
+so an EBS device number changing on boot preserves the checkout's launch history.
+When upgrading older state or using a filesystem without a UUID, the first scan
+after a reboot preserves a known checkout with the same inode. Subsequent scans
+can also compare device numbers within that boot.
+
+An automatically opened Claude Remote Control window in a linked Git worktree closes after
+48 hours if its transcript is still blank and the worktree has no recorded conversation.
+Startup bookkeeping counts as blank. Other automatically opened windows keep the seven-day cutoff.
 The watcher leaves open any window viewed in tmux, and keeps a window if it cannot verify the
 conversation is empty. It keeps the transcript and remembers retirement across reboots. Running
 `t-claude` yourself still works; to restore automatic startup for a checkout, remove
@@ -2560,8 +2577,11 @@ migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own 
 `dolphin-maps-tiles.tf` creates the private `dolphin-maps-tiles` R2 bucket for nationwide road tiles under
 `tiles/<id>.json`, without an expiry rule or a public URL. Its bucket-only object Read/Write token supplies
 `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_BUCKET` to the main-only `osm-tiles` GitHub
-environment in `dolphin-labs-hq/dolphin-maps`; existing `data-push` credentials stay separate. The administration
-minter is read ephemerally; only the narrow token enters protected Terraform state and GitHub. The bucket and
+environment in `dolphin-labs-hq/dolphin-maps` and to the `dolphin-maps/tiles-upload` secret in us-west-1.
+The weekly uploader on fcvm-arm reads that secret after retrieving the completed build from its pbox. Anyone with
+access to fcvm-arm's instance credentials has the same bucket access. The dev-role grant is restricted to that
+instance, and the secret's resource policy is installed before its first value. The administration token stays
+ephemeral. The bucket and
 one-time credential have replacement guards. A separate Maps change binds `TILES` in staging and production and
 adds the uploader after this infrastructure exists; this apply does not deploy either Worker.
 

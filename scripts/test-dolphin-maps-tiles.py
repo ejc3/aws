@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The road-tile uploader reaches one private R2 bucket from main only."""
+"""The main-only CI environment and the ARM uploader reach one private road-tile bucket."""
 import re
 import unittest
 from pathlib import Path
@@ -55,12 +55,36 @@ class CredentialTests(unittest.TestCase):
         self.assertIn("R2_ACCOUNT_ID        = var.cloudflare_account_id", CODE)
         self.assertIn("R2_BUCKET            = cloudflare_r2_bucket.dolphin_maps_tiles.name", CODE)
 
-    def test_admin_minter_is_reused_ephemerally_without_dev_or_aws_secret_grants(self):
+    def test_admin_minter_remains_ephemeral_and_only_the_narrow_credentials_are_copied(self):
         self.assertIn("provider   = cloudflare.token_minter", block("cloudflare_account_token", "dolphin_maps_tiles_r2"))
         provider = (ROOT / "workers-deploy.tf").read_text()
         self.assertIn("api_token = trimspace(ephemeral.aws_secretsmanager_secret_version.cloudflare_account_token.secret_string)", provider)
-        self.assertNotRegex(CODE, re.compile(r'^(?:resource|data|ephemeral) "aws_', re.M))
+        version = block("aws_secretsmanager_secret_version", "dolphin_maps_tiles_upload")
+        self.assertRegex(version, r"secret_string\s*= jsonencode\(local\.dolphin_maps_tiles_credentials\)")
+        self.assertRegex(version, r"depends_on\s*= \[aws_secretsmanager_secret_policy\.dolphin_maps_tiles_upload\]")
+        self.assertNotRegex(CODE, re.compile(r'^(?:data|ephemeral) "aws_', re.M))
         self.assertNotRegex(CODE, re.compile(r'^output\s', re.M))
+
+
+class DevBoundaryTests(unittest.TestCase):
+    def test_only_administration_and_the_designated_metal_instance_can_read(self):
+        name = "dolphin_maps_tiles_upload"
+        self.assertIn('"dolphin-maps/tiles-upload"', block("aws_secretsmanager_secret", name))
+        policy = block("aws_secretsmanager_secret_policy", name)
+        self.assertEqual(re.findall(r'Effect\s*= "(.*?)"', policy), ["Deny", "Deny"])
+        statements = policy.split('Sid       = ')[1:]
+        for statement in statements:
+            self.assertIn('Principal = "*"', statement)
+            self.assertIn('Action    = "secretsmanager:GetSecretValue"', statement)
+            self.assertIn('Resource  = aws_secretsmanager_secret.dolphin_maps_tiles_upload.arn', statement)
+        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) }', statements[0])
+        self.assertRegex(statements[1], r'ArnEquals\s*= \{ "aws:PrincipalArn" = aws_iam_role\.dev_server\.arn \}')
+        self.assertIn('StringNotEqualsIfExists = { "aws:userid" = try(local.browser_run_arm_userids[0], "no-fcvm-arm-instance") }',
+                      statements[1])
+        self.assertNotIn("ec2:SourceInstanceARN", policy)  # Secrets Manager rejects this EC2-specific key.
+        userids = (ROOT / "browser-run.tf").read_text()
+        self.assertRegex(userids, r'browser_run_arm_userids\s*= \[for instance in aws_instance\.firecracker_dev : '
+                                  r'"\$\{aws_iam_role\.dev_server\.unique_id\}:\$\{instance\.id\}"\]')
 
 
 class GitHubBoundaryTests(unittest.TestCase):
@@ -92,7 +116,7 @@ class GitHubBoundaryTests(unittest.TestCase):
         self.assertIn("plaintext_value = local.dolphin_maps_tiles_credentials[each.key]", secret)
         self.assertIn("depends_on = [github_repository_environment_deployment_policy.dolphin_maps_tiles_main]", secret)
 
-    def test_resource_set_has_no_repo_secret_or_worker_or_infrastructure_side_effects(self):
+    def test_resource_set_is_limited_to_the_bucket_token_and_two_credential_destinations(self):
         self.assertEqual(re.findall(r'^resource "([^"]+)" "([^"]+)"', CODE, re.M), [
             ("cloudflare_r2_bucket", "dolphin_maps_tiles"),
             ("cloudflare_r2_managed_domain", "dolphin_maps_tiles"),
@@ -100,6 +124,9 @@ class GitHubBoundaryTests(unittest.TestCase):
             ("github_repository_environment", "dolphin_maps_tiles"),
             ("github_repository_environment_deployment_policy", "dolphin_maps_tiles_main"),
             ("github_actions_environment_secret", "dolphin_maps_tiles"),
+            ("aws_secretsmanager_secret", "dolphin_maps_tiles_upload"),
+            ("aws_secretsmanager_secret_version", "dolphin_maps_tiles_upload"),
+            ("aws_secretsmanager_secret_policy", "dolphin_maps_tiles_upload"),
         ])
 
     def test_ci_runs_this_credential_free_suite(self):
