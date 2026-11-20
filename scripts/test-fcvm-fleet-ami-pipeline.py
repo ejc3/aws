@@ -32,7 +32,7 @@ stubs = {"boto3": sdk, "botocore": types.ModuleType("botocore"),
 SOURCE = Path(__file__).resolve().parents[1] / "fcvm-fleet-ami-pipeline" / "dispatch.py"
 SPEC = importlib.util.spec_from_file_location("factory_dispatch", SOURCE)
 mod = importlib.util.module_from_spec(SPEC)
-with patch.dict(sys.modules, stubs):
+with patch.dict(sys.modules, stubs), patch.object(sys, "path", [str(SOURCE.parent), *sys.path]):
     SPEC.loader.exec_module(mod)
 NOW = 1793476800
 BUILD = "factory:11111111-1111-1111-1111-111111111111"
@@ -327,7 +327,7 @@ class FactoryTests(unittest.TestCase):
             "FLEET_ROLE": "arn:aws:iam::123456789012:role/broker", "WORKER_ROLE": "arn:aws:iam::123456789012:role/worker",
             "PIPELINE_BUCKET": "fixture-factory", "RELEASE_PARAMETER": "/release", "CANONICAL_AMI": "ami-canonical",
             "SUBNET_ID": "subnet-fixture", "SECURITY_GROUP": "sg-fixture", "GUARD_SHA256": "a" * 64}
-        self.env.update(LOCK_TABLE="fixture-locks", LOCK_ID="fixture-state/terraform.tfstate")
+        self.env.update(LOCK_TABLE="fixture-locks", LOCK_ID="fixture-state/terraform.tfstate", PROD_RELEASE_PARAMETER="/prod/release")
         self.env.update(CONTROL_ACCOUNT="999999999999", PUBLISH_FUNCTION="arn:aws:lambda:us-west-1:999999999999:function:factory-publish")
         self.env["TEMPLATES_JSON"] = "[]"
         self.store, self.fleet_ssm, self.sts = Store(), Store(), STS()
@@ -1204,6 +1204,43 @@ class FactoryTests(unittest.TestCase):
         self.factory.collect_images()
         self.assertEqual(self.ec2.deleted_images, [image["image_id"]])
         self.assertEqual(self.ec2.deleted_snapshots, ["snap-fixture"])
+
+    def test_factory_cleanup_keeps_an_original_of_the_previous_production_release(self):
+        image = self.seal()
+        self.ec2.instances[image["instance_id"]]["State"]["Name"] = "terminated"
+        self.cb.builds[BUILD]["buildStatus"] = "FAILED"
+        self.cb.builds[BUILD]["endTime"] = datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc)
+        self.time = NOW + 86400
+        self.factory.env["COMPUTE_REGION"] = "us-west-2"
+        self.fleet_ssm.values["/release"] = {"host_amis": {}, "tile_amis": {}, "previous": None}
+        self.factory.env["RELEASE_REGION"] = "us-east-1"
+        def pair(host, tile):
+            return {"host_amis": {"us-east-1": {"x86_64": host}}, "tile_amis": {"us-east-1": {"x86_64": tile}}}
+        ids = ["ami-" + c * 17 for c in "abcd"]
+        self.fleet_ssm.values["/prod/release"] = {**pair(*ids[:2]), "version": 1, "generation": 23, "previous": pair(*ids[2:])}
+        remote = EC2(self.env)
+        remote.meta = Mock()
+        members = {"SourceImageRegion", "SourceImageId"}
+        remote.meta.service_model.shape_for.return_value.members = members
+        for i in ids:
+            remote.images[i] = {"ImageId": i}
+        remote.images[ids[2]].update(SourceImageRegion="us-west-2", SourceImageId=image["image_id"])
+        client = self.factory.client
+        self.factory.client = lambda service, fleet=False, region=None: remote if service == "ec2" and region == "us-east-1" else client(service, fleet)
+        remote.meta.service_model.shape_for.return_value.members = {}
+        with self.assertRaisesRegex(mod.Refused, "SDK cannot report"):
+            self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [])
+        remote.meta.service_model.shape_for.return_value.members = members
+        self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [])
+        self.fleet_ssm.values["/prod/release"]["previous"] = None
+        with self.assertRaisesRegex(Exception, "production rollback release is missing"):
+            self.factory.collect_images()
+        self.assertEqual((self.ec2.deleted_images, self.ec2.deleted_snapshots), ([], []))
+        del self.fleet_ssm.values["/prod/release"]
+        self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [image["image_id"]])
 
     def test_image_retention_preserves_release_references(self):
         image = self.seal()

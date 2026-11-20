@@ -1,11 +1,109 @@
 #!/usr/bin/env python3
 """Offline contracts for release ownership, stale saved plans and image admission."""
 from pathlib import Path
+import importlib.util
+import json
 import re
 import sys
 import unittest
+from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[1]
+SPEC = importlib.util.spec_from_file_location("seed", ROOT / "scripts/fcvm-prod-ami-seed.py")
+seed = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(seed)
+
+
+class FirstSeedTests(unittest.TestCase):
+    def setUp(self):
+        self.region, self.copy = "us-east-1", "us-west-2"
+        def manifest(n):
+            return {"generation": n, "source_sha": str(n), "build_id": str(n),
+                    **{k + "_amis": {self.region: {"x86_64": k + str(n)}} for k in ("host", "tile")}}
+        self.release = {**manifest(23), "previous": manifest(22)}
+        self.record = {k: self.release[k] for k in ("generation", "source_sha", "build_id")}
+        self.record["version"] = 1
+        self.rows = {}
+        for n, field in ((23, "images"), (22, "previous_images")):
+            self.record[field] = {self.region: {}, self.copy: {}}
+            for kind in ("host", "tile"):
+                name = kind + str(n)
+                for region, image in ((self.region, name), (self.copy, name + "-west")):
+                    self.record[field][region][kind] = image
+                    self.rows[region, image] = {"ImageId": image, "OwnerId": "123", "State": "available",
+                                                "Public": False, "Architecture": "x86_64"}
+                # Test both possible directions of an EC2 CopyImage link.
+                if kind == "host":
+                    self.rows[self.region, name].update(SourceImageRegion=self.copy, SourceImageId=name + "-west")
+                else:
+                    self.rows[self.copy, name + "-west"].update(SourceImageRegion=self.region, SourceImageId=name)
+        self.query = {"when": "apply", "role": "arn:aws:iam::123:role/fleet", "region": self.region,
+                      "prod": "/prod", "stage": "/release", "version": "24", "release": json.dumps(self.release),
+                      "copy_regions": json.dumps([self.copy])}
+        self.stage_version = 24
+        self.described = []
+
+    def client(self, service, region):
+        if service == "ssm":
+            self.assertEqual(region, self.region)
+            def get(Name, WithDecryption):
+                self.assertFalse(WithDecryption)
+                value = {"/release": self.release, "/release-copies": self.record}[Name]
+                return {"Parameter": {"Value": json.dumps(value), "Version": self.stage_version}}
+            return Mock(get_parameter=get)
+        self.assertEqual(service, "ec2")
+        def describe(ImageIds, Owners):
+            self.assertEqual(Owners, ["123"])
+            self.described.append((region, ImageIds[0]))
+            return {"Images": [self.rows[region, i] for i in ImageIds if (region, i) in self.rows]}
+        return Mock(describe_images=describe)
+
+    def test_every_current_and_rollback_target_and_linked_copy_is_available(self):
+        self.assertEqual(seed.run("verify", self.query, self.client), {"verified": "true"})
+        self.assertCountEqual(self.described, self.rows.keys())
+
+    def test_unavailable_rollback_source_fails_closed(self):
+        self.rows[self.copy, "host22-west"]["State"] = "deregistered"
+        with self.assertRaisesRegex(ValueError, "host22-west"):
+            seed.run("verify", self.query, self.client)
+
+    def test_changed_stage_version_fails_even_if_the_manifest_matches(self):
+        self.stage_version += 1
+        with self.assertRaisesRegex(ValueError, "changed after planning"):
+            seed.run("verify", self.query, self.client)
+        self.assertEqual(self.described, [])
+
+    def test_rejects_lagging_copy_record_and_unrelated_rollback_copy(self):
+        self.record["build_id"] = "older"
+        with self.assertRaisesRegex(ValueError, "do not match"):
+            seed.run("verify", self.query, self.client)
+        self.record["build_id"] = self.release["build_id"]
+        self.rows[self.copy, "tile22-west"]["SourceImageId"] = "other"
+        with self.assertRaisesRegex(ValueError, "not linked"):
+            seed.run("verify", self.query, self.client)
+
+    def test_existing_pointer_skips_stage_seed_validation(self):
+        self.assertEqual(seed.run("verify", {"when": "existing", "region": self.region}, None), {"verified": "true"})
+
+    def test_static_bootstrap_checks_the_configured_pair_without_reading_staging(self):
+        bootstrap = {**self.release, "generation": 0, "previous": None}
+        result = seed.run("verify", {**self.query, "stage": "", "release": json.dumps(bootstrap)},
+                          lambda service, region: self.client(service, region) if service == "ec2" else self.fail(service))
+        self.assertEqual(result, {"verified": "true"})
+        self.assertCountEqual(self.described, [(self.region, "host23"), (self.region, "tile23")])
+
+    def test_present_propagates_denied_read_and_only_absence_enables_the_seed_check(self):
+        class Missing(Exception):
+            pass
+        ssm = Mock()
+        ssm.exceptions.ParameterNotFound = Missing
+        ssm.get_parameter.side_effect = Missing()
+        self.assertEqual(seed.run("present", self.query, lambda *_: ssm), {"present": "false"})
+        ssm.get_parameter.side_effect = PermissionError()
+        with self.assertRaises(PermissionError):
+            seed.run("present", self.query, lambda *_: ssm)
+        ssm.get_parameter.side_effect = None
+        self.assertEqual(seed.run("present", self.query, lambda *_: ssm), {"present": "true"})
 
 
 def block(source, kind, name):

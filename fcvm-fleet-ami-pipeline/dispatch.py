@@ -17,6 +17,7 @@ import uuid
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+from publish import production_image_ids
 
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
@@ -191,8 +192,8 @@ class Factory:
         self.failures = []
 
     def client(self, service, fleet=False, region=None):
-        # COMPUTE_REGION is where the factory builds. Only the launch templates, read for image
-        # retention, live in another region (the release's), and only they pass one.
+        # COMPUTE_REGION is where the factory builds. Retention also reads the release-region
+        # launch templates and production AMIs to keep the originals they were copied from.
         key = (service, fleet) if region is None else (service, fleet, region)
         if key not in self.clients:
             kw = {"region_name": region or (self.env["COMPUTE_REGION"] if fleet else self.env["CONTROL_REGION"])}
@@ -918,6 +919,31 @@ class Factory:
         self.collect_images()
         return {"status": "checked"}
 
+    def prod_factory_images(self, owned):
+        """Protect production's active and rollback releases and both ends of their build-region copy links."""
+        ssm = self.release_ssm()
+        try:
+            prod = json.loads(ssm.get_parameter(Name=self.env["PROD_RELEASE_PARAMETER"],
+                                                WithDecryption=False)["Parameter"]["Value"])
+        except ssm.exceptions.ParameterNotFound:
+            return set()
+        build = self.env["COMPUTE_REGION"]
+        by_region = production_image_ids(prod, self.env.get("RELEASE_REGION", build))
+        keep = set(by_region.get(build, ()))
+        for region, ids in by_region.items():
+            if region == build:
+                continue
+            ec2 = self.client("ec2", True, region)
+            if not {"SourceImageRegion", "SourceImageId"} <= set(ec2.meta.service_model.shape_for("Image").members):
+                raise Refused("EC2 SDK cannot report production AMI copy sources; preserving factory images")
+            copies = ec2.describe_images(Owners=[self.env["FLEET_ACCOUNT"]], ImageIds=sorted(ids))["Images"]
+            if {row["ImageId"] for row in copies} != ids:
+                raise Refused("production AMI inventory incomplete; preserving factory images")
+            keep.update(row["SourceImageId"] for row in copies if row.get("SourceImageRegion") == build)
+            keep.update(row["ImageId"] for row, _ in owned
+                        if row.get("SourceImageRegion") == region and row.get("SourceImageId") in ids)
+        return keep
+
     def collect_images(self):
         """Bounded cleanup: factory-only images, preserving every live/default/release reference."""
         ec2 = self.client("ec2", True)
@@ -938,7 +964,7 @@ class Factory:
             if not acquired:
                 return
             release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
-            referenced = set()
+            referenced = self.prod_factory_images(owned)
             for bundle in [release, release.get("previous") or {}]:
                 for key in ("host_amis", "tile_amis"):
                     for arches in bundle.get(key, {}).values():

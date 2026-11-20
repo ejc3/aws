@@ -396,6 +396,8 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
       TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
+
+      PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
     }
   }
 }
@@ -577,7 +579,8 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     { Sid = "NoOtherProfile", Effect = "Deny", Action = "iam:PassRole", NotResource = aws_iam_role.fcvm_ami_builder.arn },
     # The fixed broker pins InstanceId from an immutable slot; workers never get this unscoped read.
     { Sid = "OwnCommandStatusBroker", Effect = "Allow", Action = "ssm:GetCommandInvocation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_build_region } } },
-    { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn,
+    "arn:aws:ssm:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:parameter${local.fcvm_prod_ami_release_parameter}"] },
     { Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", Resource = aws_ssm_parameter.fcvm_ami_failure.arn },
     { Effect = "Deny", Action = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "s3:GetObject*", "sts:AssumeRole*", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*"], Resource = "*" }
   ] })
