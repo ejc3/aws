@@ -15,20 +15,26 @@ Run with the staging fleet administration role.
   expiry, names, how many versions hold it, and whether the key stored with it is its key (a
   revocation signed with the certificate's own key, RFC 8555 section 7.6, needs it: the
   coordinator used a new ACME account for every order and kept none).
-- --check: prove each one revoked. The certificate and its intermediates come from a writable
+  With --expect, also say which expected certificates the secret does not hold.
+- --check --expect SHA256 [SHA256 ...]: prove every expected certificate revoked. The expected set
+  is the independent inventory, the SHA-256 fingerprints of the Certificate Transparency entries
+  for these names (#922), so a secret that has lost a version cannot pass on a subset: an expected
+  certificate the secret does not hold, or a held one outside the expected set, fails the check by
+  name. For each certificate: the certificate and its intermediates come from a writable
   secret, so before any request the certificate must verify through its stored intermediates
   (untrusted) to a root in this host's trust store. The CRL it names must be a Let's Encrypt CRL
   endpoint (`http://<issuer>.c.lencr.org/<n>.crl`); the fetch follows no redirect and reads at
   most 8 MiB. OpenSSL then verifies the certificate again with that CRL (`verify -crl_check`),
   which decides the CRL's issuer, signature, freshness and issuing-distribution-point scope.
   Only a run whose one error is "certificate revoked" at depth 0 proves revocation; a clean
-  verify means not revoked, and any other error is no status. Exits non-zero unless the
-  inventory is not empty and every certificate is proven revoked: an empty inventory cannot
-  prove the known certificates revoked.
+  verify means not revoked, and any other error, a failed or timed-out fetch included, is no
+  status for that certificate and the next one is checked. Exits non-zero unless every expected
+  certificate is held and proven revoked and nothing else is held.
 """
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import os
 from pathlib import Path
@@ -72,7 +78,8 @@ def names(cert):
 
 
 def outside_subzones(name):
-    host = name.removeprefix("*.")
+    # DNS names compare without case (RFC 5280 section 7.2).
+    host = name.lower().removeprefix("*.")
     return (host == PARENT or host.endswith("." + PARENT)) and not any(
         host == z or host.endswith("." + z) for z in SUBZONES)
 
@@ -98,16 +105,20 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def fetch(url, max_bytes):
-    """GET `url` with no redirect followed and at most `max_bytes` read: (status, body or None)."""
+def fetch(url, max_bytes, timeout=30):
+    """GET `url` with no redirect followed and at most `max_bytes` read: (status, body or None).
+    A transport failure (name resolution, connection, timeout) raises ValueError naming it."""
     opener = urllib.request.build_opener(NoRedirect)
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
-        with opener.open(req, timeout=30) as response:
+        with opener.open(req, timeout=timeout) as response:
             body = response.read(max_bytes + 1)
             return response.status, (body if len(body) <= max_bytes else None)
     except urllib.error.HTTPError as error:
         return error.code, b""
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+        reason = getattr(error, "reason", error)
+        raise ValueError(f"the CRL fetch failed ({type(reason).__name__})") from error
 
 
 def verify(leaf_pem, bundle_pem, trust, at, crl_pem=None):
@@ -123,7 +134,7 @@ def verify(leaf_pem, bundle_pem, trust, at, crl_pem=None):
 
 
 def crl_status(cert, intermediates, directory, now=None, trust=None, crl_url=LETS_ENCRYPT_CRL,
-               max_bytes=MAX_CRL_BYTES):
+               max_bytes=MAX_CRL_BYTES, timeout=30):
     """'revoked' or 'not revoked' for `cert`, from the CRL it names. Raises ValueError when no proof
     is possible: that is no status, never a pass. `trust` is a CA file to use instead of this
     host's trust store (tests)."""
@@ -138,7 +149,7 @@ def crl_status(cert, intermediates, directory, now=None, trust=None, crl_url=LET
     url = re.search(r"URI:(\S+)", openssl(["x509", "-noout", "-ext", "crlDistributionPoints"], cert))
     checked(url, "the certificate names no CRL")
     checked(re.fullmatch(crl_url, url.group(1)), "the certificate's CRL is not at an approved CRL endpoint")
-    status, body = fetch(url.group(1), max_bytes)
+    status, body = fetch(url.group(1), max_bytes, timeout)
     checked(status == 200, "the CRL did not download")
     checked(body is not None, "the CRL is larger than the fetch bound")
     crl_pem = directory / "crl.pem"
@@ -176,19 +187,31 @@ def collect(secrets):
     return list(found.values())
 
 
-def run(secrets, directory, check=False, now=None, **proof):
-    """List, or with `check` prove each certificate revoked. Returns whether the run passed: a
-    listing always does, a check only when there is at least one certificate and every one is
-    proven revoked. `proof` passes crl_status's trust, crl_url and max_bytes (tests)."""
+def fingerprint(text):
+    value = text.replace(":", "").lower()
+    checked(re.fullmatch(r"[0-9a-f]{64}", value), "an expected fingerprint is not a SHA-256 hex digest")
+    return value
+
+
+def run(secrets, directory, check=False, now=None, expect=(), **proof):
+    """List, or with `check` prove every expected certificate revoked. Returns whether the run passed:
+    a listing always does; a check only when `expect` is not empty, the secret holds exactly the
+    expected certificates and every one is proven revoked. `proof` passes crl_status's trust,
+    crl_url, max_bytes and timeout (tests)."""
+    expected = {fingerprint(e) for e in expect}
+    checked(expected or not check, "--check needs --expect: the SHA-256 fingerprints of the known certificates")
     certificates = collect(secrets)
     print(f"{len(certificates)} certificate(s) for names outside the fleet subzones in {LEGACY}")
-    if check and not certificates:
-        print(f"NO STATUS: {LEGACY} holds no certificate for a name outside the fleet subzones, so this run "
-              "cannot prove the known certificates (#922 inventory) revoked")
-        return False
+    held = {c["sha256"] for c in certificates}
     passed = True
+    for missing in sorted(expected - held):
+        print(f"NO STATUS: expected certificate sha256 {missing} is not in {LEGACY}; nothing here can prove it revoked")
+        passed = False
     for c in certificates:
-        label = (f"serial {c['serial']} expires {c['not_after']} names {' '.join(c['names'])} "
+        if expected and c["sha256"] not in expected:
+            print(f"NO STATUS: serial {c['serial']} sha256 {c['sha256']} is held but not in the expected set")
+            passed = False
+        label = (f"serial {c['serial']} sha256 {c['sha256']} expires {c['not_after']} names {' '.join(c['names'])} "
                  f"versions {len(c['versions'])} key {'stored' if c['key'] else 'MISSING'}")
         if not check:
             print(label)
@@ -200,16 +223,21 @@ def run(secrets, directory, check=False, now=None, **proof):
                 state = f"NO STATUS ({error})"
         passed &= state == "revoked"
         print(f"{state}: {label}")
-    return passed
+    return passed if check else True
 
 
 if __name__ == "__main__":
     import boto3
 
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--check", action="store_true", help="prove each certificate revoked from its CRL")
+    parser.add_argument("--check", action="store_true", help="prove every expected certificate revoked from its CRL")
+    parser.add_argument("--expect", nargs="+", default=(), metavar="SHA256",
+                        help="the known certificates' SHA-256 fingerprints (required with --check)")
     arguments = parser.parse_args()
+    if arguments.check and not arguments.expect:
+        parser.error("--check needs --expect: the SHA-256 fingerprints of the known certificates")
     os.umask(0o077)
     with tempfile.TemporaryDirectory(dir=os.getenv("XDG_RUNTIME_DIR") or "/dev/shm") as workspace:
-        ok = run(boto3.client("secretsmanager", region_name=REGION), Path(workspace), arguments.check)
+        ok = run(boto3.client("secretsmanager", region_name=REGION), Path(workspace), arguments.check,
+                 expect=arguments.expect)
     raise SystemExit(0 if ok else 1)

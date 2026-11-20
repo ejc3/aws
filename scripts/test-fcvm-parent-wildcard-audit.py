@@ -12,6 +12,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 
 HERE = Path(__file__).with_name("fcvm-parent-wildcard-audit.py")
@@ -53,6 +54,8 @@ class AuditTests(unittest.TestCase):
 
             def do_GET(self):
                 requests.append(self.path)
+                if self.path == "/slow.crl":
+                    time.sleep(1.5)
                 if self.path == "/redirect.crl":
                     self.send_response(302)
                     self.send_header("Location", "/ca.crl")
@@ -67,7 +70,7 @@ class AuditTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(path.read_bytes())
 
-        self.server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         stack.callback(self.server.server_close)
         stack.callback(self.server.shutdown)
@@ -118,9 +121,18 @@ class AuditTests(unittest.TestCase):
         self.openssl("ca", "-config", ca + ".cnf", "-gencrl", *dates, "-out", out + ".pem")
         self.openssl("crl", "-in", out + ".pem", "-outform", "DER", "-out", out)
 
-    def check(self, versions, now=None, **proof):
+    @staticmethod
+    def fp(doc):
+        return audit.fields(audit.chain(doc["cert"])[0])["sha256"]
+
+    def check(self, versions, now=None, expect=None, **proof):
+        """--check, expecting by default exactly the parent-zone certificates the versions hold."""
+        if expect is None:
+            expect = {self.fp(d) for d in versions.values()
+                      if any(audit.outside_subzones(n) for n in audit.names(audit.chain(d["cert"])[0]))}
         with contextlib.redirect_stdout(io.StringIO()) as out:
-            passed = audit.run(Secrets(versions), self.directory, check=True, now=now, **{**self.proof, **proof})
+            passed = audit.run(Secrets(versions), self.directory, check=True, now=now, expect=expect,
+                               **{**self.proof, **proof})
         return passed, out.getvalue()
 
     def no_status(self, versions, reason, now=None, **proof):
@@ -143,13 +155,29 @@ class AuditTests(unittest.TestCase):
         self.assertNotIn("PRIVATE KEY", text)
         self.assertEqual(self.requests, [], "listing fetches nothing")
 
-    def test_an_empty_inventory_lists_but_never_checks(self):
+    def test_an_empty_or_incomplete_inventory_never_checks(self):
+        gone, lost = self.leaf("gone", ["*.fcvm.dev"]), self.leaf("lost", ["fcvm.dev"])
+        self.crl(revoke=["gone", "lost"])
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertTrue(audit.run(Secrets({}), self.directory))
-        passed, out = self.check({"v1": self.leaf("subzone", ["*.tiles-stage.fcvm.dev"])})
+        with self.assertRaisesRegex(ValueError, "--check needs --expect"):
+            self.check({"v1": gone}, expect=())
+        expected = [self.fp(gone), self.fp(lost)]
+        passed, out = self.check({}, expect=expected)
         self.assertFalse(passed)
-        self.assertIn("NO STATUS: fcvm-fleet/tls-wildcard holds no certificate", out)
-        self.assertFalse(self.check({})[0])
+        self.assertIn(f"expected certificate sha256 {self.fp(lost)} is not in", out)
+        # A secret that kept only one of the two: the one it holds is revoked, the other is unaccounted for.
+        passed, out = self.check({"v1": gone}, expect=expected)
+        self.assertFalse(passed, out)
+        self.assertIn("revoked: serial", out)
+        self.assertIn(f"expected certificate sha256 {self.fp(lost)} is not in", out)
+        # A held certificate outside the expected set is no status too.
+        passed, out = self.check({"v1": gone, "v2": lost}, expect=[self.fp(gone)])
+        self.assertFalse(passed, out)
+        self.assertIn("is held but not in the expected set", out)
+        self.assertTrue(self.check({"v1": gone, "v2": lost}, expect=[e.upper() for e in expected])[0])
+        with self.assertRaisesRegex(ValueError, "not a SHA-256"):
+            self.check({"v1": gone}, expect=["abc"])
 
     def test_revoked_at_the_leaf_passes_and_not_listed_fails(self):
         gone, live = self.leaf("gone", ["*.fcvm.dev"]), self.leaf("live", ["fcvm.dev"])
@@ -229,6 +257,36 @@ class AuditTests(unittest.TestCase):
         self.no_status({"v1": elsewhere}, "the CRL is larger than the fetch bound", max_bytes=16)
         self.no_status({"v1": self.leaf("missing", ["*.fcvm.dev"], crl="absent.crl")}, "the CRL did not download")
 
+    def test_a_mixed_case_parent_certificate_is_collected(self):
+        cert = self.leaf("upper", ["*.FCVM.DEV"])
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            audit.run(Secrets({"v1": cert, "v2": self.leaf("sub", ["*.TILES-STAGE.fcvm.dev"])}), self.directory)
+        self.assertIn("1 certificate(s)", out.getvalue())
+        self.assertIn("names *.FCVM.DEV", out.getvalue())
+
+    def test_a_transport_failure_is_no_status_for_that_certificate_and_the_next_is_checked(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            closed = s.getsockname()[1]
+        refused = self.leaf("refused", ["*.fcvm.dev"])
+        cnf = self.directory / "ext.cnf"
+        slow = self.leaf("slow", ["*.fcvm.dev"], crl="slow.crl")
+        gone = self.leaf("gone", ["fcvm.dev"])
+        self.crl(revoke=["gone"])
+        (self.directory / "slow.crl").write_bytes((self.directory / "ca.crl").read_bytes())
+        # The refused certificate names a CRL on a port nothing listens on.
+        cnf.write_text(f"crlDistributionPoints=URI:http://127.0.0.1:{closed}/ca.crl\nsubjectAltName=DNS:fcvm.dev\n")
+        self.openssl("x509", "-req", "-in", "refused.csr", "-CA", "int2.crt", "-CAkey", "int2.key", "-days", "20",
+                     "-extfile", "ext.cnf", "-out", "refused.crt")
+        refused["cert"] = "".join((self.directory / (n + ".crt")).read_text() for n in ("refused", "int2", "int1"))
+        passed, out = self.check({"v1": refused, "v2": slow, "v3": gone}, timeout=0.3,
+                                 crl_url=r"http://127\.0\.0\.1:[0-9]+/[a-z0-9-]+\.crl")
+        self.assertFalse(passed, out)
+        self.assertEqual(out.count("NO STATUS (the CRL fetch failed"), 2, out)
+        self.assertIn("NO STATUS (the CRL fetch failed (ConnectionRefusedError))", out)
+        self.assertIn("revoked: serial", out)
+
     def test_the_production_endpoint_pattern(self):
         for url, ok in [("http://ye1.c.lencr.org/12.crl", True), ("http://r10.c.lencr.org/0.crl", True),
                         ("https://ye1.c.lencr.org/12.crl", False), ("http://ye1.c.lencr.org.evil/1.crl", False),
@@ -237,7 +295,8 @@ class AuditTests(unittest.TestCase):
             self.assertEqual(bool(__import__("re").fullmatch(audit.LETS_ENCRYPT_CRL, url)), ok, url)
 
     def test_names_outside_the_subzones(self):
-        for name, outside in [("*.fcvm.dev", True), ("fcvm.dev", True), ("fleet-api.fcvm.dev", True),
+        for name, outside in [("*.FCVM.DEV", True), ("Fcvm.Dev", True), ("*.Tiles-Stage.FCVM.dev", False),
+                              ("*.fcvm.dev", True), ("fcvm.dev", True), ("fleet-api.fcvm.dev", True),
                               ("*.tiles-stage.fcvm.dev", False), ("*.tiles.fcvm.dev", False),
                               ("x.tiles.fcvm.dev", False), ("*.example.com", False), ("evilfcvm.dev", False)]:
             self.assertEqual(audit.outside_subzones(name), outside, name)
