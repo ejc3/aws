@@ -33,11 +33,10 @@ variable "fcvm_fleet_prod_enabled" {
   type        = bool
   default     = false
 
-  # Both the Cloudflare routes and AWS resources use this input, including on targeted plans.
-  # Remove this guard only after the old DNS tokens and wildcard certificates have been retired.
+  # Targeted plans for the Cloudflare routes and the AWS fleet must enforce the same activation guard.
   validation {
     condition     = !var.fcvm_fleet_prod_enabled
-    error_message = "Production is blocked until staging and developer credentials can no longer control fcvm.dev DNS or authenticate production names. Complete ejc3/aws#922 before enabling it."
+    error_message = "Before enabling production, record three complete UTC days of matching staging costs in the original and staging-only budgets on ejc3/aws#922."
   }
 }
 

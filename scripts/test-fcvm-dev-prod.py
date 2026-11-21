@@ -9,6 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-dev-prod.tf").read_text()
+CLOUDFLARE_TOKEN = re.compile(
+    r'^resource\s+"cloudflare_(?:account|api)_token"\s+"([^"\n]+)"\s*\{.*?^\}',
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def code(text):
@@ -34,10 +38,25 @@ class SwitchTests(unittest.TestCase):
         self.assertIn("default     = false", var)
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", CODE)
 
-    def test_prod_activation_requires_retiring_parent_zone_credentials(self):
+    def test_prod_activation_is_blocked_pending_staging_budget_evidence(self):
         var = block('variable "fcvm_fleet_prod_enabled"')
         self.assertRegex(var, r"validation \{\s*condition\s*= !var\.fcvm_fleet_prod_enabled\s*\n")
+        self.assertIn("three complete UTC days", var)
         self.assertIn("ejc3/aws#922", var)
+
+    def test_cloudflare_tokens_do_not_reintroduce_retired_dns_permissions(self):
+        # Check the parent-zone and DNS Write references used by the retired Terraform tokens, even under a new name.
+        for path in sorted(ROOT.glob("*.tf")):
+            for token in CLOUDFLARE_TOKEN.finditer(code(path.read_text())):
+                for needle in ("fcvm_dev_zone_id", "dns_write", "4755a26eedb94da69e1066d98aa820be", "DNS Write"):
+                    self.assertNotIn(needle, token.group(), f"{path.name}: {token.group(1)} ({needle})")
+
+    def test_scans_the_permissions_of_a_hyphenated_token(self):
+        definition = 'resource "cloudflare_account_token" "retired-dns" {\n  policies = [{ id = local.dns_write }]\n}'
+        token = CLOUDFLARE_TOKEN.fullmatch(definition)
+        self.assertIsNotNone(token)
+        self.assertEqual(token.group(1), "retired-dns")
+        self.assertIn("local.dns_write", token.group())
 
     def test_every_resource_and_data_source_follows_the_switch(self):
         found = [("resource", k, n) for k, n in headers("resource")] + [("data", k, n) for k, n in headers("data")]
