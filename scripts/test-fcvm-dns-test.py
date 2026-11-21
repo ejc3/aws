@@ -1,87 +1,103 @@
 #!/usr/bin/env python3
-"""The fcvm.dev DNS propagation test token (fcvm-dns-test.tf): DNS Read and Write on the fcvm.dev zone only, client IPs
-from Terraform (the dev fleet's subnets and the metal boxes' EIPs), an expiry date, and a secret only administration and
-dev-server-role may read."""
-import re
-import unittest
-from datetime import datetime
+"""Test the isolated propagation probe and its IAM and DNS wiring."""
+import contextlib
+import importlib.util
+import io
 from pathlib import Path
+import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-TF = (ROOT / "fcvm-dns-test.tf").read_text()
-CONST = (ROOT / "constellation-account.tf").read_text()
-AGENTS = (ROOT / "AGENTS.md").read_text()
-
-DNS_READ = "82e64a83756745bbbb1c9c2701bf816b"
-DNS_WRITE = "4755a26eedb94da69e1066d98aa820be"
+spec = importlib.util.spec_from_file_location("probe", ROOT / "scripts/fcvm-dns-probe.py")
+probe = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
 
 
-def block(header, text=TF):
-    start = text.index(header)
-    return text[start:text.index("\n}\n", start) + 2]
+class PropagationTests(unittest.TestCase):
+    def test_child_zone_is_delegated_and_writer_is_confined(self):
+        dns = (ROOT / "fcvm-dns-test.tf").read_text()
+        self.assertIn('fcvm_dns_probe_zone = "dnstest.fcvm.dev"', dns)
+        self.assertIn('resource "aws_route53_zone" "fcvm_dns_probe"', dns)
+        delegation = dns.split('resource "cloudflare_dns_record" "fcvm_dns_probe_ns"')[1].split("\n}")[0]
+        for field in ["4", "var.fcvm_dev_zone_id", "local.fcvm_dns_probe_zone", '"NS"',
+                      "aws_route53_zone.fcvm_dns_probe.name_servers[count.index]"]:
+            self.assertIn(field, delegation)
+        grant = (ROOT / "constellation-account.tf").read_text().split('Sid      = "ChangeFcvmProbeRecords"')[1].split("}, {")[0]
+        for field in ['"route53:ChangeResourceRecordSets"', 'aws_route53_zone.fcvm_dns_probe.arn', '"aws:SourceIp"',
+                      'local.fcvm_dns_probe_source_cidrs', '["probe-*.${local.fcvm_dns_probe_zone}"]',
+                      '["A", "AAAA", "TXT"]', '["CREATE", "DELETE"]', 'Null = {']:
+            self.assertIn(field, grant)
+        for key in ["NormalizedRecordNames", "RecordTypes", "Actions"]:
+            self.assertEqual(grant.count("route53:ChangeResourceRecordSets" + key), 2)
+        self.assertNotIn('"*"', grant)
 
+    def simulate(self, timeout):
+        client = mock.Mock()
+        def answers(name, kind, server=None):
+            if kind == "NS":
+                return [f"ns{i}.example." for i in range(4)]
+            if server is None:
+                return ['"Z1234"']
+            return ['"' + name.split(".")[0].removeprefix("probe-") + '"']
+        with mock.patch.object(probe, "lookup", side_effect=answers), contextlib.redirect_stdout(io.StringIO()):
+            if timeout:
+                with self.assertRaisesRegex(RuntimeError, "timed out"):
+                    probe.probe(client, timeout=0)
+            else:
+                probe.probe(client)
+        first, second = [call.kwargs for call in client.change_resource_record_sets.call_args_list]
+        self.assertEqual(first["HostedZoneId"], "Z1234")
+        created = first["ChangeBatch"]["Changes"][0]
+        self.assertRegex(created["ResourceRecordSet"]["Name"], r"^probe-[0-9a-f]{32}\.dnstest\.fcvm\.dev$")
+        self.assertEqual(created["Action"], "CREATE")
+        self.assertEqual(second["ChangeBatch"]["Changes"], [dict(created, Action="DELETE")])
 
-class TokenTests(unittest.TestCase):
-    def test_dns_read_and_write_on_the_fcvm_dev_zone_and_nothing_else(self):
-        token = block('resource "cloudflare_account_token" "fcvm_dns_test"')
-        self.assertIn("provider   = cloudflare.token_minter", token)
-        self.assertEqual(token.count("effect"), 1, "one policy")
-        self.assertIn("permission_groups = [{ id = local.dns_read }, { id = local.dns_write }]", token)
-        self.assertIn('resources         = jsonencode({ "com.cloudflare.api.account.zone.${var.fcvm_dev_zone_id}" = "*" })', token)
-        self.assertNotIn("com.cloudflare.api.account.${", token, "no account-scoped permission")
-        self.assertNotIn("zone.*", token, "no other zone")
-        self.assertIn(f'dns_read                       = "{DNS_READ}"', TF)
-        self.assertIn(f'dns_write           = "{DNS_WRITE}"', (ROOT / "fcvm-dev.tf").read_text())
-        self.assertEqual(set(re.findall(r'"([0-9a-f]{32})"', TF)), {DNS_READ})
+    def test_created_record_is_deleted_after_observation(self):
+        self.simulate(False)
 
-    def test_client_ips_come_from_terraform_not_literals(self):
-        token = block('resource "cloudflare_account_token" "fcvm_dns_test"')
-        self.assertIn("request_ip = { in = local.fcvm_dns_test_client_cidrs }", token)
-        cidrs = TF.split("fcvm_dns_test_client_cidrs = concat(", 1)[1].split("\n  )", 1)[0]
-        self.assertIn("[for s in local.dev_fleet_subnets : s.ipv6_cidr_block]", cidrs)
-        self.assertIn('[for ip in local.firecracker_dev_public_ips : "${ip}/32"]', cidrs)
-        self.assertIn('[for e in aws_eip.x86_dev : "${e.public_ip}/32"]', cidrs)
-        self.assertNotRegex(TF, r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", "no IPv4 literal")
-        self.assertNotRegex(TF, r'"[0-9a-f]{1,4}:[0-9a-f:]+(/\d+)?"', "no IPv6 literal")
+    def test_created_record_is_deleted_after_timeout(self):
+        self.simulate(True)
 
-    def test_it_expires(self):
-        token = block('resource "cloudflare_account_token" "fcvm_dns_test"')
-        self.assertIn("expires_on = local.fcvm_dns_test_token_expires_on", token)
-        m = re.search(r'fcvm_dns_test_token_expires_on = "([^"]+)"', TF)
-        self.assertTrue(m)
-        datetime.strptime(m.group(1), "%Y-%m-%dT%H:%M:%SZ")
+    def test_recursive_queries_wait_for_the_last_authoritative_nameserver(self):
+        authorities = {f"ns{i}.example." for i in range(4)}
+        slow = "ns3.example."
+        visible = set()
+        recursive = set()
+        negative = set()
+        seen_slow = False
 
-    def test_the_name_convention_and_the_zone_wide_reach_are_written_down(self):
-        for text in (TF, AGENTS):
-            self.assertIn("dnstest-*.fcvm.dev", text)
-            for name in ("slot-*", "ec2-*", "fleet-api-stage"):
-                self.assertIn(name, text)
-        self.assertIn("could edit or delete ANY record in fcvm.dev", TF)
-        self.assertIn("The token can edit any record in the zone", AGENTS)
+        def answers(name, kind, server=None):
+            nonlocal seen_slow
+            if kind == "NS":
+                return list(authorities)
+            if server is None:
+                return ['"Z1234"']
+            if server == slow and not seen_slow:
+                seen_slow = True
+                return []
+            if server in authorities:
+                visible.add(server)
+            else:
+                if visible != authorities:
+                    negative.add(server)
+                recursive.add(server)
+                # Model a resolver that keeps its NXDOMAIN past the probe timeout.
+                if server in negative:
+                    return []
+            return ['"' + name.split(".")[0].removeprefix("probe-") + '"']
 
+        with mock.patch.object(probe, "lookup", side_effect=answers), mock.patch.object(probe.time, "sleep"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            probe.probe(mock.Mock(), timeout=0.1)
+        self.assertEqual(recursive, {"1.1.1.1", "8.8.8.8"})
+        self.assertEqual(negative, set())
 
-class ReaderTests(unittest.TestCase):
-    def test_administration_and_dev_server_role_read_it_and_no_one_else(self):
-        policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_dns_test_token"')
-        self.assertIn('Effect    = "Deny"', policy)
-        self.assertIn("concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn])", policy)
-        self.assertNotIn("nextjs_dev", TF)
-
-    def test_the_grant_is_read_only_and_on_a_policy_only_dev_server_role_holds(self):
-        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)
-        stmt = grant.split('Sid      = "ReadTheFcvmDnsTestToken"', 1)[1].split("}", 1)[0]
-        self.assertIn('Action   = "secretsmanager:GetSecretValue"', stmt)
-        self.assertIn("Resource = aws_secretsmanager_secret.fcvm_dns_test_token.arn", stmt)
-        attach = block('resource "aws_iam_role_policy_attachment" "dev_server_constellation_terraform"', CONST)
-        self.assertIn("role       = aws_iam_role.dev_server.name", attach)
-        self.assertNotIn("for_each", attach)
-
-    def test_the_value_comes_from_the_token(self):
-        version = block('resource "aws_secretsmanager_secret_version" "fcvm_dns_test_token"')
-        self.assertIn("secret_string = cloudflare_account_token.fcvm_dns_test.value", version)
-        self.assertIn('name                    = "fcvm-dns-test-token"', TF)
-        self.assertIn("--secret-id fcvm-dns-test-token", AGENTS)
+    def test_missing_delegation_prevents_write(self):
+        client = mock.Mock()
+        with mock.patch.object(probe, "lookup", return_value=[]), self.assertRaisesRegex(RuntimeError, "cannot resolve"):
+            probe.probe(client)
+        client.change_resource_record_sets.assert_not_called()
 
 
 if __name__ == "__main__":
-    unittest.main(buffer=True)
+    unittest.main(verbosity=2, buffer=True)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the first staging wildcard issue and read-only proof with isolated keys and a local CA."""
+"""Exercise the staging wildcard recovery and read-only proof with isolated keys and a local CA."""
 import contextlib
 import datetime as dt
 import importlib.util
@@ -30,14 +30,14 @@ class CertificateTests(unittest.TestCase):
     def command(self, *args):
         self.run(["openssl", *args], cwd=self.directory, check=True, capture_output=True)
 
-    def signed_leaf(self, name, names):
+    def signed_leaf(self, name, names, days=90):
         self.command("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=Test",
                      "-addext", "subjectAltName=DNS:" + names, "-keyout", name + ".key", "-out", name + ".csr")
-        self.command("x509", "-req", "-in", name + ".csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-days", "90",
+        self.command("x509", "-req", "-in", name + ".csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-days", str(days),
                      "-copy_extensions", "copy", "-out", name + ".crt")
         pem = (self.directory / (name + ".crt")).read_text() + (self.directory / "ca.crt").read_text()
         return {"cert": pem, "key": (self.directory / (name + ".key")).read_text(), "domains": ["*." + cert.ZONE],
-                "not_after": cert.expiry(pem).isoformat(), "scene_token": "original-scene-token"}
+                "not_after": cert.cert_date(pem).isoformat(), "scene_token": "original-scene-token"}
 
     def test_rejects_extra_san_mismatched_key_old_key_changed_token_and_invalid_dates(self):
         broad = self.signed_leaf("broad", "*." + cert.ZONE + ",DNS:*.fcvm.dev")
@@ -51,40 +51,66 @@ class CertificateTests(unittest.TestCase):
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                 cert.verify(doc, old, self.directory)
 
-    def test_empty_secret_requires_issue_and_first_issue_is_verified_then_read_only(self):
+    def test_explicit_recovery_accepts_near_expiry_and_rejects_expired_leaves(self):
+        soon = self.signed_leaf("soon", "*." + cert.ZONE, days=20)
+        backup = self.directory / "tls.json"
+        backup.write_text(json.dumps(soon))
+        metadata = {"ARN": "arn:test:secret:stage", "VersionIdsToStages": {}}
+        values = {cert.LEGACY: self.legacy}
+        secrets = mock.Mock()
+        secrets.describe_secret.return_value = metadata
+        secrets.get_secret_value.side_effect = lambda SecretId, **_: {"SecretString": json.dumps(values[SecretId])}
+        def put(SecretId, SecretString, VersionStages, ClientRequestToken):
+            values[SecretId] = json.loads(SecretString)
+            metadata["VersionIdsToStages"][ClientRequestToken] = VersionStages
+        secrets.put_secret_value.side_effect = put
+
+        with self.assertRaisesRegex(ValueError, "renewal window"):
+            cert.verify(soon, self.legacy, self.directory)
+        cert.bootstrap(secrets, self.directory, backup)
+        self.assertEqual(secrets.put_secret_value.call_count, 1)
+        with self.assertRaisesRegex(ValueError, "renewal window"):
+            cert.bootstrap(secrets, self.directory)
+
+        after_expiry = dt.datetime.fromisoformat(soon["not_after"]) + dt.timedelta(seconds=1)
+        class AfterExpiry(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return after_expiry.astimezone(tz)
+        metadata["VersionIdsToStages"].clear()
+        with mock.patch.object(cert.dt, "datetime", AfterExpiry), self.assertRaisesRegex(ValueError, "expir"):
+            cert.bootstrap(secrets, self.directory, backup)
+        self.assertEqual(secrets.put_secret_value.call_count, 1)
+
+    def test_restore_requires_good_backup_then_verifies_without_writing_again(self):
         secrets = mock.Mock()
         metadata = {"ARN": "arn:test:secret:stage", "VersionIdsToStages": {}}
         secrets.describe_secret.side_effect = lambda **_: metadata
-        values = {cert.LEGACY: json.dumps(dict(self.legacy, key="legacy private key never sent")),
-                  "fcvm-fleet/cloudflare-dns-token": "test-token"}
+        values = {cert.LEGACY: json.dumps(dict(self.legacy, key="legacy private key never sent"))}
         secrets.get_secret_value.side_effect = lambda SecretId, **_: {"SecretString": values[SecretId]}
 
         def put(SecretId, SecretString, VersionStages, ClientRequestToken):
             values[SecretId] = SecretString
             metadata["VersionIdsToStages"][ClientRequestToken] = VersionStages
 
-        def run(args, **kw):
-            if args[0] != "lego":
-                return self.run(args, **kw)
-            self.assertEqual(args[args.index("--email") + 1], "ops@example.org")
-            self.assertEqual(args[args.index("--domains"):], ["--domains", "*." + cert.ZONE, "run"])
-            output = self.directory / "certificates"
-            output.mkdir()
-            for suffix, field in [("key", "key"), ("crt", "cert")]:
-                (output / ("_." + cert.ZONE + "." + suffix)).write_text(self.leaf[field])
-            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
-
         secrets.put_secret_value.side_effect = put
         with self.assertRaisesRegex(ValueError, "empty secret"):
-            cert.bootstrap(secrets, self.directory, False)
-        with mock.patch.dict(os.environ, {"ACME_EMAIL": "ops@example.org"}), \
-                mock.patch.object(cert.subprocess, "check_output", return_value="_acme-challenge.fcvm.dev."), \
-                mock.patch.object(cert.subprocess, "run", side_effect=run):
-            cert.bootstrap(secrets, self.directory, True)
-            cert.bootstrap(secrets, self.directory, True)
+            cert.bootstrap(secrets, self.directory)
+        backup = self.directory / "stage-backup.json"
+        backup.write_text(json.dumps(dict(self.leaf, scene_token="wrong")))
+        with self.assertRaisesRegex(ValueError, "token differs"):
+            cert.bootstrap(secrets, self.directory, backup)
+        secrets.put_secret_value.assert_not_called()
+        backup.write_text(json.dumps({k: self.leaf[k] for k in ("cert", "key", "scene_token")}))
+        cert.bootstrap(secrets, self.directory, backup)
+        backup.unlink()
+        cert.bootstrap(secrets, self.directory)
         self.assertEqual(secrets.put_secret_value.call_count, 1)
         self.assertEqual(list(metadata["VersionIdsToStages"].values()), [["AWSCURRENT", cert.LABEL]])
-        self.assertEqual(json.loads(values[cert.STAGE])["key"], self.leaf["key"])
+        restored = json.loads(values[cert.STAGE])
+        self.assertEqual({k: restored[k] for k in self.leaf}, self.leaf)
+        self.assertIn("issuer", restored)
+        self.assertEqual(restored["issued_at"], cert.cert_date(self.leaf["cert"], "startdate").isoformat())
 
 
 if __name__ == "__main__":

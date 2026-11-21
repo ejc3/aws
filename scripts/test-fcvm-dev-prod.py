@@ -40,6 +40,18 @@ class SwitchTests(unittest.TestCase):
         # #922 is done: the switch accepts true, with no validation left that refuses it.
         self.assertNotIn("validation", var)
 
+    def test_the_guard_is_gone_only_while_no_token_here_can_write_fcvm_dev(self):
+        # Why the activation guard could be removed (#922): no Cloudflare token minted by this repository names the
+        # fcvm.dev zone or holds DNS Write (4755a26e..., Cloudflare's zone-level group), so no dev or staging credential can change production's DNS or answer
+        # a DNS-01 challenge for its names. A token like that coming back must bring the guard back with it.
+        import re
+        for path in sorted(ROOT.glob("*.tf")):
+            text = path.read_text()
+            for m in re.finditer(r'resource "cloudflare_(?:account|api)_token" "(\w+)" \{', text):
+                body = text[m.start():text.index("\n}\n", m.start())]
+                for needle in ("fcvm_dev_zone_id", "dns_write", "4755a26eedb94da69e1066d98aa820be", "DNS Write"):
+                    self.assertNotIn(needle, body, f"{path.name}: {m.group(1)} ({needle})")
+
     def test_every_resource_and_data_source_follows_the_switch(self):
         found = [("resource", k, n) for k, n in headers("resource")] + [("data", k, n) for k, n in headers("data")]
         self.assertGreater(len(found), 15)

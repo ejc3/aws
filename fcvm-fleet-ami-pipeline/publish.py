@@ -50,6 +50,26 @@ def need(value, message):
         raise Refused(message)
 
 
+def production_image_ids(release, compute):
+    """Both collectors must have a complete production pin before they can deregister anything."""
+    need(isinstance(release, dict) and release.get("version") == 1 and type(release.get("generation")) is int
+         and release["generation"] >= 0 and "previous" in release, "invalid production release; preserving images")
+    previous = release["previous"]
+    need(isinstance(previous, dict) or (release["generation"] == 0 and previous is None),
+         "production rollback release is missing; preserving images")
+    ids = {}
+    for manifest in ([release, previous] if previous is not None else [release]):
+        for kind in ("host_amis", "tile_amis"):
+            catalog = manifest.get(kind)
+            need(isinstance(catalog, dict) and isinstance(catalog.get(compute), dict)
+                 and "x86_64" in catalog[compute], "production image catalog is incomplete; preserving images")
+            for region, arches in catalog.items():
+                need(isinstance(arches, dict) and arches and all(isinstance(i, str) and IMAGE.fullmatch(i)
+                     for i in arches.values()), "invalid production AMI reference; preserving images")
+                ids.setdefault(region, set()).update(arches.values())
+    return ids
+
+
 def execution_lease_seconds(build):
     minutes = build.get("timeoutInMinutes")
     need(type(minutes) is int and minutes in EXECUTION_TIMEOUT_MINUTES,
@@ -1772,9 +1792,11 @@ class Publisher:
 
     def run_replicate(self, event):
         need(event == {"action": "replicate-active-release"}, "image copy accepts no caller configuration")
-        release = self.load(self.env["RELEASE_PARAMETER"], True)
-        record = self.replicate(release)
-        self.retain(release, record)
+        self.build_id = "replicate-active-release"
+        with self.publication_lock():
+            release = self.load(self.env["RELEASE_PARAMETER"], True)
+            record = self.replicate(release)
+            self.retain(release, record)
         return {"status": "replicated", "generation": record["generation"]}
 
     def retirable(self, image, region):
@@ -1810,15 +1832,14 @@ class Publisher:
         return False
 
     def prod_release(self):
-        """Prod's image release pointer, or {} before the prod stack exists."""
+        """The AMIs pinned by production. Only an absent pointer leaves nothing pinned."""
         try:
             value = self.load(self.env["PROD_RELEASE_PARAMETER"], True)
         except Exception as error:
             if getattr(error, "response", {}).get("Error", {}).get("Code") == "ParameterNotFound":
                 return {}
             raise
-        need(isinstance(value, dict), "prod release pointer is not an object")
-        return value
+        return production_image_ids(value, self.env["COMPUTE_REGION"])
 
     def retain(self, release, record):
         """Deregister the retirable images (retirable()) that nothing needs, and delete their snapshots.
@@ -1832,8 +1853,9 @@ class Publisher:
         snapshots are tagged FleetRetired before deregistration, so a failed deletion is retried."""
         keep = set()
         # Prod's release and its previous one (ProdPublisher): prod launches from them while staging moves on.
-        prod = self.prod_release() if self.env.get("PROD_RELEASE_PARAMETER") else {}
-        for bundle in (release, release.get("previous") or {}, prod, prod.get("previous") or {}):
+        for ids in self.prod_release().values():
+            keep.update(ids)
+        for bundle in (release, release.get("previous") or {}):
             for key in ("host_amis", "tile_amis"):
                 for arches in bundle.get(key, {}).values():
                     keep.update(arches.values())

@@ -270,13 +270,8 @@ resource "aws_iam_instance_profile" "fcvm_fleet_prod_tile" {
 # starts at staging's release as it stands on the apply that creates it; afterwards only the prod promotion (plan A4,
 # which moves it only to a release the image gate verified, while prod sleeps) changes it. Its images are the prod
 # templates' (module.fcvm_fleet_prod_east1).
-resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release" {
-  count       = local.fcvm_fleet_prod
-  provider    = aws.fcvm_fleet_east1
-  name        = "/fcvm-fleet/prod/ami-release"
-  description = "The prod fleet's validated AMI pair and previous release; the prod promotion owns the value"
-  type        = "String"
-  value = var.fcvm_ami_pipeline_enabled ? nonsensitive(data.aws_ssm_parameter.fcvm_ami_release[0].value) : jsonencode({
+locals {
+  fcvm_prod_initial_ami_release = var.fcvm_ami_pipeline_enabled ? nonsensitive(data.aws_ssm_parameter.fcvm_ami_release[0].value) : jsonencode({
     version      = 1
     generation   = 0
     source_sha   = ""
@@ -287,9 +282,50 @@ resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release" {
     versions     = {}
     previous     = null
   })
-  tags = local.fcvm_fleet_prod_tags
+  fcvm_prod_seed_query = {
+    role   = local.fcvm_fleet_access_role_arn
+    region = local.fcvm_ami_region
+    prod   = local.fcvm_prod_ami_release_parameter
+  }
+}
+
+# The seed must be checked under Terraform's apply lock. A normal data source is read at plan time:
+# timestamp() defers the read to the saved apply, only during creation. Later releases belong to the publisher.
+data "external" "fcvm_prod_ami_pointer_present" {
+  count   = local.fcvm_fleet_prod
+  program = ["python3", "${path.module}/scripts/fcvm-prod-ami-seed.py", "present"]
+  query   = local.fcvm_prod_seed_query
+}
+
+data "external" "fcvm_prod_ami_seed" {
+  count   = local.fcvm_fleet_prod
+  program = ["python3", "${path.module}/scripts/fcvm-prod-ami-seed.py", "verify"]
+  query = merge(local.fcvm_prod_seed_query, data.external.fcvm_prod_ami_pointer_present[0].result.present == "true" ? {
+    when = "existing"
+    } : {
+    when         = timestamp()
+    release      = local.fcvm_prod_initial_ami_release
+    stage        = var.fcvm_ami_pipeline_enabled ? aws_ssm_parameter.fcvm_ami_release.name : ""
+    version      = var.fcvm_ami_pipeline_enabled ? tostring(data.aws_ssm_parameter.fcvm_ami_release[0].version) : ""
+    copy_regions = jsonencode(local.fcvm_ami_copy_regions)
+  })
+}
+
+resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release" {
+  count       = local.fcvm_fleet_prod
+  provider    = aws.fcvm_fleet_east1
+  name        = "/fcvm-fleet/prod/ami-release"
+  description = "The prod fleet's validated AMI pair and previous release; the prod promotion owns the value"
+  type        = "String"
+  value       = local.fcvm_prod_initial_ami_release
+  tags        = local.fcvm_fleet_prod_tags
   lifecycle {
-    ignore_changes = [value]
+    ignore_changes  = [value]
+    prevent_destroy = true
+    precondition {
+      condition     = data.external.fcvm_prod_ami_seed[0].result.verified == "true"
+      error_message = "The production AMI seed must pass its apply-time staging release and image availability checks."
+    }
     postcondition {
       condition = (
         try(jsondecode(self.value).version, 0) == 1 &&

@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Offline tests for fcvm-fleet-account.tf: the fcvm-fleet member account (ejc3/aws#604) and its G spot quotas (#605)."""
-import json
 import re
 import unittest
 from pathlib import Path
@@ -120,9 +119,99 @@ class ApplyRoleTests(unittest.TestCase):
             self.assertNotIn(leak, param.lower().replace("no credentials", ""))
 
 
+class GpuboxRoleTests(unittest.TestCase):
+    """ejc3/aws#922: fcvm-arm's role in the fleet account reaches gpuboxes and nothing that holds or uses a secret."""
+    ALLOWED = {"ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",
+               "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation",
+               "servicequotas:GetServiceQuota", "ssm:GetParameter", "ec2:RunInstances", "ec2:CreateTags", "ec2:TerminateInstances",
+               "ssm:SendCommand", "iam:PassRole", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"}
+
+    def statements(self):
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"')
+        self.assertIn("role     = aws_iam_role.fcvm_fleet_terraform.name", pol)
+        return {m.group(1): m.group(0) for m in re.finditer(r'Sid\s+= "(\w+)".*?\n      \}', pol, re.S)}
+
+    def actions(self, stmt):
+        field = re.search(r'\bAction\s+= (\[[^\]]*\]|"[^"]+")', stmt, re.S)
+        return set(re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', field.group(1))) if field else set()
+
+    def test_no_administrator_access_and_no_other_policy_on_the_role(self):
+        self.assertNotIn("policy/AdministratorAccess", TF)
+        attached = re.findall(r'role\s+= aws_iam_role\.fcvm_fleet_terraform\.(?:name|id)', TF)
+        self.assertEqual(len(attached), 2, "the gpubox allow list and the G admission deny, nothing else")
+
+    def test_every_allowed_action_is_a_gpubox_call(self):
+        stmts = self.statements()
+        allowed = set().union(*(self.actions(s) for s in stmts.values() if re.search(r'Effect\s+= "Allow"', s)))
+        self.assertLessEqual(allowed, self.ALLOWED)
+        self.assertNotRegex("".join(s for s in stmts.values() if re.search(r'Effect\s+= "Allow"', s)), r'"[a-z0-9]+:\*"')
+
+    def test_instance_actions_need_the_gpubox_tag(self):
+        s = self.statements()
+        self.assertIn('"aws:RequestTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["LaunchOnlyGpuboxes"])
+        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["EndOnlyGpuboxes"])
+        self.assertIn('"ssm:resourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["RunCommandsOnlyOnGpuboxes"])
+        self.assertIn('"ec2:CreateAction" = "RunInstances"', s["TagAtLaunch"])
+        self.assertRegex(s["TheShellDocument"], r'Resource\s+= "arn:aws:ssm:\*::document/AWS-RunShellScript"')
+        self.assertIn('fcvm_fleet_gpubox_purpose = "fcvm-fleet-gpubox"', TF)
+
+    def test_only_the_lease_tag_can_be_changed_after_launch(self):
+        statements = self.statements()
+        tag_writers = {sid for sid, stmt in statements.items() if "ec2:CreateTags" in self.actions(stmt)}
+        self.assertEqual(tag_writers, {"TagAtLaunch", "ExtendOnlyGpuboxLeases"})
+        for sid, keys in (("TagAtLaunch", {"Purpose", "Name", "Owner", "LeaseUntil", "Market", "fcvm-admission"}),
+                          ("ExtendOnlyGpuboxLeases", {"LeaseUntil"})):
+            stmt = statements[sid]
+            self.assertIn(':instance/*"', stmt)
+            allowed = re.search(r'"ForAllValues:StringEquals"\s*=\s*\{ "aws:TagKeys" = \[(.*?)\]', stmt)
+            self.assertIsNotNone(allowed)
+            self.assertEqual(set(re.findall(r'"([^"]+)"', allowed[1])), keys)
+        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', statements["ExtendOnlyGpuboxLeases"])
+
+    def test_ssm_agent_core_cannot_read_unrelated_parameters(self):
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_gpubox_ssm"')
+        self.assertIn("aws_iam_role.fcvm_fleet_gpubox.name", attachment)
+        self.assertIn("policy/AmazonSSMManagedInstanceCore", attachment)
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
+        self.assertIn("aws_iam_role.fcvm_fleet_gpubox.id", policy)
+        deny = re.search(r'Sid\s+= "DenyUnrelatedParameters"(.*?)\n      \}', policy, re.S)
+        self.assertIsNotNone(deny)
+        self.assertRegex(deny[1], r'Effect\s+= "Deny"')
+        self.assertRegex(deny[1], r'Action\s+= "ssm:GetParameter\*"')
+        exceptions = re.search(r'NotResource\s+= \[(.*?)\]', deny[1], re.S)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', exceptions[1])), {
+            "arn:aws:ssm:*::parameter/aws/service/*",
+            "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release",
+            "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release-copies",
+        })
+
+    def test_it_passes_only_the_gpubox_role_and_writes_only_the_gpubox_prefix(self):
+        s = self.statements()
+        self.assertRegex(s["PassOnlyTheGpuboxRole"], r"Resource\s+= aws_iam_role\.fcvm_fleet_gpubox\.arn\n")
+        self.assertRegex(s["PassOnlyTheGpuboxRole"], r'"iam:PassedToService" = "ec2.amazonaws.com"')
+        self.assertRegex(s["TheGpuboxPrefix"], r'Resource\s+= "\$\{aws_s3_bucket\.fcvm_fleet_assets\.arn\}/gpubox/\*"')
+        for sid, stmt in s.items():
+            if "iam:PassRole" in stmt:
+                self.assertEqual(sid, "PassOnlyTheGpuboxRole")
+
+    def test_secrets_iam_and_what_workloads_run_are_denied_by_name(self):
+        deny = self.statements()["NeverSecretsIamOrWhatWorkloadsRun"]
+        self.assertRegex(deny, r'Effect\s+= "Deny"')
+        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:PutParameter", "ssm:StartSession",
+                       "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"):
+            self.assertIn(f'"{action}"', deny)
+
+    def test_a_gpubox_reads_no_secret(self):
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
+        self.assertNotIn("secretsmanager", pol)
+        self.assertIn("role     = aws_iam_role.fcvm_fleet_gpubox.name", block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
+        self.assertIn('name     = "fcvm-fleet-gpubox"', block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
+
+
 class QuotaTests(unittest.TestCase):
-    def test_g_spot_is_192_in_us_east_1_and_never_lowered(self):
-        self.assertIn("fcvm_fleet_spot_g_vcpus = 192", TF)
+    def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
+        # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
+        self.assertIn("fcvm_fleet_spot_g_vcpus = 480", TF)
         for suffix, alias in (("east1", "fcvm_fleet_east1"),):
             q = block(f'resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_{suffix}"')
             self.assertIn(f"provider     = aws.{alias}", q)

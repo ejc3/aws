@@ -22,10 +22,21 @@ def over_budget_days(budgets, env, today):
         "TimePeriod": {"Start": start, "End": end}, "MaxResults": 100,
     }
     overages = set()
+    definition = None
     while True:
         page = budgets.describe_budget_performance_history(**request)
         history = page["BudgetPerformanceHistory"]
-        if (history["BudgetName"], history["TimeUnit"], history["BudgetType"]) != (env["BUDGET_NAME"], "DAILY", "COST"):
+        if (history["BudgetName"], history["BudgetType"]) != (env["BUDGET_NAME"], "COST"):
+            raise ValueError("Unexpected daily fleet budget in billing history")
+        unit = history.get("TimeUnit")
+        if unit is None:
+            # Filter-expression budgets can omit TimeUnit from history. DescribeBudget still returns it.
+            if definition is None:
+                definition = budgets.describe_budget(AccountId=env["ACCOUNT_ID"], BudgetName=env["BUDGET_NAME"])["Budget"]
+            if (definition["BudgetName"], definition["BudgetType"]) != (env["BUDGET_NAME"], "COST"):
+                raise ValueError("Unexpected fleet budget definition")
+            unit = definition["TimeUnit"]
+        if unit != "DAILY":
             raise ValueError("Unexpected daily fleet budget in billing history")
         for entry in history.get("BudgetedAndActualAmountsList", []):
             period = entry["TimePeriod"]

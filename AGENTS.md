@@ -757,8 +757,8 @@ qualifies), shared with nextjs-dev's `agents-start` and with `agent-session-sync
 reads the prompt's origin Claude Code records (`origin.kind: human`), so SDK-injected turns, background
 task notices and settings commands broadcast to every window (`/model`) do not count. A folder nobody
 prompted stays closed at the next boot; linked worktrees count as their own folders, subagent worktrees
-under `.claude/worktrees/` never do. It restricts roots to `/home/ubuntu` and `github.com/ejc3/*`, and
-uses t-claude's default path-derived sessions. t-claude follows its `main` branch, so the unit
+under `.claude/worktrees/` never do. The launcher uses path-derived sessions under `/home/ubuntu` for
+`github.com/ejc3/*` and the exact GitHub projects in the root-owned metal policy described below. t-claude follows its `main` branch, so the unit
 is guarded by an integrity check (`zsh -n` on the installed file) rather than a fixed hash,
 and by live `claude auth status`, so credentials remain personal and Terraform never seeds or
 copies them.
@@ -1138,7 +1138,9 @@ scan plus about a second.
   "clone is fine, I just don't want one for every internal worktree that agents create"). A linked worktree
   of one, wherever it lives, counts only when marked for interactive use: `claude-interactive` in its git
   directory (`touch "$(git rev-parse --git-dir)/claude-interactive"`); a subagent worktree under
-  `.claude/worktrees/` never counts. The checkout must be finished (no `*.lock`, the index exists). The
+  `.claude/worktrees/` never counts. The checkout must have a valid HEAD and index. Git operation locks block discovery; the two
+  persistent gh-stack lock files only block it while exclusively held. On upgrade the watcher records
+  older checkouts made visible by this distinction so their resting locks do not trigger new sessions. The
   first run only records what exists and launches nothing, and so does the first scan of a state file from
   before every clone counted (no `clones` key), so the upgrade does not open a session in every old clone.
 - **The admin jumpboxes require explicit approval for new clones.** Both jumpboxes set `--require-clone-marker`
@@ -1147,7 +1149,10 @@ scan plus about a second.
   the collaboration repository, does not authorize its startup hooks to run with administrator credentials.
 - **Whose repos.** The account's own GitHub login (from gh's `hosts.yml`) plus
   `~/.config/agent-session-sync/owners` and `--owner`. The ubuntu account on the metal boxes and jumpboxes
-  also gets `dolphin-labs-hq/dolphin-labs` by exact name; never an organisation wildcard.
+  also gets `dolphin-labs-hq/dolphin-labs` by exact name. On metal,
+  `/usr/local/lib/fcvm/claude-collaboration-repos` allows `dolphin-labs-hq/dolphin-labs` and
+  `dolphin-labs-hq/dolphin-maps` for the interactive marker, boot launcher and watcher. The same
+  per-directory activity and retirement rules apply to each checkout of those repositories.
 - **What it never does.** Own the user's tmux server (it waits for `claude-rc@<user>` or the boot launcher
   to have made it), start a window for an account that is not logged in, or take a session down when it is
   restarted (`KillMode=process`). Claude and Codex are tracked separately, so Codex not being logged in
@@ -1575,15 +1580,17 @@ Available if a task needs them; neither needs a key on disk.
   Cloudflare also checks the primary ARM Elastic IPv4 and host IPv6. Run the hosted Quick Actions on fcvm-arm
   with the token in the benchmark process environment. Keep it out of argv, logs, files and commits.
   Browser usage is billable. Rotate with `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
-- **fcvm.dev DNS propagation tests**, metal boxes. `fcvm-dns-test-token` (us-west-1) is a Cloudflare token with DNS Read
-  and DNS Write on the fcvm.dev zone and nothing else (`fcvm-dns-test.tf`), usable only from the dev fleet's subnets
-  (IPv6) and the metal boxes' Elastic IPs, and it expires 90 days after its date was last set. It is for creating,
-  timing and deleting short-lived test records. The token can edit any record in the zone; the box touches only names
-  under `dnstest-*.fcvm.dev`, and never the coordinator's (`slot-*`, `ec2-*`, `_acme-challenge*`), `stage` or
-  `fleet-api-stage`. Readable by dev-server-role (through `assume-constellation-terraform`) and admins.
-  `export CLOUDFLARE_API_TOKEN=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id fcvm-dns-test-token
-  --query SecretString --output text)`; never onto a command line, into a file in a repo or a commit. Renew by moving
-  `fcvm_dns_test_token_expires_on` forward and applying.
+- **DNS propagation on the metal boxes.** Run `python3 scripts/fcvm-dns-probe.py` from this checkout with boto3 and
+  dig. It publishes one unique TXT record under `dnstest.fcvm.dev`, measures each of the four authoritative
+  nameservers, then Cloudflare and Google recursive DNS, and deletes the record after success or timeout. Recursive
+  queries begin after every authority has the TXT record to avoid seeding negative caches. All times start at CREATE.
+  The delegated test zone uses Route 53. This measures its publication and recursive visibility. To measure the
+  fleet coordinator's own DNS implementation, resolve a fresh staging launch name under `tiles-stage.fcvm.dev`.
+  The temporary instance credentials allow CREATE/DELETE only for probe-prefixed A, AAAA and TXT records in the
+  test zone from the existing dev IP ranges. The test discovers its public zone ID from the _zone-id TXT record.
+  During token retirement first apply only the probe delegation, ID record and `aws_iam_policy.dev_server_constellation_terraform`
+  (including their dependencies), then run the probe from a metal dev box. Verify the old tokens are still at the issuer
+  and both the probe CREATE and DELETE succeeded before the full retirement apply.
 - **The claw-master dashboard, as an agent**, metal boxes and the owner's nextjs-ct container. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
   (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
@@ -1824,10 +1831,12 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   other regions, and IAM users, access keys and console passwords (roles only). Global services are exempt (the Dolphin
   policy's list).
 - **Applied from here** for the fleet's infrastructure (through OrganizationAccountAccessRole), and from fcvm-metal-arm
-  through `fcvm-fleet-terraform` (AdministratorAccess in that account, one-hour sessions), which trusts dev-server-role
+  through `fcvm-fleet-terraform` (an allow list for fcvm's gpubox tools only: gpubox launches, Run Command and
+  `gpubox/` objects, no secret, one-hour sessions; gpuboxes run as `fcvm-fleet-gpubox`), which trusts dev-server-role
   pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
-  another policy. CI itself cannot assume a fleet role; its main-only management-account
+  another policy. After launch the launcher can update only the lease tag. The instance profile can read AWS public
+  service parameters and the two fleet release pointers in us-east-1. CI itself cannot assume a fleet role; its main-only management-account
   role can publish the coordinator image and invoke the scoped release function.
 - **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in us-east-1, granted 2026-10-22; one region is enough (owner).
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
@@ -1838,7 +1847,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   page's `/live` and `/poster.jpg` to the API host with its own service token, `fcvm-fleet-stage-worker`, admitted by the
   API application only and uploaded from ejc3/fcvm's `cloudflare-deploy` environment, so a browser needs one Access
   session). Written into the
-  fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
+  fleet account: `fcvm-fleet/coordinator-tunnel-token`,
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
   a public subnet per AZ, one security group admitting TCP 443 from anywhere and nothing else, no SSH: SSM only, flow logs
@@ -1848,15 +1857,21 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/stage/tls` secret, which the
   coordinator renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`). The tunnel token and agent
   Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
-  and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
-  including copies on host or tile disks and in backups. Production activation depends on completing #922.
-- **Staging certificate cutover.** First apply only the staging certificate container and its resource policy. On the jumpbox,
-  set `ACME_EMAIL` from the `owner` field of the management account's `people/addresses` secret, then assume the
-  fleet administration role. With lego v4.17.4 and the existing parent-zone ACME CNAME, run
-  `python3 scripts/fcvm-stage-certificate.py --issue`. It bootstraps the stage wildcard with a fresh key, retains the
-  old scene token, verifies the chain and matching keys and labels the verified version. The coordinator requires a
-  populated certificate on startup. The Terraform cutover reads version metadata only. Run
-  `python3 scripts/fcvm-stage-certificate.py` to verify it again before planning. Check that deployed viewers
+  and DNS token. Applying the DNS retirement deletes the two old tokens at Cloudflare. The old certificates remain valid
+  until revoked or expired, including copies on host or tile disks and in backups. Production activation depends on #922.
+- **Staging certificate recovery.** The coordinator renews `*.tiles-stage.fcvm.dev` through its delegated authoritative
+  DNS. It needs a populated staging secret on startup. On the jumpbox, assume the fleet administration role and run
+  `python3 scripts/fcvm-stage-certificate.py` to verify the chain, SAN, key, remaining lifetime, bootstrap label and
+  original scene token. If the container is pending deletion, restore it with its versions intact. For a new empty
+  container, recover from a staging host’s protected `/run/fcvm-fleet/tls/tls.json` or an existing current secret backup. On the
+  administration host, pass that JSON on private tmpfs as `--restore /protected/path/tls.json`. Its chain, key and
+  scene token suffice; the script verifies them and rebuilds expiry and SAN metadata before writing or labeling it.
+  When the GPU host has terminated, a retained staging tile's EBS root already holds the same fields. Read its
+  `/etc/fcvm-fleet/tls/fullchain.pem` as `cert`, `/etc/fcvm-fleet/tls/key.pem` as `key`, and
+  `/etc/fcvm-fleet/scene/token` as `scene_token`. Assemble the JSON on private tmpfs and use the same verifier.
+  Explicit restore accepts a still-valid leaf inside the 30-day renewal window. Confirm the coordinator renews it
+  and rerun the default readiness check before declaring the recovery complete. Retain the legacy certificate secret for
+  revocation evidence and scene-token verification. Terraform reads version metadata only. Check that deployed viewers
   and direct integrations use the published launch names under `tiles-stage.fcvm.dev`. The old certificate covers
   both namespaces, so consumers can migrate first. Clients pinned to `slot-<n>.fcvm.dev` or `ec2-<n>.fcvm.dev`
   will fail TLS against a new renderer even if they supply their own address. An empty parent DNS record list alone
@@ -1864,7 +1879,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   Already-created pool tiles retain their original boot configuration. On a wake, an old tile may spend up to
   600 seconds waiting for renderer health before the coordinator replaces it. The cold launch takes additional
   time. Verify a fresh tile and host serve frames on IPv4 and IPv6 after the cutover. Retire the old
-  certificate and DNS credentials separately as tracked in #922.
+  certificates separately as tracked in #922.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
   terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit
