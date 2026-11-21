@@ -221,6 +221,23 @@ class SpendCapTests(unittest.TestCase):
                 self.assertEqual(self.iam.attached, {OTHER_POLICY})
                 self.assertEqual(self.store.state["billed_days"], [])
 
+    def test_missing_history_unit_checks_budget_definition_before_using_daily_rows(self):
+        self.budget.pages = [[cost(self.yesterday)]]
+        response = self.budget.describe_budget_performance_history(
+            AccountId=ENV["ACCOUNT_ID"], BudgetName=ENV["BUDGET_NAME"], TimePeriod={}, MaxResults=100)
+        del response["BudgetPerformanceHistory"]["TimeUnit"]
+        definition = {"BudgetName": ENV["BUDGET_NAME"], "BudgetType": "COST", "TimeUnit": "DAILY"}
+        with patch.object(self.budget, "describe_budget_performance_history", return_value=response), \
+                patch.object(self.budget, "describe_budget", create=True, return_value={"Budget": definition}) as details:
+            for field, bad_value in [("TimeUnit", "MONTHLY"), ("BudgetName", "other"), ("BudgetType", "USAGE")]:
+                with self.subTest(field=field), patch.dict(definition, {field: bad_value}):
+                    with self.assertRaises(ValueError):
+                        self.sync()
+                    self.assertEqual(self.iam.attached, {OTHER_POLICY})
+            self.sync()
+            details.assert_called_with(AccountId=ENV["ACCOUNT_ID"], BudgetName=ENV["BUDGET_NAME"])
+        self.assertIn(ENV["POLICY_ARN"], self.iam.attached)
+
     def test_billing_response_crossing_midnight_is_evaluated_in_the_new_window(self):
         self.budget.pages = [[cost(self.yesterday, "800")]]
         query = self.budget.describe_budget_performance_history
