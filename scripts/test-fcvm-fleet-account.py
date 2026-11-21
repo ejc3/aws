@@ -205,9 +205,14 @@ class GpuboxRoleTests(unittest.TestCase):
     def test_secrets_iam_and_what_workloads_run_are_denied_by_name(self):
         deny = self.statements()["NeverSecretsIamOrWhatWorkloadsRun"]
         self.assertRegex(deny, r'Effect\s+= "Deny"')
-        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:PutParameter", "ssm:StartSession",
+        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:StartSession",
                        "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"):
             self.assertIn(f'"{action}"', deny)
+        self.assertNotIn('"ssm:PutParameter"', deny)
+        scoped_deny = self.statements()["NeverWriteOtherParameters"]
+        self.assertRegex(scoped_deny, r'Effect\s+= "Deny"')
+        self.assertEqual(self.actions(scoped_deny), {"ssm:PutParameter"})
+        self.assertRegex(scoped_deny, r'NotResource\s+= local\.fcvm_fleet_ops_parameters')
 
     def test_a_gpubox_reads_no_secret(self):
         pol = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
@@ -233,8 +238,8 @@ class ProjectOperationsTests(unittest.TestCase):
         self.assertEqual(re.search(r'\bResource\s*=\s*([^\n]+)', statement)[1], resource)
 
     def test_only_current_state_and_lock_are_accessible(self):
-        self.assertIn('fcvm_fleet_ops_key   = "fleet-ops/terraform.tfstate"', TF)
-        self.assertIn('fcvm_fleet_ops_state = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"', TF)
+        self.assertRegex(TF, r'fcvm_fleet_ops_key\s*= "fleet-ops/terraform.tfstate"')
+        self.assertRegex(TF, r'fcvm_fleet_ops_state\s*= "\$\{aws_s3_bucket.fcvm_fleet_terraform_state\.arn\}/\$\{local.fcvm_fleet_ops_key\}"')
         self.assert_grant("ReadWriteCurrentState", ["s3:GetObject", "s3:PutObject"], "local.fcvm_fleet_ops_state")
         self.assert_grant("LockCurrentState", ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
                           '"${local.fcvm_fleet_ops_state}.tflock"')
@@ -250,7 +255,8 @@ class ProjectOperationsTests(unittest.TestCase):
         self.assert_grant("ManageOperationsParameters", [
             "ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
             "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource",
-        ], '"arn:aws:ssm:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:parameter/fcvm/ops/*"')
+        ], "local.fcvm_fleet_ops_parameters")
+        self.assertRegex(TF, r'fcvm_fleet_ops_parameters\s*= "arn:aws:ssm:\$\{local.fcvm_fleet_home_region\}:\$\{local.fcvm_fleet_account_id\}:parameter/fcvm/ops/\*"')
         self.assert_grant("ManageOperationsLogs", [
             "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
             "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",

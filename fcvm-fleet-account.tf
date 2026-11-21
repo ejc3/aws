@@ -343,11 +343,17 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
         Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/gpubox/*"
       },
       {
+        Sid         = "NeverWriteOtherParameters"
+        Effect      = "Deny"
+        Action      = "ssm:PutParameter"
+        NotResource = local.fcvm_fleet_ops_parameters
+      },
+      {
         # Already outside the allow list above; denied by name so a later broad grant cannot reopen them.
         Sid    = "NeverSecretsIamOrWhatWorkloadsRun"
         Effect = "Deny"
         Action = ["secretsmanager:*", "kms:Decrypt", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*",
-        "iam:AddRoleToInstanceProfile", "ssm:PutParameter", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
+        "iam:AddRoleToInstanceProfile", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
         Resource = "*"
       },
     ]
@@ -473,9 +479,10 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
 # because S3 hides missing keys with HTTP 403 from prefix-limited bucket readers.
 # Thereafter only fleet-ops writes the state. Version history stays with recovery admins.
 locals {
-  fcvm_fleet_ops_key   = "fleet-ops/terraform.tfstate"
-  fcvm_fleet_ops_state = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"
-  fcvm_fleet_ops_logs  = "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/fcvm/ops/*"
+  fcvm_fleet_ops_parameters = "arn:aws:ssm:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:parameter/fcvm/ops/*"
+  fcvm_fleet_ops_key        = "fleet-ops/terraform.tfstate"
+  fcvm_fleet_ops_state      = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"
+  fcvm_fleet_ops_logs       = "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/fcvm/ops/*"
 }
 
 resource "aws_s3_object" "fcvm_fleet_ops_initial_state" {
@@ -541,7 +548,7 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_ops" {
         Effect = "Allow"
         Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
         "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"]
-        Resource = "arn:aws:ssm:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:parameter/fcvm/ops/*"
+        Resource = local.fcvm_fleet_ops_parameters
       },
       {
         Sid    = "ManageOperationsLogs"
