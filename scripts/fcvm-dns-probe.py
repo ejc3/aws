@@ -33,18 +33,21 @@ def probe(client, timeout=120):
     start = time.monotonic()
     change("CREATE")
     try:
-        pending = set(servers) | {"1.1.1.1", "8.8.8.8"}
-        with ThreadPoolExecutor(max_workers=len(pending)) as workers:
-            while pending and time.monotonic() - start < timeout:
-                ordered = sorted(pending)
-                for server, answers in zip(ordered, workers.map(lambda ns: lookup(name, "TXT", ns), ordered)):
-                    if record["ResourceRecords"][0]["Value"] in answers:
-                        print(f"{server}: {time.monotonic() - start:.2f} seconds", flush=True)
-                        pending.remove(server)
+        # A recursor that asks a lagging authority can cache NXDOMAIN past our whole run.
+        with ThreadPoolExecutor(max_workers=len(servers)) as workers:
+            for group in (servers, ["1.1.1.1", "8.8.8.8"]):
+                pending = set(group)
+                deadline = time.monotonic() + timeout
+                while pending and time.monotonic() < deadline:
+                    ordered = sorted(pending)
+                    for server, answers in zip(ordered, workers.map(lambda ns: lookup(name, "TXT", ns), ordered)):
+                        if record["ResourceRecords"][0]["Value"] in answers:
+                            print(f"{server}: {time.monotonic() - start:.2f} seconds", flush=True)
+                            pending.remove(server)
+                    if pending:
+                        time.sleep(1)
                 if pending:
-                    time.sleep(1)
-        if pending:
-            raise RuntimeError("timed out waiting for " + ", ".join(sorted(pending)))
+                    raise RuntimeError("timed out waiting for " + ", ".join(sorted(pending)))
     finally:
         change("DELETE")
 

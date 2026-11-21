@@ -30,10 +30,10 @@ class CertificateTests(unittest.TestCase):
     def command(self, *args):
         self.run(["openssl", *args], cwd=self.directory, check=True, capture_output=True)
 
-    def signed_leaf(self, name, names):
+    def signed_leaf(self, name, names, days=90):
         self.command("req", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes", "-subj", "/CN=Test",
                      "-addext", "subjectAltName=DNS:" + names, "-keyout", name + ".key", "-out", name + ".csr")
-        self.command("x509", "-req", "-in", name + ".csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-days", "90",
+        self.command("x509", "-req", "-in", name + ".csr", "-CA", "ca.crt", "-CAkey", "ca.key", "-days", str(days),
                      "-copy_extensions", "copy", "-out", name + ".crt")
         pem = (self.directory / (name + ".crt")).read_text() + (self.directory / "ca.crt").read_text()
         return {"cert": pem, "key": (self.directory / (name + ".key")).read_text(), "domains": ["*." + cert.ZONE],
@@ -50,6 +50,37 @@ class CertificateTests(unittest.TestCase):
         ]:
             with self.subTest(error=error), self.assertRaisesRegex(ValueError, error):
                 cert.verify(doc, old, self.directory)
+
+    def test_explicit_recovery_accepts_near_expiry_and_rejects_expired_leaves(self):
+        soon = self.signed_leaf("soon", "*." + cert.ZONE, days=20)
+        backup = self.directory / "tls.json"
+        backup.write_text(json.dumps(soon))
+        metadata = {"ARN": "arn:test:secret:stage", "VersionIdsToStages": {}}
+        values = {cert.LEGACY: self.legacy}
+        secrets = mock.Mock()
+        secrets.describe_secret.return_value = metadata
+        secrets.get_secret_value.side_effect = lambda SecretId, **_: {"SecretString": json.dumps(values[SecretId])}
+        def put(SecretId, SecretString, VersionStages, ClientRequestToken):
+            values[SecretId] = json.loads(SecretString)
+            metadata["VersionIdsToStages"][ClientRequestToken] = VersionStages
+        secrets.put_secret_value.side_effect = put
+
+        with self.assertRaisesRegex(ValueError, "renewal window"):
+            cert.verify(soon, self.legacy, self.directory)
+        cert.bootstrap(secrets, self.directory, backup)
+        self.assertEqual(secrets.put_secret_value.call_count, 1)
+        with self.assertRaisesRegex(ValueError, "renewal window"):
+            cert.bootstrap(secrets, self.directory)
+
+        after_expiry = dt.datetime.fromisoformat(soon["not_after"]) + dt.timedelta(seconds=1)
+        class AfterExpiry(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return after_expiry.astimezone(tz)
+        metadata["VersionIdsToStages"].clear()
+        with mock.patch.object(cert.dt, "datetime", AfterExpiry), self.assertRaisesRegex(ValueError, "expir"):
+            cert.bootstrap(secrets, self.directory, backup)
+        self.assertEqual(secrets.put_secret_value.call_count, 1)
 
     def test_restore_requires_good_backup_then_verifies_without_writing_again(self):
         secrets = mock.Mock()

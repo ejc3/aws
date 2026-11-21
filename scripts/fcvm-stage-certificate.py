@@ -37,7 +37,7 @@ def cert_date(cert, date="enddate"):
     return dt.datetime.strptime(value, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=dt.timezone.utc)
 
 
-def verify(doc, legacy, directory):
+def verify(doc, legacy, directory, *, recovery=False):
     cert = doc["cert"]
     chain = re.findall(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", cert, re.S)
     checked(len(chain) >= 2 and "".join(cert.split()) == "".join("".join(chain).split()),
@@ -51,9 +51,12 @@ def verify(doc, legacy, directory):
     checked(bool(legacy["scene_token"]) and hmac.compare_digest(doc["scene_token"], legacy["scene_token"]),
             "staging scene token differs from the existing fleet")
     deadline = cert_date(chain[0])
-    checked(dt.datetime.fromisoformat(doc["not_after"].replace("Z", "+00:00")) == deadline
-            and deadline > dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=30),
-            "staging certificate expiry does not meet the renewal window")
+    checked(dt.datetime.fromisoformat(doc["not_after"].replace("Z", "+00:00")) == deadline,
+            "staging certificate expiry disagrees with the signed leaf")
+    remaining = deadline - dt.datetime.now(dt.timezone.utc)
+    checked(remaining > dt.timedelta(), "staging certificate has expired")
+    if not recovery:
+        checked(remaining > dt.timedelta(days=30), "staging certificate expiry is inside the renewal window")
     intermediates = directory / "chain.pem"
     intermediates.write_text("\n".join(chain[1:]) + "\n")
     openssl(["verify", "-purpose", "sslserver", "-verify_hostname", "probe." + ZONE,
@@ -68,7 +71,7 @@ def bootstrap(secrets, directory, restore_file=None):
     current = [version for version, stages in versions.items() if "AWSCURRENT" in stages]
     if current:
         doc = json.loads(secrets.get_secret_value(SecretId=STAGE, VersionStage="AWSCURRENT")["SecretString"])
-        verify(doc, legacy, directory)
+        verify(doc, legacy, directory, recovery=restore_file is not None)
         checked(any(LABEL in stages for stages in versions.values()), "missing verified staging bootstrap label")
         print("Verified staging certificate:", *doc["domains"], "expires", doc["not_after"])
         return
@@ -80,14 +83,14 @@ def bootstrap(secrets, directory, restore_file=None):
     doc.update(domains=["*." + ZONE], not_after=cert_date(cert).isoformat(),
                issued_at=backup.get("issued_at") or cert_date(cert, "startdate").isoformat(),
                issuer=openssl(["x509", "-noout", "-issuer"], cert).removeprefix("issuer=").strip())
-    verify(doc, legacy, directory)
+    verify(doc, legacy, directory, recovery=True)
     checked(not secrets.describe_secret(SecretId=STAGE).get("VersionIdsToStages"),
             "another writer populated the staging secret during certificate recovery")
     # Concurrent bootstraps cannot overwrite one another with different private keys.
     request_id = str(uuid.uuid5(uuid.NAMESPACE_URL, metadata["ARN"] + "/" + LABEL))
     secrets.put_secret_value(SecretId=STAGE, ClientRequestToken=request_id, SecretString=json.dumps(doc),
                              VersionStages=["AWSCURRENT", LABEL])
-    bootstrap(secrets, directory)
+    bootstrap(secrets, directory, restore_file)
 
 
 if __name__ == "__main__":

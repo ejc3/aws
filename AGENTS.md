@@ -1582,7 +1582,8 @@ Available if a task needs them; neither needs a key on disk.
   Browser usage is billable. Rotate with `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
 - **DNS propagation on the metal boxes.** Run `python3 scripts/fcvm-dns-probe.py` from this checkout with boto3 and
   dig. It publishes one unique TXT record under `dnstest.fcvm.dev`, measures each of the four authoritative
-  nameservers plus Cloudflare and Google recursive DNS, and deletes the record after success or timeout.
+  nameservers, then Cloudflare and Google recursive DNS, and deletes the record after success or timeout. Recursive
+  queries begin after every authority has the TXT record to avoid seeding negative caches. All times start at CREATE.
   The delegated test zone uses Route 53. This measures its publication and recursive visibility. To measure the
   fleet coordinator's own DNS implementation, resolve a fresh staging launch name under `tiles-stage.fcvm.dev`.
   The temporary instance credentials allow CREATE/DELETE only for probe-prefixed A, AAAA and TXT records in the
@@ -1862,7 +1863,12 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   original scene token. If the container is pending deletion, restore it with its versions intact. For a new empty
   container, recover from a staging host’s protected `/run/fcvm-fleet/tls/tls.json` or an existing current secret backup. On the
   administration host, pass that JSON on private tmpfs as `--restore /protected/path/tls.json`. Its chain, key and
-  scene token suffice; the script verifies them and rebuilds expiry and SAN metadata before writing or labeling it. Retain the legacy certificate secret for
+  scene token suffice; the script verifies them and rebuilds expiry and SAN metadata before writing or labeling it.
+  When the GPU host has terminated, a retained staging tile's EBS root already holds the same fields. Read its
+  `/etc/fcvm-fleet/tls/fullchain.pem` as `cert`, `/etc/fcvm-fleet/tls/key.pem` as `key`, and
+  `/etc/fcvm-fleet/scene/token` as `scene_token`. Assemble the JSON on private tmpfs and use the same verifier.
+  Explicit restore accepts a still-valid leaf inside the 30-day renewal window. Confirm the coordinator renews it
+  and rerun the default readiness check before declaring the recovery complete. Retain the legacy certificate secret for
   revocation evidence and scene-token verification. Terraform reads version metadata only. Check that deployed viewers
   and direct integrations use the published launch names under `tiles-stage.fcvm.dev`. The old certificate covers
   both namespaces, so consumers can migrate first. Clients pinned to `slot-<n>.fcvm.dev` or `ec2-<n>.fcvm.dev`
