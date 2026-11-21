@@ -17,6 +17,9 @@
 # output; only names are printed. Run it AFTER the site's own deploy has finished: a secret change made while a deploy is
 # uploading can be lost when that deploy activates.
 #
+# dolphin-labs-prod reads the two scorebook fetch keys straight from the Dolphin news functions’
+# source secrets. Load just those bindings after the site deploys; Wrangler keeps all other bindings.
+#
 # Production values only ever go to `<SITE>-prod`; staging has its own containers and loader (workers-stage-secrets.sh).
 set -euo pipefail
 { set +x; } 2>/dev/null
@@ -35,6 +38,11 @@ MANAGED_CONTAINER=1 # workers-prod/SITE/terraform exists (Terraform writes it)
 # credential is refused here and not found after the cutover.
 case "$SITE" in
   colton-games) OUT_OF_BAND_NAMES="SKYHOOK_LEADERBOARD_SECRET SUPABASE_SECRET_KEY SUPABASE_URL" ;;
+  dolphin-labs)
+    SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID
+    MANAGED_CONTAINER=""
+    OUT_OF_BAND_NAMES="BROWSERBASE_API_KEY SCRAPINGDOG_API_KEY"
+    ;;
   dolphin-maps)
     SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID
     MANAGED_CONTAINER=1 # workers-prod/dolphin-maps/terraform: the moderation key (dolphin-maps-moderation.tf)
@@ -70,7 +78,22 @@ read_container() {
     aws secretsmanager get-secret-value --region us-west-1 --secret-id "$1" --query SecretString --output text 2>/dev/null
   ) || { echo "$1 in account $SOURCE_ACCOUNT has no value yet: put one first (dolphin-labs-hq/dolphin-aws, secrets.tf; a /terraform container is written by an apply here)" >&2; return 1; }
 }
-OUT_OF_BAND=$(read_container "workers-prod/$SITE") || exit 1
+if [[ "$SITE" == dolphin-labs ]]; then
+  # Each source can hold fields for other consumers. Only these two string values belong to the scorebook feed.
+  scrapingdog=$(read_container "scrapingdog/api-key") || exit 1
+  browserbase=$(read_container "browserbase/credentials") || exit 1
+  OUT_OF_BAND=$(SCRAPINGDOG="$scrapingdog" BROWSERBASE="$browserbase" python3 -c '
+import json, os, sys
+try:
+    print(json.dumps({key + "_API_KEY": json.loads(os.environ[key])[key + "_API_KEY"]
+                      for key in ("SCRAPINGDOG", "BROWSERBASE")}))
+except (ValueError, TypeError, KeyError):
+    sys.exit("missing or invalid Dolphin scorebook credential")
+') || exit 1
+  unset scrapingdog browserbase
+else
+  OUT_OF_BAND=$(read_container "workers-prod/$SITE") || exit 1
+fi
 MANAGED=""
 if [[ -n "$MANAGED_CONTAINER" ]]; then
   MANAGED=$(read_container "workers-prod/$SITE/terraform") || exit 1
@@ -148,7 +171,8 @@ if musickit:
         sys.exit("dolphin-maps/musickit: MUSICKIT_KEY_ID and MUSICKIT_TEAM_ID are 10-character Apple ids")
     if "-----BEGIN PRIVATE KEY-----" not in d["MUSICKIT_PRIVATE_KEY"]:
         sys.exit("dolphin-maps/musickit: MUSICKIT_PRIVATE_KEY is not the PEM text of the .p8")
-print("workers-prod/%s: loading %d names into %s: %s" % (sys.argv[1], len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
+source = "Dolphin news" if sys.argv[1] == "dolphin-labs" else "workers-prod/" + sys.argv[1]
+print("%s: loading %d names into %s: %s" % (source, len(merged), sys.argv[2], ", ".join(sorted(merged))), file=sys.stderr)
 sys.stdout.write(json.dumps(merged))
 ' "$SITE" "$WORKER")
 unset OUT_OF_BAND MANAGED MUSICKIT
