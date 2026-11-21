@@ -1694,23 +1694,20 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
 unlock once.
 
-**The CI VM's runners** (`scripts/mac-vm-setup.sh ci --lan mini-lan --runners`): one pool of four GitHub Actions
-runners at the `dolphin-labs-hq` organization (owner, 2026-11-14), named `mini-<n>` and labelled `gww-ios`,
-`kidsports-ios` and `mini`, so any idle one takes a self-hosted macOS job from dolphin-labs, dolphin-films or
-kid-sports-highlights. They are in the org's Default runner group, which serves private repositories only. The VM is
-provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
-run on the mini. The MacBook's two CI VMs joined the same pool on 2026-11-15 (owner), each keeping the one label it was
-provisioned for: `macbook-gww-1` and `macbook-gww-2` in `gww-ci` (`gww-ios`, `macbook`), `macbook-kidsports-1` in
-`kidsports-ci` (`kidsports-ios`, `macbook`); their repository registrations were removed. GitHub cannot rank runners:
-a job goes to whichever matching runner is idle, so the MacBook is a peer of the mini, not a fallback, and a job running
-there fails if the MacBook sleeps or leaves the network. A job that must build on one Mac asks for `mini` or `macbook`
-too. `ci-vm.sh runners` (the MacBook VMs' own script) registers at a repository, so re-registering them by hand means
-`config.sh --url https://github.com/dolphin-labs-hq --runnergroup Default` with those names and labels. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
-dropped again right after (`gh auth refresh -r admin:org -s read:org`), because GitHub applies the scope to every org
-the login reaches, not just dolphin-labs-hq. The Default group's visibility is "selected": a repository can use its
-runners only once it is on the group's list, which was empty. dolphin-labs, dolphin-films and kid-sports-highlights were
-added on 2026-11-14 (`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo id>`); a new
-repository needs the same before its jobs can run here. Nothing in Terraform manages the org's runner groups.
+**The CI VM's runners** are `mini-1` through `mini-4`. To rebuild them, run
+`scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
+the build tools and a signing keychain in the guest, then registers each missing runner with the
+`dolphin-labs-hq` organization. GitHub supplies `self-hosted`, `macOS` and `ARM64`. The script adds
+`ios-pool`, `mini` and the legacy `gww-ios` label. Registration uses the operator's org-admin GitHub login.
+
+As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
+`kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
+`[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
+require the mini. The Default runner group allows three private repositories, `dolphin-labs`,
+`dolphin-films` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
+match. An organization runner administrator can grant access with
+`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
+`gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
 
 #### Agent builds on the physical mini
 
