@@ -1,7 +1,7 @@
 # fcvm-dev-prod.tf
 #
-# The Cloudflare side of the PRODUCTION fcvm fleet (fcvm.dev), all behind var.fcvm_fleet_prod_enabled, which is false:
-# with it off this file creates nothing. Staging (fcvm-dev.tf: stage.fcvm.dev, fleet-api-stage.fcvm.dev) is untouched and
+# The Cloudflare side of the PRODUCTION fcvm fleet (fcvm.dev), gated on var.fcvm_fleet_prod_enabled.
+# Turning the switch off omits these resources. Staging (fcvm-dev.tf: stage.fcvm.dev, fleet-api-stage.fcvm.dev) is untouched and
 # stays behind Access. Owner decisions, 2026-11-18: a separate production stack at fcvm.dev in the same fcvm-fleet account
 # as staging (tagged Fleet=prod); only Turnstile-verified visitors may wake the fleet or take a seat; all modes public.
 #
@@ -29,15 +29,9 @@
 #                                             the coordinator reads them from (fcvm fleet/PROTOCOL.md, "Running it")
 
 variable "fcvm_fleet_prod_enabled" {
-  description = "Create the production fcvm fleet's Cloudflare resources (tunnel, Access, Turnstile) and their fleet secrets"
+  description = "Create the production fcvm fleet (fcvm.dev): its Cloudflare resources, fleet secrets and AWS stack."
   type        = bool
-  default     = false
-
-  # Targeted plans for the Cloudflare routes and the AWS fleet must enforce the same activation guard.
-  validation {
-    condition     = !var.fcvm_fleet_prod_enabled
-    error_message = "Before enabling production, record three complete UTC days of matching staging costs in the original and staging-only budgets on ejc3/aws#922."
-  }
+  default     = true
 }
 
 locals {

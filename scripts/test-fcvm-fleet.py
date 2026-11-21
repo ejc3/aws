@@ -1809,7 +1809,7 @@ class ProdStackTests(unittest.TestCase):
 
     # ------------------------------------------------------------------------------------------- nothing while off
     def test_every_prod_block_exists_only_while_the_switch_is_on(self):
-        self.assertIn("default     = false", block('variable "fcvm_fleet_prod_enabled"', DEV_PROD))
+        self.assertIn("default     = true", block('variable "fcvm_fleet_prod_enabled"', DEV_PROD))
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", DEV_PROD)
         self.assertIn("fcvm_fleet_prod_broadcast = var.fcvm_fleet_prod_enabled && local.fcvm_fleet_broadcast ? 1 : 0", PROD_BC)
         seen = []

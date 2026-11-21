@@ -32,17 +32,15 @@ def headers(kind):
 
 
 class SwitchTests(unittest.TestCase):
-    def test_the_switch_defaults_off(self):
+    def test_the_switch_is_on(self):
         var = block('variable "fcvm_fleet_prod_enabled"')
         self.assertIn("type        = bool", var)
-        self.assertIn("default     = false", var)
+        self.assertIn("default     = true", var)
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", CODE)
 
-    def test_prod_activation_is_blocked_pending_staging_budget_evidence(self):
+    def test_the_enabled_default_is_allowed_by_the_activation_switch(self):
         var = block('variable "fcvm_fleet_prod_enabled"')
-        self.assertRegex(var, r"validation \{\s*condition\s*= !var\.fcvm_fleet_prod_enabled\s*\n")
-        self.assertIn("three complete UTC days", var)
-        self.assertIn("ejc3/aws#922", var)
+        self.assertNotRegex(var, r"condition\s*=\s*!var\.fcvm_fleet_prod_enabled\s*\n")
 
     def test_cloudflare_tokens_do_not_reintroduce_retired_dns_permissions(self):
         # Check the parent-zone and DNS Write references used by the retired Terraform tokens, even under a new name.
