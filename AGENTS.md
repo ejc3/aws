@@ -1829,7 +1829,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   other regions, and IAM users, access keys and console passwords (roles only). Global services are exempt (the Dolphin
   policy's list).
 - **Applied from here** for the fleet's infrastructure (through OrganizationAccountAccessRole), and from fcvm-metal-arm
-  through `fcvm-fleet-terraform` (AdministratorAccess in that account, one-hour sessions), which trusts dev-server-role
+  through `fcvm-fleet-terraform` (an allow list for fcvm's gpubox tools only: gpubox launches, Run Command and
+  `gpubox/` objects, no secret, one-hour sessions; gpuboxes run as `fcvm-fleet-gpubox`), which trusts dev-server-role
   pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
   another policy. CI itself cannot assume a fleet role; its main-only management-account
