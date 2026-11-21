@@ -58,7 +58,7 @@ class GuardrailTests(unittest.TestCase):
                           "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
             if f.name in {"fcvm-fleet-alarms.tf", "fcvm-fleet-budget.tf", "fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf",
-                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf"}:
+                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf", "fcvm-fleet-lambda.tf"}:
                 # Fleet-owned: every resource that names the fleet account is created inside it.
                 for r in re.finditer(r'^resource "\w+" "\w+" \{\n.*?^\}', f.read_text(), re.S | re.M):
                     if "local.fcvm_fleet_account_id" in r.group():
@@ -145,7 +145,7 @@ class GpuboxRoleTests(unittest.TestCase):
                     attached.add(header.split('"')[3])
         self.assertEqual(attached, {
             "fcvm_fleet_terraform_gpubox", "fcvm_fleet_terraform_g_admission", "fcvm_fleet_terraform_observe",
-            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops",
+            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops", "fcvm_fleet_terraform_lambda",
         })
 
     def test_every_allowed_action_is_a_gpubox_call(self):
@@ -359,6 +359,50 @@ class ObserveTests(unittest.TestCase):
         })
         self.assertNotIn("lambda:", stmt)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
+
+
+class LambdaGrantTests(unittest.TestCase):
+    source = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+    grant = block('resource "aws_iam_policy" "fcvm_fleet_terraform_lambda"', source)
+
+    def test_arm_can_deploy_one_private_function_without_the_capacity_operator_role(self):
+        self.assertIn('fcvm_lambda_name         = "fcvm-lambda-tile"', self.source)
+        self.assertIn('Resource = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"]', self.grant)
+        self.assertIn('"lambda:PublishVersion"', self.grant)
+        self.assertIn('"lambda:InvokeFunction"', self.grant)
+        self.assertIn('"lambda:PutFunctionScalingConfig"', self.grant)
+        self.assertNotRegex(self.grant, r'lambda:(?:\*|ListFunctions|.*FunctionUrl.*|AddPermission)|iam:(?:Create|Update|Put|Attach)')
+        passrole = self.grant.split('"iam:PassRole"', 1)[1].split("},", 1)[0]
+        self.assertIn('aws_iam_role.fcvm_fleet_lambda_tile.arn', passrole)
+        self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', passrole)
+        self.assertNotIn('fcvm_fleet_lambda_operator', self.grant)
+        self.assertNotIn('"iam:AWSServiceName"', block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"'))
+
+    def test_only_central_terraform_can_change_the_single_gpu_provider(self):
+        provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
+        self.assertIn('allowed_instance_types = ["g4dn.xlarge"]', provider)
+        self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
+        self.assertRegex(provider, r'max_vcpu_count\s*= 4\b')
+        self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
+        capacity_actions = re.findall(r'"(lambda:[^"]*CapacityProvider[^"]*)"', self.grant)
+        self.assertEqual(set(capacity_actions), {"lambda:GetCapacityProvider", "lambda:PassCapacityProvider"})
+        self.assertIn("Resource = aws_lambda_capacity_provider.fcvm_fleet_spike.arn", self.grant)
+        security_group = block('resource "aws_security_group" "fcvm_fleet_lambda_tile"', self.source)
+        self.assertNotIn("ingress", security_group)
+        self.assertIn("aws_security_group.fcvm_fleet_lambda_tile.id", provider)
+        self.assertRegex(block('resource "aws_ssm_parameter" "fcvm_fleet"'), r'gpu_lambda\s*= local.fcvm_fleet_gpu_lambda')
+
+    def test_the_project_owns_exact_app_assets_without_changing_resource_policies(self):
+        runtime = block('resource "aws_iam_role_policy" "fcvm_fleet_lambda_tile_runtime"', self.source)
+        self.assertIn('["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', runtime)
+        self.assertIn('Resource = local.fcvm_lambda_repo_arn', runtime)
+        self.assertIn('Resource = "${local.fcvm_lambda_logs_arn}:log-stream:*"', runtime)
+        self.assertNotIn('Resource = "*"', runtime)
+        self.assertIn('"ecr:CreateRepository"', self.grant)
+        self.assertIn('"logs:CreateLogGroup"', self.grant)
+        self.assertIn('Resource = local.fcvm_lambda_repo_arn', self.grant)
+        self.assertIn('Resource = [local.fcvm_lambda_logs_arn, "${local.fcvm_lambda_logs_arn}:*"]', self.grant)
+        self.assertNotRegex(self.grant, r'ecr:(?:\*|SetRepositoryPolicy)|logs:PutResourcePolicy')
 
 
 class QuotaTests(unittest.TestCase):

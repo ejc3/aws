@@ -606,6 +606,7 @@ resource "aws_ssm_parameter" "fcvm_fleet" {
   value = jsonencode({
     account_id     = local.fcvm_fleet_account_id
     regions        = local.fcvm_fleet_regions
+    gpu_lambda     = local.fcvm_fleet_gpu_lambda
     home_region    = local.fcvm_fleet_home_region
     state_bucket   = aws_s3_bucket.fcvm_fleet_terraform_state.bucket
     terraform_role = aws_iam_role.fcvm_fleet_terraform.arn
