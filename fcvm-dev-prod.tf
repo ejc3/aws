@@ -29,9 +29,9 @@
 #                                             the coordinator reads them from (fcvm fleet/PROTOCOL.md, "Running it")
 
 variable "fcvm_fleet_prod_enabled" {
-  description = "Create the production fcvm fleet's Cloudflare resources (tunnel, Access, Turnstile) and their fleet secrets"
+  description = "Create the production fcvm fleet (fcvm.dev): its Cloudflare resources, fleet secrets and AWS stack. On since 2026-11-21."
   type        = bool
-  default     = false
+  default     = true
 
   # Both the Cloudflare routes and AWS resources use this input, including on targeted plans. It was refused until
   # ejc3/aws#922 retired the parent-zone DNS tokens and the staging certificates for fcvm.dev names (#929).

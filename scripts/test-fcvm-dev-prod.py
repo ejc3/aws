@@ -28,10 +28,11 @@ def headers(kind):
 
 
 class SwitchTests(unittest.TestCase):
-    def test_the_switch_defaults_off(self):
+    def test_the_switch_is_on(self):
+        # Turned on after #922 (owner, 2026-11-21). Turning it off again is this one line.
         var = block('variable "fcvm_fleet_prod_enabled"')
         self.assertIn("type        = bool", var)
-        self.assertIn("default     = false", var)
+        self.assertIn("default     = true", var)
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", CODE)
 
     def test_the_switch_has_no_validation_left_after_922(self):
