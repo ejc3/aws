@@ -2,7 +2,12 @@
 # operator publishes a function version. Pin the size here: IAM cannot cap MaxVCpuCount in a
 # CreateCapacityProvider call. GPU versions default to one minimum execution environment.
 locals {
-  fcvm_lambda_region       = "us-east-1"
+  fcvm_lambda_region        = "us-east-1"
+  fcvm_lambda_instance_type = "g4dn.xlarge"
+  fcvm_lambda_subnets = [
+    for az, id in module.fcvm_fleet_east1.subnet_ids_by_az : id
+    if contains(data.aws_availability_zones.fcvm_lambda.names, az) && contains(data.aws_ec2_instance_type_offerings.fcvm_lambda_gpu.locations, az)
+  ]
   fcvm_lambda_name         = "fcvm-lambda-tile"
   fcvm_lambda_function_arn = "arn:aws:lambda:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:function:${local.fcvm_lambda_name}"
   fcvm_lambda_repo_name    = "fcvm-fleet/lambda-tile"
@@ -82,11 +87,28 @@ resource "aws_security_group" "fcvm_fleet_lambda_tile" {
   }
 }
 
+# CreateCapacityProvider rejects use1-az3 (us-east-1e in this account). Use the physical AZ ID
+# because accounts can map that zone to different names. EC2 offerings are for the selected GPU.
+data "aws_availability_zones" "fcvm_lambda" {
+  provider         = aws.fcvm_fleet_east1
+  state            = "available"
+  exclude_zone_ids = ["use1-az3"]
+}
+
+data "aws_ec2_instance_type_offerings" "fcvm_lambda_gpu" {
+  provider      = aws.fcvm_fleet_east1
+  location_type = "availability-zone"
+  filter {
+    name   = "instance-type"
+    values = [local.fcvm_lambda_instance_type]
+  }
+}
+
 resource "aws_lambda_capacity_provider" "fcvm_fleet_spike" {
   provider = aws.fcvm_fleet_east1
   name     = "fcvm-lambda-spike"
   vpc_config {
-    subnet_ids         = module.fcvm_fleet_east1.subnet_ids
+    subnet_ids         = local.fcvm_lambda_subnets
     security_group_ids = [aws_security_group.fcvm_fleet_lambda_tile.id]
   }
   permissions_config {
@@ -94,11 +116,17 @@ resource "aws_lambda_capacity_provider" "fcvm_fleet_spike" {
   }
   instance_requirements {
     architectures          = ["x86_64"]
-    allowed_instance_types = ["g4dn.xlarge"]
+    allowed_instance_types = [local.fcvm_lambda_instance_type]
   }
   capacity_provider_scaling_config {
     scaling_mode   = "Auto"
     max_vcpu_count = 4 # One 4-vCPU T4 host for this spike.
+  }
+  lifecycle {
+    precondition {
+      condition     = length(local.fcvm_lambda_subnets) > 0
+      error_message = "The fleet has no Lambda-supported subnet offering the GPU Lambda instance type."
+    }
   }
   depends_on = [aws_iam_role_policy_attachment.fcvm_fleet_lambda_operator]
 }
