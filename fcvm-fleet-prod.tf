@@ -139,8 +139,7 @@ locals {
 }
 
 # ------------------------------------------------------------------------------------------------ the certificate
-# *.tiles.fcvm.dev (JSON: cert, key, scene_token). No value here: the coordinator issues the first certificate when the
-# secret has none, and adds the renderers' scene token (ejc3/fcvm src/fleet/coord/cert.rs, scene_token.rs).
+# The coordinator first reads a JSON object, then issues *.tiles.fcvm.dev and adds the renderers' scene token.
 resource "aws_secretsmanager_secret" "fcvm_fleet_prod_tls" {
   count                   = local.fcvm_fleet_prod
   provider                = aws.fcvm_fleet
@@ -148,6 +147,22 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_prod_tls" {
   description             = "Wildcard TLS certificate for *.tiles.fcvm.dev, the prod fleet's launch names (JSON: cert, key, scene_token). Issued and renewed by the prod coordinator; see fcvm-fleet-prod.tf."
   recovery_window_in_days = 7
   tags                    = merge(local.fcvm_fleet_prod_tags, { Name = local.fcvm_fleet_prod_stack.tls_secret, Project = "fcvm-fleet" })
+}
+
+# Only a pristine secret needs a seed. Later versions belong to the coordinator and never enter Terraform state.
+resource "terraform_data" "fcvm_fleet_prod_tls_bootstrap" {
+  count            = local.fcvm_fleet_prod
+  triggers_replace = aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].arn
+
+  provisioner "local-exec" {
+    working_dir = path.module
+    command     = "python3 -I scripts/fcvm-prod-tls-seed.py"
+    environment = {
+      PROD_TLS_ARN = aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].arn
+      FLEET_REGION = local.fcvm_fleet_home_region
+      FLEET_ROLE   = local.fcvm_fleet_access_role_arn
+    }
+  }
 }
 
 # Whatever any other identity's IAM policy says, only prod's coordinator, hosts and tiles (and the role Terraform
@@ -952,6 +967,7 @@ resource "aws_ecs_service" "fcvm_fleet_prod_coordinator" {
   depends_on = [
     ephemeral.aws_ssm_parameter.fcvm_fleet_prod_coordinator_release_guard,
     aws_lb_listener.fcvm_fleet_prod_dns,
+    terraform_data.fcvm_fleet_prod_tls_bootstrap,
     aws_secretsmanager_secret_version.fcvm_fleet_prod_broadcast,
     aws_secretsmanager_secret_version.fcvm_fleet_prod_turnstile,
     aws_secretsmanager_secret_version.fcvm_fleet_prod_coordinator_tunnel,
