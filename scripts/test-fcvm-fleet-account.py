@@ -378,12 +378,12 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertNotIn('fcvm_fleet_lambda_operator', self.grant)
         self.assertNotIn('"iam:AWSServiceName"', block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"'))
 
-    def test_only_central_terraform_can_change_the_single_gpu_provider(self):
+    def test_only_central_terraform_can_change_the_three_host_gpu_ceiling(self):
         provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
         self.assertIn('allowed_instance_types = [local.fcvm_lambda_instance_type]', provider)
         self.assertRegex(self.source, r'fcvm_lambda_instance_type\s*= "g4dn.xlarge"')
         self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
-        self.assertRegex(provider, r'max_vcpu_count\s*= 4\b')
+        self.assertRegex(provider, r'max_vcpu_count\s*= 12\b')
         self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
         capacity_actions = re.findall(r'"(lambda:[^"]*CapacityProvider[^"]*)"', self.grant)
         self.assertEqual(set(capacity_actions), {"lambda:GetCapacityProvider", "lambda:PassCapacityProvider"})
