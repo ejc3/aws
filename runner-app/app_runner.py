@@ -1126,8 +1126,11 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             del claimed[job]
     if job_id in claimed:
         return 'claimed', token
-    if (cfg.get('org_group') or any(tag(i, 'JobId') == job_id for i in listed + live)) and not still_waiting(repo, job_id, pat):
-        return 'not queued', token
+    queued = None
+    if cfg.get('org_group') or any(tag(i, 'JobId') == job_id for i in listed + live):
+        queued = queued_job(repo, job_id, pat)
+        if not queued:
+            return 'not queued', token
     max_hosts, max_vcpus, mode = int(cfg['max']), cfg.get('max_vcpus'), ''
     if budget:
         # Refill and drain to now, and decide the mode counting the host this job would add.
@@ -1164,7 +1167,7 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
             return 'cap', token
     if budget and (state['throttled'] or cfg.get('org_group')):
         outcome = group_capacity_check(repo, cfg, budget, repos, group_listed, running,
-                                       unseen, claimed, size, job_id, mode, state['throttled'])
+                                       unseen, claimed, size, job_id, mode, state['throttled'], pat, queued)
         if outcome:
             return outcome, token
     nonce = claim(repo, job_id, need)
@@ -1194,17 +1197,64 @@ def ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token=None, busy=
     return 'failed', token
 
 
-def still_waiting(repo, job_id, pat):
-    """True when GitHub's record of the job says it is queued and no runner has been assigned to it."""
+def queued_job(repo, job_id, pat):
+    """The current GitHub record when the job is queued and has no assigned runner."""
     job = github('GET', f'/repos/{repo}/actions/jobs/{job_id}', pat)
     if job.get('status') == 'queued' and not job.get('runner_name'):
-        return True
+        return job
     print(f"{repo}: job {job_id} is listed as queued but its record says {job.get('status')} "
-          f"on {job.get('runner_name') or 'no runner'}; it had a host already, so nothing is launched")
-    return False
+          f"on {job.get('runner_name') or 'no runner'}")
+    return None
 
 
-def group_capacity_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode, throttled):
+# Four two-minute reconciles can renew a genuine wait. If its repository stops being
+# served or cannot reach GitHub, its reservation cannot keep other jobs out indefinitely.
+GROUP_WAIT_SECONDS = 8 * 60
+
+
+def waiting_for_group(group, repos, repo, job_id, need, free, cap, pat, queued):
+    """Preserve headroom for the oldest observed eligible job blocked by a shared throttled cap."""
+    key = {'group': {'S': 'waiting/' + group}}
+    table = {'TableName': BUDGET_TABLE}
+    item = dynamodb.get_item(**table, Key=key, ConsistentRead=True).get('Item', {})
+    now_s = int(now().timestamp())
+    owner = item.get('repo', {}).get('S')
+    waiting = owner in repos and repos[owner].get('budget_group') == group and int(item['expires']['N']) > now_s
+    own_wait = waiting and (owner, item['job']['S']) == (repo, job_id)
+    # A younger job can run alongside the reserved size. A stale reservation is harmless here.
+    if free >= need and not own_wait and (not waiting or free - need >= int(item['vcpus']['N'])):
+        return None
+    queued = queued or queued_job(repo, job_id, pat)
+    if not queued:
+        return 'not queued'
+    created = parse_time(queued.get('created_at'))
+    age_key = (int(created.timestamp()) if created else now_s, int(job_id))
+    active = waiting
+    if waiting and not own_wait and age_key >= (int(item['created']['N']), int(item['job']['S'])):
+        # Check the reservation only when it would block this candidate. Completion,
+        # cancellation or GitHub assigning a runner immediately gives the capacity back.
+        token = pat if owner == repo else repo_pat(repos[owner])
+        try:
+            active = token and queued_job(owner, item['job']['S'], token)
+        except urllib.error.HTTPError as error:
+            if error.code not in (404, 410):
+                raise
+            active = None
+        if active:
+            print(f"{repo}: job {job_id} waits for {owner} job {item['job']['S']} ({item['vcpus']['N']} reserved vCPUs)")
+            return 'cap'
+    # The controller has reserved concurrency one. This row is separate from the
+    # spend bucket, so a refill cannot overwrite it. Only a fresh live job renews it.
+    if free < need:
+        dynamodb.put_item(**table, Item={**key, 'repo': {'S': repo}, 'job': {'S': job_id},
+            'created': {'N': item['created']['N'] if own_wait else str(age_key[0])},
+            'vcpus': {'N': str(min(need, cap))}, 'expires': {'N': str(now_s + GROUP_WAIT_SECONDS)}})
+    elif waiting and (own_wait or not active):
+        dynamodb.put_item(**table, Item=key)
+    return None
+
+
+def group_capacity_check(repo, cfg, group, repos, group_listed, running, unseen, claimed, size, job_id, mode, throttled, pat, queued):
     """Count all sponsors' hosts and unseen claims before enforcing the group's shared limit.
 
     Counted like the per-repo vCPU cap, across the group: every live host of every member (each once, by its own
@@ -1230,9 +1280,15 @@ def group_capacity_check(repo, cfg, group, repos, group_listed, running, unseen,
     if cfg.get('org_group') and len(hosts) + len(unseen) + others >= DOLPHIN_GROUP_MAX_HOSTS:
         print(f"{repo}: at its shared pool cap of {DOLPHIN_GROUP_MAX_HOSTS} hosts; job {job_id} waits{mode}")
         return 'cap'
-    if not hosts and not unseen and not others:
-        return None   # the group holds nothing: one host of any size
-    if used + need > cap:
+    empty = not hosts and not unseen and not others
+    if throttled and len(group_repos(group, repos)) > 1:
+        # The empty-pool exception still admits an oversized job, but cannot
+        # let a later job take the last room reserved for an older one.
+        outcome = waiting_for_group(group, repos, repo, job_id, min(need, cap) if empty else need,
+                                    cap - used, cap, pat, queued)
+        if outcome:
+            return outcome
+    if not empty and used + need > cap:
         limit = 'throttled cap' if throttled else 'shared pool cap'
         print(f"{repo}: at its group's {limit} of {cap} vCPUs ({used} in use across budget {group}, an {size} "
               f"runner needs {need}); job {job_id} waits{mode}")
