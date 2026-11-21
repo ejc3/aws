@@ -58,7 +58,7 @@ class GuardrailTests(unittest.TestCase):
                           "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
             if f.name in {"fcvm-fleet-alarms.tf", "fcvm-fleet-budget.tf", "fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf",
-                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf"}:
+                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf"}:
                 # Fleet-owned: every resource that names the fleet account is created inside it.
                 for r in re.finditer(r'^resource "\w+" "\w+" \{\n.*?^\}', f.read_text(), re.S | re.M):
                     if "local.fcvm_fleet_account_id" in r.group():
@@ -138,7 +138,7 @@ class GpuboxRoleTests(unittest.TestCase):
     def test_no_administrator_access_and_no_other_policy_on_the_role(self):
         self.assertNotIn("policy/AdministratorAccess", TF)
         attached = re.findall(r'role\s+= aws_iam_role\.fcvm_fleet_terraform\.(?:name|id)', TF)
-        self.assertEqual(len(attached), 2, "the gpubox allow list and the G admission deny, nothing else")
+        self.assertEqual(len(attached), 3, "the gpubox allow list, the G admission deny and the observe policy, nothing else")
 
     def test_every_allowed_action_is_a_gpubox_call(self):
         stmts = self.statements()
@@ -206,6 +206,98 @@ class GpuboxRoleTests(unittest.TestCase):
         self.assertNotIn("secretsmanager", pol)
         self.assertIn("role     = aws_iam_role.fcvm_fleet_gpubox.name", block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
         self.assertIn('name     = "fcvm-fleet-gpubox"', block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
+
+
+class ObserveTests(unittest.TestCase):
+    """fcvm-arm reads the coordinators and runs the Spot drill (#942); nothing that names a secret, no other write."""
+
+    def test_arm_invokes_only_the_guard_and_has_no_fis_actions(self):
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe"')
+        self.assertIn("role     = aws_iam_role.fcvm_fleet_terraform.name", pol)
+        action_fields = re.findall(r'\bAction\s*=\s*(\[[^\]]*\]|"[^"]+")', pol)
+        actions = {name for field in action_fields for name in re.findall(r'"([^"]+)"', field)}
+        self.assertEqual(actions, {"ecs:DescribeClusters", "ecs:DescribeServices", "ecs:ListServices", "ecs:ListTasks",
+                                   "ecs:DescribeTasks", "logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams",
+                                   "lambda:InvokeFunction"})
+        self.assertIn("for broker in aws_lambda_function.fcvm_fleet_prod_spot_drill", pol)
+        self.assertIn("Resource = broker.arn", pol)
+
+    def test_drill_guard_serializes_its_receipt_and_stops_only_its_experiments(self):
+        drill = (ROOT / "fcvm-fleet-prod-drills.tf").read_text()
+        guard = block('resource "aws_lambda_function" "fcvm_fleet_prod_spot_drill"', drill)
+        self.assertIn("reserved_concurrent_executions = 1", guard)
+        self.assertIn("aws_s3_object.fcvm_fleet_prod_spot_drill[0].key", guard)
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_spot_drill_guard"', drill)
+        self.assertIn('/${local.fcvm_prod_drill_state}', pol)
+        self.assertIn('experiment-template/${aws_fis_experiment_template.fcvm_fleet_prod_spot_drill[0].id}', pol)
+        stop = pol.split('"fis:StopExperiment"', 1)[1].split('},\n', 1)[0]
+        self.assertIn('Resource  = local.fcvm_prod_drill_exp_arn', stop)
+        self.assertIn('"aws:ResourceTag/Drill" = "fcvm-fleet-prod-spot"', stop)
+        self.assertNotIn('fis:UpdateExperimentTemplate', pol)
+        self.assertNotIn('ec2:SendSpotInstanceInterruptions', pol)
+
+    def test_the_drill_interrupts_one_running_prod_host_only(self):
+        drill = (ROOT / "fcvm-fleet-prod-drills.tf").read_text()
+        linked_role = block('resource "aws_iam_service_linked_role" "fcvm_fleet_fis"', drill)
+        self.assertIn('aws_service_name = "fis.amazonaws.com"', linked_role)
+        trust = block('resource "aws_iam_role" "fcvm_fleet_prod_spot_drill"', drill)
+        self.assertIn('"aws:SourceAccount" = local.fcvm_fleet_account_id', trust)
+        self.assertIn('"aws:SourceArn" = "arn:aws:fis:us-east-1:${local.fcvm_fleet_account_id}:experiment/*"', trust)
+        role = block('resource "aws_iam_role_policy" "fcvm_fleet_prod_spot_drill"', drill)
+        self.assertIn('"ec2:ResourceTag/Fleet"   = "prod"', role)
+        self.assertIn('"ec2:ResourceTag/Purpose" = "fcvm-fleet-host"', role)
+        self.assertEqual(set(re.findall(r'"(ec2:[A-Za-z]+)"', role)), {"ec2:SendSpotInstanceInterruptions", "ec2:DescribeInstances"})
+        tpl = block('resource "aws_fis_experiment_template" "fcvm_fleet_prod_spot_drill"', drill)
+        self.assertIn("aws_iam_service_linked_role.fcvm_fleet_fis,", tpl)
+        self.assertIn("aws_iam_role_policy.fcvm_fleet_prod_spot_drill,", tpl)
+        self.assertIn('selection_mode = "COUNT(1)"', tpl)
+        self.assertIn('action_id = "aws:ec2:send-spot-instance-interruptions"', tpl)
+        self.assertRegex(tpl, r'key\s+= "Fleet"\n\s+value = "prod"')
+
+    def test_the_dev_box_reads_and_simulates_only_the_fcvm_ci_roles(self):
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)
+        stmt = grant.split('Sid       = "ReadTheFcvmCiRoles"', 1)[1].split("}, {", 1)[0]
+        self.assertEqual(set(re.findall(r'"(iam:[A-Za-z]+)"', stmt)), {"iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies",
+                                                                     "iam:ListAttachedRolePolicies", "iam:SimulatePrincipalPolicy"})
+        self.assertIn('for r in ["fcvm-stage-ci", "fcvm-prod-ci"]', stmt)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
+
+    def test_ecs_actions_are_limited_to_the_two_coordinator_clusters(self):
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe"')
+        clusters = "local.fcvm_fleet_observed_clusters"
+        cluster_arns = "local.fcvm_fleet_observed_cluster_arns"
+        ecs = "${local.fcvm_fleet_observed_ecs}"
+        self.assertRegex(TF, r'fcvm_fleet_observed_clusters\s*= \[local\.fcvm_fleet_stacks\.stage\.prefix, local\.fcvm_fleet_stacks\.prod\.prefix\]')
+        self.assertRegex(TF, r'fcvm_fleet_observed_ecs\s*= "arn:aws:ecs:\$\{local\.fcvm_fleet_home_region\}:\$\{local\.fcvm_fleet_account_id\}"')
+        self.assertIn(f'[for c in {clusters} : "{ecs}:cluster/${{c}}"]', TF)
+        resources = {
+            'ecs:DescribeClusters': cluster_arns,
+            'ecs:ListServices': '"*"',
+            'ecs:DescribeServices': f'[for c in {clusters} : "{ecs}:service/${{c}}/${{c}}-coordinator"]',
+            'ecs:ListTasks': f'[for c in {clusters} : "{ecs}:container-instance/${{c}}/*"]',
+            'ecs:DescribeTasks': f'[for c in {clusters} : "{ecs}:task/${{c}}/*"]',
+        }
+        for action, resource in resources.items():
+            with self.subTest(action=action):
+                stmt = next(s for s in pol.split('\n      },') if f'"{action}"' in s)
+                self.assertRegex(stmt, r'Action\s+= "' + re.escape(action) + '"')
+                self.assertRegex(stmt, r'(?m)^ *Resource\s+= ' + re.escape(resource) + r'$')
+                if action.startswith('ecs:List'):
+                    self.assertIn('ArnEquals = { "ecs:cluster" = ' + cluster_arns + ' }', stmt)
+        self.assertIn(f'[for c in {clusters} :\n        "arn:aws:logs:${{local.fcvm_fleet_home_region}}:'
+                      '${local.fcvm_fleet_account_id}:log-group:/ecs/${c}-coordinator:*"]', pol)
+
+    def test_the_dev_box_reads_only_the_two_prod_release_log_groups_in_the_management_region(self):
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)
+        stmt = grant.split('"ReadTheFcvmReleaseLogs"', 1)[1].split("}, {", 1)[0]
+        self.assertEqual(set(re.findall(r'"(logs:[A-Za-z]+)"', stmt)), {"logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"})
+        resource = re.search(r'Resource\s+= \[(.*?)\]', stmt, re.S).group(1)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', resource)), {
+            'arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/' + name + ':*'
+            for name in ('fcvm-coordinator-release-prod', 'fcvm-fleet-ami-prod-release')
+        })
+        self.assertNotIn("lambda:", stmt)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
 
 
 class QuotaTests(unittest.TestCase):

@@ -403,6 +403,72 @@ resource "aws_iam_instance_profile" "fcvm_fleet_gpubox" {
   role     = aws_iam_role.fcvm_fleet_gpubox.name
 }
 
+# What fcvm-arm reads to verify the fleet (owner, 2026-11-21: "If you can't read something ask for perms"): the
+# coordinators' ECS services and tasks and their logs, and the guarded Spot reclaim drill (fcvm-fleet-prod-drills.tf), which it
+# may invoke locally in the fleet account. No task definition (it names the secrets), no secret, no write besides the drill.
+locals {
+  fcvm_fleet_observed_clusters     = [local.fcvm_fleet_stacks.stage.prefix, local.fcvm_fleet_stacks.prod.prefix]
+  fcvm_fleet_observed_ecs          = "arn:aws:ecs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}"
+  fcvm_fleet_observed_cluster_arns = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:cluster/${c}"]
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
+  provider = aws.fcvm_fleet
+  name     = "observe-the-coordinators-and-run-the-spot-drill"
+  role     = aws_iam_role.fcvm_fleet_terraform.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Sid      = "TheCoordinatorClusters"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeClusters"
+        Resource = local.fcvm_fleet_observed_cluster_arns
+      },
+      {
+        # ListServices has no resource type. ECS supplies the cluster ARN as a condition key.
+        Sid       = "ListTheCoordinatorServices"
+        Effect    = "Allow"
+        Action    = "ecs:ListServices"
+        Resource  = "*"
+        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
+      },
+      {
+        Sid      = "TheCoordinatorServices"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeServices"
+        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:service/${c}/${c}-coordinator"]
+      },
+      {
+        # ECS authorizes ListTasks against container-instance resources, including for a Fargate service.
+        Sid       = "ListTheCoordinatorTasks"
+        Effect    = "Allow"
+        Action    = "ecs:ListTasks"
+        Resource  = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:container-instance/${c}/*"]
+        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
+      },
+      {
+        Sid      = "TheCoordinatorTasks"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTasks"
+        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:task/${c}/*"]
+      },
+      {
+        Sid    = "TheCoordinatorLogs"
+        Effect = "Allow"
+        Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+        Resource = [for c in local.fcvm_fleet_observed_clusters :
+        "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/ecs/${c}-coordinator:*"]
+      },
+      ], [for broker in aws_lambda_function.fcvm_fleet_prod_spot_drill : {
+        Sid      = "InvokeTheProdSpotDrill"
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = broker.arn
+    }])
+  })
+}
+
 # Every G launch in us-east-1 by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which
 # leaves the wall's GPU host its room in the account's G vCPU quotas and tags the launch
 # fcvm-admission=wall-reserve. A launch without the tag is a copy of gpubox.sh or build-ami.sh

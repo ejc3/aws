@@ -219,6 +219,24 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Resource  = aws_iam_role.fcvm_fleet_terraform.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
       }, {
+      # The two functions invoked by a prod promotion run in the management account (fcvm-fleet-prod-ci.tf).
+      Sid    = "ReadTheFcvmReleaseLogs"
+      Effect = "Allow"
+      Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+      Resource = [
+        "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/fcvm-coordinator-release-prod:*",
+        "arn:aws:logs:us-west-1:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/fcvm-fleet-ami-prod-release:*",
+      ]
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      # The fcvm CI roles' policies, read and simulated, so fcvm-arm can say why a promotion was refused
+      # (2026-11-21: AccessDeniedException invoking the prod release functions). Read only.
+      Sid       = "ReadTheFcvmCiRoles"
+      Effect    = "Allow"
+      Action    = ["iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies", "iam:SimulatePrincipalPolicy"]
+      Resource  = [for r in ["fcvm-stage-ci", "fcvm-prod-ci"] : "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/${r}"]
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
       Sid       = "ReadTheFcvmFleetPointerOnly"
       Effect    = "Allow"
       Action    = "ssm:GetParameter"
