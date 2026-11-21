@@ -34,18 +34,16 @@ class SwitchTests(unittest.TestCase):
         self.assertIn("default     = false", var)
         self.assertIn("fcvm_fleet_prod             = var.fcvm_fleet_prod_enabled ? 1 : 0", CODE)
 
-    def test_the_switch_has_no_validation_left_after_922(self):
+    def test_prod_activation_is_blocked_pending_staging_budget_evidence(self):
         var = block('variable "fcvm_fleet_prod_enabled"')
-        # #922 is done: the switch accepts true, with no validation left that refuses it.
-        self.assertNotIn("validation", var)
+        self.assertRegex(var, r"validation \{\s*condition\s*= !var\.fcvm_fleet_prod_enabled\s*\n")
+        self.assertIn("three complete UTC days", var)
+        self.assertIn("ejc3/aws#922", var)
 
-    def test_the_guard_is_gone_only_while_no_token_here_can_write_fcvm_dev(self):
-        # Why the activation guard could be removed (#922): no Cloudflare token minted by this repository names the
-        # fcvm.dev zone or holds DNS Write (4755a26e..., Cloudflare's zone-level group), so no dev or staging credential can change production's DNS or answer
-        # a DNS-01 challenge for its names. A token like that coming back must bring the guard back with it.
-        import re
+    def test_cloudflare_tokens_do_not_reintroduce_retired_dns_permissions(self):
+        # Check the parent-zone and DNS Write references used by the retired Terraform tokens, even under a new name.
         for path in sorted(ROOT.glob("*.tf")):
-            text = path.read_text()
+            text = code(path.read_text()) + "\n"
             for m in re.finditer(r'resource "cloudflare_(?:account|api)_token" "(\w+)" \{', text):
                 body = text[m.start():text.index("\n}\n", m.start())]
                 for needle in ("fcvm_dev_zone_id", "dns_write", "4755a26eedb94da69e1066d98aa820be", "DNS Write"):

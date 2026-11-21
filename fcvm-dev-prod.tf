@@ -33,8 +33,11 @@ variable "fcvm_fleet_prod_enabled" {
   type        = bool
   default     = false
 
-  # Both the Cloudflare routes and AWS resources use this input, including on targeted plans. It was refused until
-  # ejc3/aws#922 retired the parent-zone DNS tokens and the staging certificates for fcvm.dev names (#929).
+  # Targeted plans for the Cloudflare routes and the AWS fleet must enforce the same activation guard.
+  validation {
+    condition     = !var.fcvm_fleet_prod_enabled
+    error_message = "Before enabling production, record three complete UTC days of matching staging costs in the original and staging-only budgets on ejc3/aws#922."
+  }
 }
 
 locals {
