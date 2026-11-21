@@ -3,8 +3,8 @@
 # serves books/<id>.json only behind the staging-Workers Access application (workers-stage.tf).
 # The bucket has no public r2.dev URL. A book is built on fcvm-arm from the owner's test leagues
 # (read-only provider captures that never enter a repository) and uploaded with the bucket-scoped
-# token below, which is written only to the fantasy/books-upload secret. Rotate with
-# `terraform apply -replace=cloudflare_account_token.fantasy_books_r2`; the same apply rewrites the secret.
+# credential in fantasy/books-upload. The protected Terraform state also contains the credential.
+# See "Open Fantasy staging books" in README.md for token rotation.
 
 locals {
   fantasy_books_bucket = "fantasy-stage-books"
