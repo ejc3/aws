@@ -234,6 +234,14 @@ class ObserveTests(unittest.TestCase):
         self.assertIn('action_id = "aws:ec2:send-spot-instance-interruptions"', tpl)
         self.assertRegex(tpl, r'key\s+= "Fleet"\n\s+value = "prod"')
 
+    def test_the_dev_box_reads_and_simulates_only_the_fcvm_ci_roles(self):
+        grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)
+        stmt = grant.split('Sid       = "ReadTheFcvmCiRoles"', 1)[1].split("}, {", 1)[0]
+        self.assertEqual(set(re.findall(r'"(iam:[A-Za-z]+)"', stmt)), {"iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies",
+                                                                     "iam:ListAttachedRolePolicies", "iam:SimulatePrincipalPolicy"})
+        self.assertIn('for r in ["fcvm-stage-ci", "fcvm-prod-ci"]', stmt)
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
+
     def test_the_dev_box_reads_only_fcvm_lambda_logs_in_this_account(self):
         grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)
         stmt = grant.split('Sid       = "ReadTheFcvmReleaseLogs"', 1)[1].split("}, {", 1)[0]
