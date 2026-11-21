@@ -60,11 +60,11 @@ class GrantTests(unittest.TestCase):
         # Every instance profile's role is attached here, already has every anthropic.* model (dev_server),
         # is an administrator (jumpbox_admin), is a CI machine, is the Mac (SSM channels only), or is in the
         # Dolphin account (dolphin_redis, which calls no model), or is in the fcvm-fleet account
-        # (its runtime hosts, tiles and isolated image factory call no model), or is the boot-race ECS
+        # (its runtime hosts, tiles, gpuboxes and isolated image factory call no model), or is the boot-race ECS
         # container instance or dedicated benchmark driver worker (neither calls Bedrock models).
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "runner_app_image_builder",
                     "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile",
-                    "fcvm_fleet_prod_host", "fcvm_fleet_prod_tile", "fcvm_ami_builder",
+                    "fcvm_fleet_prod_host", "fcvm_fleet_prod_tile", "fcvm_fleet_gpubox", "fcvm_ami_builder",
                     "boot_race_ecs_host", "benchmark_worker"}
         profile_roles = set()
         for tf in ROOT.glob("*.tf"):
