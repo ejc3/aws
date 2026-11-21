@@ -113,6 +113,8 @@ jobs:
         run: python3 -S -B scripts/test-dolphin-site-probe.py
       - name: Dolphin Maps road tiles (private R2, bucket-only credentials in a main-only environment)
         run: python3 -S -B scripts/test-dolphin-maps-tiles.py
+      - name: Open Fantasy staging books (private R2, a bucket-only token read by fcvm-arm)
+        run: python3 -S -B scripts/test-fantasy-books.py
       - name: browser-manager tunnel rotation (browser-manager.tf)
         run: python3 -S -B scripts/test-browser-manager-tunnel.py
 

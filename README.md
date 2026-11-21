@@ -2685,6 +2685,14 @@ step here: `games-mp-migrate` applies every file under its `supabase/migrations`
 merges to `main`, before that release is promoted (`docs/games-multiplayer.md`, "Site
 migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
 
+### Open Fantasy staging books
+
+`fantasy-books.tf` creates the private `fantasy-stage-books` R2 bucket (no public URL) that the staging Worker
+`fantasy-stage` binds as `BOOKS` in a later constellation change, serving `books/<id>.json` only behind the
+staging-Workers Access application. Its bucket-only object Read/Write token goes only to the `fantasy/books-upload`
+secret in us-west-1, readable by the administration set and by dev-server-role on fcvm-arm's instance, where the books
+are built from the owner's test leagues and uploaded. The bucket and the one-time credential have replacement guards.
+
 ### Dolphin Maps road tiles
 
 `dolphin-maps-tiles.tf` creates the private `dolphin-maps-tiles` R2 bucket for nationwide road tiles under
