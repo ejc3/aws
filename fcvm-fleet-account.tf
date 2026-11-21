@@ -287,16 +287,29 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
         Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
       },
       {
-        Sid       = "TagAtLaunch"
-        Effect    = "Allow"
-        Action    = "ec2:CreateTags"
-        Resource  = "*"
-        Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances", "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+        Sid      = "TagAtLaunch"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Purpose", "Owner", "LeaseUntil", "Market", "fcvm-admission"] }
+        }
       },
       {
-        Sid       = "TagAndEndOnlyGpuboxes"
+        Sid      = "ExtendOnlyGpuboxLeases"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["LeaseUntil"] }
+        }
+      },
+      {
+        Sid       = "EndOnlyGpuboxes"
         Effect    = "Allow"
-        Action    = ["ec2:CreateTags", "ec2:TerminateInstances"]
+        Action    = "ec2:TerminateInstances"
         Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
         Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
       },
@@ -359,6 +372,18 @@ resource "aws_iam_role_policy" "fcvm_fleet_gpubox" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
+      # ManagedInstanceCore grants GetParameter and GetParameters on "*". Keep SSM command delivery
+      # and AWS's public AMI parameters while excluding other account parameters from the effective grant.
+      {
+        Sid    = "DenyUnrelatedParameters"
+        Effect = "Deny"
+        Action = "ssm:GetParameter*"
+        NotResource = [
+          "arn:aws:ssm:*::parameter/aws/service/*",
+          "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release",
+          "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release-copies",
+        ]
+      },
       { Sid = "ReadReleaseArtifacts", Effect = "Allow", Action = "s3:GetObject", Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/*" },
       { Sid = "ListReleaseArtifacts", Effect = "Allow", Action = "s3:ListBucket", Resource = aws_s3_bucket.fcvm_fleet_assets.arn },
     ]

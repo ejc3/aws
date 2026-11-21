@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 """Offline tests for fcvm-fleet-account.tf: the fcvm-fleet member account (ejc3/aws#604) and its G spot quotas (#605)."""
-import json
 import re
 import unittest
 from pathlib import Path
@@ -150,11 +149,41 @@ class GpuboxRoleTests(unittest.TestCase):
     def test_instance_actions_need_the_gpubox_tag(self):
         s = self.statements()
         self.assertIn('"aws:RequestTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["LaunchOnlyGpuboxes"])
-        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["TagAndEndOnlyGpuboxes"])
+        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["EndOnlyGpuboxes"])
         self.assertIn('"ssm:resourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["RunCommandsOnlyOnGpuboxes"])
         self.assertIn('"ec2:CreateAction" = "RunInstances"', s["TagAtLaunch"])
         self.assertRegex(s["TheShellDocument"], r'Resource\s+= "arn:aws:ssm:\*::document/AWS-RunShellScript"')
         self.assertIn('fcvm_fleet_gpubox_purpose = "fcvm-fleet-gpubox"', TF)
+
+    def test_only_the_lease_tag_can_be_changed_after_launch(self):
+        statements = self.statements()
+        tag_writers = {sid for sid, stmt in statements.items() if "ec2:CreateTags" in self.actions(stmt)}
+        self.assertEqual(tag_writers, {"TagAtLaunch", "ExtendOnlyGpuboxLeases"})
+        for sid, keys in (("TagAtLaunch", {"Purpose", "Name", "Owner", "LeaseUntil", "Market", "fcvm-admission"}),
+                          ("ExtendOnlyGpuboxLeases", {"LeaseUntil"})):
+            stmt = statements[sid]
+            self.assertIn(':instance/*"', stmt)
+            allowed = re.search(r'"ForAllValues:StringEquals"\s*=\s*\{ "aws:TagKeys" = \[(.*?)\]', stmt)
+            self.assertIsNotNone(allowed)
+            self.assertEqual(set(re.findall(r'"([^"]+)"', allowed[1])), keys)
+        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', statements["ExtendOnlyGpuboxLeases"])
+
+    def test_ssm_agent_core_cannot_read_unrelated_parameters(self):
+        attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_gpubox_ssm"')
+        self.assertIn("aws_iam_role.fcvm_fleet_gpubox.name", attachment)
+        self.assertIn("policy/AmazonSSMManagedInstanceCore", attachment)
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
+        self.assertIn("aws_iam_role.fcvm_fleet_gpubox.id", policy)
+        deny = re.search(r'Sid\s+= "DenyUnrelatedParameters"(.*?)\n      \}', policy, re.S)
+        self.assertIsNotNone(deny)
+        self.assertRegex(deny[1], r'Effect\s+= "Deny"')
+        self.assertRegex(deny[1], r'Action\s+= "ssm:GetParameter\*"')
+        exceptions = re.search(r'NotResource\s+= \[(.*?)\]', deny[1], re.S)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', exceptions[1])), {
+            "arn:aws:ssm:*::parameter/aws/service/*",
+            "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release",
+            "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release-copies",
+        })
 
     def test_it_passes_only_the_gpubox_role_and_writes_only_the_gpubox_prefix(self):
         s = self.statements()
