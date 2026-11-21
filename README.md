@@ -800,6 +800,38 @@ us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
         +-> AWS Backup -> us-east-1 DR vault + dev-staging account vault
 ```
 
+### Apply project AWS changes from fcvm-arm
+
+Use `~/bin/fcvm-fleet-ops` on `fcvm-arm`. It discovers the fleet account from
+`/infra/fcvm-fleet` and assumes the instance-bound project role for each command.
+Fleet agents own the Terraform in `ejc3/fcvm` under `fleet/ops/terraform`.
+Changes to project log groups, retention and Parameter Store settings under
+`/fcvm/ops/` in `us-east-2` can go from merged project code to AWS directly on ARM.
+The project has its own versioned state and S3 lock.
+
+Use a clean checkout of the merged fcvm revision. The installed helper defaults
+to a dedicated checkout, leaving interactive worktrees available for development.
+To use another checkout, set `FCVM_REPO` to its absolute path.
+
+```bash
+git -C "$HOME/.local/share/fcvm-fleet-ops/fcvm" pull --ff-only
+ops="$HOME/bin/fcvm-fleet-ops"
+"$ops" terraform init
+plan_dir=$(mktemp -d)
+"$ops" terraform plan -out="$plan_dir/fleet.tfplan"
+"$ops" terraform apply "$plan_dir/fleet.tfplan"
+"$ops" terraform plan -detailed-exitcode
+```
+
+`quota` reports the regional GPU Spot quota and request history.
+`budget status` reads the production drill selection. During a planned budget
+rehearsal, `budget trip` selects the $1 ceiling for the current UTC date.
+`budget restore` clears that selection. A coordinator that has already tripped
+stays asleep until the next UTC day. Use its live spend and power telemetry to
+confirm it observed the selection. Release and rollback use the fcvm repository's
+existing workflows. The jumpbox continues to own shared infrastructure, IAM and
+the production spending backstop.
+
 ### Production Spot interruption drill
 
 On `fcvm-arm`, use the fleet credentials for `fcvm-fleet-terraform`, the same role

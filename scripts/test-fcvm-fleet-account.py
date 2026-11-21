@@ -137,8 +137,16 @@ class GpuboxRoleTests(unittest.TestCase):
 
     def test_no_administrator_access_and_no_other_policy_on_the_role(self):
         self.assertNotIn("policy/AdministratorAccess", TF)
-        attached = re.findall(r'role\s+= aws_iam_role\.fcvm_fleet_terraform\.(?:name|id)', TF)
-        self.assertEqual(len(attached), 3, "the gpubox allow list, the G admission deny and the observe policy, nothing else")
+        attached = set()
+        for path in ROOT.glob("*.tf"):
+            source = path.read_text()
+            for header in re.findall(r'resource "aws_iam_role_policy(?:_attachment)?" "[^"]+"', source):
+                if re.search(r'\brole\s*=\s*aws_iam_role\.fcvm_fleet_terraform\.(?:name|id)', block(header, source)):
+                    attached.add(header.split('"')[3])
+        self.assertEqual(attached, {
+            "fcvm_fleet_terraform_gpubox", "fcvm_fleet_terraform_g_admission", "fcvm_fleet_terraform_observe",
+            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops",
+        })
 
     def test_every_allowed_action_is_a_gpubox_call(self):
         stmts = self.statements()
@@ -197,15 +205,68 @@ class GpuboxRoleTests(unittest.TestCase):
     def test_secrets_iam_and_what_workloads_run_are_denied_by_name(self):
         deny = self.statements()["NeverSecretsIamOrWhatWorkloadsRun"]
         self.assertRegex(deny, r'Effect\s+= "Deny"')
-        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:PutParameter", "ssm:StartSession",
+        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:StartSession",
                        "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"):
             self.assertIn(f'"{action}"', deny)
+        self.assertNotIn('"ssm:PutParameter"', deny)
+        scoped_deny = self.statements()["NeverWriteOtherParameters"]
+        self.assertRegex(scoped_deny, r'Effect\s+= "Deny"')
+        self.assertEqual(self.actions(scoped_deny), {"ssm:PutParameter"})
+        self.assertRegex(scoped_deny, r'NotResource\s+= local\.fcvm_fleet_ops_parameters')
 
     def test_a_gpubox_reads_no_secret(self):
         pol = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
         self.assertNotIn("secretsmanager", pol)
         self.assertIn("role     = aws_iam_role.fcvm_fleet_gpubox.name", block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
         self.assertIn('name     = "fcvm-fleet-gpubox"', block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
+
+
+class ProjectOperationsTests(unittest.TestCase):
+    def setUp(self):
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_ops"')
+        self.statements = dict(re.findall(r'Sid\s*= "([^"]+)"(.*?)\n      \},', policy, re.S))
+        self.assertEqual(set(self.statements), {
+            "ListOperationsState", "ReadWriteCurrentState", "LockCurrentState", "DiscoverOperationsMetadata",
+            "ManageOperationsParameters", "ManageOperationsLogs", "ReadPendingRegionalGSpotQuota",
+        })
+
+    def assert_grant(self, sid, actions, resource):
+        statement = self.statements[sid]
+        action = re.search(r'\bAction\s*=\s*("[^"]+"|\[[^\]]*\])', statement, re.S)
+        self.assertEqual(set(re.findall(r'"([^"]+)"', action[1])), set(actions), sid)
+        self.assertRegex(statement, r'\bEffect\s*=\s*"Allow"')
+        self.assertEqual(re.search(r'\bResource\s*=\s*([^\n]+)', statement)[1], resource)
+
+    def test_only_current_state_and_lock_are_accessible(self):
+        self.assertRegex(TF, r'fcvm_fleet_ops_key\s*= "fleet-ops/terraform.tfstate"')
+        self.assertRegex(TF, r'fcvm_fleet_ops_state\s*= "\$\{aws_s3_bucket.fcvm_fleet_terraform_state\.arn\}/\$\{local.fcvm_fleet_ops_key\}"')
+        self.assert_grant("ReadWriteCurrentState", ["s3:GetObject", "s3:PutObject"], "local.fcvm_fleet_ops_state")
+        self.assert_grant("LockCurrentState", ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                          '"${local.fcvm_fleet_ops_state}.tflock"')
+        self.assert_grant("ListOperationsState", ["s3:ListBucket"], "aws_s3_bucket.fcvm_fleet_terraform_state.arn")
+        self.assertIn('"s3:prefix" = [local.fcvm_fleet_ops_key, "fleet-ops/workspaces/"]', self.statements["ListOperationsState"])
+        seed = block('resource "aws_s3_object" "fcvm_fleet_ops_initial_state"')
+        self.assertIn("aws_s3_bucket_versioning.fcvm_fleet_terraform_state", seed)
+        self.assertRegex(seed, r'key\s*= local.fcvm_fleet_ops_key')
+        self.assertRegex(seed, r'ignore_changes\s*= all')
+        self.assertIn("prevent_destroy = true", seed)
+
+    def test_operations_writes_and_content_reads_stay_in_new_namespaces(self):
+        self.assert_grant("ManageOperationsParameters", [
+            "ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
+            "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource",
+        ], "local.fcvm_fleet_ops_parameters")
+        self.assertRegex(TF, r'fcvm_fleet_ops_parameters\s*= "arn:aws:ssm:\$\{local.fcvm_fleet_home_region\}:\$\{local.fcvm_fleet_account_id\}:parameter/fcvm/ops/\*"')
+        self.assert_grant("ManageOperationsLogs", [
+            "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
+            "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
+            "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents", "logs:GetLogEvents", "logs:FilterLogEvents",
+        ], "local.fcvm_fleet_ops_logs")
+        self.assertRegex(TF, r'fcvm_fleet_ops_logs\s*= "arn:aws:logs:\$\{local.fcvm_fleet_home_region\}:\$\{local.fcvm_fleet_account_id\}:log-group:/fcvm/ops/\*"')
+        self.assert_grant("DiscoverOperationsMetadata", ["logs:DescribeLogGroups", "ssm:DescribeParameters"], '"*"')
+        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_home_region', self.statements["DiscoverOperationsMetadata"])
+        self.assert_grant("ReadPendingRegionalGSpotQuota", ["servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"],
+                          '"arn:aws:servicequotas:us-east-1:${local.fcvm_fleet_account_id}:ec2/L-3819A6DF"')
 
 
 class ObserveTests(unittest.TestCase):
