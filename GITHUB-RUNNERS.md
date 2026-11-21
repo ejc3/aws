@@ -767,7 +767,12 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   counted by its `Vcpus` tag, set at launch (a host launched before that tag existed, by its `Size` tag through the map).
   A claim records the vCPUs of the host it launches; a claim from before claims recorded them counts as the largest size,
   the safe side. The reconcile takes jobs oldest first and stops at the first that waits, so a smaller job behind it does
-  not take the room it is next for. A repo without `max_vcpus` is capped by hosts alone, as before.
+  not take the room it is next for. When a shared budget group is throttled, a job that cannot fit reserves
+  its size across repositories, ordered by GitHub job creation time and then job ID. Both queued webhooks and
+  reconciliation read the same DynamoDB reservation. Later jobs can still use any spare capacity beyond it.
+  The controller checks whether the reserved job is still queued before holding another job back. A reservation
+  expires after eight minutes without renewal. Running jobs finish normally and the group's vCPU cap still applies.
+  A repo without `max_vcpus` is capped by hosts alone, as before.
   Each check takes the claims first, then a fresh listing, and counts a host by its state in that
   listing. A claim is dropped once ITS OWN launch is listed, in any state, found by the claim's
   nonce in the host's `ClientToken`: a finished host frees its slot at once, and an older dead host

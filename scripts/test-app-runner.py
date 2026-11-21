@@ -141,6 +141,7 @@ class FakeDynamo:
         self.items, self.deleted, self.queries = {}, [], []
         self.buckets, self.bucket_reads, self.bucket_writes, self.conflicts, self.rival = {}, [], [], 0, None
         self.reruns = {}
+        self.waiting = {}
 
     def put_rerun(self, Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames):
         assert ConditionExpression == "attribute_not_exists(job)", ConditionExpression
@@ -163,15 +164,22 @@ class FakeDynamo:
 
     def get_item(self, TableName, Key, ConsistentRead=False):
         assert TableName == "github-app-runner-budget" and ConsistentRead, (TableName, ConsistentRead)
+        if Key["group"]["S"].startswith("waiting/"):
+            item = self.waiting.get(Key["group"]["S"])
+            return {"Item": dict(item)} if item else {}
         self.bucket_reads.append(Key["group"]["S"])
         item = self.buckets.get(Key["group"]["S"])
         return {"Item": json.loads(json.dumps(item))} if item else {}
 
-    def put_item(self, TableName, Item, ConditionExpression, ExpressionAttributeValues=None, ExpressionAttributeNames=None):
+    def put_item(self, TableName, Item, ConditionExpression=None, ExpressionAttributeValues=None, ExpressionAttributeNames=None):
         if TableName == "github-app-runner-reruns":
             return self.put_rerun(Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames)
         if TableName == "github-app-runner-budget":
             group = Item["group"]["S"]
+            if group.startswith("waiting/"):
+                assert ConditionExpression is None
+                self.waiting[group] = dict(Item)
+                return
             self.bucket_writes.append(Item)
             if self.conflicts:
                 self.conflicts -= 1
@@ -258,6 +266,7 @@ class FakeSecrets:
 class FakeGitHub:
     def __init__(self):
         self.calls, self.runs, self.jobs, self.runners, self.job_status = [], {}, {}, {}, {}
+        self.created = {}
         # run id -> {"status", "conclusion", "run_attempt"}; a rerun GitHub accepts starts the run's next attempt.
         self.run_info, self.reruns, self.rerun_refusal, self.rerun_lost = {}, [], None, False
 
@@ -293,7 +302,8 @@ class FakeGitHub:
             return {"total_count": len(runs), "workflow_runs": [{"id": r} for r in runs]}
         m = re.match(r"/repos/(.+?)/actions/jobs/(\d+)$", path)
         if m:
-            return {"id": int(m.group(2)), "status": self.job_status.get(int(m.group(2)), "queued")}
+            return {"id": int(m.group(2)), "status": self.job_status.get(int(m.group(2)), "queued"),
+                    "created_at": self.created.get(int(m.group(2)), NOW.isoformat())}
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs", path)
         if m:
             return {"jobs": self.jobs.get(int(m.group(2)), [])}
@@ -2413,6 +2423,69 @@ class BudgetLaunchTests(unittest.TestCase):
         app, ec2 = load_budget_app()
         ec2.instances += aged(DOLPHIN, ["s"] * 8, 5)
         self.assertEqual(self.ensure(app, FILMS, 9, "s")[0], "launched")
+
+    def test_queued_delivery_cannot_take_capacity_reserved_by_another_repos_reconcile(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["l"], 1)
+        bucket(app, "dolphin", 5, throttled=True)
+        labels = ["self-hosted", "dolphin", "xl"]
+        app.github.runs[FILMS, "queued"] = [901]
+        app.github.jobs[901] = [{"id": 870, "status": "queued", "labels": labels}]
+        app.github.created[870] = (NOW - timedelta(hours=2)).isoformat()
+        cfg = BUDGET_REPOS[FILMS]
+        self.assertEqual(app.reconcile(FILMS, cfg, SUBNETS)["outcomes"], {"cap": 1})
+        # A newer job has a *lower* ID. On a cold controller, only DynamoDB carries the reservation.
+        fresh, ec2new = load_budget_app()
+        fresh.now = app.now
+        fresh.fake_dynamo.waiting = dict(app.fake_dynamo.waiting)
+        fresh.github.created = dict(app.github.created)
+        fresh.fake_dynamo.buckets = dict(app.fake_dynamo.buckets)
+        ec2new.instances = list(ec2.instances)
+        delivery = {"repo": DOLPHIN, "action": "queued", "workflow_job": {
+            "id": 67, "labels": ["self-hosted", "dolphin", "l"]}}
+        self.assertEqual(fresh.handler(delivery, None)["outcome"], "cap")
+        self.assertFalse(ec2new.launched)
+        self.assertEqual(ec2new.instances[0]["State"]["Name"], "running")
+        ec2new.instances[0]["State"]["Name"] = "terminated"
+        self.assertEqual(fresh.handler(delivery, None)["outcome"], "cap")
+        self.assertEqual(self.ensure(fresh, FILMS, 870, "xl")[0], "launched")
+        self.assertEqual([fresh.tag(i, "JobId") for i in ec2new.instances if
+                          i["State"]["Name"] in fresh.LIVE_STATES], ["870"])
+
+    def test_wait_releases_on_cancellation_or_expiry_and_an_older_waiter_wins(self):
+        for release in ("cancel", "expire"):
+            with self.subTest(release=release):
+                app, ec2 = load_budget_app()
+                bucket(app, "dolphin", 5, throttled=True)
+                ec2.instances += aged(DOLPHIN, ["l"], 1)
+                self.assertEqual(self.ensure(app, FILMS, 30, "xl")[0], "cap")
+                app.github.created[40] = (NOW - timedelta(seconds=10)).isoformat()
+                self.assertEqual(self.ensure(app, FILMS, 40, "xl")[0], "cap")
+                self.assertEqual(app.fake_dynamo.waiting["waiting/dolphin"]["job"]["S"], "40")
+                if release == "cancel":
+                    app.github.job_status[40] = "completed"
+                else:
+                    app.now = lambda: NOW + timedelta(seconds=app.GROUP_WAIT_SECONDS + 1)
+                self.assertEqual(self.ensure(app, DOLPHIN, 50, "l")[0], "launched")
+
+    def test_job_that_exceeds_its_own_vcpu_cap_cannot_reserve_the_group(self):
+        app, ec2 = load_budget_app()
+        ec2.instances += aged(DOLPHIN, ["l"], 1)
+        bucket(app, "dolphin", 5, throttled=True)
+        cfg = dict(BUDGET_REPOS[FILMS], max_vcpus=32)
+        self.assertEqual(app.ensure_runner(FILMS, cfg, SUBNETS, "PAT", "10", "xl", [])[0], "cap")
+        self.assertFalse(app.fake_dynamo.waiting)
+        self.assertEqual(self.ensure(app, DOLPHIN, 11, "l")[0], "launched")
+
+    def test_a_younger_job_can_use_capacity_beyond_the_reservation(self):
+        g = dict(GROUPS, dolphin=dict(GROUPS["dolphin"], throttled_vcpus=80))
+        app, ec2 = load_budget_app(g)
+        ec2.instances += aged(DOLPHIN, ["l"], 1)
+        bucket(app, "dolphin", 5, throttled=True)
+        self.assertEqual(self.ensure(app, FILMS, 7, "xl")[0], "cap")
+        ec2.instances[0]["State"]["Name"] = "terminated"
+        self.assertEqual(self.ensure(app, DOLPHIN, 8, "s")[0], "launched")
+        self.assertEqual(self.ensure(app, FILMS, 7, "xl")[0], "launched")
 
     def test_a_group_whose_only_repo_is_gated_off_has_no_bucket_and_withholds_no_total(self):
         # constellation's group is in BUDGET_GROUPS from the first apply, while constellation_token_ready keeps the repo out
