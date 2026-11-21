@@ -390,8 +390,66 @@ class ZshEnv(Base):
                 (d / tool).write_text("#!/bin/sh\n")
                 (d / tool).chmod(0o755)
 
-    def set_(self):
-        subprocess.run(["sh", str(ROOT / "scripts" / "mac" / "set-zshenv.sh"), str(self.zshenv)], check=True)
+    def set_(self, *args):
+        subprocess.run(["sh", str(ROOT / "scripts" / "mac" / "set-zshenv.sh"), str(self.zshenv), *args],
+                       env=self.env, check=True, capture_output=True, text=True)
+
+    def selected_developer(self, *zsh_args, **env):
+        shell_env = {"HOME": str(self.temp), "ZDOTDIR": str(self.temp), "PATH": "/usr/bin:/bin", **env}
+        return subprocess.check_output(["zsh", *zsh_args, "-c", 'print -r -- "${DEVELOPER_DIR-unset}"'],
+                                       env=shell_env, text=True).rstrip("\n")
+
+    def test_mini_defaults_to_the_probed_xcode_and_preserves_toolchain_overrides(self):
+        contents = self.temp / "Applications/Xcode.app/Contents"
+        developer = contents / "Developer"
+        tool = developer / "usr/bin/xcodebuild"
+        tool.parent.mkdir(parents=True)
+        version = contents / "version.plist"
+        version.write_text("27B52")
+        tool.write_text('''#!/bin/sh
+[ "$DEVELOPER_DIR" = "$HOME/Applications/Xcode.app/Contents/Developer" ] || exit 1
+echo "$*" >> "$HOME/checks"
+if [ "$*" = -checkFirstLaunchStatus ] && [ -f "$HOME/updating" ]; then
+    echo "upgrade in progress" > "$DEVELOPER_DIR/../version.plist"
+fi
+case "$*" in
+    "-license check") test -f "$HOME/licensed" ;;
+    "-checkFirstLaunchStatus") test -f "$HOME/initialized" ;;
+    *) exit 1 ;;
+esac
+''')
+        tool.chmod(0o755)
+        for marker in ("initialized", "licensed"):
+            (self.temp / marker).touch()
+        self.set_()
+        self.assertEqual(self.selected_developer(), "unset", "the desktop profile keeps its own selection")
+        self.assertFalse((self.temp / "checks").exists())
+        self.set_("--build-only")
+        for args in ((), ("-i",)):
+            self.assertEqual(self.selected_developer(*args), str(developer))
+        for override in ("/other/Xcode.app/Contents/Developer", ""):
+            self.assertEqual(self.selected_developer(DEVELOPER_DIR=override), override)
+        self.assertEqual((self.temp / "checks").read_text().splitlines(), ["-license check", "-checkFirstLaunchStatus"],
+                         "no readiness probes run at shell startup")
+        version.write_text("new build")
+        self.assertEqual(self.selected_developer(), "unset")
+        self.set_("--build-only")
+        self.assertEqual(self.selected_developer(), str(developer))
+        updating = self.temp / "updating"
+        updating.touch()
+        self.set_("--build-only")
+        self.assertEqual(self.selected_developer(), "unset", "a build replaced during the probes was not validated")
+        updating.unlink()
+        for marker in ("initialized", "licensed"):
+            (self.temp / marker).unlink()
+            self.set_("--build-only")
+            self.assertEqual(self.selected_developer(), "unset", f"fallback when {marker} is missing")
+            (self.temp / marker).touch()
+        self.set_("--build-only")
+        tool.unlink()
+        self.assertEqual(self.selected_developer(), "unset")
+        self.set_("--build-only")
+        self.assertEqual(self.selected_developer(), "unset")
 
     def resolved(self):
         # As an SSH command runs: non-interactive, non-login zsh, which reads only ~/.zshenv.
