@@ -74,7 +74,8 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
 # Agents on the metal boxes: a service token of their own, so an agent can open a staging Worker it just deployed and
 # check it, as the owner does in a browser. Admitted by a non_identity policy on this application only, so it opens the
 # staging Workers and nothing else (not *.cc-games.dev, unlike the cc-games automation token). Readers: dev-server-role
-# (the metal boxes) and the administration set. Not nextjs-dev-role: every account there has sudo. Revoking it touches
+# (the metal boxes), nextjs-dev-role for the owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf; every member
+# container is denied it again by nextjs_ct_deny_member), and the administration set. Revoking it touches
 # no other token. The grant is the secret's own resource policy, not one on the role: dev-server-role's inline policies
 # are at IAM's 10,240-character limit. The secret is outside workers-stage/, which holds the Workers' own runtime secrets
 # (scripts/workers-stage-secrets.sh), and its Terraform names avoid the workers_stage prefix that
@@ -130,7 +131,8 @@ resource "aws_secretsmanager_secret_policy" "stage_workers_agent_access" {
         Principal = "*"
         Action    = "secretsmanager:GetSecretValue"
         Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+        # nextjs-dev-role for the owner's nextjs-ct container (nextjs-dev-fcvm-parity.tf); members are denied it.
+        Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn, aws_iam_role.nextjs_dev.arn]) } }
       },
     ]
   })
