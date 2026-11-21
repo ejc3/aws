@@ -237,21 +237,6 @@ resource "aws_s3_object" "fcvm_fleet_prod_budget_day" {
   }
 }
 
-resource "aws_iam_role_policy" "fcvm_fleet_operate_budget_drill" {
-  count    = local.fcvm_fleet_prod
-  provider = aws.fcvm_fleet
-  name     = "operate-prod-budget-drill"
-  role     = aws_iam_role.fcvm_fleet_terraform.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = ["s3:GetObject", "s3:PutObject"]
-      Resource = "${aws_s3_bucket.fcvm_fleet_coordinator_state.arn}/${aws_s3_object.fcvm_fleet_prod_budget_day[0].key}"
-    }]
-  })
-}
-
 resource "aws_iam_role_policy" "fcvm_fleet_read_budget_drill" {
   count    = local.fcvm_fleet_prod
   provider = aws.fcvm_fleet

@@ -119,62 +119,26 @@ class ApplyRoleTests(unittest.TestCase):
             self.assertNotIn(leak, param.lower().replace("no credentials", ""))
 
 
-class GpuboxRoleTests(unittest.TestCase):
-    """ejc3/aws#922: fcvm-arm's role in the fleet account reaches gpuboxes and nothing that holds or uses a secret."""
-    ALLOWED = {"ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",
-               "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation",
-               "servicequotas:GetServiceQuota", "ssm:GetParameter", "ec2:RunInstances", "ec2:CreateTags", "ec2:TerminateInstances",
-               "ssm:SendCommand", "iam:PassRole", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"}
+class ApplyRoleScopeTests(unittest.TestCase):
+    """fcvm-arm's role in the fleet account: fcvm's administrator (owner, 2026-11-21), and gpuboxes that hold no secret."""
 
-    def statements(self):
-        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"')
-        self.assertIn("role     = aws_iam_role.fcvm_fleet_terraform.name", pol)
-        return {m.group(1): m.group(0) for m in re.finditer(r'Sid\s+= "(\w+)".*?\n      \}', pol, re.S)}
-
-    def actions(self, stmt):
-        field = re.search(r'\bAction\s+= (\[[^\]]*\]|"[^"]+")', stmt, re.S)
-        return set(re.findall(r'"([a-z0-9]+:[A-Za-z*]+)"', field.group(1))) if field else set()
-
-    def test_no_administrator_access_and_no_other_policy_on_the_role(self):
-        self.assertNotIn("policy/AdministratorAccess", TF)
+    def test_the_role_is_fcvms_administrator_with_only_the_g_admission_beside_it(self):
+        # Owner, 2026-11-21: "I am fine with this box having all of fcvm powers".
+        att = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_admin"')
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_terraform.name", att)
+        self.assertIn('policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"', att)
         attached = set()
         for path in ROOT.glob("*.tf"):
             source = path.read_text()
             for header in re.findall(r'resource "aws_iam_role_policy(?:_attachment)?" "[^"]+"', source):
                 if re.search(r'\brole\s*=\s*aws_iam_role\.fcvm_fleet_terraform\.(?:name|id)', block(header, source)):
                     attached.add(header.split('"')[3])
-        self.assertEqual(attached, {
-            "fcvm_fleet_terraform_gpubox", "fcvm_fleet_terraform_g_admission", "fcvm_fleet_terraform_observe",
-            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops",
-        })
+        self.assertEqual(attached, {"fcvm_fleet_terraform_admin", "fcvm_fleet_terraform_g_admission"})
+        # Still only fcvm-arm's instance can assume it, for an hour at a time.
+        role = block('resource "aws_iam_role" "fcvm_fleet_terraform"')
+        self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', role)
+        self.assertIn("max_session_duration = 3600", role)
 
-    def test_every_allowed_action_is_a_gpubox_call(self):
-        stmts = self.statements()
-        allowed = set().union(*(self.actions(s) for s in stmts.values() if re.search(r'Effect\s+= "Allow"', s)))
-        self.assertLessEqual(allowed, self.ALLOWED)
-        self.assertNotRegex("".join(s for s in stmts.values() if re.search(r'Effect\s+= "Allow"', s)), r'"[a-z0-9]+:\*"')
-
-    def test_instance_actions_need_the_gpubox_tag(self):
-        s = self.statements()
-        self.assertIn('"aws:RequestTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["LaunchOnlyGpuboxes"])
-        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["EndOnlyGpuboxes"])
-        self.assertIn('"ssm:resourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', s["RunCommandsOnlyOnGpuboxes"])
-        self.assertIn('"ec2:CreateAction" = "RunInstances"', s["TagAtLaunch"])
-        self.assertRegex(s["TheShellDocument"], r'Resource\s+= "arn:aws:ssm:\*::document/AWS-RunShellScript"')
-        self.assertIn('fcvm_fleet_gpubox_purpose = "fcvm-fleet-gpubox"', TF)
-
-    def test_only_the_lease_tag_can_be_changed_after_launch(self):
-        statements = self.statements()
-        tag_writers = {sid for sid, stmt in statements.items() if "ec2:CreateTags" in self.actions(stmt)}
-        self.assertEqual(tag_writers, {"TagAtLaunch", "ExtendOnlyGpuboxLeases"})
-        for sid, keys in (("TagAtLaunch", {"Purpose", "Name", "Owner", "LeaseUntil", "Market", "fcvm-admission"}),
-                          ("ExtendOnlyGpuboxLeases", {"LeaseUntil"})):
-            stmt = statements[sid]
-            self.assertIn(':instance/*"', stmt)
-            allowed = re.search(r'"ForAllValues:StringEquals"\s*=\s*\{ "aws:TagKeys" = \[(.*?)\]', stmt)
-            self.assertIsNotNone(allowed)
-            self.assertEqual(set(re.findall(r'"([^"]+)"', allowed[1])), keys)
-        self.assertIn('"ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose', statements["ExtendOnlyGpuboxLeases"])
 
     def test_ssm_agent_core_cannot_read_unrelated_parameters(self):
         attachment = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_gpubox_ssm"')
@@ -193,27 +157,6 @@ class GpuboxRoleTests(unittest.TestCase):
             "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release-copies",
         })
 
-    def test_it_passes_only_the_gpubox_role_and_writes_only_the_gpubox_prefix(self):
-        s = self.statements()
-        self.assertRegex(s["PassOnlyTheGpuboxRole"], r"Resource\s+= aws_iam_role\.fcvm_fleet_gpubox\.arn\n")
-        self.assertRegex(s["PassOnlyTheGpuboxRole"], r'"iam:PassedToService" = "ec2.amazonaws.com"')
-        self.assertRegex(s["TheGpuboxPrefix"], r'Resource\s+= "\$\{aws_s3_bucket\.fcvm_fleet_assets\.arn\}/gpubox/\*"')
-        for sid, stmt in s.items():
-            if "iam:PassRole" in stmt:
-                self.assertEqual(sid, "PassOnlyTheGpuboxRole")
-
-    def test_secrets_iam_and_what_workloads_run_are_denied_by_name(self):
-        deny = self.statements()["NeverSecretsIamOrWhatWorkloadsRun"]
-        self.assertRegex(deny, r'Effect\s+= "Deny"')
-        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:StartSession",
-                       "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"):
-            self.assertIn(f'"{action}"', deny)
-        self.assertNotIn('"ssm:PutParameter"', deny)
-        scoped_deny = self.statements()["NeverWriteOtherParameters"]
-        self.assertRegex(scoped_deny, r'Effect\s+= "Deny"')
-        self.assertEqual(self.actions(scoped_deny), {"ssm:PutParameter"})
-        self.assertRegex(scoped_deny, r'NotResource\s+= local\.fcvm_fleet_ops_parameters')
-
     def test_a_gpubox_reads_no_secret(self):
         pol = block('resource "aws_iam_role_policy" "fcvm_fleet_gpubox"')
         self.assertNotIn("secretsmanager", pol)
@@ -221,67 +164,8 @@ class GpuboxRoleTests(unittest.TestCase):
         self.assertIn('name     = "fcvm-fleet-gpubox"', block('resource "aws_iam_instance_profile" "fcvm_fleet_gpubox"'))
 
 
-class ProjectOperationsTests(unittest.TestCase):
-    def setUp(self):
-        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_ops"')
-        self.statements = dict(re.findall(r'Sid\s*= "([^"]+)"(.*?)\n      \},', policy, re.S))
-        self.assertEqual(set(self.statements), {
-            "ListOperationsState", "ReadWriteCurrentState", "LockCurrentState", "DiscoverOperationsMetadata",
-            "ManageOperationsParameters", "ManageOperationsLogs", "ReadPendingRegionalGSpotQuota",
-        })
-
-    def assert_grant(self, sid, actions, resource):
-        statement = self.statements[sid]
-        action = re.search(r'\bAction\s*=\s*("[^"]+"|\[[^\]]*\])', statement, re.S)
-        self.assertEqual(set(re.findall(r'"([^"]+)"', action[1])), set(actions), sid)
-        self.assertRegex(statement, r'\bEffect\s*=\s*"Allow"')
-        self.assertEqual(re.search(r'\bResource\s*=\s*([^\n]+)', statement)[1], resource)
-
-    def test_only_current_state_and_lock_are_accessible(self):
-        self.assertRegex(TF, r'fcvm_fleet_ops_key\s*= "fleet-ops/terraform.tfstate"')
-        self.assertRegex(TF, r'fcvm_fleet_ops_state\s*= "\$\{aws_s3_bucket.fcvm_fleet_terraform_state\.arn\}/\$\{local.fcvm_fleet_ops_key\}"')
-        self.assert_grant("ReadWriteCurrentState", ["s3:GetObject", "s3:PutObject"], "local.fcvm_fleet_ops_state")
-        self.assert_grant("LockCurrentState", ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-                          '"${local.fcvm_fleet_ops_state}.tflock"')
-        self.assert_grant("ListOperationsState", ["s3:ListBucket"], "aws_s3_bucket.fcvm_fleet_terraform_state.arn")
-        self.assertIn('"s3:prefix" = [local.fcvm_fleet_ops_key, "fleet-ops/workspaces/"]', self.statements["ListOperationsState"])
-        seed = block('resource "aws_s3_object" "fcvm_fleet_ops_initial_state"')
-        self.assertIn("aws_s3_bucket_versioning.fcvm_fleet_terraform_state", seed)
-        self.assertRegex(seed, r'key\s*= local.fcvm_fleet_ops_key')
-        self.assertRegex(seed, r'ignore_changes\s*= all')
-        self.assertIn("prevent_destroy = true", seed)
-
-    def test_operations_writes_and_content_reads_stay_in_new_namespaces(self):
-        self.assert_grant("ManageOperationsParameters", [
-            "ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
-            "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource",
-        ], "local.fcvm_fleet_ops_parameters")
-        self.assertRegex(TF, r'fcvm_fleet_ops_parameters\s*= "arn:aws:ssm:\$\{local.fcvm_fleet_home_region\}:\$\{local.fcvm_fleet_account_id\}:parameter/fcvm/ops/\*"')
-        self.assert_grant("ManageOperationsLogs", [
-            "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
-            "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
-            "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents", "logs:GetLogEvents", "logs:FilterLogEvents",
-        ], "local.fcvm_fleet_ops_logs")
-        self.assertRegex(TF, r'fcvm_fleet_ops_logs\s*= "arn:aws:logs:\$\{local.fcvm_fleet_home_region\}:\$\{local.fcvm_fleet_account_id\}:log-group:/fcvm/ops/\*"')
-        self.assert_grant("DiscoverOperationsMetadata", ["logs:DescribeLogGroups", "ssm:DescribeParameters"], '"*"')
-        self.assertIn('"aws:RequestedRegion" = local.fcvm_fleet_home_region', self.statements["DiscoverOperationsMetadata"])
-        self.assert_grant("ReadPendingRegionalGSpotQuota", ["servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"],
-                          '"arn:aws:servicequotas:us-east-1:${local.fcvm_fleet_account_id}:ec2/L-3819A6DF"')
-
-
 class ObserveTests(unittest.TestCase):
     """fcvm-arm reads the coordinators and runs the Spot drill (#942); nothing that names a secret, no other write."""
-
-    def test_arm_invokes_only_the_guard_and_has_no_fis_actions(self):
-        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe"')
-        self.assertIn("role     = aws_iam_role.fcvm_fleet_terraform.name", pol)
-        action_fields = re.findall(r'\bAction\s*=\s*(\[[^\]]*\]|"[^"]+")', pol)
-        actions = {name for field in action_fields for name in re.findall(r'"([^"]+)"', field)}
-        self.assertEqual(actions, {"ecs:DescribeClusters", "ecs:DescribeServices", "ecs:ListServices", "ecs:ListTasks",
-                                   "ecs:DescribeTasks", "logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams",
-                                   "lambda:InvokeFunction"})
-        self.assertIn("for broker in aws_lambda_function.fcvm_fleet_prod_spot_drill", pol)
-        self.assertIn("Resource = broker.arn", pol)
 
     def test_drill_guard_serializes_its_receipt_and_stops_only_its_experiments(self):
         drill = (ROOT / "fcvm-fleet-prod-drills.tf").read_text()
@@ -322,31 +206,6 @@ class ObserveTests(unittest.TestCase):
                                                                      "iam:ListAttachedRolePolicies", "iam:SimulatePrincipalPolicy"})
         self.assertIn('for r in ["fcvm-stage-ci", "fcvm-prod-ci"]', stmt)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
-
-    def test_ecs_actions_are_limited_to_the_two_coordinator_clusters(self):
-        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe"')
-        clusters = "local.fcvm_fleet_observed_clusters"
-        cluster_arns = "local.fcvm_fleet_observed_cluster_arns"
-        ecs = "${local.fcvm_fleet_observed_ecs}"
-        self.assertRegex(TF, r'fcvm_fleet_observed_clusters\s*= \[local\.fcvm_fleet_stacks\.stage\.prefix, local\.fcvm_fleet_stacks\.prod\.prefix\]')
-        self.assertRegex(TF, r'fcvm_fleet_observed_ecs\s*= "arn:aws:ecs:\$\{local\.fcvm_fleet_home_region\}:\$\{local\.fcvm_fleet_account_id\}"')
-        self.assertIn(f'[for c in {clusters} : "{ecs}:cluster/${{c}}"]', TF)
-        resources = {
-            'ecs:DescribeClusters': cluster_arns,
-            'ecs:ListServices': '"*"',
-            'ecs:DescribeServices': f'[for c in {clusters} : "{ecs}:service/${{c}}/${{c}}-coordinator"]',
-            'ecs:ListTasks': f'[for c in {clusters} : "{ecs}:container-instance/${{c}}/*"]',
-            'ecs:DescribeTasks': f'[for c in {clusters} : "{ecs}:task/${{c}}/*"]',
-        }
-        for action, resource in resources.items():
-            with self.subTest(action=action):
-                stmt = next(s for s in pol.split('\n      },') if f'"{action}"' in s)
-                self.assertRegex(stmt, r'Action\s+= "' + re.escape(action) + '"')
-                self.assertRegex(stmt, r'(?m)^ *Resource\s+= ' + re.escape(resource) + r'$')
-                if action.startswith('ecs:List'):
-                    self.assertIn('ArnEquals = { "ecs:cluster" = ' + cluster_arns + ' }', stmt)
-        self.assertIn(f'[for c in {clusters} :\n        "arn:aws:logs:${{local.fcvm_fleet_home_region}}:'
-                      '${local.fcvm_fleet_account_id}:log-group:/ecs/${c}-coordinator:*"]', pol)
 
     def test_the_dev_box_reads_only_the_two_prod_release_log_groups_in_the_management_region(self):
         grant = block('resource "aws_iam_policy" "dev_server_constellation_terraform"', CONST)

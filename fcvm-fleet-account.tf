@@ -239,125 +239,15 @@ resource "aws_iam_role" "fcvm_fleet_terraform" {
   tags = { Name = "fcvm-fleet-terraform", Managed = "terraform" }
 }
 
-# What fcvm-arm does in this account: fcvm's fleet/tools/gpubox.sh (and g-admission.sh) launch, drive and end
-# short-lived GPU boxes. Separate policies below cover project operations. The account also holds certificates and tokens, staging's and
-# production's, so the role is an allow list for exactly those calls (ejc3/aws#922), not AdministratorAccess: an
-# administrator can reach any secret by reading it, by passing a role that can, or by changing what a role-holding
-# workload runs (a launch template, an AMI pointer, a host through Run Command).
-locals {
-  fcvm_fleet_gpubox_purpose = "fcvm-fleet-gpubox" # gpubox.sh PURPOSE
-  fcvm_fleet_gpubox_regions = ["us-west-2", "us-east-1"]
-}
-
-resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
-  provider = aws.fcvm_fleet
-  name     = "gpubox-only"
-  role     = aws_iam_role.fcvm_fleet_terraform.name
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid    = "Look"
-        Effect = "Allow"
-        Action = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",
-        "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation", "servicequotas:GetServiceQuota"]
-        Resource  = "*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid       = "ReadTheImageRelease"
-        Effect    = "Allow"
-        Action    = "ssm:GetParameter"
-        Resource  = [for name in ["ami-release", "ami-release-copies"] : "arn:aws:ssm:*:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/${name}"]
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid       = "LaunchOnlyGpuboxes"
-        Effect    = "Allow"
-        Action    = "ec2:RunInstances"
-        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions, "aws:RequestTag/Purpose" = local.fcvm_fleet_gpubox_purpose } }
-      },
-      {
-        Sid    = "WhatALaunchUses"
-        Effect = "Allow"
-        Action = "ec2:RunInstances"
-        Resource = ["arn:aws:ec2:*::image/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:subnet/*",
-          "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:security-group/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:network-interface/*",
-        "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:volume/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:spot-instances-request/*"]
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid      = "TagAtLaunch"
-        Effect   = "Allow"
-        Action   = "ec2:CreateTags"
-        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
-        Condition = {
-          StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Purpose", "Owner", "LeaseUntil", "Market", "fcvm-admission"] }
-        }
-      },
-      {
-        Sid      = "ExtendOnlyGpuboxLeases"
-        Effect   = "Allow"
-        Action   = "ec2:CreateTags"
-        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
-        Condition = {
-          StringEquals                = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
-          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["LeaseUntil"] }
-        }
-      },
-      {
-        Sid       = "EndOnlyGpuboxes"
-        Effect    = "Allow"
-        Action    = "ec2:TerminateInstances"
-        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
-        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid       = "RunCommandsOnlyOnGpuboxes"
-        Effect    = "Allow"
-        Action    = "ssm:SendCommand"
-        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
-        Condition = { StringEquals = { "ssm:resourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid       = "TheShellDocument"
-        Effect    = "Allow"
-        Action    = "ssm:SendCommand"
-        Resource  = "arn:aws:ssm:*::document/AWS-RunShellScript"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
-      },
-      {
-        Sid       = "PassOnlyTheGpuboxRole"
-        Effect    = "Allow"
-        Action    = "iam:PassRole"
-        Resource  = aws_iam_role.fcvm_fleet_gpubox.arn
-        Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
-      },
-      {
-        # copy's staging objects (signed URLs carry this role's permissions) and the admission lock (g-admission.sh).
-        Sid      = "TheGpuboxPrefix"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-        Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/gpubox/*"
-      },
-      {
-        Sid         = "NeverWriteOtherParameters"
-        Effect      = "Deny"
-        Action      = "ssm:PutParameter"
-        NotResource = local.fcvm_fleet_ops_parameters
-      },
-      {
-        # Already outside the allow list above; denied by name so a later broad grant cannot reopen them.
-        Sid    = "NeverSecretsIamOrWhatWorkloadsRun"
-        Effect = "Deny"
-        Action = ["secretsmanager:*", "kms:Decrypt", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*",
-        "iam:AddRoleToInstanceProfile", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
-        Resource = "*"
-      },
-    ]
-  })
+# What fcvm-arm does in this account (owner, 2026-11-21: "I am fine with this box having all of fcvm powers"): it is
+# fcvm's operator, so the role has AdministratorAccess here, as fcvm-arm has in the constellation and astryx accounts. The
+# OU's guardrails above still apply (the fleet regions, no IAM users or keys, no leaving the organization), and so do the
+# secrets' and the state bucket's own resource policies. The G admission below stays: it is fcvm's quota protocol, not
+# a permission.
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_admin" {
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_terraform.name
+  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
 }
 
 # The instance role of a gpubox: Session Manager and the release artifacts a host image fetches at boot, and no secret
@@ -409,80 +299,12 @@ resource "aws_iam_instance_profile" "fcvm_fleet_gpubox" {
   role     = aws_iam_role.fcvm_fleet_gpubox.name
 }
 
-# What fcvm-arm reads to verify the fleet (owner, 2026-11-21: "If you can't read something ask for perms"): the
-# coordinators' ECS services and tasks and their logs, and the guarded Spot reclaim drill (fcvm-fleet-prod-drills.tf), which it
-# may invoke locally in the fleet account. No task definition (it names the secrets), no secret, no write besides the drill.
-locals {
-  fcvm_fleet_observed_clusters     = [local.fcvm_fleet_stacks.stage.prefix, local.fcvm_fleet_stacks.prod.prefix]
-  fcvm_fleet_observed_ecs          = "arn:aws:ecs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}"
-  fcvm_fleet_observed_cluster_arns = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:cluster/${c}"]
-}
-
-resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
-  provider = aws.fcvm_fleet
-  name     = "observe-the-coordinators-and-run-the-spot-drill"
-  role     = aws_iam_role.fcvm_fleet_terraform.name
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat([
-      {
-        Sid      = "TheCoordinatorClusters"
-        Effect   = "Allow"
-        Action   = "ecs:DescribeClusters"
-        Resource = local.fcvm_fleet_observed_cluster_arns
-      },
-      {
-        # ListServices has no resource type. ECS supplies the cluster ARN as a condition key.
-        Sid       = "ListTheCoordinatorServices"
-        Effect    = "Allow"
-        Action    = "ecs:ListServices"
-        Resource  = "*"
-        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
-      },
-      {
-        Sid      = "TheCoordinatorServices"
-        Effect   = "Allow"
-        Action   = "ecs:DescribeServices"
-        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:service/${c}/${c}-coordinator"]
-      },
-      {
-        # ECS authorizes ListTasks against container-instance resources, including for a Fargate service.
-        Sid       = "ListTheCoordinatorTasks"
-        Effect    = "Allow"
-        Action    = "ecs:ListTasks"
-        Resource  = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:container-instance/${c}/*"]
-        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
-      },
-      {
-        Sid      = "TheCoordinatorTasks"
-        Effect   = "Allow"
-        Action   = "ecs:DescribeTasks"
-        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:task/${c}/*"]
-      },
-      {
-        Sid    = "TheCoordinatorLogs"
-        Effect = "Allow"
-        Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
-        Resource = [for c in local.fcvm_fleet_observed_clusters :
-        "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/ecs/${c}-coordinator:*"]
-      },
-      ], [for broker in aws_lambda_function.fcvm_fleet_prod_spot_drill : {
-        Sid      = "InvokeTheProdSpotDrill"
-        Effect   = "Allow"
-        Action   = "lambda:InvokeFunction"
-        Resource = broker.arn
-    }])
-  })
-}
-
 # The member role owns one Terraform state object. Bootstrap an empty v4 state
 # because S3 hides missing keys with HTTP 403 from prefix-limited bucket readers.
 # Thereafter only fleet-ops writes the state. Version history stays with recovery admins.
 locals {
-  fcvm_fleet_ops_parameters = "arn:aws:ssm:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:parameter/fcvm/ops/*"
-  fcvm_fleet_ops_key        = "fleet-ops/terraform.tfstate"
-  fcvm_fleet_ops_state      = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"
-  fcvm_fleet_ops_logs       = "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/fcvm/ops/*"
+  fcvm_fleet_ops_key   = "fleet-ops/terraform.tfstate"
+  fcvm_fleet_ops_state = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"
 }
 
 resource "aws_s3_object" "fcvm_fleet_ops_initial_state" {
@@ -504,70 +326,6 @@ resource "aws_s3_object" "fcvm_fleet_ops_initial_state" {
     # The project backend owns the object and its metadata after bootstrap.
     ignore_changes = all
   }
-}
-
-resource "aws_iam_role_policy" "fcvm_fleet_terraform_ops" {
-  provider = aws.fcvm_fleet
-  role     = aws_iam_role.fcvm_fleet_terraform.name
-  name     = "manage-project-operations"
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid      = "ListOperationsState"
-        Effect   = "Allow"
-        Action   = "s3:ListBucket"
-        Resource = aws_s3_bucket.fcvm_fleet_terraform_state.arn
-        Condition = { StringEquals = {
-          "s3:prefix" = [local.fcvm_fleet_ops_key, "fleet-ops/workspaces/"]
-        } }
-      },
-      {
-        Sid      = "ReadWriteCurrentState"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject"]
-        Resource = local.fcvm_fleet_ops_state
-      },
-      {
-        Sid      = "LockCurrentState"
-        Effect   = "Allow"
-        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
-        Resource = "${local.fcvm_fleet_ops_state}.tflock"
-      },
-      {
-        # Terraform queries the names and metadata with filter-by-name. These two
-        # Describe APIs require Resource="*" and return no parameter or log values.
-        Sid       = "DiscoverOperationsMetadata"
-        Effect    = "Allow"
-        Action    = ["ssm:DescribeParameters", "logs:DescribeLogGroups"]
-        Resource  = "*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_home_region } }
-      },
-      {
-        Sid    = "ManageOperationsParameters"
-        Effect = "Allow"
-        Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
-        "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"]
-        Resource = local.fcvm_fleet_ops_parameters
-      },
-      {
-        Sid    = "ManageOperationsLogs"
-        Effect = "Allow"
-        Action = ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
-          "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
-        "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents", "logs:GetLogEvents", "logs:FilterLogEvents"]
-        Resource = local.fcvm_fleet_ops_logs
-      },
-      {
-        # The quota-scoped listing includes pending requests and their current status.
-        Sid      = "ReadPendingRegionalGSpotQuota"
-        Effect   = "Allow"
-        Action   = "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"
-        Resource = "arn:aws:servicequotas:us-east-1:${local.fcvm_fleet_account_id}:ec2/L-3819A6DF"
-      },
-    ]
-  })
-  depends_on = [aws_s3_object.fcvm_fleet_ops_initial_state]
 }
 
 # Every G launch in us-east-1 by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which

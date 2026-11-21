@@ -201,7 +201,7 @@ class CommandTests(unittest.TestCase):
 
 
 class PermissionsTests(unittest.TestCase):
-    def test_marker_and_role_grants_only(self):
+    def test_marker_and_coordinator_read_grant(self):
         text = (SCRIPTS.parent / "fcvm-fleet-prod-drills.tf").read_text()
 
         def block(kind, name):
@@ -212,8 +212,9 @@ class PermissionsTests(unittest.TestCase):
         self.assertIn('content      = "off"', marker)
         self.assertRegex(marker, r"ignore_changes\s*= all")
         self.assertIn("aws_s3_bucket.fcvm_fleet_coordinator_state.id", marker)
+        # fcvm-arm writes the marker as fcvm's administrator (fcvm-fleet-account.tf); the coordinator only reads it.
+        self.assertIsNone(re.search(r'"fcvm_fleet_operate_budget_drill"', text))
         for name, role, actions in (
-            ("fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform.id", ["s3:GetObject", "s3:PutObject"]),
             ("fcvm_fleet_read_budget_drill", "fcvm_fleet_prod_coordinator_task[0].id", ["s3:GetObject"]),
         ):
             grant = block("aws_iam_role_policy", name)
