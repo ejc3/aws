@@ -151,7 +151,7 @@ resource "aws_iam_policy" "fcvm_fleet_terraform_lambda" {
       },
       {
         Effect   = "Allow"
-        Action   = ["lambda:GetCapacityProvider", "lambda:PassCapacityProvider"]
+        Action   = ["lambda:GetCapacityProvider", "lambda:ListFunctionVersionsByCapacityProvider", "lambda:PassCapacityProvider"]
         Resource = aws_lambda_capacity_provider.fcvm_fleet_spike.arn
       },
       {

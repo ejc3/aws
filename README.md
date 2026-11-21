@@ -857,8 +857,10 @@ Publishing a function version starts billable GPU capacity before the first
 invocation. Set that version to zero minimum and one maximum execution
 environment for this spike and invoke the published version through Lambda.
 The version limit controls execution environments; the provider cap applies
-across versions. Delete versions or the function after the test and verify
-the provider drains. [AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
+across versions. Delete versions or the function after the test. With the fleet
+role, use `aws lambda list-function-versions-by-capacity-provider --capacity-provider-name fcvm-lambda-spike --region us-east-1`
+to check which published versions are still attached, then verify the provider drains.
+[AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
 
 At November 2026 us-east-1 Linux On-Demand prices, one running host costs about
 $0.58/hour including Lambda's 9.75% G-series management fee, or about $1.73/hour
