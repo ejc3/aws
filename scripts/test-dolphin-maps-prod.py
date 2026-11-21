@@ -143,6 +143,11 @@ elif "workers-prod/" in a:
     if p is None or os.environ.get("AWS_ACCESS_KEY_ID") != "ASIAFAKEDOLPHIN":
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
+elif "--secret-id scrapingdog/api-key " in a or "--secret-id browserbase/credentials " in a:
+    source = "FAKE_SCRAPINGDOG" if "--secret-id scrapingdog/api-key " in a else "FAKE_BROWSERBASE"
+    if os.environ.get("AWS_ACCESS_KEY_ID") != "ASIAFAKEDOLPHIN" or source not in os.environ:
+        sys.exit(254)
+    print(os.environ[source])
 elif "dolphin-maps/musickit" in a:
     p = os.environ.get("FAKE_MUSICKIT")
     if p is None:
@@ -175,7 +180,7 @@ class LoaderTests(unittest.TestCase):
             p.chmod(p.stat().st_mode | stat.S_IEXEC)
         self.log, self.stdin, self.aws_log = self.tmp / "npx.log", self.tmp / "npx.stdin", self.tmp / "aws.log"
 
-    def run_loader(self, oob, managed=MANAGED, **extra):
+    def run_loader(self, oob, managed=MANAGED, site="dolphin-maps", **extra):
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
                    NPX_STDIN=str(self.stdin), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile", **extra)
         env.pop("AWS_ACCESS_KEY_ID", None)
@@ -184,8 +189,44 @@ class LoaderTests(unittest.TestCase):
                 env.pop(name, None)
             else:
                 env[name] = json.dumps(value)
-        r = subprocess.run(["bash", str(SCRIPT), "dolphin-maps"], capture_output=True, text=True, env=env, timeout=60)
+        r = subprocess.run(["bash", str(SCRIPT), site], capture_output=True, text=True, env=env, timeout=60)
         return r, r.stdout + r.stderr
+
+    def test_scorebook_uses_only_its_two_keys_from_the_dolphin_news_secrets(self):
+        expected = {"SCRAPINGDOG_API_KEY": "fake-dog-key-938", "BROWSERBASE_API_KEY": "fake-browser-key-938"}
+        private_project = "unused-private-project-938"
+        r, out = self.run_loader(None, site="dolphin-labs",
+                                 FAKE_SCRAPINGDOG=json.dumps({"SCRAPINGDOG_API_KEY": expected["SCRAPINGDOG_API_KEY"]}),
+                                 FAKE_BROWSERBASE=json.dumps({"BROWSERBASE_API_KEY": expected["BROWSERBASE_API_KEY"],
+                                                             "BROWSERBASE_PROJECT_ID": private_project}))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), expected)
+        self.assertIn("secret bulk --name dolphin-labs-prod", self.log.read_text())
+        calls = self.aws_log.read_text()
+        for name in ("browserbase/credentials", "scrapingdog/api-key"):
+            read, = [line for line in calls.splitlines() if "--secret-id " + name + " " in line]
+            self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=-", read)
+        self.assertNotIn("workers-stage/", calls)
+        self.assertNotIn("workers-prod/", calls)
+        for value in (*expected.values(), private_project):
+            self.assertNotIn(value, out + calls + self.log.read_text())
+
+    def test_scorebook_refuses_a_missing_malformed_or_empty_provider_key_before_upload(self):
+        good = {"FAKE_SCRAPINGDOG": '{"SCRAPINGDOG_API_KEY":"fake-dog-key-938"}',
+                "FAKE_BROWSERBASE": '{"BROWSERBASE_API_KEY":"fake-browser-key-938"}'}
+        for field in good:
+            for invalid in (None, "{broken-json", "{}", "[]", '{"BROWSERBASE_API_KEY":"[SENSITIVE]"}'):
+                with self.subTest(field=field, invalid=invalid):
+                    values = dict(good)
+                    if invalid is None:
+                        del values[field]
+                    else:
+                        values[field] = invalid
+                    r, out = self.run_loader(None, site="dolphin-labs", **values)
+                    self.assertNotEqual(r.returncode, 0)
+                    self.assertFalse(self.log.exists(), "no partial update of the production Worker")
+                    self.assertNotIn("fake-browser-key-938", out)
+                    self.assertNotIn("fake-dog-key-938", out)
 
     def test_it_loads_both_dolphin_account_containers_into_the_prod_worker(self):
         r, out = self.run_loader(self.VALUES)
