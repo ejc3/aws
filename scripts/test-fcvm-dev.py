@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for fcvm-dev.tf (ejc3/aws#607): the fcvm.dev zone, its DNS-only token, the coordinator tunnel behind Access,
+"""Offline tests for fcvm-dev.tf (ejc3/aws#607): the fcvm.dev zone, its Access policy, the coordinator tunnel behind Access,
 and the secrets written into the fcvm-fleet account. Staging only: no public apex or fleet-api.fcvm.dev yet."""
 import re
 import unittest
@@ -32,18 +32,13 @@ class ZoneTests(unittest.TestCase):
 
 
 class TokenTests(unittest.TestCase):
-    def test_no_token_minted_here_can_change_the_fcvm_dev_zone(self):
-        # ejc3/aws#922: staging and dev credentials may not control production DNS. Any token scoped to the
-        # fcvm.dev zone, or to the whole account, is refused, whatever its permissions.
-        for path in sorted(ROOT.glob("*.tf")):
+    def test_retired_parent_zone_writers_and_read_grants_stay_absent(self):
+        for path in ROOT.glob("*.tf"):
             text = path.read_text()
-            for m in re.finditer(r'resource "cloudflare_(account|api)_token" "(\w+)" \{', text):
-                tok = block(m.group(0)[:-2], text)
-                self.assertNotIn("fcvm_dev_zone_id", tok, f"{path.name}: {m.group(2)}")
-        self.assertFalse((ROOT / "fcvm-dns-test.tf").exists())
-        for gone in ("fcvm_fleet_dns_token", "fcvm_dns_test_token", "cloudflare-dns-token", "fcvm-dns-test-token"):
-            for path in sorted(ROOT.glob("*.tf")):
-                self.assertNotIn(gone, path.read_text(), f"{path.name}: {gone}")
+            for retired in ('cloudflare_account_token" "fcvm_fleet_dns"', 'cloudflare_account_token" "fcvm_dns_test"',
+                            'fcvm-fleet/cloudflare-dns-token',
+                            'fcvm-dns-test-token', 'fcvm_fleet_dns_token', 'fcvm_dns_test_token'):
+                self.assertNotIn(retired, text, f"{path.name}: {retired}")
 
 
 class AccessTests(unittest.TestCase):

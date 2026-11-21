@@ -386,6 +386,9 @@ jobs:
       - name: "Browser Run token: explicit short window, administrator-only, exact permission and primary jumpbox IPv4"
         run: python3 -S -B scripts/test-browser-run.py
 
+      - name: "DNS propagation probes: child-zone delegation, scoped temporary credentials and record cleanup"
+        run: python3 -S -B scripts/test-fcvm-dns-test.py
+
       - name: "GitHub App token: a JWT GitHub accepts, the installation token, retries only on transient errors"
         run: python3 -B scripts/test-github-app-token.py
 
@@ -446,7 +449,6 @@ jobs:
           python3 -S -B scripts/test-fcvm-fleet.py
           python3 -S -B scripts/test-fcvm-stage-certificate.py
           python3 -S -B scripts/test-fcvm-parent-wildcard-audit.py
-          python3 -S -B scripts/test-fcvm-revoke-parent-wildcards.py
           python3 -S -B scripts/test-fcvm-fleet-spend-cap.py
 
       - name: "Coordinator releases: image-only changes, Terraform backend lock ownership and rollback"

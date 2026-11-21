@@ -1580,6 +1580,16 @@ Available if a task needs them; neither needs a key on disk.
   Cloudflare also checks the primary ARM Elastic IPv4 and host IPv6. Run the hosted Quick Actions on fcvm-arm
   with the token in the benchmark process environment. Keep it out of argv, logs, files and commits.
   Browser usage is billable. Rotate with `terraform apply -replace='cloudflare_account_token.browser_run[0]'`.
+- **DNS propagation on the metal boxes.** Run `python3 scripts/fcvm-dns-probe.py` from this checkout with boto3 and
+  dig. It publishes one unique TXT record under `dnstest.fcvm.dev`, measures each of the four authoritative
+  nameservers plus Cloudflare and Google recursive DNS, and deletes the record after success or timeout.
+  The delegated test zone uses Route 53. This measures its publication and recursive visibility. To measure the
+  fleet coordinator's own DNS implementation, resolve a fresh staging launch name under `tiles-stage.fcvm.dev`.
+  The temporary instance credentials allow CREATE/DELETE only for probe-prefixed A, AAAA and TXT records in the
+  test zone from the existing dev IP ranges. The test discovers its public zone ID from the _zone-id TXT record.
+  During token retirement first apply only the probe delegation, ID record and `aws_iam_policy.dev_server_constellation_terraform`
+  (including their dependencies), then run the probe from a metal dev box. Verify the old tokens are still at the issuer
+  and both the probe CREATE and DELETE succeeded before the full retirement apply.
 - **The claw-master dashboard, as an agent**, metal boxes and the owner's nextjs-ct container. `claude-master-dashboard/agent-access` (us-west-1) holds a
   Cloudflare Access service token (`client_id`, `client_secret`) that the dashboard Worker admits by client id
   (`claw-master-dashboard-site.tf`, #374), so an agent can read what the page shows and check a deploy:
@@ -1834,7 +1844,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   page's `/live` and `/poster.jpg` to the API host with its own service token, `fcvm-fleet-stage-worker`, admitted by the
   API application only and uploaded from ejc3/fcvm's `cloudflare-deploy` environment, so a browser needs one Access
   session). Written into the
-  fleet account: `fcvm-fleet/cloudflare-dns-token` (DNS Write on fcvm.dev only), `fcvm-fleet/coordinator-tunnel-token`,
+  fleet account: `fcvm-fleet/coordinator-tunnel-token`,
   `fcvm-fleet/agent-access-token`. The apex and `fleet-api.fcvm.dev` go live only on the owner's go-ahead.
 - **Infrastructure** (`fcvm-fleet.tf`, ejc3/aws#606; `modules/fcvm-fleet-region` once per region): a VPC per region (IPv6 /56,
   a public subnet per AZ, one security group admitting TCP 443 from anywhere and nothing else, no SSH: SSM only, flow logs
@@ -1844,15 +1854,16 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   `fcvm-fleet` in us-east-2 with its state object in S3; the asset bucket; the `fcvm-fleet/stage/tls` secret, which the
   coordinator renews for `*.tiles-stage.fcvm.dev` only (`--tls-scope subzone`). The tunnel token and agent
   Access token come from `fcvm-dev.tf`. The staging runtime roles lose their grants to the old parent-zone secret
-  and DNS token. The token remains valid at its issuer. The old certificate remains valid until revoked or expired,
-  including copies on host or tile disks and in backups. Production activation depends on completing #922.
-- **Staging certificate cutover.** First apply only the staging certificate container and its resource policy. On the jumpbox,
-  set `ACME_EMAIL` from the `owner` field of the management account's `people/addresses` secret, then assume the
-  fleet administration role. With lego v4.17.4 and the existing parent-zone ACME CNAME, run
-  `python3 scripts/fcvm-stage-certificate.py --issue`. It bootstraps the stage wildcard with a fresh key, retains the
-  old scene token, verifies the chain and matching keys and labels the verified version. The coordinator requires a
-  populated certificate on startup. The Terraform cutover reads version metadata only. Run
-  `python3 scripts/fcvm-stage-certificate.py` to verify it again before planning. Check that deployed viewers
+  and DNS token. Applying the DNS retirement deletes the two old tokens at Cloudflare. The old certificates remain valid
+  until revoked or expired, including copies on host or tile disks and in backups. Production activation depends on #922.
+- **Staging certificate recovery.** The coordinator renews `*.tiles-stage.fcvm.dev` through its delegated authoritative
+  DNS. It needs a populated staging secret on startup. On the jumpbox, assume the fleet administration role and run
+  `python3 scripts/fcvm-stage-certificate.py` to verify the chain, SAN, key, remaining lifetime, bootstrap label and
+  original scene token. If the container is pending deletion, restore it with its versions intact. For a new empty
+  container, recover from a staging host’s protected `/run/fcvm-fleet/tls/tls.json` or an existing current secret backup. On the
+  administration host, pass that JSON on private tmpfs as `--restore /protected/path/tls.json`. Its chain, key and
+  scene token suffice; the script verifies them and rebuilds expiry and SAN metadata before writing or labeling it. Retain the legacy certificate secret for
+  revocation evidence and scene-token verification. Terraform reads version metadata only. Check that deployed viewers
   and direct integrations use the published launch names under `tiles-stage.fcvm.dev`. The old certificate covers
   both namespaces, so consumers can migrate first. Clients pinned to `slot-<n>.fcvm.dev` or `ec2-<n>.fcvm.dev`
   will fail TLS against a new renderer even if they supply their own address. An empty parent DNS record list alone
@@ -1860,7 +1871,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   Already-created pool tiles retain their original boot configuration. On a wake, an old tile may spend up to
   600 seconds waiting for renderer health before the coordinator replaces it. The cold launch takes additional
   time. Verify a fresh tile and host serve frames on IPv4 and IPv6 after the cutover. Retire the old
-  certificate and DNS credentials separately as tracked in #922.
+  certificates separately as tracked in #922.
 - **The two gates are on**: `local.fcvm_fleet_hosts_enabled` (also needing a regional AMI in
   `var.fcvm_fleet_host_amis`) and `local.fcvm_fleet_coordinator_enabled`. GPU hosts are
   terminated when idle. Main-only CI builds and tests an ARM64 coordinator image, publishes a full-commit

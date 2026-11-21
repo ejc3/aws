@@ -244,6 +244,27 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Action   = "secretsmanager:GetSecretValue"
       Resource = aws_secretsmanager_secret.abliteration_api_key.arn
       }, {
+      # Both metal boxes test DNS propagation under the delegated dnstest zone with their instance credentials.
+      Sid      = "ChangeFcvmProbeRecords"
+      Effect   = "Allow"
+      Action   = "route53:ChangeResourceRecordSets"
+      Resource = aws_route53_zone.fcvm_dns_probe.arn
+      Condition = {
+        IpAddress = { "aws:SourceIp" = local.fcvm_dns_probe_source_cidrs }
+        "ForAllValues:StringLike" = {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames" = ["probe-*.${local.fcvm_dns_probe_zone}"]
+        }
+        "ForAllValues:StringEquals" = {
+          "route53:ChangeResourceRecordSetsRecordTypes" = ["A", "AAAA", "TXT"]
+          "route53:ChangeResourceRecordSetsActions"     = ["CREATE", "DELETE"]
+        }
+        Null = {
+          "route53:ChangeResourceRecordSetsNormalizedRecordNames" = "false"
+          "route53:ChangeResourceRecordSetsRecordTypes"           = "false"
+          "route53:ChangeResourceRecordSetsActions"               = "false"
+        }
+      }
+      }, {
       # fcvm-arm ubuntu's Cloudflare Access tokens for `ssh mini` and `ssh ci-mac` (mini-ssh.tf, mac-vms.tf), its instance only.
       Sid    = "ReadTheMiniSshTokens"
       Effect = "Allow"
