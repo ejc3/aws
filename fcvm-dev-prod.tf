@@ -1,7 +1,7 @@
 # fcvm-dev-prod.tf
 #
-# The Cloudflare side of the PRODUCTION fcvm fleet (fcvm.dev), all behind var.fcvm_fleet_prod_enabled, which is false:
-# with it off this file creates nothing. Staging (fcvm-dev.tf: stage.fcvm.dev, fleet-api-stage.fcvm.dev) is untouched and
+# The Cloudflare side of the PRODUCTION fcvm fleet (fcvm.dev), gated on var.fcvm_fleet_prod_enabled.
+# Turning the switch off omits these resources. Staging (fcvm-dev.tf: stage.fcvm.dev, fleet-api-stage.fcvm.dev) is untouched and
 # stays behind Access. Owner decisions, 2026-11-18: a separate production stack at fcvm.dev in the same fcvm-fleet account
 # as staging (tagged Fleet=prod); only Turnstile-verified visitors may wake the fleet or take a seat; all modes public.
 #
@@ -29,12 +29,9 @@
 #                                             the coordinator reads them from (fcvm fleet/PROTOCOL.md, "Running it")
 
 variable "fcvm_fleet_prod_enabled" {
-  description = "Create the production fcvm fleet (fcvm.dev): its Cloudflare resources, fleet secrets and AWS stack. On since 2026-11-21."
+  description = "Create the production fcvm fleet (fcvm.dev): its Cloudflare resources, fleet secrets and AWS stack."
   type        = bool
   default     = true
-
-  # Both the Cloudflare routes and AWS resources use this input, including on targeted plans. It was refused until
-  # ejc3/aws#922 retired the parent-zone DNS tokens and the staging certificates for fcvm.dev names (#929).
 }
 
 locals {
