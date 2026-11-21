@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline tests for fcvm-dev.tf (ejc3/aws#607): the fcvm.dev zone, its DNS-only token, the coordinator tunnel behind Access,
+"""Offline tests for fcvm-dev.tf (ejc3/aws#607): the fcvm.dev zone, its Access policy, the coordinator tunnel behind Access,
 and the secrets written into the fcvm-fleet account. Staging only: no public apex or fleet-api.fcvm.dev yet."""
 import re
 import unittest
@@ -9,9 +9,10 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-dev.tf").read_text()
 
 
-def block(header):
-    start = TF.index(header)
-    return TF[start:TF.index("\n}\n", start) + 2]
+def block(header, text=None):
+    text = TF if text is None else text
+    start = text.index(header)
+    return text[start:text.index("\n}\n", start) + 2]
 
 
 class ZoneTests(unittest.TestCase):
@@ -31,13 +32,13 @@ class ZoneTests(unittest.TestCase):
 
 
 class TokenTests(unittest.TestCase):
-    def test_the_dns_token_edits_dns_in_this_zone_only(self):
-        tok = block('resource "cloudflare_account_token" "fcvm_fleet_dns"')
-        self.assertIn("provider   = cloudflare.token_minter", tok)
-        self.assertEqual(re.findall(r"\{ id = ([^}]+) \}", tok), ["local.dns_write"])
-        self.assertIn('"com.cloudflare.api.account.zone.${var.fcvm_dev_zone_id}" = "*"', tok)
-        self.assertNotIn("com.cloudflare.api.account.${", tok)
-        self.assertIn('dns_write           = "4755a26eedb94da69e1066d98aa820be"', TF)
+    def test_retired_parent_zone_writers_and_read_grants_stay_absent(self):
+        for path in ROOT.glob("*.tf"):
+            text = path.read_text()
+            for retired in ('cloudflare_account_token" "fcvm_fleet_dns"', 'cloudflare_account_token" "fcvm_dns_test"',
+                            'fcvm-fleet/cloudflare-dns-token',
+                            'fcvm-dns-test-token', 'fcvm_fleet_dns_token', 'fcvm_dns_test_token'):
+                self.assertNotIn(retired, text, f"{path.name}: {retired}")
 
 
 class AccessTests(unittest.TestCase):
@@ -140,9 +141,8 @@ class StageWorkerTests(unittest.TestCase):
 
 
 class FleetSecretTests(unittest.TestCase):
-    def test_the_three_secrets_live_in_the_fleet_account(self):
-        for name, path in (("fcvm_fleet_dns_token", "fcvm-fleet/cloudflare-dns-token"),
-                           ("fcvm_fleet_coordinator_tunnel", "fcvm-fleet/coordinator-tunnel-token"),
+    def test_the_two_secrets_live_in_the_fleet_account(self):
+        for name, path in (("fcvm_fleet_coordinator_tunnel", "fcvm-fleet/coordinator-tunnel-token"),
                            ("fcvm_fleet_agent_access", "fcvm-fleet/agent-access-token")):
             s = block(f'resource "aws_secretsmanager_secret" "{name}"')
             self.assertIn("provider                = aws.fcvm_fleet", s)
