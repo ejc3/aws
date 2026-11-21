@@ -120,7 +120,7 @@ resource "aws_lambda_capacity_provider" "fcvm_fleet_spike" {
   }
   capacity_provider_scaling_config {
     scaling_mode   = "Auto"
-    max_vcpu_count = 4 # One 4-vCPU T4 host for this spike.
+    max_vcpu_count = 12 # At most three 4-vCPU T4 hosts. Lambda rejected a ceiling of four vCPUs.
   }
   lifecycle {
     precondition {

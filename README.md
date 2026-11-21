@@ -849,14 +849,21 @@ immutable tags and an image lifecycle policy before deploying the function.
 Use the execution role and capacity provider from the pointer. Creating the GPU
 function requires an AWS SDK or CLI whose CreateFunction supports
 `AcceleratorConfig.AcceleratorMemorySize`. The pinned Terraform AWS provider
-6.64.0 lacks this field on `aws_lambda_function`. The provider is
-limited to four vCPUs of `g4dn.xlarge` (one T4 host) and accepts no inbound
-connections. Invoke a published version through Lambda. Publishing starts
-billable GPU capacity, even before the first invocation. Use zero minimum and
-one maximum execution environment for the spike. Delete its versions or the
-function when finished and verify the capacity provider drains. Old published
-versions can keep capacity running. The limit bounds concurrent GPU capacity;
-total charges depend on runtime. [AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
+6.64.0 lacks this field on `aws_lambda_function`.
+
+The empty provider starts no hosts. It allows only `g4dn.xlarge` and caps the
+pool at 12 vCPUs, up to three T4 hosts. It accepts no inbound connections.
+Publishing a function version starts billable GPU capacity before the first
+invocation. Set that version to zero minimum and one maximum execution
+environment for this spike and invoke the published version through Lambda.
+The version limit controls execution environments; the provider cap applies
+across versions. Delete versions or the function after the test and verify
+the provider drains. [AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
+
+At November 2026 us-east-1 Linux On-Demand prices, one running host costs about
+$0.58/hour including Lambda's 9.75% G-series management fee, or about $1.73/hour
+with all three running. Requests, storage and networking are additional.
+[AWS Lambda pricing](https://aws.amazon.com/lambda/pricing/)
 
 ### Production Spot interruption drill
 
