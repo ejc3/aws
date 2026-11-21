@@ -86,7 +86,7 @@ class MetricAlarmTests(unittest.TestCase):
         spend = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_prod_spend_80_percent"')
         self.assertIn('metric_name         = "SpendUsdToday"', spend)
         self.assertIn("threshold           = local.fcvm_fleet_prod_daily_spend_usd * 0.8", spend)
-        self.assertIn("fcvm_fleet_prod_daily_spend_usd = 750", PROD)
+        self.assertIn("fcvm_fleet_prod_daily_spend_usd = 1", PROD)  # budget-trip drill (#942); restored to 750 next
         cert = block('resource "aws_cloudwatch_metric_alarm" "fcvm_fleet_prod_certificate_expiring"')
         for line in ('metric_name         = "CertDaysLeft"', 'statistic           = "Minimum"', "threshold           = 21",
                      'comparison_operator = "LessThanThreshold"', 'treat_missing_data  = "breaching"'):

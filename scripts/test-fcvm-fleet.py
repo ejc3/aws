@@ -1946,7 +1946,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn('"--tls-secret", aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].name', cmd)
         self.assertIn('["--dns-subzone", local.fcvm_fleet_prod_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_prod_names_ns)', cmd)
         self.assertIn('["--daily-spend-usd", tostring(local.fcvm_fleet_prod_daily_spend_usd)]', cmd)
-        self.assertIn("fcvm_fleet_prod_daily_spend_usd = 750", PROD)
+        self.assertIn("fcvm_fleet_prod_daily_spend_usd = 1", PROD)  # budget-trip drill (#942); restored to 750 next
         # ejc3/fcvm#1973 (src/cli/args.rs, src/fleet/coord/cert.rs): two awake hosts, one per zone, and the subzone
         # certificate, which refuses --dns-token-secret. --awake-capacity is gone from fcvm, so no file may pass it.
         self.assertIn('["--awake-hosts", tostring(local.fcvm_fleet_prod_awake_hosts), "--host-spread", "az"]', cmd)

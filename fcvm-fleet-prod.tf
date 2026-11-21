@@ -38,7 +38,8 @@ locals {
   # The page's origin (ejc3/fcvm fleet/web wrangler.jsonc, env.production): the only browser origin /live accepts.
   fcvm_fleet_prod_site_origin = "https://fcvm.dev"
   # Owner, 2026-11-18: $750 a day, metered at the Spot price; the coordinator sleeps the fleet at the ceiling.
-  fcvm_fleet_prod_daily_spend_usd = 750
+  # BUDGET-TRIP DRILL (#942), 2026-11-21: $1, so the coordinator trips at once on today's spend. The next PR restores 750.
+  fcvm_fleet_prod_daily_spend_usd = 1
   # Two awake GPU hosts in us-east-1, each launched by its own request into an availability zone no live host is in
   # (ejc3/fcvm#1973, src/cli/args.rs --awake-hosts and --host-spread az). A host given a spot notice is replaced at the
   # notice, so the replacement needs a third zone: the task definition requires three host zones.
