@@ -9,6 +9,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "fcvm-dev-prod.tf").read_text()
+CLOUDFLARE_TOKEN = re.compile(
+    r'^resource\s+"cloudflare_(?:account|api)_token"\s+"([^"\n]+)"\s*\{.*?^\}',
+    re.MULTILINE | re.DOTALL,
+)
 
 
 def code(text):
@@ -43,11 +47,16 @@ class SwitchTests(unittest.TestCase):
     def test_cloudflare_tokens_do_not_reintroduce_retired_dns_permissions(self):
         # Check the parent-zone and DNS Write references used by the retired Terraform tokens, even under a new name.
         for path in sorted(ROOT.glob("*.tf")):
-            text = code(path.read_text()) + "\n"
-            for m in re.finditer(r'resource "cloudflare_(?:account|api)_token" "(\w+)" \{', text):
-                body = text[m.start():text.index("\n}\n", m.start())]
+            for token in CLOUDFLARE_TOKEN.finditer(code(path.read_text())):
                 for needle in ("fcvm_dev_zone_id", "dns_write", "4755a26eedb94da69e1066d98aa820be", "DNS Write"):
-                    self.assertNotIn(needle, body, f"{path.name}: {m.group(1)} ({needle})")
+                    self.assertNotIn(needle, token.group(), f"{path.name}: {token.group(1)} ({needle})")
+
+    def test_scans_the_permissions_of_a_hyphenated_token(self):
+        definition = 'resource "cloudflare_account_token" "retired-dns" {\n  policies = [{ id = local.dns_write }]\n}'
+        token = CLOUDFLARE_TOKEN.fullmatch(definition)
+        self.assertIsNotNone(token)
+        self.assertEqual(token.group(1), "retired-dns")
+        self.assertIn("local.dns_write", token.group())
 
     def test_every_resource_and_data_source_follows_the_switch(self):
         found = [("resource", k, n) for k, n in headers("resource")] + [("data", k, n) for k, n in headers("data")]
