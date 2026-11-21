@@ -99,6 +99,6 @@ resource "cloudflare_dns_record" "fcvm_fleet_prod_names_delegation" {
   type       = "NS"
   content    = local.fcvm_fleet_prod_names_ns[count.index]
   ttl        = 3600
-  comment    = "fcvm prod fleet launch names, served by the prod coordinator (fcvm-fleet-prod-dns.tf); insecure delegation, no DS"
+  comment    = "Delegate production launch names to the fleet coordinator (unsigned, no DS)"
   depends_on = [cloudflare_dns_record.fcvm_fleet_prod_names_ns_address, aws_lb_listener.fcvm_fleet_prod_dns]
 }

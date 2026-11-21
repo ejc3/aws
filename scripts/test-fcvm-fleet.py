@@ -2046,6 +2046,9 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn('preserve_client_ip   = "true"', block('resource "aws_lb_target_group" "fcvm_fleet_prod_dns"', PROD_DNS))
         ns = block('resource "cloudflare_dns_record" "fcvm_fleet_prod_names_delegation"', PROD_DNS)
         self.assertIn('type       = "NS"', ns)
+        # Cloudflare rejects DNS record comments longer than 100 characters on this zone.
+        comment = re.search(r'^  comment\s*= "([^"\n]*)"$', ns, re.M).group(1)
+        self.assertLessEqual(len(comment), 100)
         self.assertIn("name       = local.fcvm_fleet_prod_names_zone", ns)
         addr = block('resource "cloudflare_dns_record" "fcvm_fleet_prod_names_ns_address"', PROD_DNS)
         self.assertIn("content = aws_eip.fcvm_fleet_prod_dns[count.index].public_ip", addr)
