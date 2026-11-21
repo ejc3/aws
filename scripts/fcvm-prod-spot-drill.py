@@ -101,11 +101,15 @@ def process(event, fis, ec2, read, save, template, now):
     def recorded(record):
         try:
             return owned(record["id"])
-        except fis.exceptions.ResourceNotFoundException:
+        except fis.exceptions.ClientError as error:
+            if error.response["Error"]["Code"] not in {"ResourceNotFoundException", "AccessDeniedException"}:
+                raise
             if now < record.get("accepted_at", record["requested_at"]) + HISTORY_SECONDS:
                 raise
-            # FIS deletes only terminal experiments at its history horizon. Keep the request
-            # receipt so an old retry cannot recreate an expired experiment.
+            # FIS drops terminal records after 120 days. A deleted experiment has no Drill
+            # tag, so the scoped Get can return AccessDenied. Confirm absence in FIS first.
+            if any(exp["id"] == record["id"] for exp in observed()):
+                raise
             return {"id": record["id"], "state": {"status": "expired"}}
 
     def observed():

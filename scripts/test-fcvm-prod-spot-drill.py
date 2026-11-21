@@ -16,6 +16,12 @@ SECOND = "20000000-0000-4000-a000-000000000002"
 A, B = "i-00000001", "i-00000002"
 
 
+class FisClientError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
 class DrillTests(unittest.TestCase):
     def setUp(self):
         self.zones = {A: "us-east-1a", B: "us-east-1b"}
@@ -36,14 +42,20 @@ class DrillTests(unittest.TestCase):
             ]
         )
         self.fis.list_experiments.side_effect = lambda: {"experiments": list(self.experiments.values())}
-        self.fis.get_experiment.side_effect = lambda id: {"experiment": self.experiments[id]}
+        self.fis.get_experiment.side_effect = self.get_fis
         self.fis.start_experiment.side_effect = self.start_fis
         self.fis.stop_experiment.side_effect = self.stop_fis
         self.fis.list_experiment_resolved_targets.side_effect = self.targets
-        self.fis.exceptions.ResourceNotFoundException = LookupError
+        self.fis.exceptions.ClientError = FisClientError
         self.ec2 = Mock(spec=["describe_instances", "describe_instance_status"])
         self.ec2.describe_instances.side_effect = self.describe
         self.ec2.describe_instance_status.side_effect = self.health
+
+    def get_fis(self, id):
+        if id not in self.experiments:
+            # The broker's GetExperiment permission requires the Drill resource tag.
+            raise FisClientError("AccessDeniedException")
+        return {"experiment": self.experiments[id]}
 
     def targets(self, *, experimentId, targetName):
         self.assertIn(experimentId, self.experiments)
@@ -213,7 +225,7 @@ class DrillTests(unittest.TestCase):
         self.experiments["EXP1"]["startTime"] = dt.datetime.fromtimestamp(self.now, dt.timezone.utc)
         self.assertEqual(self.invoke("status")["target_azs"], ["us-east-1a"])
         del self.experiments["EXP1"]
-        with self.assertRaises(LookupError):
+        with self.assertRaisesRegex(FisClientError, "AccessDeniedException"):
             self.invoke("start", request_id=SECOND)
         self.now += drill.HISTORY_SECONDS + 1
         for action, opts in (
@@ -226,6 +238,35 @@ class DrillTests(unittest.TestCase):
             self.assertEqual(result["target_azs"], ["us-east-1a"])
             self.assertIsNotNone(result["started_at"])
         self.assertEqual(self.invoke("start", request_id=SECOND)["experiment_id"], "EXP2")
+
+    def test_expiry_requires_a_complete_listing_without_the_recorded_id(self):
+        self.invoke("start", request_id=FIRST)
+        self.now += drill.HISTORY_SECONDS + 1
+        exp = self.experiments["EXP1"]
+        for code in ("AccessDeniedException", "ResourceNotFoundException"):
+            with self.subTest(code=code):
+                self.fis.get_experiment.side_effect = FisClientError(code)
+                self.fis.list_experiments.side_effect = [
+                    {"experiments": [], "nextToken": "more"},
+                    {"experiments": [exp]},
+                ]
+                with self.assertRaisesRegex(FisClientError, code):
+                    self.invoke("status")
+                self.fis.list_experiments.assert_called_with(nextToken="more")
+                self.fis.list_experiments.side_effect = [{"experiments": []}]
+                self.assertEqual(self.invoke("status")["state"], "expired")
+        self.fis.list_experiments.side_effect = [
+            {"experiments": [], "nextToken": "more"},
+            FisClientError("ThrottlingException"),
+        ]
+        with self.assertRaisesRegex(FisClientError, "ThrottlingException"):
+            self.invoke("status")
+        self.fis.get_experiment.side_effect = FisClientError("InternalServerException")
+        self.fis.list_experiments.reset_mock()
+        with self.assertRaisesRegex(FisClientError, "InternalServerException"):
+            self.invoke("status")
+        self.fis.list_experiments.assert_not_called()
+        self.fis.start_experiment.assert_called_once()
 
     def test_pending_unknown_retired_without_replaying(self):
         self.fis.start_experiment.side_effect = TimeoutError()
