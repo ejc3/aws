@@ -2685,6 +2685,19 @@ step here: `games-mp-migrate` applies every file under its `supabase/migrations`
 merges to `main`, before that release is promoted (`docs/games-multiplayer.md`, "Site
 migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
 
+### Open Fantasy staging books
+
+`fantasy-books.tf` creates the private `fantasy-stage-books` R2 bucket (no public URL) that the staging Worker
+`fantasy-stage` binds as `BOOKS` in a later constellation change, serving `books/<id>.json` only behind the
+staging-Workers Access application. The uploader on fcvm-arm reads its bucket-scoped credentials from
+`fantasy/books-upload` in us-west-1. Only the administration set and the fcvm-arm instance session can read that
+secret. The protected Terraform state also contains the credentials.
+
+To rotate, add a second token with a distinct Terraform resource address and Cloudflare token name, the same
+bucket-only policy and the same replacement guard. Point `local.fantasy_books_credentials` at the new token and
+apply. Verify the uploader on fcvm-arm can upload and read back a test book with the new credentials. Then remove the old
+token resource and apply again to revoke it.
+
 ### Dolphin Maps road tiles
 
 `dolphin-maps-tiles.tf` creates the private `dolphin-maps-tiles` R2 bucket for nationwide road tiles under
