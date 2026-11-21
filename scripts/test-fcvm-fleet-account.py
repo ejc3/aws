@@ -121,8 +121,9 @@ class ApplyRoleTests(unittest.TestCase):
 
 
 class QuotaTests(unittest.TestCase):
-    def test_g_spot_is_192_in_us_east_1_and_never_lowered(self):
-        self.assertIn("fcvm_fleet_spot_g_vcpus = 192", TF)
+    def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
+        # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
+        self.assertIn("fcvm_fleet_spot_g_vcpus = 480", TF)
         for suffix, alias in (("east1", "fcvm_fleet_east1"),):
             q = block(f'resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_g_{suffix}"')
             self.assertIn(f"provider     = aws.{alias}", q)

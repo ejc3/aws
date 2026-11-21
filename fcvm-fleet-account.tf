@@ -15,8 +15,8 @@
 # - CI cannot assume a role in this account. Its management-account role may publish to the coordinator's ECR repository
 #   and invoke the image-only release function (fcvm-fleet-ci.tf). Only that function assumes the scoped release role;
 #   neither has Terraform-state or reusable-credential access.
-# - Quotas (ejc3/aws#605): 192 vCPU of G spot in us-east-1 (one metal host, its replacement and the EC2 tiles); one
-#   region is enough.
+# - Quotas (ejc3/aws#605, #913): 480 vCPU of G spot in us-east-1 (production's two hosts and a replacement, staging's
+#   host and an image-factory build host); one region is enough.
 #
 # First apply: the provider aliases need the account id, so apply the account first
 # (-target=aws_organizations_account.fcvm_fleet), then everything.
@@ -27,9 +27,10 @@ locals {
   fcvm_fleet_account_id      = aws_organizations_account.fcvm_fleet.id
   fcvm_fleet_terraform_role  = "arn:aws:iam::${aws_organizations_account.fcvm_fleet.id}:role/fcvm-fleet-terraform"
   fcvm_fleet_access_role_arn = "arn:aws:iam::${aws_organizations_account.fcvm_fleet.id}:role/OrganizationAccountAccessRole"
-  # G and VT spot vCPUs per region (#605): a g4dn.metal (96) and its replacement while the old one terminates, or a
-  # g5g.metal (64) plus the EC2 comparison tiles at 4 vCPU each.
-  fcvm_fleet_spot_g_vcpus = 192
+  # G and VT spot vCPUs in us-east-1 (#605, #913): production's two awake g4dn.metal hosts (192), the replacement a
+  # Spot interruption notice launches while the reclaimed host drains (96), staging's host (96) and an image-factory
+  # build host (96).
+  fcvm_fleet_spot_g_vcpus = 480
   # On-demand G vCPUs in us-east-1 (ejc3/fcvm#1257): the wall's host (96) and its replacement while the old one shuts
   # down (96), the EC2 tiles started on demand (8 x 4), and the gpubox test hosts and AMI builders that share the
   # region (96 each, four at once). At 384 the wall's host was refused with VcpuLimitExceeded for 13 minutes on two
