@@ -409,6 +409,9 @@ class ZshEnv(Base):
         tool.write_text('''#!/bin/sh
 [ "$DEVELOPER_DIR" = "$HOME/Applications/Xcode.app/Contents/Developer" ] || exit 1
 echo "$*" >> "$HOME/checks"
+if [ "$*" = -checkFirstLaunchStatus ] && [ -f "$HOME/updating" ]; then
+    echo "upgrade in progress" > "$DEVELOPER_DIR/../version.plist"
+fi
 case "$*" in
     "-license check") test -f "$HOME/licensed" ;;
     "-checkFirstLaunchStatus") test -f "$HOME/initialized" ;;
@@ -432,6 +435,11 @@ esac
         self.assertEqual(self.selected_developer(), "unset")
         self.set_("--build-only")
         self.assertEqual(self.selected_developer(), str(developer))
+        updating = self.temp / "updating"
+        updating.touch()
+        self.set_("--build-only")
+        self.assertEqual(self.selected_developer(), "unset", "a build replaced during the probes was not validated")
+        updating.unlink()
         for marker in ("initialized", "licensed"):
             (self.temp / marker).unlink()
             self.set_("--build-only")

@@ -12,13 +12,15 @@ if [ "${2:-}" = --build-only ]; then
   developer="$contents/Developer"
   build="$developer/usr/bin/xcodebuild"
   stamp="$HOME/.local/state/mac-setup/mini-xcode-version.plist"
+  mkdir -p "$(dirname "$stamp")"
+  candidate=$(mktemp "$stamp.XXXXXXXX")
+  trap 'rm -f "$candidate"' EXIT
   # Probe only at setup. A replacement Xcode needs its own first-launch and license checks.
-  if [ -r "$contents/version.plist" ] && [ -x "$build" ] &&
+  if [ -r "$contents/version.plist" ] && [ -x "$build" ] && cp "$contents/version.plist" "$candidate" &&
      DEVELOPER_DIR="$developer" "$build" -license check </dev/null >/dev/null 2>&1 &&
-     DEVELOPER_DIR="$developer" "$build" -checkFirstLaunchStatus </dev/null >/dev/null 2>&1; then
-    mkdir -p "$(dirname "$stamp")"
-    cp "$contents/version.plist" "$stamp.$$"
-    mv -f "$stamp.$$" "$stamp"
+     DEVELOPER_DIR="$developer" "$build" -checkFirstLaunchStatus </dev/null >/dev/null 2>&1 &&
+     cmp -s "$contents/version.plist" "$candidate"; then
+    mv -f "$candidate" "$stamp"
     mini_xcode='
 # Use this validated Xcode for the mini account unless the caller selected a toolchain.
 if [[ ! -v DEVELOPER_DIR && -x "$HOME/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild" ]] &&
@@ -26,7 +28,7 @@ if [[ ! -v DEVELOPER_DIR && -x "$HOME/Applications/Xcode.app/Contents/Developer/
   export DEVELOPER_DIR="$HOME/Applications/Xcode.app/Contents/Developer"
 fi'
   else
-    echo "mac-setup: mini Xcode is absent or still needs license/first-launch setup; using the system selection" >&2
+    echo "mac-setup: mini Xcode readiness could not be confirmed; using the system selection" >&2
   fi
 fi
 begin='# >>> mac-setup >>>'
