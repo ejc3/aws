@@ -9,9 +9,8 @@
 #
 # --runners (ci only) provisions ci the way dolphin-labs' apps/native/scripts/ci-vm.sh `provision` does (Xcode copied
 # in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
-# pool of GitHub Actions runners in the VM at the dolphin-labs-hq ORGANIZATION (owner, 2026-11-14), so any idle one
-# takes any repository's job: named mini-<n>, labelled with every label those repositories' macOS jobs ask for
-# (CI_LABELS below) and `mini`. They join the org's Default runner group, which serves private repositories only.
+# pool of GitHub Actions runners named mini-<n> in dolphin-labs-hq's Default group. An eligible private
+# repository can select any runner in the shared iOS pool or require the mini using its host label.
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
 # and reach the VM on stdin only. A runner already registered is left alone.
 #
@@ -31,12 +30,10 @@ set -euo pipefail
 BASE=ghcr.io/cirruslabs/macos-tahoe-base@sha256:1b093499716409d29e8b5336844528e1cae375db97d2ad8e5aeff78cf0da201e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 
-# The ci VM's org-wide pool. The labels are what the org's private repositories' self-hosted macOS jobs ask for:
-# gww-ios (dolphin-labs, dolphin-films) and kidsports-ios (kid-sports-highlights). Four at once is what 9 cores and
-# 36 GB hold for Xcode builds. GitHub cannot rank runners: a job goes to whichever matching runner is idle, so while the
-# MacBook's gww-ci and kidsports-ci VMs serve the same labels, jobs split between the two Macs.
+# GitHub adds self-hosted, macOS and ARM64. ios-pool is shared with the MacBook.
+# mini selects this host and gww-ios supports workflows that still use the older label.
 CI_ORG=dolphin-labs-hq
-CI_LABELS=gww-ios,kidsports-ios
+CI_LABELS=gww-ios,mini,ios-pool
 CI_COUNT=4
 # The runner, pinned: dolphin-labs' ci-vm.sh's version and the SHA-256 GitHub publishes for it.
 RUNNER_VERSION=2.338.0
@@ -261,10 +258,10 @@ for i in $(seq 1 "$CI_COUNT"); do
       token=\$(cat)
       mkdir -p ~/runners/$name && cd ~/runners/$name
       [ -x ./config.sh ] || tar xzf ../actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
-      ./config.sh --unattended --url https://github.com/$CI_ORG --token \"\$token\" --name $name --labels $CI_LABELS,mini --work _work --replace >/dev/null
+      ./config.sh --unattended --url https://github.com/$CI_ORG --token \"\$token\" --name $name --labels $CI_LABELS --work _work --replace >/dev/null
       ./svc.sh install >/dev/null
       ./svc.sh start >/dev/null
     ")"
   unset token
-  echo "   $name: registered at $CI_ORG ($CI_LABELS,mini)"
+  echo "   $name: registered at $CI_ORG ($CI_LABELS)"
 done

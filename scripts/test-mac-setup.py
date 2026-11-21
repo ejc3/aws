@@ -10,6 +10,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import tarfile
 import tempfile
 import time
 import unittest
@@ -629,11 +630,36 @@ class Files(unittest.TestCase):
         for f in sorted(p.name for p in BIN.iterdir()):
             self.assertIn(f"bin/{f}", setup)
             self.assertIn(f, install)
-        self.assertIn("set-zshenv.sh peekaboo-install.sh bin |", setup, "the helpers travel with the tools")
         self.assertIn('/bin/sh "$src/peekaboo-install.sh" --update-running', install)
         self.assertIn('/bin/sh "$src/peekaboo-install.sh"\n', install)
         self.assertIn('"$src/set-zshenv.sh" "$HOME/.zshenv"', install)
         self.assertNotIn("grep -q '\\.local/bin'", install, "no mention-based check decides the PATH")
+
+    def test_setup_selects_the_tools_for_each_host(self):
+        setup = ROOT / "scripts" / "mac-setup.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp)
+            ssh = dest / "ssh"
+            ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$OUT/args"\ncat > "$OUT/files.tar"\n')
+            ssh.chmod(0o755)
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
+            build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
+            desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo"}
+            for args, names, flag in [
+                (["mini"], build, "--build-only"),
+                ([], build | desktop, ""),
+                (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
+            ]:
+                subprocess.run([str(setup), *args], env=env, check=True)
+                with tarfile.open(dest / "files.tar") as archive:
+                    self.assertEqual(set(archive.getnames()), names)
+                remote = (dest / "args").read_text().splitlines()
+                self.assertEqual(remote[-2], args[0] if args else "mac")
+                self.assertIn(f'"$d" {flag};', remote[-1])
+            (dest / "args").unlink()
+            result = subprocess.run([str(setup), "mini", "--update-peekaboo"], env=env, capture_output=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse((dest / "args").exists())
 
     def test_peekaboo_is_pinned_to_the_release_and_the_wrapper_follows_cli_current(self):
         text = (ROOT / "scripts" / "mac" / "peekaboo-install.sh").read_text()

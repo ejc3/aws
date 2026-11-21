@@ -1218,7 +1218,8 @@ Touch ID SSH key; approve its authentication prompt when connecting. The public 
 
 There is one way into EJ's MacBook Pro, the same from every box, and one alias for it, `mac`: Cloudflare Access in
 front of macOS **Remote Login** (`127.0.0.1:22` on the Mac). No reverse tunnel, and no inbound port on the Mac or in
-AWS. A plain `ssh mac` builds on the external drive, scripts System Events and Chrome, and drives the screen with
+AWS. Send new headless Mac builds to the [physical mini](#agent-builds-on-the-physical-mini) to keep the laptop available.
+A plain `ssh mac` can use its external drive, script System Events and Chrome, and drive the screen with
 Peekaboo; `mac-gui <cmd>` runs a command in the logged-in GUI session for what needs the login keychain (signing).
 
 | From | Service token (Secrets Manager) | Configured by |
@@ -1693,23 +1694,46 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
 unlock once.
 
-**The CI VM's runners** (`scripts/mac-vm-setup.sh ci --lan mini-lan --runners`): one pool of four GitHub Actions
-runners at the `dolphin-labs-hq` organization (owner, 2026-11-14), named `mini-<n>` and labelled `gww-ios`,
-`kidsports-ios` and `mini`, so any idle one takes a self-hosted macOS job from dolphin-labs, dolphin-films or
-kid-sports-highlights. They are in the org's Default runner group, which serves private repositories only. The VM is
-provisioned by dolphin-labs' own `apps/native/scripts/ci-vm.sh provision` (Xcode, the build tools, a signing keychain),
-run on the mini. The MacBook's two CI VMs joined the same pool on 2026-11-15 (owner), each keeping the one label it was
-provisioned for: `macbook-gww-1` and `macbook-gww-2` in `gww-ci` (`gww-ios`, `macbook`), `macbook-kidsports-1` in
-`kidsports-ci` (`kidsports-ios`, `macbook`); their repository registrations were removed. GitHub cannot rank runners:
-a job goes to whichever matching runner is idle, so the MacBook is a peer of the mini, not a fallback, and a job running
-there fails if the MacBook sleeps or leaves the network. A job that must build on one Mac asks for `mini` or `macbook`
-too. `ci-vm.sh runners` (the MacBook VMs' own script) registers at a repository, so re-registering them by hand means
-`config.sh --url https://github.com/dolphin-labs-hq --runnergroup Default` with those names and labels. Registering needs `gh` with the `admin:org` scope (`gh auth refresh -s admin:org`); it was
-dropped again right after (`gh auth refresh -r admin:org -s read:org`), because GitHub applies the scope to every org
-the login reaches, not just dolphin-labs-hq. The Default group's visibility is "selected": a repository can use its
-runners only once it is on the group's list, which was empty. dolphin-labs, dolphin-films and kid-sports-highlights were
-added on 2026-11-14 (`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo id>`); a new
-repository needs the same before its jobs can run here. Nothing in Terraform manages the org's runner groups.
+**The CI VM's runners** are `mini-1` through `mini-4`. To rebuild them, run
+`scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
+the build tools and a signing keychain in the guest, then registers each missing runner with the
+`dolphin-labs-hq` organization. GitHub supplies `self-hosted`, `macOS` and `ARM64`. The script adds
+`ios-pool`, `mini` and the legacy `gww-ios` label. Registration uses the operator's org-admin GitHub login.
+
+As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
+`kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
+`[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
+require the mini. The Default runner group allows three private repositories, `dolphin-labs`,
+`dolphin-films` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
+match. An organization runner administrator can grant access with
+`gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
+`gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
+
+#### Agent builds on the physical mini
+
+Use `ssh mini` from fcvm-arm as `ubuntu` or the Next.js `ejc3` container for new macOS CLI builds,
+scripts, and Apple silicon compiler work. This uses the existing host login. Install or refresh its two
+build slots with `scripts/mac-setup.sh mini` from either client. New SSH shells automatically queue
+`swift build|test|run` and Xcode build actions through the same `mac-build` helper as the MacBook.
+For other heavy commands use `mac-build COMMAND ...`. The host shares physical memory with both Tart
+VMs. Limit SwiftPM to two build workers initially and inspect `mac-build --status` before a large build.
+
+Give each task its own checkout and build products. To build an exact committed Swift package from a
+Linux checkout, run the following in Bash. Copy any needed uncommitted inputs explicitly.
+
+```bash
+set -o pipefail
+work=$(ssh mini 'mktemp -d "$HOME/agent-work/task.XXXXXXXX"') &&
+git archive HEAD | ssh mini "tar -xf - -C '$work'" &&
+ssh mini "cd '$work' && swift build --jobs 2"
+```
+
+Keep reusable work under that task directory, use its own DerivedData for Xcode, and return needed
+artifacts before removing your task directory. The host Command Line Tools build macOS SwiftPM packages
+and C programs. Full Xcode lives at `~/Applications/Xcode.app` and needs its host license accepted
+before SDK-dependent builds or Swift Testing suites run there. Existing iOS CI and TestFlight workflows
+have provisioned Xcode and signing in the runners. Jobs that require the mini also need its `mini`
+runner label. Use the MacBook for work tied to its desktop, personal keychain, or attached device.
 
 **Rebuilding it**, from a Mac on the mini's LAN that has `ssh mini-lan` (below),
 an Identity Center AdministratorAccess session (`aws sso login`) and `gh` signed in as an org admin of dolphin-labs-hq

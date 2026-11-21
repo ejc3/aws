@@ -12,6 +12,7 @@
 # for mac, as colton or ejc3 for colton-mac), from a checkout of this repository:
 #
 #   scripts/mac-setup.sh [SSH_ALIAS] [--update-peekaboo]      default alias: mac
+#   scripts/mac-setup.sh mini      bare mini: private workspaces and the shared build slots only
 #
 # Idempotent; it replaces files and never restarts, kills or relaunches anything, except that --update-peekaboo quits a
 # running Peekaboo of another version, installs the pinned one and reopens it. The macOS privacy grants Peekaboo needs
@@ -30,9 +31,17 @@ for a in "$@"; do
   esac
 done
 [[ $alias_ =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
-for f in install.zsh set-zshenv.sh peekaboo-install.sh bin/mac-gui bin/mac-lease bin/mac-build bin/mac-build-shim bin/peekaboo; do
+mode=$update
+files=(install.zsh set-zshenv.sh bin/mac-build bin/mac-build-shim)
+if [[ $alias_ = mini ]]; then
+  [[ -z $update ]] || usage
+  mode=--build-only
+else
+  files+=(peekaboo-install.sh bin/mac-gui bin/mac-lease bin/peekaboo)
+fi
+for f in "${files[@]}"; do
   [ -f "$here/$f" ] || { echo "mac-setup: missing $here/$f" >&2; exit 1; }
 done
 # One SSH session: the files as a tar stream on stdin, unpacked into a private temporary directory.
-tar -C "$here" -cf - install.zsh set-zshenv.sh peekaboo-install.sh bin | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
-  '/bin/zsh -c '\''d=$(mktemp -d) && tar -C "$d" -xf - && /bin/zsh "$d/install.zsh" "$d" '"$update"'; rc=$?; rm -rf "$d"; exit $rc'\'''
+tar -C "$here" -cf - "${files[@]}" | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
+  '/bin/zsh -c '\''d=$(mktemp -d) && tar -C "$d" -xf - && /bin/zsh "$d/install.zsh" "$d" '"$mode"'; rc=$?; rm -rf "$d"; exit $rc'\'''
