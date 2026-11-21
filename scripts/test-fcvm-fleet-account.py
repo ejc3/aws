@@ -380,7 +380,8 @@ class LambdaGrantTests(unittest.TestCase):
 
     def test_only_central_terraform_can_change_the_single_gpu_provider(self):
         provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
-        self.assertIn('allowed_instance_types = ["g4dn.xlarge"]', provider)
+        self.assertIn('allowed_instance_types = [local.fcvm_lambda_instance_type]', provider)
+        self.assertRegex(self.source, r'fcvm_lambda_instance_type\s*= "g4dn.xlarge"')
         self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
         self.assertRegex(provider, r'max_vcpu_count\s*= 4\b')
         self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
@@ -391,6 +392,22 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertNotIn("ingress", security_group)
         self.assertIn("aws_security_group.fcvm_fleet_lambda_tile.id", provider)
         self.assertRegex(block('resource "aws_ssm_parameter" "fcvm_fleet"'), r'gpu_lambda\s*= local.fcvm_fleet_gpu_lambda')
+
+    def test_gpu_subnets_must_be_offered_and_supported_by_lambda(self):
+        zones = block('data "aws_availability_zones" "fcvm_lambda"', self.source)
+        self.assertIn('exclude_zone_ids = ["use1-az3"]', zones)
+        offerings = block('data "aws_ec2_instance_type_offerings" "fcvm_lambda_gpu"', self.source)
+        self.assertIn('location_type = "availability-zone"', offerings)
+        self.assertIn('values = [local.fcvm_lambda_instance_type]', offerings)
+        self.assertIn('aws.fcvm_fleet_east1', zones)
+        self.assertIn('aws.fcvm_fleet_east1', offerings)
+        selection = self.source.split("fcvm_lambda_subnets = [", 1)[1].split("]\n", 1)[0]
+        self.assertIn("for az, id in module.fcvm_fleet_east1.subnet_ids_by_az : id", selection)
+        self.assertIn("if contains(data.aws_availability_zones.fcvm_lambda.names, az)", selection)
+        self.assertIn("&& contains(data.aws_ec2_instance_type_offerings.fcvm_lambda_gpu.locations, az)", selection)
+        provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
+        self.assertRegex(provider, r'subnet_ids\s*= local.fcvm_lambda_subnets')
+        self.assertIn('length(local.fcvm_lambda_subnets) > 0', provider)
 
     def test_the_project_owns_exact_app_assets_without_changing_resource_policies(self):
         runtime = block('resource "aws_iam_role_policy" "fcvm_fleet_lambda_tile_runtime"', self.source)
