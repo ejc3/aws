@@ -20,6 +20,18 @@ locals {
 # Integrity is still checked, just not against a constant that rots: a truncated or garbled
 # download fails `zsh -n`, and the previous copy is kept instead.
 install -d -m 755 /usr/local/lib/fcvm
+# Exact collaboration origins for the metal tracker, boot launcher and watcher. Publish first so
+# an already-running watcher sees the policy when it re-execs the updated script in the same PID.
+policy_tmp=$(mktemp /usr/local/lib/fcvm/.claude-collaboration-repos.XXXXXXXX) || exit 1
+cat > "$policy_tmp" <<'METALREPOS' || exit 1
+dolphin-labs-hq/dolphin-labs
+dolphin-labs-hq/dolphin-maps
+METALREPOS
+chmod 644 "$policy_tmp" && mv -f "$policy_tmp" /usr/local/lib/fcvm/claude-collaboration-repos || exit 1
+
+# Install the gate before publishing or starting the launcher that calls it.
+${local.agent_session_sync_install}
+
 TCLAUDE_SYSTEM=/usr/local/lib/fcvm/t-claude.zsh
 TCLAUDE_TMP=$(mktemp)
 if curl -fsSL --retry 3 \
@@ -52,24 +64,7 @@ case "$repo" in
 esac
 
 origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || exit 0
-case "$origin" in
-  https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
-  # Collaboration repos owned by someone else, allowed ONE AT A TIME by exact name.
-  # dolphin-labs moved from another owner to dolphin-labs-hq on 2026-08-12 and the
-  # launcher correctly stopped starting an agent there until the new owner was named
-  # here. That is the gate working, not a bug: a repo that gets an agent with
-  # --dangerously-skip-permissions changed hands, and automation paused for a human.
-  # Deliberately not an org wildcard: this gate decides which checkouts get an agent
-  # started with --dangerously-skip-permissions at boot, and a wildcard would opt in
-  # every future repo of that owner -- including ones added without our review.
-  https://github.com/dolphin-labs-hq/dolphin-labs|https://github.com/dolphin-labs-hq/dolphin-labs.git) ;;
-  git@github.com:dolphin-labs-hq/dolphin-labs|git@github.com:dolphin-labs-hq/dolphin-labs.git) ;;
-  ssh://git@github.com/dolphin-labs-hq/dolphin-labs|ssh://git@github.com/dolphin-labs-hq/dolphin-labs.git) ;;
-  *) exit 0 ;;
-esac
-case "$origin" in
-  */claude-code-history|*/claude-code-history.git|*/claude-code-sync|*/claude-code-sync.git) exit 0 ;;
-esac
+/usr/local/bin/agent-session-sync --check-metal-origin "$origin" || exit 0
 
 gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || exit 0
 touch "$gitdir/claude-interactive"
@@ -101,9 +96,6 @@ grep -qxF '[ -f ~/.config/fcvm-t-claude.zsh ] && source ~/.config/fcvm-t-claude.
   || printf '%s\n' '[ -f ~/.config/fcvm-t-claude.zsh ] && source ~/.config/fcvm-t-claude.zsh' \
     >> /home/ubuntu/.zshrc
 chown ubuntu:ubuntu /home/ubuntu/.zshrc
-
-# Install the gate before publishing or starting the launcher that calls it.
-${local.agent_session_sync_install}
 
 # Launch the folders with session activity in the last 30 days (owner, 2026-10-13): a person prompted
 # a Claude conversation there, or it was marked for interactive use (claude-interactive in its git dir).
@@ -178,17 +170,7 @@ add_repo() {
 
   # A linked worktree shares its main checkout's origin, so the allowlist below covers it too.
   origin=$(git -C "$repo" remote get-url origin 2>/dev/null) || return 0
-  case "$origin" in
-    https://github.com/ejc3/*|git@github.com:ejc3/*|ssh://git@github.com/ejc3/*) ;;
-    # Exact-name collaboration repos; see the note at the marker-writing gate above.
-    https://github.com/dolphin-labs-hq/dolphin-labs|https://github.com/dolphin-labs-hq/dolphin-labs.git) ;;
-    git@github.com:dolphin-labs-hq/dolphin-labs|git@github.com:dolphin-labs-hq/dolphin-labs.git) ;;
-    ssh://git@github.com/dolphin-labs-hq/dolphin-labs|ssh://git@github.com/dolphin-labs-hq/dolphin-labs.git) ;;
-    *) return 0 ;;
-  esac
-  case "$origin" in
-    */claude-code-history|*/claude-code-history.git|*/claude-code-sync|*/claude-code-sync.git) return 0 ;;
-  esac
+  /usr/local/bin/agent-session-sync --check-metal-origin "$origin" || return 0
   printf '%s\n' "$repo" >> "$REPOS"
 }
 

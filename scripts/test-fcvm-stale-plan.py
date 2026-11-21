@@ -76,6 +76,87 @@ module "region" {
     print("fresh enabled region: saved apply created all four template probes", flush=True)
 
 
+def test_first_image_seed(directory, provider, lockfile, state, run):
+    """Exercise the production deferred lookup + precondition with a local availability service."""
+    prod = (ROOT / "fcvm-fleet-prod.tf").read_text()
+    resource = block(prod, 'resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release"')
+    presence = block(prod, 'data "external" "fcvm_prod_ami_pointer_present"')
+    lookup = block(prod, 'data "external" "fcvm_prod_ami_seed"')
+    guard = re.search(r'(?ms)^    precondition \{.*?^    \}', resource)[0]
+    external = block(lockfile, 'provider "registry.terraform.io/hashicorp/external"')
+    aws = block(lockfile, 'provider "registry.terraform.io/hashicorp/aws"')
+    version = re.search(r'version\s*=\s*"([^"]+)"', external)[1]
+    provider = re.sub(r'required_providers \{ (aws = \{[^\n}]+\}) \}', lambda m:
+                      'required_providers {\n' + m[1] + '\nexternal = { source = "hashicorp/external", version = "'
+                      + version + '" }\n}', provider)
+    for name, target in (("full", []), ("targeted", ["-target=terraform_data.seed"])):
+        case = directory / ("first-seed-" + name)
+        (case / "scripts").mkdir(parents=True)
+        (case / ".terraform.lock.hcl").write_text(aws + "\n" + external + "\n")
+        (case / "scripts/fcvm-prod-ami-seed.py").write_text('''import json, sys
+from pathlib import Path
+q = json.load(sys.stdin)
+if sys.argv[1] == "present":
+    print(json.dumps({"present": str(Path("created").exists()).lower()}))
+else:
+    ok = q["when"] == "existing" or (Path("availability").read_text() == "available" and
+                                     q["version"] == Path("stage-version").read_text())
+    print(json.dumps({"verified": str(ok).lower()}))
+''')
+        lookup = lookup.replace("aws_ssm_parameter.fcvm_ami_release.name", '"/mock/image"').replace(
+            "data.aws_ssm_parameter.fcvm_ami_release[0].version", "data.aws_ssm_parameter.fcvm_coordinator_release.version")
+        (case / "main.tf").write_text(provider + presence + "\n" + lookup + """
+variable "fcvm_ami_pipeline_enabled" { default = true }
+locals {
+  fcvm_fleet_prod = 1
+  fcvm_prod_seed_query = { role = "local", region = "test", prod = "/mock/prod" }
+  fcvm_prod_initial_ami_release = data.aws_ssm_parameter.fcvm_coordinator_release.value
+  fcvm_ami_copy_regions = ["us-west-2"]
+}
+resource "terraform_data" "seed" {
+  lifecycle {
+""" + guard + """
+  }
+}
+variable "consumer_tag" { default = "first" }
+resource "terraform_data" "consumer" {
+  input = var.consumer_tag
+  depends_on = [terraform_data.seed]
+}
+""")
+        def ok(*args):
+            code, out = run(case, *args)
+            assert code == 0, out
+        available = case / "availability"
+        current = case / "stage-version"
+        state["version"] = 1
+        available.write_text("available")
+        current.write_text(str(state["version"]))
+        ok("init", "-backend=false", "-input=false", "-lockfile=readonly")
+        ok("plan", *target, "-out=saved.tfplan")
+        state["version"] += 1
+        current.write_text(str(state["version"]))
+        code, out = run(case, "apply", "-input=false", "saved.tfplan")
+        assert code != 0 and "production AMI seed must pass" in out, out
+        ok("plan", *target, "-out=unavailable.tfplan")
+        available.write_text("missing")
+        code, out = run(case, "apply", "-input=false", "unavailable.tfplan")
+        assert code != 0 and "production AMI seed must pass" in out, out
+        saved_state = case / "terraform.tfstate"
+        assert not any(r["type"] == "terraform_data" and r.get("instances") for r in json.loads(saved_state.read_text())["resources"])
+        available.write_text("available")
+        ok("plan", *target, "-out=fresh.tfplan")
+        ok("apply", "-input=false", "fresh.tfplan")
+        (case / "created").touch()
+        ok("plan", "-target=terraform_data.consumer", "-var=consumer_tag=changed", "-out=existing.tfplan")
+        state["version"] += 1
+        current.write_text(str(state["version"]))
+        available.write_text("missing")
+        ok("apply", "-input=false", "existing.tfplan")
+        ok("plan", "-input=false", "-var=consumer_tag=changed", "-detailed-exitcode")
+        print(f"{name} seed: saved applies refused changed versions and unavailable images; fresh apply and existing pointer passed", flush=True)
+
+
 def main():
     locked = block((ROOT / ".terraform.lock.hcl").read_text(), 'provider "registry.terraform.io/hashicorp/aws"')
     version = re.search(r'version\s*=\s*"([^"]+)"', locked)[1]
@@ -122,10 +203,15 @@ def main():
             target.parent.mkdir(parents=True)
             # Keep the whole signed package, including LICENSE, for lockfile hash verification.
             target.symlink_to(binaries[0].parent.resolve(), target_is_directory=True)
+            ext_root = ROOT / ".terraform/providers/registry.terraform.io/hashicorp/external"
+            ext = next(ext_root.glob("*/*/terraform-provider-external*")).parent
+            target = mirror / "registry.terraform.io/hashicorp/external" / ext.parent.name / ext.name
+            target.parent.mkdir(parents=True)
+            target.symlink_to(ext.resolve(), target_is_directory=True)
             cli = directory / "terraform.rc"
             cli.write_text('provider_installation {\n filesystem_mirror {\n path = '
-                + json.dumps(str(mirror)) + '\n include = ["registry.terraform.io/hashicorp/aws"]\n }\n'
-                + ' direct { exclude = ["registry.terraform.io/hashicorp/aws"] }\n}\n')
+                + json.dumps(str(mirror)) + '\n include = ["registry.terraform.io/hashicorp/*"]\n }\n'
+                + ' direct { exclude = ["registry.terraform.io/hashicorp/*"] }\n}\n')
             env = {k: v for k, v in os.environ.items() if not k.startswith(("AWS_", "TF_CLI_ARGS", "TF_LOG"))
                    and k not in ("TF_DATA_DIR", "TF_PLUGIN_CACHE_DIR", "TF_WORKSPACE")}
             env.update(TF_CLI_CONFIG_FILE=str(cli), AWS_EC2_METADATA_DISABLED="true", TF_IN_AUTOMATION="1")
@@ -190,6 +276,7 @@ data "aws_ssm_parameter" "fcvm_coordinator_release" {
                 assert rc == 0, output
                 print("fresh saved plan: apply succeeds, follow-up plan empty", flush=True)
             test_counted_region(directory, provider, locked, state, run)
+            test_first_image_seed(directory, provider, (ROOT / ".terraform.lock.hcl").read_text(), state, run)
     finally:
         server.shutdown()
         server.server_close()

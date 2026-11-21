@@ -348,7 +348,7 @@ class PublisherTests(unittest.TestCase):
             "FLEET_ACCOUNT": "222222222222", "PROJECT_NAME": "factory", "STATE_PREFIX": "/factory",
             "PIPELINE_BUCKET": "private-stage", "ASSET_BUCKET": "runtime-assets", "GUARD_SHA256": "c" * 64,
             "BUILDER_PROFILE": "arn:aws:iam::222222222222:instance-profile/factory-builder",
-            "RELEASE_PARAMETER": "/release", "LOCK_ID": "exact-backend/key", "LOCK_TABLE": "locks",
+            "RELEASE_PARAMETER": "/release", "PROD_RELEASE_PARAMETER": "/prod/release", "LOCK_ID": "exact-backend/key", "LOCK_TABLE": "locks",
             "COPY_REGIONS": "us-west-2", "BUILD_REGION": "us-east-1"}
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
         build = {"id": self.build, "projectName": "factory", "buildStatus": "SUCCEEDED", "buildComplete": True,
@@ -3389,6 +3389,18 @@ class PublisherTests(unittest.TestCase):
             "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet"}, {"Key": "FleetImageKind", "Value": kind}],
             "BlockDeviceMappings": [{"Ebs": {"SnapshotId": snapshot}}] if snapshot else []}
 
+    def test_standalone_replication_cannot_read_or_retire_during_a_terraform_apply(self):
+        publisher = self.publisher()
+        publisher.acquire()
+        try:
+            other = self.publisher()
+            with mock.patch.object(other, "load") as read:
+                with self.assertRaisesRegex(RuntimeError, "locked"):
+                    other.run({"action": "replicate-active-release"})
+                read.assert_not_called()
+        finally:
+            publisher.release()
+
     def test_retention_keeps_prod_release_images_and_their_previous(self):
         # Prod launches from its own pointer while staging moves on: staging's retention keeps both prod releases.
         self.build_in_west()
@@ -3397,6 +3409,7 @@ class PublisherTests(unittest.TestCase):
         self.publisher_copy(self.ec2, earlier, "ami-" + "f3" * 8 + "f", "us-west-2", kind="tile")
         self.env["PROD_RELEASE_PARAMETER"] = "/prod/release"
         self.fleet_ssm.values["/prod/release"] = {
+            "version": 1, "generation": 2,
             "host_amis": {"us-east-1": {"x86_64": current}}, "tile_amis": {"us-east-1": {"x86_64": self.old["tile"]}},
             "previous": {"host_amis": {"us-east-1": {"x86_64": self.old["host"]}}, "tile_amis": {"us-east-1": {"x86_64": earlier}}}}
         with self.assertRaises(MODULE.Refused): self.publisher().run(self.event)
@@ -3405,6 +3418,17 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.ec2.deregistered, [])
         for image in (current, earlier):
             self.assertIn(image, self.ec2.images)
+
+    def test_malformed_present_prod_pointer_refuses_all_image_and_snapshot_deletion(self):
+        stale = "ami-" + "e" * 17
+        self.publisher_copy(self.ec2, stale, "ami-" + "f" * 17, "us-west-2")
+        for pointer in ({}, {"version": 1, "generation": 23, "previous": None},
+                        {"version": 1, "generation": 0, "previous": None, "host_amis": {}, "tile_amis": {}}):
+            with self.subTest(pointer=pointer):
+                self.fleet_ssm.values["/prod/release"] = pointer
+                with self.assertRaisesRegex(MODULE.Refused, "production"):
+                    self.publisher().retain({}, {})
+                self.assertEqual((self.ec2.deregistered, self.ec2.deleted_snapshots), ([], []))
 
     def test_retention_without_a_prod_pointer_yet_is_unchanged(self):
         self.build_in_west()

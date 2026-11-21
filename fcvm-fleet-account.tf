@@ -10,13 +10,13 @@
 #   policy on the OU denies every regional action elsewhere, denies leaving the organization, and denies IAM users and
 #   access keys (roles only).
 # - Applied two ways: the fleet's infrastructure from here (fcvm-fleet.tf, a jumpbox through OrganizationAccountAccessRole),
-#   and fcvm's own Terraform, if it has any, from fcvm-metal-arm through `fcvm-fleet-terraform` (AdministratorAccess inside
-#   this account only, one-hour sessions), which trusts dev-server-role pinned to fcvm-arm's instance, as constellation's.
+#   and fcvm's gpubox tools from fcvm-metal-arm through `fcvm-fleet-terraform` (an allow list for gpubox's calls only, no
+#   secret, one-hour sessions), which trusts dev-server-role pinned to fcvm-arm's instance, as constellation's.
 # - CI cannot assume a role in this account. Its management-account role may publish to the coordinator's ECR repository
 #   and invoke the image-only release function (fcvm-fleet-ci.tf). Only that function assumes the scoped release role;
 #   neither has Terraform-state or reusable-credential access.
-# - Quotas (ejc3/aws#605): 192 vCPU of G spot in us-east-1 (one metal host, its replacement and the EC2 tiles); one
-#   region is enough.
+# - Quotas (ejc3/aws#605, #913): 480 vCPU of G spot in us-east-1 (production's two hosts and a replacement, staging's
+#   host and an image-factory build host); one region is enough.
 #
 # First apply: the provider aliases need the account id, so apply the account first
 # (-target=aws_organizations_account.fcvm_fleet), then everything.
@@ -27,9 +27,10 @@ locals {
   fcvm_fleet_account_id      = aws_organizations_account.fcvm_fleet.id
   fcvm_fleet_terraform_role  = "arn:aws:iam::${aws_organizations_account.fcvm_fleet.id}:role/fcvm-fleet-terraform"
   fcvm_fleet_access_role_arn = "arn:aws:iam::${aws_organizations_account.fcvm_fleet.id}:role/OrganizationAccountAccessRole"
-  # G and VT spot vCPUs per region (#605): a g4dn.metal (96) and its replacement while the old one terminates, or a
-  # g5g.metal (64) plus the EC2 comparison tiles at 4 vCPU each.
-  fcvm_fleet_spot_g_vcpus = 192
+  # G and VT spot vCPUs in us-east-1 (#605, #913): production's two awake g4dn.metal hosts (192), the replacement a
+  # Spot interruption notice launches while the reclaimed host drains (96), staging's host (96) and an image-factory
+  # build host (96).
+  fcvm_fleet_spot_g_vcpus = 480
   # On-demand G vCPUs in us-east-1 (ejc3/fcvm#1257): the wall's host (96) and its replacement while the old one shuts
   # down (96), the EC2 tiles started on demand (8 x 4), and the gpubox test hosts and AMI builders that share the
   # region (96 each, four at once). At 384 the wall's host was refused with VcpuLimitExceeded for 13 minutes on two
@@ -238,10 +239,168 @@ resource "aws_iam_role" "fcvm_fleet_terraform" {
   tags = { Name = "fcvm-fleet-terraform", Managed = "terraform" }
 }
 
-resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_admin" {
+# What fcvm-arm does in this account: fcvm's fleet/tools/gpubox.sh (and g-admission.sh) launch, drive and end
+# short-lived GPU boxes. Nothing else. The account also holds the fleet's certificates and tokens, staging's and
+# production's, so the role is an allow list for exactly those calls (ejc3/aws#922), not AdministratorAccess: an
+# administrator can reach any secret by reading it, by passing a role that can, or by changing what a role-holding
+# workload runs (a launch template, an AMI pointer, a host through Run Command).
+locals {
+  fcvm_fleet_gpubox_purpose = "fcvm-fleet-gpubox" # gpubox.sh PURPOSE
+  fcvm_fleet_gpubox_regions = ["us-west-2", "us-east-1"]
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
+  provider = aws.fcvm_fleet
+  name     = "gpubox-only"
+  role     = aws_iam_role.fcvm_fleet_terraform.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "Look"
+        Effect = "Allow"
+        Action = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeInstanceTypeOfferings", "ec2:DescribeInstanceTypes",
+        "ec2:DescribeSecurityGroups", "ec2:DescribeSubnets", "ssm:DescribeInstanceInformation", "ssm:GetCommandInvocation", "servicequotas:GetServiceQuota"]
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid       = "ReadTheImageRelease"
+        Effect    = "Allow"
+        Action    = "ssm:GetParameter"
+        Resource  = [for name in ["ami-release", "ami-release-copies"] : "arn:aws:ssm:*:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/${name}"]
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid       = "LaunchOnlyGpuboxes"
+        Effect    = "Allow"
+        Action    = "ec2:RunInstances"
+        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions, "aws:RequestTag/Purpose" = local.fcvm_fleet_gpubox_purpose } }
+      },
+      {
+        Sid    = "WhatALaunchUses"
+        Effect = "Allow"
+        Action = "ec2:RunInstances"
+        Resource = ["arn:aws:ec2:*::image/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:subnet/*",
+          "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:security-group/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:network-interface/*",
+        "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:volume/*", "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:spot-instances-request/*"]
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid      = "TagAtLaunch"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:CreateAction" = "RunInstances", "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Purpose", "Owner", "LeaseUntil", "Market", "fcvm-admission"] }
+        }
+      },
+      {
+        Sid      = "ExtendOnlyGpuboxLeases"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = {
+          StringEquals                = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["LeaseUntil"] }
+        }
+      },
+      {
+        Sid       = "EndOnlyGpuboxes"
+        Effect    = "Allow"
+        Action    = "ec2:TerminateInstances"
+        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid       = "RunCommandsOnlyOnGpuboxes"
+        Effect    = "Allow"
+        Action    = "ssm:SendCommand"
+        Resource  = "arn:aws:ec2:*:${local.fcvm_fleet_account_id}:instance/*"
+        Condition = { StringEquals = { "ssm:resourceTag/Purpose" = local.fcvm_fleet_gpubox_purpose, "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid       = "TheShellDocument"
+        Effect    = "Allow"
+        Action    = "ssm:SendCommand"
+        Resource  = "arn:aws:ssm:*::document/AWS-RunShellScript"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_gpubox_regions } }
+      },
+      {
+        Sid       = "PassOnlyTheGpuboxRole"
+        Effect    = "Allow"
+        Action    = "iam:PassRole"
+        Resource  = aws_iam_role.fcvm_fleet_gpubox.arn
+        Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
+      },
+      {
+        # copy's staging objects (signed URLs carry this role's permissions) and the admission lock (g-admission.sh).
+        Sid      = "TheGpuboxPrefix"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/gpubox/*"
+      },
+      {
+        # Already outside the allow list above; denied by name so a later broad grant cannot reopen them.
+        Sid    = "NeverSecretsIamOrWhatWorkloadsRun"
+        Effect = "Deny"
+        Action = ["secretsmanager:*", "kms:Decrypt", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*",
+        "iam:AddRoleToInstanceProfile", "ssm:PutParameter", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+# The instance role of a gpubox: Session Manager and the release artifacts a host image fetches at boot, and no secret
+# (the fleet's host role reads the certificate and the agents' Access token; a gpubox needs neither).
+resource "aws_iam_role" "fcvm_fleet_gpubox" {
+  provider = aws.fcvm_fleet
+  name     = "fcvm-fleet-gpubox"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+  tags = { Name = "fcvm-fleet-gpubox", Managed = "terraform" }
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_gpubox" {
+  provider = aws.fcvm_fleet
+  name     = "gpubox"
+  role     = aws_iam_role.fcvm_fleet_gpubox.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      # ManagedInstanceCore grants GetParameter and GetParameters on "*". Keep SSM command delivery
+      # and AWS's public AMI parameters while excluding other account parameters from the effective grant.
+      {
+        Sid    = "DenyUnrelatedParameters"
+        Effect = "Deny"
+        Action = "ssm:GetParameter*"
+        NotResource = [
+          "arn:aws:ssm:*::parameter/aws/service/*",
+          "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release",
+          "arn:aws:ssm:us-east-1:${local.fcvm_fleet_account_id}:parameter/fcvm-fleet/ami-release-copies",
+        ]
+      },
+      { Sid = "ReadReleaseArtifacts", Effect = "Allow", Action = "s3:GetObject", Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/*" },
+      { Sid = "ListReleaseArtifacts", Effect = "Allow", Action = "s3:ListBucket", Resource = aws_s3_bucket.fcvm_fleet_assets.arn },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_gpubox_ssm" {
   provider   = aws.fcvm_fleet
-  role       = aws_iam_role.fcvm_fleet_terraform.name
-  policy_arn = "arn:aws:iam::aws:policy/AdministratorAccess"
+  role       = aws_iam_role.fcvm_fleet_gpubox.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "fcvm_fleet_gpubox" {
+  provider = aws.fcvm_fleet
+  name     = "fcvm-fleet-gpubox"
+  role     = aws_iam_role.fcvm_fleet_gpubox.name
 }
 
 # Every G launch in us-east-1 by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which

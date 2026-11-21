@@ -189,6 +189,64 @@ def heredoc(text, opener, terminator):
     return text[start:text.index("\n%s\n" % terminator, start)] + "\n"
 
 
+class MetalClaudePolicyTests(unittest.TestCase):
+    def test_tracker_and_boot_restore_only_active_approved_checkouts(self):
+        config = (ROOT / "claude-remote-control.tf").read_text()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp, "home")
+            home.mkdir()
+            tools = Path(tmp, "bin")
+            tools.mkdir()
+            policy = tools / "claude-collaboration-repos"
+            if "\nMETALREPOS\n" in config:
+                policy.write_text(config.split("<<'METALREPOS' || exit 1\n", 1)[1].split("\nMETALREPOS\n", 1)[0] + "\n")
+            source = (ROOT / "scripts/agent-session-sync.py").read_text()
+            source = source.replace("/usr/local/lib/fcvm/claude-collaboration-repos", str(policy))
+            sync = tools / "agent-session-sync"
+            sync.write_text(source)
+            sync.chmod(0o755)
+            active = tools / "agent-active-dirs"
+            shutil.copyfile(ROOT / "scripts/agent-active-dirs.py", active)
+            active.chmod(0o755)
+
+            def shell(name, tag):
+                body = heredoc(config, f"cat > /usr/local/bin/{name} <<'{tag}'\n", tag)
+                return body.replace("/home/ubuntu", str(home)).replace("/usr/local/bin", str(tools)).replace("$${", "${")
+
+            tracker = shell("fcvm-claude-track", "TRACKER")
+            # Run the complete discovery, trust and retirement gates. Record the launch instead of opening tmux.
+            launcher = shell("fcvm-claude-active-repos", "LAUNCHER").split("  # t-claude intentionally tries", 1)[0]
+            launcher += '  echo "$repo" >> "$HOME/would-start"\ndone < "$REPOS"\n'
+            origins = {
+                "route": "https://github.com/dolphin-labs-hq/dolphin-maps.git",
+                "route-ssh": "git@github.com:dolphin-labs-hq/dolphin-maps",
+                "route-ssh-url": "ssh://git@github.com/dolphin-labs-hq/dolphin-maps.git",
+                "route-idle": "https://github.com/dolphin-labs-hq/dolphin-maps",
+                "route-retired": "https://github.com/dolphin-labs-hq/dolphin-maps",
+                "collab": "git@github.com:dolphin-labs-hq/dolphin-labs.git",
+                "personal": "https://github.com/ejc3/one",
+                "neighbor": "https://github.com/dolphin-labs-hq/dolphin-maps-fork",
+                "other": "ssh://git@github.com/someone-else/dolphin-maps.git",
+                "spoof": "https://github.com.invalid/dolphin-labs-hq/dolphin-maps.git",
+                "sync": "https://github.com/ejc3/claude-code-history.git",
+            }
+            allowed = {"route", "route-ssh", "route-ssh-url", "route-retired", "collab", "personal"}
+            for name, url in origins.items():
+                repo = home / name
+                subprocess.run(["git", "init", "-q", str(repo)], check=True)
+                subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", url], check=True)
+                if name == "route-idle":
+                    continue
+                subprocess.run(["bash", "-c", tracker, "tracker", str(repo)], check=True)
+                marker = repo / ".git" / "claude-interactive"
+                self.assertEqual(marker.exists(), name in allowed, name)
+                marker.touch()  # exercise the independent boot gate, even on a rejected origin
+            (home / "route-retired" / ".git" / "claude-remote-retired").touch()
+            subprocess.run(["bash", "-c", launcher], check=True, capture_output=True, text=True)
+            restored = {Path(path).name for path in (home / "would-start").read_text().splitlines()}
+            self.assertEqual(restored, allowed - {"route-retired"})
+
+
 class NoAutomaticRestartTests(unittest.TestCase):
     """The metal boxes' tmux server lives in fcvm-claude-rc.service, so restarting that unit kills every session. On
     2026-10-07 needrestart did, after unattended-upgrades updated libfreetype6. The snippets are evaluated by the tools
