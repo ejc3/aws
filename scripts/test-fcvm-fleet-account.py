@@ -385,9 +385,12 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
         self.assertRegex(provider, r'max_vcpu_count\s*= 12\b')
         self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
-        capacity_actions = re.findall(r'"(lambda:[^"]*CapacityProvider[^"]*)"', self.grant)
-        self.assertEqual(set(capacity_actions), {"lambda:GetCapacityProvider", "lambda:PassCapacityProvider"})
-        self.assertIn("Resource = aws_lambda_capacity_provider.fcvm_fleet_spike.arn", self.grant)
+        capacity_grants = [s for s in self.grant.split('\n      },') if re.search(r'"lambda:[^"]*CapacityProvider', s)]
+        self.assertEqual(len(capacity_grants), 1)
+        self.assertCountEqual(re.findall(r'"(lambda:[^"]+)"', capacity_grants[0]), [
+            "lambda:GetCapacityProvider", "lambda:ListFunctionVersionsByCapacityProvider", "lambda:PassCapacityProvider",
+        ])
+        self.assertRegex(capacity_grants[0], r'(?m)^ *Resource\s*= aws_lambda_capacity_provider\.fcvm_fleet_spike\.arn$')
         security_group = block('resource "aws_security_group" "fcvm_fleet_lambda_tile"', self.source)
         self.assertNotIn("ingress", security_group)
         self.assertIn("aws_security_group.fcvm_fleet_lambda_tile.id", provider)
