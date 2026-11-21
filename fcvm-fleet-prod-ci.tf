@@ -79,7 +79,7 @@ resource "github_actions_environment_variable" "fcvm_prod" {
     # The one browser origin the prod coordinator accepts (fcvm-fleet-prod.tf).
     PROD_ORIGIN = local.fcvm_fleet_prod_site_origin
     # Whether fcvm.dev serves the Worker yet: the go-live PR (plan A6) sets "true", and the smoke then requires the page.
-    PROD_SITE_LIVE = "false"
+    PROD_SITE_LIVE = tostring(local.fcvm_fleet_prod_page_public)
   } : {}
   repository    = "fcvm"
   environment   = github_repository_environment.fcvm_prod[0].environment

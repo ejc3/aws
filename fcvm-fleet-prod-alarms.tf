@@ -39,8 +39,9 @@ locals {
     "ec2.amazonaws.com" = aws_iam_role.fcvm_ami_prod_release_fleet[*].arn
   }
   fcvm_fleet_prod_worker = "fcvm-fleet" # ejc3/fcvm fleet/web/wrangler.jsonc, env.production
-  # Plan A6 serves the Worker at fcvm.dev and sets this.
-  fcvm_fleet_prod_page_public     = false
+  # Plan A6: fcvm.dev serves the prod Worker (fcvm-dev-prod.tf, fcvm_dev_prod_site). The owner approved going public
+  # once the prod smoke and the drills passed (2026-11-20, 2026-11-21). Off again is this one line.
+  fcvm_fleet_prod_page_public     = true
   fcvm_fleet_prod_template_prefix = "${local.fcvm_fleet_prod_stack.prefix}-"
   fcvm_fleet_prod_template_ids    = var.fcvm_fleet_prod_enabled ? [for t in module.fcvm_fleet_prod_east1[0].image_templates : t.id] : []
 

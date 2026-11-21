@@ -136,6 +136,18 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_ops_prod" {
   ]
 }
 
+# ------------------------------------------------------------------------------------------------ the page (plan A6)
+# fcvm.dev itself: the prod Worker (ejc3/fcvm fleet/web, env.production, deployed by the prod promotion). Public, no
+# Access: visitors pass Turnstile before they may wake the fleet or take a seat. The custom domain creates the apex's
+# proxied record, so the page answers over IPv4 and IPv6.
+resource "cloudflare_workers_custom_domain" "fcvm_dev_prod_site" {
+  count      = local.fcvm_fleet_prod_page_public ? local.fcvm_fleet_prod : 0
+  account_id = var.cloudflare_account_id
+  zone_id    = var.fcvm_dev_zone_id
+  hostname   = "fcvm.dev"
+  service    = local.fcvm_fleet_prod_worker
+}
+
 # ------------------------------------------------------------------------------------------------ Turnstile
 # Managed mode: Cloudflare decides whether a visitor sees a checkbox. fcvm.dev and its subdomains may use the widget.
 resource "cloudflare_turnstile_widget" "fcvm_dev_prod" {

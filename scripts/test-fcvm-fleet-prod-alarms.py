@@ -463,7 +463,8 @@ class SyntheticTests(Watch):
 
     def test_the_page_is_checked_only_once_it_is_public(self):
         self.assertIn('PAGE_URL = local.fcvm_fleet_prod_page_public ? "${local.fcvm_fleet_prod_site_origin}/" : ""', ALARMS)
-        self.assertRegex(ALARMS, r"fcvm_fleet_prod_page_public\s+= false\n")
+        # Public since plan A6: the synthetic check also requires the page.
+        self.assertRegex(ALARMS, r"fcvm_fleet_prod_page_public\s+= true\n")
         hello = text_frame(json.dumps({"type": "hello", "turnstile": "k"}))
         with mock.patch.object(self.watch, "check_page", return_value="https://example.test/ answered 522") as page:
             self.assertTrue(self.run_with(FakeSocket(hello))["ok"])

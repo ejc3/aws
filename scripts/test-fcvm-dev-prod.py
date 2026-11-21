@@ -61,18 +61,24 @@ class SwitchTests(unittest.TestCase):
         self.assertGreater(len(found), 15)
         for prefix, kind, name in found:
             b = block(f'{prefix} "{kind}" "{name}"')
-            self.assertRegex(b, r"\n  count\s+= local\.fcvm_fleet_prod\n", f"{kind}.{name}")
+            gate = r"(local\.fcvm_fleet_prod|local\.fcvm_fleet_prod_page_public \? local\.fcvm_fleet_prod : 0)"
+            self.assertRegex(b, r"\n  count\s+= " + gate + r"\n", f"{kind}.{name}")
         self.assertIn("value = var.fcvm_fleet_prod_enabled ? {", block('output "fcvm_dev_prod"'))
 
 
 class GoLiveTests(unittest.TestCase):
-    def test_no_apex_www_or_custom_domain(self):
+    def test_the_apex_serves_the_prod_worker_and_nothing_else_is_public(self):
         names = [re.search(r"name    = (\S+)", block(f'resource "cloudflare_dns_record" "{n}"')).group(1)
                  for _, n in headers("resource") if _ == "cloudflare_dns_record"]
         self.assertEqual(sorted(names), ["local.fcvm_dev_api_prod_hostname", "local.fcvm_dev_ops_prod_hostname"])
         self.assertIn('fcvm_dev_api_prod_hostname  = "fleet-api.fcvm.dev"', CODE)
         self.assertIn('fcvm_dev_ops_prod_hostname  = "fleet-ops.fcvm.dev"', CODE)
-        self.assertNotIn("cloudflare_workers_custom_domain", CODE)
+        # Plan A6: one custom domain, the apex, for the prod Worker, only while the page is public.
+        self.assertEqual(CODE.count('resource "cloudflare_workers_custom_domain"'), 1)
+        site = block('resource "cloudflare_workers_custom_domain" "fcvm_dev_prod_site"')
+        self.assertIn("count      = local.fcvm_fleet_prod_page_public ? local.fcvm_fleet_prod : 0", site)
+        self.assertIn('hostname   = "fcvm.dev"', site)
+        self.assertIn("service    = local.fcvm_fleet_prod_worker", site)
         self.assertNotIn("cloudflare_workers_route", CODE)
         self.assertNotIn("www", CODE)
 
