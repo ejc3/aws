@@ -404,8 +404,14 @@ resource "aws_iam_instance_profile" "fcvm_fleet_gpubox" {
 }
 
 # What fcvm-arm reads to verify the fleet (owner, 2026-11-21: "If you can't read something ask for perms"): the
-# coordinators' ECS services and tasks and their logs, and the Spot reclaim drill (fcvm-fleet-prod-drills.tf), which it
-# may start, read and stop. No task definition (it names the secrets), no secret, no write besides the drill.
+# coordinators' ECS services and tasks and their logs, and the guarded Spot reclaim drill (fcvm-fleet-prod-drills.tf), which it
+# may invoke locally in the fleet account. No task definition (it names the secrets), no secret, no write besides the drill.
+locals {
+  fcvm_fleet_observed_clusters     = [local.fcvm_fleet_stacks.stage.prefix, local.fcvm_fleet_stacks.prod.prefix]
+  fcvm_fleet_observed_ecs          = "arn:aws:ecs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}"
+  fcvm_fleet_observed_cluster_arns = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:cluster/${c}"]
+}
+
 resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
   provider = aws.fcvm_fleet
   name     = "observe-the-coordinators-and-run-the-spot-drill"
@@ -414,36 +420,52 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
     Version = "2012-10-17"
     Statement = concat([
       {
-        Sid       = "TheCoordinatorServicesAndTasks"
+        Sid      = "TheCoordinatorClusters"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeClusters"
+        Resource = local.fcvm_fleet_observed_cluster_arns
+      },
+      {
+        # ListServices has no resource type. ECS supplies the cluster ARN as a condition key.
+        Sid       = "ListTheCoordinatorServices"
         Effect    = "Allow"
-        Action    = ["ecs:DescribeClusters", "ecs:DescribeServices", "ecs:ListServices", "ecs:ListTasks", "ecs:DescribeTasks"]
+        Action    = "ecs:ListServices"
         Resource  = "*"
-        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
+      },
+      {
+        Sid      = "TheCoordinatorServices"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeServices"
+        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:service/${c}/${c}-coordinator"]
+      },
+      {
+        # ECS authorizes ListTasks against container-instance resources, including for a Fargate service.
+        Sid       = "ListTheCoordinatorTasks"
+        Effect    = "Allow"
+        Action    = "ecs:ListTasks"
+        Resource  = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:container-instance/${c}/*"]
+        Condition = { ArnEquals = { "ecs:cluster" = local.fcvm_fleet_observed_cluster_arns } }
+      },
+      {
+        Sid      = "TheCoordinatorTasks"
+        Effect   = "Allow"
+        Action   = "ecs:DescribeTasks"
+        Resource = [for c in local.fcvm_fleet_observed_clusters : "${local.fcvm_fleet_observed_ecs}:task/${c}/*"]
       },
       {
         Sid    = "TheCoordinatorLogs"
         Effect = "Allow"
         Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
-        Resource = [for g in ["/ecs/fcvm-fleet-coordinator", "/ecs/fcvm-fleet-prod-coordinator"] :
-        "arn:aws:logs:*:${local.fcvm_fleet_account_id}:log-group:${g}:*"]
+        Resource = [for c in local.fcvm_fleet_observed_clusters :
+        "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/ecs/${c}-coordinator:*"]
       },
-      ], flatten([for t in aws_fis_experiment_template.fcvm_fleet_prod_spot_drill : [
-        {
-          Sid    = "StartTheSpotDrillOnly"
-          Effect = "Allow"
-          Action = "fis:StartExperiment"
-          Resource = [
-            "arn:aws:fis:us-east-1:${local.fcvm_fleet_account_id}:experiment-template/${t.id}",
-            "arn:aws:fis:us-east-1:${local.fcvm_fleet_account_id}:experiment/*",
-          ]
-        },
-        {
-          Sid      = "WatchAndStopIt"
-          Effect   = "Allow"
-          Action   = ["fis:GetExperiment", "fis:ListExperiments", "fis:StopExperiment", "fis:GetExperimentTemplate"]
-          Resource = "*"
-        },
-    ]]))
+      ], [for broker in aws_lambda_function.fcvm_fleet_prod_spot_drill : {
+        Sid      = "InvokeTheProdSpotDrill"
+        Effect   = "Allow"
+        Action   = "lambda:InvokeFunction"
+        Resource = broker.arn
+    }])
   })
 }
 

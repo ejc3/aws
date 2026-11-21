@@ -800,6 +800,38 @@ us-west-1 dev VPC <-> private VPC peer <-> us-west-2 io-box + parallel-box
         +-> AWS Backup -> us-east-1 DR vault + dev-staging account vault
 ```
 
+### Production Spot interruption drill
+
+On `fcvm-arm`, use the fleet credentials for `fcvm-fleet-terraform`, the same role
+`fleet/tools/gpubox.sh` looks up in `/infra/fcvm-fleet`. The drill function
+runs in `us-east-1`. Check its status before a rehearsal.
+
+```bash
+drill_reply=$(mktemp)
+spot_drill() {
+  local result
+  result=$(aws lambda invoke --region us-east-1 --output json --function-name fcvm-fleet-prod-spot-drill \
+    --cli-binary-format raw-in-base64-out --payload "$1" "$drill_reply") || return 1
+  jq . "$drill_reply" || return 1
+  jq -e '.StatusCode == 200 and .FunctionError == null' >/dev/null <<<"$result"
+}
+spot_drill '{"action":"status"}'
+```
+
+Before starting, confirm the coordinator has two registered production hosts in
+different Availability Zones and the viewer smoke passes. Keep the smoke running
+through the rehearsal. The following call sends one production Spot host a real
+two-minute interruption notice. Keep the request ID and reuse it if the call times out.
+
+```bash
+drill_request=$(python3 -c 'import uuid; print(uuid.uuid4())')
+spot_drill "$(jq -nc --arg id "$drill_request" '{action:"start",request_id:$id}')"
+```
+
+Use `status` for the start time, result and selected host's Availability Zone. To stop an
+active experiment, call `spot_drill` with `{"action":"stop","experiment_id":"EXP…"}`
+using its returned ID. An interruption notice already delivered can still take effect.
+
 ## Access and trust boundaries
 
 The Next.js containers have no cgroup memory or swap caps, individually or in their shared
