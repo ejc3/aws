@@ -455,7 +455,11 @@ class ProdCiTerraformTests(unittest.TestCase):
         policy = self.block('resource "aws_iam_role_policy"', "fcvm_prod_ci")
         allows = re.findall(r'Effect = "Allow", Action = "([^"]+)", Resource = ([^ }]+)', policy)
         self.assertEqual(allows, [("lambda:InvokeFunction", "local.fcvm_prod_release_functions")])
-        self.assertIn('NotResource = local.fcvm_prod_release_functions', policy)
+        # Lambda tests the resolved $LATEST even for CI's unqualified Invoke. Versions, aliases and other functions
+        # must still match the explicit deny, and only the unqualified production ARNs appear in the Allow above.
+        deny = re.search(r'Sid\s+= "NoOtherFunction"\s+Effect\s+= "Deny"\s+Action\s+= "lambda:\*"\s+NotResource\s+= ([^\n]+)', policy)
+        self.assertIsNotNone(deny)
+        self.assertEqual(deny[1], 'concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])')
         self.assertIn('"ecr:*"', policy)
         functions = self.text.split("fcvm_prod_release_functions = concat(", 1)[1].split("\n  )", 1)[0]
         self.assertEqual(re.findall(r"aws_lambda_function\.([a-z_]+)", functions),

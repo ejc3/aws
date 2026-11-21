@@ -140,8 +140,13 @@ resource "aws_iam_role_policy" "fcvm_prod_ci" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = local.fcvm_prod_release_functions },
-      # Staging's release, publisher and gate functions included.
-      { Sid = "NoOtherFunction", Effect = "Deny", Action = "lambda:*", NotResource = local.fcvm_prod_release_functions },
+      # Unqualified Invoke also checks the function's $LATEST ARN against explicit denies.
+      {
+        Sid         = "NoOtherFunction"
+        Effect      = "Deny"
+        Action      = "lambda:*"
+        NotResource = concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])
+      },
       {
         Sid    = "NeverPublishAdministerOrReadCredentials"
         Effect = "Deny"
