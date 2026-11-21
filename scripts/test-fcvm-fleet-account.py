@@ -58,7 +58,7 @@ class GuardrailTests(unittest.TestCase):
                           "fcvm-fleet-ami-release.tf", "fcvm-fleet-ami-pipeline.tf"}:
                 continue
             if f.name in {"fcvm-fleet-alarms.tf", "fcvm-fleet-budget.tf", "fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf",
-                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf"}:
+                          "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf", "fcvm-fleet-lambda.tf"}:
                 # Fleet-owned: every resource that names the fleet account is created inside it.
                 for r in re.finditer(r'^resource "\w+" "\w+" \{\n.*?^\}', f.read_text(), re.S | re.M):
                     if "local.fcvm_fleet_account_id" in r.group():
@@ -145,7 +145,7 @@ class GpuboxRoleTests(unittest.TestCase):
                     attached.add(header.split('"')[3])
         self.assertEqual(attached, {
             "fcvm_fleet_terraform_gpubox", "fcvm_fleet_terraform_g_admission", "fcvm_fleet_terraform_observe",
-            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops",
+            "fcvm_fleet_operate_budget_drill", "fcvm_fleet_terraform_ops", "fcvm_fleet_terraform_lambda",
         })
 
     def test_every_allowed_action_is_a_gpubox_call(self):
@@ -359,6 +359,31 @@ class ObserveTests(unittest.TestCase):
         })
         self.assertNotIn("lambda:", stmt)
         self.assertIn('"ec2:SourceInstanceARN" = local.constellation_applier_instance_arn', stmt)
+
+
+class LambdaGrantTests(unittest.TestCase):
+    """GPU Lambda (fcvm-fleet-lambda.tf): fcvm-arm manages fcvm-lambda-* functions and capacity providers only."""
+
+    def test_the_lambda_grant_is_scoped_to_fcvm_lambda_resources(self):
+        lam = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_lambda"', lam)
+        wide = pol.split('Sid    = "OnlyFcvmLambdaFunctionsAndCapacityProviders"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action = "lambda:*"', wide)
+        self.assertIn(":function:${local.fcvm_lambda_prefix}-*", wide)
+        self.assertIn(":capacity-provider:${local.fcvm_lambda_prefix}-*", wide)
+        self.assertNotRegex(wide, r'Resource\s*=\s*"\*"')
+        passrole = pol.split('Sid       = "PassOnlyTheTwoLambdaRoles"', 1)[1].split("},", 1)[0]
+        self.assertIn("[aws_iam_role.fcvm_fleet_lambda_tile.arn, aws_iam_role.fcvm_fleet_lambda_operator.arn]", passrole)
+        self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', passrole)
+        self.assertIn('"iam:AWSServiceName" = "lambda.amazonaws.com"', pol)
+        self.assertNotIn("secretsmanager", pol)
+
+    def test_the_function_role_reads_no_secret_and_the_deny_still_covers_iam(self):
+        lam = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+        self.assertNotIn("secretsmanager", lam)
+        deny = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"').split('Sid    = "NeverSecretsIamOrWhatWorkloadsRun"', 1)[1]
+        self.assertIn('"iam:Create*"', deny)
+        self.assertIn('StringNotEqualsIfExists = { "iam:AWSServiceName" = "lambda.amazonaws.com" }', deny)
 
 
 class QuotaTests(unittest.TestCase):

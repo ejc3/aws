@@ -355,6 +355,8 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
         Action = ["secretsmanager:*", "kms:Decrypt", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*",
         "iam:AddRoleToInstanceProfile", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
         Resource = "*"
+        # Except Lambda's own service-linked role (fcvm-fleet-lambda.tf): the key exists only on CreateServiceLinkedRole.
+        Condition = { StringNotEqualsIfExists = { "iam:AWSServiceName" = "lambda.amazonaws.com" } }
       },
     ]
   })
