@@ -203,11 +203,16 @@ class GpuboxRoleTests(unittest.TestCase):
                 self.assertEqual(sid, "PassOnlyTheGpuboxRole")
 
     def test_secrets_iam_and_what_workloads_run_are_denied_by_name(self):
-        deny = self.statements()["NeverSecretsIamOrWhatWorkloadsRun"]
-        self.assertRegex(deny, r'Effect\s+= "Deny"')
-        for action in ("secretsmanager:*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:StartSession",
+        stmts = self.statements()
+        deny = stmts["NeverSecretsIamOrWhatWorkloadsRun"] + stmts["NeverIamOutsideTheLambdaRoles"]
+        self.assertRegex(stmts["NeverSecretsIamOrWhatWorkloadsRun"], r'Effect\s+= "Deny"')
+        self.assertRegex(stmts["NeverIamOutsideTheLambdaRoles"], r'Effect\s+= "Deny"')
+        for action in ("secretsmanager:*", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "ssm:StartSession",
                        "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"):
             self.assertIn(f'"{action}"', deny)
+        # The IAM deny exempts only the boundary-carrying fcvm-lambda-* roles (fcvm-fleet-lambda.tf).
+        self.assertIn('NotResource = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-lambda-*"]',
+                      stmts["NeverIamOutsideTheLambdaRoles"])
         self.assertNotIn('"ssm:PutParameter"', deny)
         scoped_deny = self.statements()["NeverWriteOtherParameters"]
         self.assertRegex(scoped_deny, r'Effect\s+= "Deny"')
@@ -362,28 +367,41 @@ class ObserveTests(unittest.TestCase):
 
 
 class LambdaGrantTests(unittest.TestCase):
-    """GPU Lambda (fcvm-fleet-lambda.tf): fcvm-arm manages fcvm-lambda-* functions and capacity providers only."""
+    """GPU Lambda (fcvm-fleet-lambda.tf): fcvm-arm builds fcvm-lambda-* resources itself, every role under a boundary."""
 
-    def test_the_lambda_grant_is_scoped_to_fcvm_lambda_resources(self):
-        lam = (ROOT / "fcvm-fleet-lambda.tf").read_text()
-        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_lambda"', lam)
-        wide = pol.split('Sid    = "OnlyFcvmLambdaFunctionsAndCapacityProviders"', 1)[1].split("},", 1)[0]
-        self.assertIn('Action = "lambda:*"', wide)
+    LAM = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+
+    def stmt(self, sid):
+        pol = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_lambda"', self.LAM)
+        return re.search(r'Sid\s+= "' + sid + r'"(.*?)\n      \}', pol, re.S).group(1)
+
+    def test_roles_are_created_only_with_the_boundary_and_it_cannot_be_removed(self):
+        create = self.stmt("CreateLambdaRolesOnlyWithTheBoundary")
+        self.assertIn('"iam:CreateRole"', create)
+        self.assertIn('"iam:PutRolePolicy"', create)
+        self.assertIn('"iam:PermissionsBoundary" = local.fcvm_lambda_boundary', create)
+        self.assertIn("Resource  = local.fcvm_lambda_roles", create)
+        self.assertNotIn("iam:CreateRole", self.stmt("ManageLambdaRoles"))
+        stays = self.stmt("TheBoundaryStays")
+        self.assertRegex(stays, r'Effect\s+= "Deny"')
+        self.assertIn('"iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary"', stays)
+        self.assertIn('fcvm_lambda_roles    = "arn:aws:iam::${local.fcvm_fleet_account_id}:role/${local.fcvm_lambda_prefix}-*"', self.LAM)
+
+    def test_the_boundary_shuts_out_the_fleets_credentials_and_state(self):
+        b = block('resource "aws_iam_policy" "fcvm_lambda_boundary"', self.LAM)
+        for action in ("secretsmanager:*", "kms:Decrypt", "sts:AssumeRole*", "ssm:GetParameter*", "s3:*", "iam:Create*", "iam:Put*", "iam:Attach*"):
+            self.assertIn(f'"{action}"', b)
+
+    def test_lambda_access_is_scoped_to_fcvm_lambda_names_in_one_region(self):
+        wide = self.stmt("OnlyFcvmLambdaFunctionsAndCapacityProviders")
         self.assertIn(":function:${local.fcvm_lambda_prefix}-*", wide)
         self.assertIn(":capacity-provider:${local.fcvm_lambda_prefix}-*", wide)
         self.assertNotRegex(wide, r'Resource\s*=\s*"\*"')
-        passrole = pol.split('Sid       = "PassOnlyTheTwoLambdaRoles"', 1)[1].split("},", 1)[0]
-        self.assertIn("[aws_iam_role.fcvm_fleet_lambda_tile.arn, aws_iam_role.fcvm_fleet_lambda_operator.arn]", passrole)
+        self.assertIn('repository/fcvm-fleet/lambda-*"', self.stmt("LambdaTileRepositories"))
+        passrole = self.stmt("PassLambdaRolesToLambdaOnly")
+        self.assertIn("Resource  = local.fcvm_lambda_roles", passrole)
         self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', passrole)
-        self.assertIn('"iam:AWSServiceName" = "lambda.amazonaws.com"', pol)
-        self.assertNotIn("secretsmanager", pol)
-
-    def test_the_function_role_reads_no_secret_and_the_deny_still_covers_iam(self):
-        lam = (ROOT / "fcvm-fleet-lambda.tf").read_text()
-        self.assertNotIn("secretsmanager", lam)
-        deny = block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"').split('Sid    = "NeverSecretsIamOrWhatWorkloadsRun"', 1)[1]
-        self.assertIn('"iam:Create*"', deny)
-        self.assertIn('StringNotEqualsIfExists = { "iam:AWSServiceName" = "lambda.amazonaws.com" }', deny)
+        self.assertNotIn("secretsmanager", block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_lambda"', self.LAM))
 
 
 class QuotaTests(unittest.TestCase):

@@ -350,13 +350,19 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox" {
       },
       {
         # Already outside the allow list above; denied by name so a later broad grant cannot reopen them.
-        Sid    = "NeverSecretsIamOrWhatWorkloadsRun"
-        Effect = "Deny"
-        Action = ["secretsmanager:*", "kms:Decrypt", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*",
-        "iam:AddRoleToInstanceProfile", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
+        Sid      = "NeverSecretsIamOrWhatWorkloadsRun"
+        Effect   = "Deny"
+        Action   = ["secretsmanager:*", "kms:Decrypt", "ssm:StartSession", "ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:ModifyInstanceAttribute"]
         Resource = "*"
-        # Except Lambda's own service-linked role (fcvm-fleet-lambda.tf): the key exists only on CreateServiceLinkedRole.
-        Condition = { StringNotEqualsIfExists = { "iam:AWSServiceName" = "lambda.amazonaws.com" } }
+      },
+      {
+        # IAM writes too, except on fcvm-lambda-* roles, which carry a boundary that cannot be removed
+        # (fcvm-fleet-lambda.tf), and Lambda's service-linked role (the key exists only on CreateServiceLinkedRole).
+        Sid         = "NeverIamOutsideTheLambdaRoles"
+        Effect      = "Deny"
+        Action      = ["iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*", "iam:AddRoleToInstanceProfile"]
+        NotResource = ["arn:aws:iam::${local.fcvm_fleet_account_id}:role/fcvm-lambda-*"]
+        Condition   = { StringNotEqualsIfExists = { "iam:AWSServiceName" = "lambda.amazonaws.com" } }
       },
     ]
   })
