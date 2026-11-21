@@ -1,116 +1,167 @@
-# fcvm-fleet-lambda.tf
-#
-# Access for fcvm-arm to build GPU Lambda for the fleet demos itself (owner, 2026-11-21: "small pr to get access then you
-# drive the apply"). fcvm-arm creates the ECR repository, roles, capacity providers and functions from the fcvm project
-# Terraform root (fleet/ops/terraform, scripts/fcvm-fleet-ops); this file only grants that, scoped by name:
-#
-# - roles named fcvm-lambda-*, created only with the fcvm-lambda-boundary permissions boundary, which can never be
-#   removed or replaced: whatever policy fcvm-arm attaches, such a role cannot read a secret, decrypt, write IAM, assume
-#   another role, read SSM parameters or touch S3, so a function cannot reach the fleet's credentials or state;
-# - passing those roles to Lambda; Lambda's service-linked role;
-# - ECR repositories named fcvm-fleet/lambda-*, every Lambda action on fcvm-lambda-* functions and capacity providers,
-#   and their logs, in us-east-1 (the fleet's GPU region).
-
+# GPU Lambda spike for the fleet wall. A capacity provider is configuration only until a project
+# operator publishes a function version. Pin the size here: IAM cannot cap MaxVCpuCount in a
+# CreateCapacityProvider call. GPU versions default to one minimum execution environment.
 locals {
-  fcvm_lambda_region   = "us-east-1"
-  fcvm_lambda_prefix   = "fcvm-lambda"
-  fcvm_lambda_roles    = "arn:aws:iam::${local.fcvm_fleet_account_id}:role/${local.fcvm_lambda_prefix}-*"
-  fcvm_lambda_boundary = "arn:aws:iam::${local.fcvm_fleet_account_id}:policy/${local.fcvm_lambda_prefix}-boundary"
+  fcvm_lambda_region       = "us-east-1"
+  fcvm_lambda_name         = "fcvm-lambda-tile"
+  fcvm_lambda_function_arn = "arn:aws:lambda:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:function:${local.fcvm_lambda_name}"
+  fcvm_lambda_repo_name    = "fcvm-fleet/lambda-tile"
+  fcvm_lambda_repo_arn     = "arn:aws:ecr:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:repository/${local.fcvm_lambda_repo_name}"
+  fcvm_lambda_logs_arn     = "arn:aws:logs:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:log-group:/aws/lambda/${local.fcvm_lambda_name}"
+  fcvm_fleet_gpu_lambda = {
+    region                = local.fcvm_lambda_region
+    function_name         = local.fcvm_lambda_name
+    repository_name       = local.fcvm_lambda_repo_name
+    execution_role_arn    = aws_iam_role.fcvm_fleet_lambda_tile.arn
+    capacity_provider_arn = aws_lambda_capacity_provider.fcvm_fleet_spike.arn
+  }
 }
 
-resource "aws_iam_policy" "fcvm_lambda_boundary" {
-  provider    = aws.fcvm_fleet
-  name        = "${local.fcvm_lambda_prefix}-boundary"
-  description = "The ceiling of every fcvm-lambda-* role: no secret, decrypt, IAM write, role assumption, SSM parameter or S3 (fcvm-fleet-lambda.tf)"
+# The execution role writes its own log streams and permits same-account Lambda image retrieval
+# from the one spike repository. ARM has no permission to change a repository policy.
+resource "aws_iam_role" "fcvm_fleet_lambda_tile" {
+  provider = aws.fcvm_fleet
+  name     = local.fcvm_lambda_name
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+  tags = { Name = local.fcvm_lambda_name, Project = "fcvm-fleet" }
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_lambda_tile_runtime" {
+  provider = aws.fcvm_fleet
+  role     = aws_iam_role.fcvm_fleet_lambda_tile.name
+  name     = "tile-logs-and-image"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
-      { Sid = "WhatTheRolesPoliciesGrant", Effect = "Allow", Action = "*", Resource = "*" },
       {
-        Sid    = "NeverTheFleetsCredentialsOrState"
-        Effect = "Deny"
-        Action = ["secretsmanager:*", "kms:Decrypt", "sts:AssumeRole*", "ssm:GetParameter*", "s3:*",
-        "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*", "iam:Delete*", "iam:Detach*", "iam:AddRoleToInstanceProfile"]
-        Resource = "*"
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "${local.fcvm_lambda_logs_arn}:log-stream:*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+        Resource = local.fcvm_lambda_repo_arn
       },
     ]
   })
 }
 
-resource "aws_iam_role_policy" "fcvm_fleet_terraform_lambda" {
+# The capacity provider's operator role: Lambda manages the GPU instances with it (AWS's documented managed policy).
+resource "aws_iam_role" "fcvm_fleet_lambda_operator" {
   provider = aws.fcvm_fleet
-  name     = "gpu-lambda-functions-and-capacity-providers"
-  role     = aws_iam_role.fcvm_fleet_terraform.name
+  name     = "fcvm-lambda-operator"
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "lambda.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+  tags = { Name = "fcvm-lambda-operator", Project = "fcvm-fleet" }
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_lambda_operator" {
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_lambda_operator.name
+  policy_arn = "arn:aws:iam::aws:policy/AWSLambdaManagedEC2ResourceOperator"
+}
+
+# The invocation-only spike needs HTTPS for image/runtime services. It has no ingress rules.
+resource "aws_security_group" "fcvm_fleet_lambda_tile" {
+  provider    = aws.fcvm_fleet_east1
+  name        = "fcvm-lambda-tile"
+  description = "GPU Lambda spike outbound HTTPS"
+  vpc_id      = module.fcvm_fleet_east1.vpc_id
+  egress {
+    protocol         = "tcp"
+    from_port        = 443
+    to_port          = 443
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+}
+
+resource "aws_lambda_capacity_provider" "fcvm_fleet_spike" {
+  provider = aws.fcvm_fleet_east1
+  name     = "fcvm-lambda-spike"
+  vpc_config {
+    subnet_ids         = module.fcvm_fleet_east1.subnet_ids
+    security_group_ids = [aws_security_group.fcvm_fleet_lambda_tile.id]
+  }
+  permissions_config {
+    capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn
+  }
+  instance_requirements {
+    architectures          = ["x86_64"]
+    allowed_instance_types = ["g4dn.xlarge"]
+  }
+  capacity_provider_scaling_config {
+    scaling_mode   = "Auto"
+    max_vcpu_count = 4 # One 4-vCPU T4 host for this spike.
+  }
+  depends_on = [aws_iam_role_policy_attachment.fcvm_fleet_lambda_operator]
+}
+
+resource "aws_iam_policy" "fcvm_fleet_terraform_lambda" {
+  provider    = aws.fcvm_fleet
+  name        = "fcvm-lambda-tile-deploy"
+  description = "Project deployment for one private function and fixed GPU capacity provider"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
       {
-        Sid       = "CreateLambdaRolesOnlyWithTheBoundary"
-        Effect    = "Allow"
-        Action    = ["iam:CreateRole", "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy", "iam:DeleteRolePolicy"]
-        Resource  = local.fcvm_lambda_roles
-        Condition = { StringEquals = { "iam:PermissionsBoundary" = local.fcvm_lambda_boundary } }
-      },
-      {
-        Sid    = "ManageLambdaRoles"
+        Sid    = "DeployAndInvokeTile"
         Effect = "Allow"
-        Action = ["iam:DeleteRole", "iam:GetRole", "iam:GetRolePolicy", "iam:ListRolePolicies", "iam:ListAttachedRolePolicies",
-        "iam:ListInstanceProfilesForRole", "iam:TagRole", "iam:UntagRole", "iam:UpdateRole", "iam:UpdateAssumeRolePolicy"]
-        Resource = local.fcvm_lambda_roles
+        Action = [
+          "lambda:CreateFunction", "lambda:GetFunction", "lambda:GetFunctionConfiguration", "lambda:UpdateFunctionCode",
+          "lambda:UpdateFunctionConfiguration", "lambda:DeleteFunction", "lambda:PublishVersion", "lambda:InvokeFunction",
+          "lambda:ListVersionsByFunction", "lambda:GetFunctionConcurrency", "lambda:GetFunctionCodeSigningConfig",
+          "lambda:GetFunctionScalingConfig", "lambda:PutFunctionScalingConfig", "lambda:ListTags", "lambda:TagResource", "lambda:UntagResource",
+        ]
+        Resource = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"]
       },
       {
-        Sid      = "TheBoundaryStays"
-        Effect   = "Deny"
-        Action   = ["iam:DeleteRolePermissionsBoundary", "iam:PutRolePermissionsBoundary"]
-        Resource = "*"
+        Effect   = "Allow"
+        Action   = ["lambda:GetCapacityProvider", "lambda:PassCapacityProvider"]
+        Resource = aws_lambda_capacity_provider.fcvm_fleet_spike.arn
       },
       {
-        Sid       = "PassLambdaRolesToLambdaOnly"
         Effect    = "Allow"
         Action    = "iam:PassRole"
-        Resource  = local.fcvm_lambda_roles
+        Resource  = aws_iam_role.fcvm_fleet_lambda_tile.arn
         Condition = { StringEquals = { "iam:PassedToService" = "lambda.amazonaws.com" } }
       },
       {
-        # Lambda creates its service-linked role on the first capacity provider in the account.
-        Sid       = "LambdasServiceLinkedRole"
-        Effect    = "Allow"
-        Action    = "iam:CreateServiceLinkedRole"
-        Resource  = "*"
-        Condition = { StringEquals = { "iam:AWSServiceName" = "lambda.amazonaws.com" } }
-      },
-      { Sid = "ReadTheBoundaryAndManagedPolicies", Effect = "Allow", Action = ["iam:GetPolicy", "iam:GetPolicyVersion"], Resource = "*" },
-      {
-        # Lambda Managed Instances is new and its IAM action list is not yet documented, so every Lambda action is
-        # allowed, but only on fcvm-lambda-* functions and capacity providers in us-east-1.
-        Sid    = "OnlyFcvmLambdaFunctionsAndCapacityProviders"
         Effect = "Allow"
-        Action = "lambda:*"
-        Resource = [
-          "arn:aws:lambda:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:function:${local.fcvm_lambda_prefix}-*",
-          "arn:aws:lambda:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:capacity-provider:${local.fcvm_lambda_prefix}-*",
+        Action = [
+          "ecr:CreateRepository", "ecr:DescribeRepositories", "ecr:DeleteRepository", "ecr:ListTagsForResource", "ecr:TagResource", "ecr:UntagResource",
+          "ecr:GetLifecyclePolicy", "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability",
+          "ecr:PutImageScanningConfiguration", "ecr:GetRepositoryPolicy", "ecr:DescribeImages", "ecr:BatchCheckLayerAvailability",
+          "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer",
         ]
+        Resource = local.fcvm_lambda_repo_arn
       },
       {
-        Sid       = "ListLambda"
         Effect    = "Allow"
-        Action    = ["lambda:List*", "lambda:GetAccountSettings"]
+        Action    = ["ecr:GetAuthorizationToken", "logs:DescribeLogGroups"]
         Resource  = "*"
         Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_lambda_region } }
       },
       {
-        Sid      = "LambdaTileRepositories"
-        Effect   = "Allow"
-        Action   = "ecr:*"
-        Resource = "arn:aws:ecr:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:repository/fcvm-fleet/lambda-*"
-      },
-      { Sid = "EcrLoginAndListing", Effect = "Allow", Action = ["ecr:GetAuthorizationToken", "ecr:DescribeRepositories"], Resource = "*" },
-      {
-        Sid      = "TheFunctionsLogs"
-        Effect   = "Allow"
-        Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams", "logs:DescribeLogGroups"]
-        Resource = "arn:aws:logs:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:log-group:/aws/lambda/${local.fcvm_lambda_prefix}-*:*"
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
+          "logs:ListTagsForResource", "logs:TagResource", "logs:UntagResource", "logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams",
+        ]
+        Resource = [local.fcvm_lambda_logs_arn, "${local.fcvm_lambda_logs_arn}:*"]
       },
     ]
   })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_lambda" {
+  provider   = aws.fcvm_fleet
+  role       = aws_iam_role.fcvm_fleet_terraform.name
+  policy_arn = aws_iam_policy.fcvm_fleet_terraform_lambda.arn
 }

@@ -832,6 +832,32 @@ confirm it observed the selection. Release and rollback use the fcvm repository'
 existing workflows. The jumpbox continues to own shared infrastructure, IAM and
 the production spending backstop.
 
+### GPU Lambda spike
+
+On ARM, read the spike inputs with the instance identity before assuming the fleet
+role. The project Terraform root can manage the private image repository
+`fcvm-fleet/lambda-tile`, the log group `/aws/lambda/fcvm-lambda-tile`, and the
+function `fcvm-lambda-tile` in `us-east-1`.
+
+```bash
+aws ssm get-parameter --region us-west-1 --name /infra/fcvm-fleet \
+  --query Parameter.Value --output text | jq .gpu_lambda
+```
+
+Create the log group with retention and the same-account ECR repository with
+immutable tags and an image lifecycle policy before deploying the function.
+Use the execution role and capacity provider from the pointer. Creating the GPU
+function requires an AWS SDK or CLI whose CreateFunction supports
+`AcceleratorConfig.AcceleratorMemorySize`. The pinned Terraform AWS provider
+6.64.0 lacks this field on `aws_lambda_function`. The provider is
+limited to four vCPUs of `g4dn.xlarge` (one T4 host) and accepts no inbound
+connections. Invoke a published version through Lambda. Publishing starts
+billable GPU capacity, even before the first invocation. Use zero minimum and
+one maximum execution environment for the spike. Delete its versions or the
+function when finished and verify the capacity provider drains. Old published
+versions can keep capacity running. The limit bounds concurrent GPU capacity;
+total charges depend on runtime. [AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
+
 ### Production Spot interruption drill
 
 On `fcvm-arm`, use the fleet credentials for `fcvm-fleet-terraform`, the same role
