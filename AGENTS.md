@@ -1830,15 +1830,21 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   us-east-1 (`local.fcvm_fleet_regions`, one provider alias each) is denied, as are leaving the organization, buckets in
   other regions, and IAM users, access keys and console passwords (roles only). Global services are exempt (the Dolphin
   policy's list).
-- **Applied from here** for the fleet's infrastructure (through OrganizationAccountAccessRole), and from fcvm-metal-arm
-  through `fcvm-fleet-terraform` (an allow list for fcvm's gpubox tools only: gpubox launches, Run Command and
-  `gpubox/` objects, no secret, one-hour sessions; gpuboxes run as `fcvm-fleet-gpubox`), which trusts dev-server-role
+- **Apply project changes directly from fcvm-arm.** Use `~/bin/fcvm-fleet-ops` and the
+  `fleet/ops/terraform` root in `ejc3/fcvm` for project log groups and Parameter Store
+  settings under `/fcvm/ops/`. Use the same tool for the production budget drill and
+  GPU Spot quota status. See “Apply project AWS changes from fcvm-arm” in `README.md`.
+  Use the existing fcvm promotion/rollback workflows and the guarded production Spot drill
+  for their respective operations. Keep shared resources and trust policy in this repository.
+- **Fleet access** from fcvm-metal-arm uses `fcvm-fleet-terraform` (one-hour sessions,
+  project operations, gpubox launches, scoped Run Command and `gpubox/` objects;
+  gpuboxes run as `fcvm-fleet-gpubox`), which trusts dev-server-role
   pinned to fcvm-arm's instance; the grant and the read of `/infra/fcvm-fleet` (account id, regions, state bucket, apply
   role; no credentials) are statements in `assume-constellation-terraform`, because dev-server-role has no room for
   another policy. After launch the launcher can update only the lease tag. The instance profile can read AWS public
   service parameters and the two fleet release pointers in us-east-1. CI itself cannot assume a fleet role; its main-only management-account
   role can publish the coordinator image and invoke the scoped release function.
-- **Quotas** (#605): G and VT spot (L-3819A6DF) at 192 vCPU in us-east-1, granted 2026-10-22; one region is enough (owner).
+- **Quotas** (#605, #937): G and VT Spot (L-3819A6DF) reached 480 vCPUs in us-east-1 on 2026-11-21.
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, behind Access for the owner and the main-only CI service token: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`

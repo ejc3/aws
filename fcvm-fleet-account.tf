@@ -10,8 +10,8 @@
 #   policy on the OU denies every regional action elsewhere, denies leaving the organization, and denies IAM users and
 #   access keys (roles only).
 # - Applied two ways: the fleet's infrastructure from here (fcvm-fleet.tf, a jumpbox through OrganizationAccountAccessRole),
-#   and fcvm's gpubox tools from fcvm-metal-arm through `fcvm-fleet-terraform` (an allow list for gpubox's calls only, no
-#   secret, one-hour sessions), which trusts dev-server-role pinned to fcvm-arm's instance, as constellation's.
+#   and the fcvm project from fcvm-metal-arm through `fcvm-fleet-terraform` (gpubox, coordinator diagnostics, guarded
+#   drills and the project's operations Terraform; one-hour sessions pinned to fcvm-arm's instance).
 # - CI cannot assume a role in this account. Its management-account role may publish to the coordinator's ECR repository
 #   and invoke the image-only release function (fcvm-fleet-ci.tf). Only that function assumes the scoped release role;
 #   neither has Terraform-state or reusable-credential access.
@@ -240,7 +240,7 @@ resource "aws_iam_role" "fcvm_fleet_terraform" {
 }
 
 # What fcvm-arm does in this account: fcvm's fleet/tools/gpubox.sh (and g-admission.sh) launch, drive and end
-# short-lived GPU boxes. Nothing else. The account also holds the fleet's certificates and tokens, staging's and
+# short-lived GPU boxes. Separate policies below cover project operations. The account also holds certificates and tokens, staging's and
 # production's, so the role is an allow list for exactly those calls (ejc3/aws#922), not AdministratorAccess: an
 # administrator can reach any secret by reading it, by passing a role that can, or by changing what a role-holding
 # workload runs (a launch template, an AMI pointer, a host through Run Command).
@@ -467,6 +467,100 @@ resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
         Resource = broker.arn
     }])
   })
+}
+
+# The member role owns one Terraform state object. Bootstrap an empty v4 state
+# because S3 hides missing keys with HTTP 403 from prefix-limited bucket readers.
+# Thereafter only fleet-ops writes the state. Version history stays with recovery admins.
+locals {
+  fcvm_fleet_ops_key   = "fleet-ops/terraform.tfstate"
+  fcvm_fleet_ops_state = "${aws_s3_bucket.fcvm_fleet_terraform_state.arn}/${local.fcvm_fleet_ops_key}"
+  fcvm_fleet_ops_logs  = "arn:aws:logs:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:log-group:/fcvm/ops/*"
+}
+
+resource "aws_s3_object" "fcvm_fleet_ops_initial_state" {
+  provider = aws.fcvm_fleet
+  bucket   = aws_s3_bucket.fcvm_fleet_terraform_state.bucket
+  key      = local.fcvm_fleet_ops_key
+  content = jsonencode({
+    version           = 4
+    terraform_version = "1.10.3"
+    serial            = 0
+    lineage           = uuidv5("url", local.fcvm_fleet_ops_state)
+    outputs           = {}
+    resources         = []
+  })
+  content_type = "application/json"
+  depends_on   = [aws_s3_bucket_versioning.fcvm_fleet_terraform_state]
+  lifecycle {
+    prevent_destroy = true
+    # The project backend owns the object and its metadata after bootstrap.
+    ignore_changes = all
+  }
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_terraform_ops" {
+  provider = aws.fcvm_fleet
+  role     = aws_iam_role.fcvm_fleet_terraform.name
+  name     = "manage-project-operations"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ListOperationsState"
+        Effect   = "Allow"
+        Action   = "s3:ListBucket"
+        Resource = aws_s3_bucket.fcvm_fleet_terraform_state.arn
+        Condition = { StringEquals = {
+          "s3:prefix" = [local.fcvm_fleet_ops_key, "fleet-ops/workspaces/"]
+        } }
+      },
+      {
+        Sid      = "ReadWriteCurrentState"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject"]
+        Resource = local.fcvm_fleet_ops_state
+      },
+      {
+        Sid      = "LockCurrentState"
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${local.fcvm_fleet_ops_state}.tflock"
+      },
+      {
+        # Terraform queries the names and metadata with filter-by-name. These two
+        # Describe APIs require Resource="*" and return no parameter or log values.
+        Sid       = "DiscoverOperationsMetadata"
+        Effect    = "Allow"
+        Action    = ["ssm:DescribeParameters", "logs:DescribeLogGroups"]
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_home_region } }
+      },
+      {
+        Sid    = "ManageOperationsParameters"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:DeleteParameter",
+        "ssm:AddTagsToResource", "ssm:RemoveTagsFromResource", "ssm:ListTagsForResource"]
+        Resource = "arn:aws:ssm:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:parameter/fcvm/ops/*"
+      },
+      {
+        Sid    = "ManageOperationsLogs"
+        Effect = "Allow"
+        Action = ["logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DeleteRetentionPolicy",
+          "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
+        "logs:CreateLogStream", "logs:DescribeLogStreams", "logs:PutLogEvents", "logs:GetLogEvents", "logs:FilterLogEvents"]
+        Resource = local.fcvm_fleet_ops_logs
+      },
+      {
+        # The quota-scoped listing includes pending requests and their current status.
+        Sid      = "ReadPendingRegionalGSpotQuota"
+        Effect   = "Allow"
+        Action   = "servicequotas:ListRequestedServiceQuotaChangeHistoryByQuota"
+        Resource = "arn:aws:servicequotas:us-east-1:${local.fcvm_fleet_account_id}:ec2/L-3819A6DF"
+      },
+    ]
+  })
+  depends_on = [aws_s3_object.fcvm_fleet_ops_initial_state]
 }
 
 # Every G launch in us-east-1 by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which

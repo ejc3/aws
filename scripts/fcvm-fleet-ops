@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""Run the fcvm project's Terraform and fleet operations directly from fcvm-arm."""
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+FLEET_HOME = "us-east-2"
+DRILL_KEY = "drills/prod-budget-day"
+QUOTA_REGION = "us-east-1"
+G_SPOT = ["--service-code", "ec2", "--quota-code", "L-3819A6DF"]
+
+
+def instance_env():
+    # Use the host's instance role even in a shell with a personal AWS profile or stale temporary credentials.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AWS_")}
+    env.update(AWS_CONFIG_FILE=os.devnull, AWS_SHARED_CREDENTIALS_FILE=os.devnull, AWS_PAGER="")
+    return env
+
+
+def aws(env, region, *args):
+    raw = subprocess.check_output(["aws", "--region", region, "--output", "json", *args], env=env)
+    return json.loads(raw)
+
+
+def fleet_session():
+    env = instance_env()
+    pointer = aws(env, "us-west-1", "ssm", "get-parameter", "--name", "/infra/fcvm-fleet")
+    fleet = json.loads(pointer["Parameter"]["Value"])
+    account = fleet["account_id"]
+    if (
+        not re.fullmatch(r"\d{12}", account)
+        or fleet["terraform_role"] != f"arn:aws:iam::{account}:role/fcvm-fleet-terraform"
+        or fleet["state_bucket"] != f"fcvm-fleet-terraform-state-{account}"
+        or fleet["home_region"] != FLEET_HOME
+    ):
+        raise ValueError("Unexpected fleet account, region, role or state bucket in /infra/fcvm-fleet.")
+    creds = aws(
+        env,
+        FLEET_HOME,
+        "sts",
+        "assume-role",
+        "--role-arn",
+        fleet["terraform_role"],
+        "--role-session-name",
+        "fcvm-fleet-ops",
+        "--duration-seconds",
+        "3600",
+    )["Credentials"]
+    env.update(
+        AWS_ACCESS_KEY_ID=creds["AccessKeyId"],
+        AWS_SECRET_ACCESS_KEY=creds["SecretAccessKey"],
+        AWS_SESSION_TOKEN=creds["SessionToken"],
+        AWS_REGION=FLEET_HOME,
+        AWS_DEFAULT_REGION=FLEET_HOME,
+    )
+    return fleet, env
+
+
+def budget(action, fleet, env):
+    location = [
+        "--bucket",
+        f"fcvm-fleet-coordinator-state-{fleet['account_id']}",
+        "--key",
+        DRILL_KEY,
+        "--expected-bucket-owner",
+        fleet["account_id"],
+    ]
+    meta = aws(env, FLEET_HOME, "s3api", "head-object", *location)
+    length = meta["ContentLength"]
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / "selection"
+        marker = None
+        if length in (3, 10):
+            # The conditional read also prevents a concurrent replacement from being downloaded here.
+            aws(env, FLEET_HOME, "s3api", "get-object", *location, "--if-match", meta["ETag"], str(path))
+            marker = path.read_bytes().decode("ascii", errors="replace")
+        today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+        if action != "status":
+            desired = today if action == "trip" else "off"
+            if marker != desired:
+                path.write_bytes(desired.encode("ascii"))
+                aws(
+                    env,
+                    FLEET_HOME,
+                    "s3api",
+                    "put-object",
+                    *location,
+                    "--if-match",
+                    meta["ETag"],
+                    "--content-type",
+                    "text/plain",
+                    "--body",
+                    str(path),
+                )
+            marker = desired
+    # Never print arbitrary S3 contents. The coordinator ignores malformed selectors.
+    if marker != "off":
+        try:
+            if not marker or dt.date.fromisoformat(marker).isoformat() != marker:
+                marker = "invalid"
+        except ValueError:
+            marker = "invalid"
+    return {
+        "selected": marker,
+        "utc_day": today,
+        "override_active_today": marker == today,
+        "meaning": "Today's selection lowers the ceiling to $1. A tripped spending ledger stays asleep until 00:00 UTC.",
+    }
+
+
+def quota(env):
+    current = aws(env, QUOTA_REGION, "service-quotas", "get-service-quota", *G_SPOT, "--query", "Quota.Value")
+    history = aws(
+        env,
+        QUOTA_REGION,
+        "service-quotas",
+        "list-requested-service-quota-change-history-by-quota",
+        *G_SPOT,
+        "--query",
+        "RequestedQuotas[].{status:Status,requested_vcpus:DesiredValue,updated:LastUpdated}",
+    )
+    return {"region": QUOTA_REGION, "quota_code": G_SPOT[-1], "applied_vcpus": current, "requests": history}
+
+
+def terraform(action, args, fleet, env):
+    checkout = Path(os.environ.get("FCVM_REPO", Path.home() / ".local/share/fcvm-fleet-ops/fcvm"))
+    root = checkout / "fleet/ops/terraform"
+    if not (root / "main.tf").is_file():
+        raise ValueError(
+            f"Missing fleet/ops/terraform in {checkout}. Fetch ejc3/fcvm main or set FCVM_REPO to a current checkout."
+        )
+    binary = Path.home() / "bin/terraform"
+    if not binary.is_file():
+        resolved = shutil.which("terraform")
+        if not resolved:
+            raise ValueError("Terraform 1.10.3 is required. Install it in ~/bin or PATH.")
+        binary = Path(resolved)
+    version = json.loads(subprocess.check_output([str(binary), "version", "-json"], env=env))
+    if version["terraform_version"] != "1.10.3":
+        raise ValueError(
+            f"{binary} is Terraform {version['terraform_version']}. The project requires 1.10.3."
+        )
+    if action == "init":
+        if args:
+            raise ValueError(
+                "terraform init takes no arguments; the fleet supplies its backend configuration."
+            )
+        args = ["-input=false", "-lockfile=readonly", "-backend-config=bucket=" + fleet["state_bucket"]]
+    if action == "apply" and (len(args) != 1 or args[0].startswith("-") or not (root / args[0]).is_file()):
+        raise ValueError("First run terraform plan -out=FILE, then terraform apply FILE.")
+    env = {k: v for k, v in env.items() if not k.startswith("TF_CLI_ARGS") and k != "TF_DATA_DIR"}
+    env.update(TF_WORKSPACE="default", TF_VAR_fleet_account_id=fleet["account_id"])
+    return subprocess.call([str(binary), "-chdir=" + str(root), action, *args], env=env)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    commands.add_parser("quota", help="Show the current us-east-1 G Spot vCPU quota and request history")
+    commands.add_parser("budget", help="Read or change the production budget drill selector").add_argument(
+        "action", choices=["status", "trip", "restore"]
+    )
+    deploy = commands.add_parser("terraform", help="Run Terraform against the project's fleet-only state")
+    deploy.add_argument("action", choices=["init", "plan", "apply"])
+    deploy.add_argument("args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    fleet, env = fleet_session()
+    if args.command == "terraform":
+        return terraform(args.action, args.args, fleet, env)
+    result = quota(env) if args.command == "quota" else budget(args.action, fleet, env)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as error:
+        print(f"fcvm-fleet-ops: {error}", file=sys.stderr)
+        sys.exit(1)
