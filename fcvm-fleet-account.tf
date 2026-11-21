@@ -403,6 +403,50 @@ resource "aws_iam_instance_profile" "fcvm_fleet_gpubox" {
   role     = aws_iam_role.fcvm_fleet_gpubox.name
 }
 
+# What fcvm-arm reads to verify the fleet (owner, 2026-11-21: "If you can't read something ask for perms"): the
+# coordinators' ECS services and tasks and their logs, and the Spot reclaim drill (fcvm-fleet-prod-drills.tf), which it
+# may start, read and stop. No task definition (it names the secrets), no secret, no write besides the drill.
+resource "aws_iam_role_policy" "fcvm_fleet_terraform_observe" {
+  provider = aws.fcvm_fleet
+  name     = "observe-the-coordinators-and-run-the-spot-drill"
+  role     = aws_iam_role.fcvm_fleet_terraform.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = concat([
+      {
+        Sid       = "TheCoordinatorServicesAndTasks"
+        Effect    = "Allow"
+        Action    = ["ecs:DescribeClusters", "ecs:DescribeServices", "ecs:ListServices", "ecs:ListTasks", "ecs:DescribeTasks"]
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+      {
+        Sid    = "TheCoordinatorLogs"
+        Effect = "Allow"
+        Action = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+        Resource = [for g in ["/ecs/fcvm-fleet-coordinator", "/ecs/fcvm-fleet-prod-coordinator"] :
+        "arn:aws:logs:*:${local.fcvm_fleet_account_id}:log-group:${g}:*"]
+      },
+      ], flatten([for t in aws_fis_experiment_template.fcvm_fleet_prod_spot_drill : [
+        {
+          Sid    = "StartTheSpotDrillOnly"
+          Effect = "Allow"
+          Action = "fis:StartExperiment"
+          Resource = [
+            "arn:aws:fis:us-east-1:${local.fcvm_fleet_account_id}:experiment-template/${t.id}",
+            "arn:aws:fis:us-east-1:${local.fcvm_fleet_account_id}:experiment/*",
+          ]
+        },
+        {
+          Sid      = "WatchAndStopIt"
+          Effect   = "Allow"
+          Action   = ["fis:GetExperiment", "fis:ListExperiments", "fis:StopExperiment", "fis:GetExperimentTemplate"]
+          Resource = "*"
+        },
+    ]]))
+  })
+}
+
 # Every G launch in us-east-1 by this role goes through fcvm's admission (fleet/tools/g-admission.sh), which
 # leaves the wall's GPU host its room in the account's G vCPU quotas and tags the launch
 # fcvm-admission=wall-reserve. A launch without the tag is a copy of gpubox.sh or build-ami.sh

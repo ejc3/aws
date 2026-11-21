@@ -1800,7 +1800,8 @@ class ProdStackTests(unittest.TestCase):
     every prod launch, instance and spot request is Fleet=prod and the prod coordinator acts on nothing else; and
     staging's resources render exactly as before."""
 
-    PROD_FILES = {"fcvm-fleet-prod.tf": PROD, "fcvm-fleet-prod-dns.tf": PROD_DNS, "fcvm-fleet-prod-broadcast.tf": PROD_BC}
+    PROD_FILES = {"fcvm-fleet-prod.tf": PROD, "fcvm-fleet-prod-dns.tf": PROD_DNS, "fcvm-fleet-prod-broadcast.tf": PROD_BC,
+                  "fcvm-fleet-prod-drills.tf": (ROOT / "fcvm-fleet-prod-drills.tf").read_text()}
     GATES = (r"local\.fcvm_fleet_prod", r"2 \* local\.fcvm_fleet_prod", r"local\.fcvm_fleet_prod_broadcast",
              r"var\.fcvm_fleet_prod_enabled \? .+ : 0", r"length\(aws_iam_policy\.fcvm_fleet_prod_coordinator_java\)")
 

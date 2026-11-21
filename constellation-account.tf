@@ -219,6 +219,14 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Resource  = aws_iam_role.fcvm_fleet_terraform.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
       }, {
+      # The fcvm release functions' logs in this account (fcvm-fleet-ci.tf, fcvm-fleet-prod-ci.tf), so fcvm-arm can say
+      # why a promotion failed. Logs only: a function's configuration holds its environment.
+      Sid       = "ReadTheFcvmReleaseLogs"
+      Effect    = "Allow"
+      Action    = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
+      Resource  = "arn:aws:logs:*:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/fcvm-*:*"
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
       Sid       = "ReadTheFcvmFleetPointerOnly"
       Effect    = "Allow"
       Action    = "ssm:GetParameter"
