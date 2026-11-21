@@ -1729,9 +1729,11 @@ ssh mini "cd '$work' && swift build --jobs 2"
 ```
 
 Keep reusable work under that task directory, use its own DerivedData for Xcode, and return needed
-artifacts before removing your task directory. The host Command Line Tools build macOS SwiftPM packages
-and C programs. Full Xcode lives at `~/Applications/Xcode.app` and needs its host license accepted
-before SDK-dependent builds or Swift Testing suites run there. Existing iOS CI and TestFlight workflows
+artifacts before removing your task directory. The mini account defaults to its full Xcode at
+`~/Applications/Xcode.app` for `swift test`, `xcodebuild`, and SDK selection. An explicit
+`DEVELOPER_DIR` takes precedence. After installing or upgrading Xcode, complete its license and
+first-launch setup and rerun `scripts/mac-setup.sh mini`. Until the new version passes those checks,
+new SSH sessions use the system-selected Command Line Tools. Existing iOS CI and TestFlight workflows
 have provisioned Xcode and signing in the runners. Jobs that require the mini also need its `mini`
 runner label. Use the MacBook for work tied to its desktop, personal keychain, or attached device.
 

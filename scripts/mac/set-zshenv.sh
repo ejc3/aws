@@ -1,17 +1,40 @@
 #!/bin/sh
-# set-zshenv.sh FILE: make FILE (~/.zshenv) end with the managed block that puts ~/.local/bin first on
+# set-zshenv.sh FILE [--build-only]: make FILE (~/.zshenv) end with the managed block that puts ~/.local/bin first on
 # PATH, so every zsh, non-interactive SSH sessions included, finds the swift/xcodebuild/xcrun shims and
 # the other agent tools before /usr/bin, and that puts TMPDIR on the disk ~/.config/mac-setup/tmpdir names, if any. The block is authoritative: whatever FILE does to PATH before it,
 # the block runs last. An earlier copy of the block is removed and the current one appended, so a rerun
 # leaves an up-to-date FILE unchanged. Installed by ejc3/aws scripts/mac-setup.sh (scripts/mac/install.zsh).
 set -eu
-f=${1:?usage: set-zshenv.sh FILE}
+f=${1:?usage: set-zshenv.sh FILE [--build-only]}
+mini_xcode=''
+if [ "${2:-}" = --build-only ]; then
+  contents="$HOME/Applications/Xcode.app/Contents"
+  developer="$contents/Developer"
+  build="$developer/usr/bin/xcodebuild"
+  stamp="$HOME/.local/state/mac-setup/mini-xcode-version.plist"
+  # Probe only at setup. A replacement Xcode needs its own first-launch and license checks.
+  if [ -r "$contents/version.plist" ] && [ -x "$build" ] &&
+     DEVELOPER_DIR="$developer" "$build" -license check </dev/null >/dev/null 2>&1 &&
+     DEVELOPER_DIR="$developer" "$build" -checkFirstLaunchStatus </dev/null >/dev/null 2>&1; then
+    mkdir -p "$(dirname "$stamp")"
+    cp "$contents/version.plist" "$stamp.$$"
+    mv -f "$stamp.$$" "$stamp"
+    mini_xcode='
+# Use this validated Xcode for the mini account unless the caller selected a toolchain.
+if [[ ! -v DEVELOPER_DIR && -x "$HOME/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild" ]] &&
+   /usr/bin/cmp -s "$HOME/Applications/Xcode.app/Contents/version.plist" "$HOME/.local/state/mac-setup/mini-xcode-version.plist"; then
+  export DEVELOPER_DIR="$HOME/Applications/Xcode.app/Contents/Developer"
+fi'
+  else
+    echo "mac-setup: mini Xcode is absent or still needs license/first-launch setup; using the system selection" >&2
+  fi
+fi
 begin='# >>> mac-setup >>>'
 end='# <<< mac-setup <<<'
 block="$begin (ejc3/aws scripts/mac-setup.sh; rewritten on every run, keep it last)
 typeset -U path
 path=(\"\$HOME/.local/bin\" \$path)
-export PATH
+export PATH$mini_xcode
 # Temporary files (build products, a test run's DerivedData) on the disk named in
 # ~/.config/mac-setup/tmpdir, when that file exists and the disk is mounted; else the system default.
 if [[ -r \$HOME/.config/mac-setup/tmpdir ]]; then
