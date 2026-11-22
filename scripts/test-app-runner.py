@@ -2382,6 +2382,7 @@ class BudgetLaunchTests(unittest.TestCase):
         # The cap the reconcile holds the group to, from Terraform's formula at these constants.
         self.assertEqual(math.floor((50 / 24 - 8 * 0.016) / 0.027), 72)
         self.assertEqual(math.floor((50 / 24 - 14 * 0.016) / 0.027), 68)
+        self.assertEqual(math.floor((80 / 24 - 14 * 0.016) / 0.027), 115, "dolphin at $80 a day (runner-app.tf)")
 
     def test_a_single_large_job_runs_when_its_throttled_group_holds_nothing(self):
         # A $20 a day group's throttled cap is under one xl host's 64 vCPUs; the xl still runs, alone.
@@ -2540,10 +2541,10 @@ class BudgetLaunchTests(unittest.TestCase):
 
 
 class BudgetTerraformTests(unittest.TestCase):
-    def test_two_50_dollar_buckets_two_days_deep_imagine_alone_and_the_dolphin_repos_together(self):
+    def test_imagine_at_50_and_the_dolphin_repos_together_at_80_two_days_deep(self):
         groups = re.search(r"runner_budget_groups = \{(.*?)\n  \}", APP_TF, re.S).group(1)
         self.assertIn('imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }', groups)
-        self.assertRegex(groups, r'dolphin = \{\s+daily_usd = 50\s+repos\s+= concat\(local.dolphin_runner_pool_repos, '
+        self.assertRegex(groups, r'dolphin = \{\s+(?:#[^\n]*\n\s+)*daily_usd = 80\s+repos\s+= concat\(local.dolphin_runner_pool_repos, '
                                  r'\["dolphin-labs-hq/dolphin-family"\]\)')
         pool = re.search(r"dolphin_runner_pool_repos = concat\(\[(.*?)\], keys\(local.dolphin_runner_pool_expansion_active\)\)", APP_TF, re.S)
         self.assertEqual(set(re.findall(r'"([^"]+)"', pool.group(1))), {DOLPHIN, FILMS, "dolphin-labs-hq/dolphin-maps"})
