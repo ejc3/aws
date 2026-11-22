@@ -13,7 +13,9 @@ import signal
 import stat
 import subprocess
 import sys
+import syslog
 import time
+import traceback
 from urllib.parse import quote
 
 
@@ -32,7 +34,7 @@ COMMAND_OWNER = None
 
 
 class Incomplete(Exception):
-    """The account cannot be ranked completely during this run."""
+    """A fixed diagnostic for the account journal. Keep paths and command output out of these messages."""
 
 
 def pressure(home):
@@ -489,8 +491,17 @@ def main():
                 raise OSError("invalid owner")
             COMMAND_OWNER = (uid, entry.pw_gid)
         result = prune(home, uid, args.remove, inspect_all=root)
-    except (OSError, RuntimeError, ValueError, KeyError, IndexError, Incomplete):
+    except (OSError, RuntimeError, ValueError, KeyError, IndexError, Incomplete) as error:
         if not args.remove:
+            # The host discards container stderr. Keep diagnostics in this account's journal;
+            # OS errors may contain paths, so record only errno and our own source locations.
+            reason = (str(error) if type(error) is Incomplete else "") or type(error).__name__
+            if isinstance(error, OSError) and error.errno is not None:
+                reason += f" errno={error.errno}"
+            stages = " > ".join(f"{frame.f_code.co_name}:{line}" for frame, line in
+                                traceback.walk_tb(error.__traceback__) if frame.f_globals is globals())
+            syslog.openlog("nextjs-worktree-prune-worker")
+            syslog.syslog(syslog.LOG_WARNING, f"Account listing failed: {reason} ({stages})")
             print("worktree-prune: unable to rank account completely", file=sys.stderr)
             return 1
         result = {"status": "skipped"}
