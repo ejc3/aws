@@ -753,6 +753,24 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     calls per reconcile (well inside 5,000/hour) and the repo's deadline.
     """
     found, seen, runs_seen, budget = [], set(), set(), [SCAN_CALL_BUDGET]
+    group = cfg.get('budget_group')
+    if group and len(group_repos(group, repos := config()[0])) > 1 and not out_of_time():
+        waiter = active_group_wait(group, repos)
+        if waiter and waiter['repo']['S'] == repo and not out_of_time():
+            job_id = waiter['job']['S']
+            budget[0] -= 1
+            job = queued_waiter(repo, job_id, pat)
+            size = job_size(cfg, job.get('labels')) if job else None
+            # Workflow creation order is not job creation order. Fetch the holder even
+            # when this turn cannot reach its run or page, then use normal launch admission.
+            seen.add(int(job_id))
+            cap = int(budget_groups()[group]['throttled_vcpus'])
+            if size and min(size_vcpus(cfg, size), cap) == int(waiter['vcpus']['N']):
+                found.append((job_id, size))
+            else:
+                # Definitive status or label change. Do not let a stale workflow listing
+                # resurrect it this scan or let the old reservation keep other jobs out.
+                dynamodb.put_item(TableName=BUDGET_TABLE, Item={'group': {'S': 'waiting/' + group}})
     statuses = ('queued', 'in_progress') if int(time.time() // 120) % 2 == 0 else ('in_progress', 'queued')
     for status in statuses:
         for run in runs_oldest_first(repo, status, pat, budget):
@@ -1217,14 +1235,39 @@ def queued_job(repo, job_id, pat):
 GROUP_WAIT_SECONDS = 8 * 60
 
 
+def active_group_wait(group, repos):
+    key = {'group': {'S': 'waiting/' + group}}
+    item = dynamodb.get_item(TableName=BUDGET_TABLE, Key=key, ConsistentRead=True).get('Item', {})
+    if not item.get('repo'):
+        return None
+    try:
+        owner = item['repo']['S']
+        if (owner in repos and repos[owner].get('budget_group') == group
+                and int(item['expires']['N']) > int(now().timestamp()) and int(item['created']['N']) >= 0
+                and item['job']['S'].isascii() and item['job']['S'].isdigit() and int(item['vcpus']['N']) > 0):
+            return item
+    except (KeyError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def queued_waiter(repo, job_id, pat):
+    try:
+        return queued_job(repo, job_id, pat)
+    except urllib.error.HTTPError as error:
+        if error.code not in (404, 410):
+            raise
+        return None
+
+
 def waiting_for_group(group, repos, repo, job_id, need, free, cap, pat, queued):
     """Preserve headroom for the oldest observed eligible job blocked by a shared throttled cap."""
     key = {'group': {'S': 'waiting/' + group}}
     table = {'TableName': BUDGET_TABLE}
-    item = dynamodb.get_item(**table, Key=key, ConsistentRead=True).get('Item', {})
+    item = active_group_wait(group, repos)
     now_s = int(now().timestamp())
-    owner = item.get('repo', {}).get('S')
-    waiting = owner in repos and repos[owner].get('budget_group') == group and int(item['expires']['N']) > now_s
+    waiting = bool(item)
+    owner = item['repo']['S'] if waiting else None
     own_wait = waiting and (owner, item['job']['S']) == (repo, job_id)
     # A younger job can run alongside the reserved size. A stale reservation is harmless here.
     if free >= need and not own_wait and (not waiting or free - need >= int(item['vcpus']['N'])):
@@ -1239,12 +1282,7 @@ def waiting_for_group(group, repos, repo, job_id, need, free, cap, pat, queued):
         # Check the reservation only when it would block this candidate. Completion,
         # cancellation or GitHub assigning a runner immediately gives the capacity back.
         token = pat if owner == repo else repo_pat(repos[owner])
-        try:
-            active = token and queued_job(owner, item['job']['S'], token)
-        except urllib.error.HTTPError as error:
-            if error.code not in (404, 410):
-                raise
-            active = None
+        active = token and queued_waiter(owner, item['job']['S'], token)
         if active:
             print(f"{repo}: job {job_id} waits for {owner} job {item['job']['S']} ({item['vcpus']['N']} reserved vCPUs)")
             return 'cap'
