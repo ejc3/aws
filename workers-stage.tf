@@ -69,10 +69,6 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
       id         = cloudflare_zero_trust_access_policy.workers_stage_agents.id
       precedence = 3
     },
-    {
-      id         = cloudflare_zero_trust_access_policy.workers_stage_constellation_ci.id
-      precedence = 4
-    },
   ]
 }
 

@@ -1,49 +1,84 @@
 # constellation-stage-smoke.tf
 #
-# constellation's deploy-lights-web job walks the live lights-stage Worker after every deploy, through the staging
-# Workers' Access application (workers-stage.tf), from a photo to the bag (apps/lights-web/scripts/stage-smoke.mjs):
-# the owner's rule that a feature is done only when it works on the user's path, checked automatically and failing
-# closed (ejc3/aws#989). CI gets a token of its own, not a copy of the agents' (workers-stage-agents), so either can be
-# revoked alone. It lives only in constellation's main-only `cloudflare-deploy` environment (workers-deploy.tf).
-# Like every staging-Workers token it opens the staging Workers, none in production.
+# A Cloudflare Access service token for constellation's lights-stage live smoke (ejc3/aws#989). After deploy-lights-web
+# deploys lights-stage, the same job walks the live site through Access with this token, from a photo to the bag
+# (apps/lights-web/scripts/stage-smoke.mjs), and fails closed without it: the owner's rule that a feature is done only
+# when it works on the user's path, checked automatically.
+#
+#   STAGE_ACCESS_CLIENT_ID, STAGE_ACCESS_CLIENT_SECRET (secrets), LIGHTS_STAGE_URL (a variable)
+#     in constellation's `cloudflare-deploy` environment (workers-deploy.tf), which admits `main` only: the job that
+#     reads them is the staging deploy, and it holds that environment already.
+#
+# As dolphin-labs-stage-check.tf: hostname-level Access takes precedence over the Worker-native gate, so the exact
+# hostname gets the same three policies as the shared staging application plus the CI token. Preview URLs and the
+# sibling staging Workers keep their Worker-level gate, which never admits this token.
+# https://developers.cloudflare.com/workers/configuration/cloudflare-access/#understand-access-hierarchy
+# The token lives in Terraform state and the main-only GitHub environment. Rotate between deploys with
+# terraform apply -replace=cloudflare_zero_trust_access_service_token.lights_stage_smoke
 
-resource "cloudflare_zero_trust_access_service_token" "workers_stage_constellation_ci" {
-  account_id = var.cloudflare_account_id
-  name       = "constellation-ci-stage-smoke"
-  duration   = "8760h"
-
-  lifecycle {
-    create_before_destroy = true
-  }
+locals {
+  lights_stage_hostname = "lights-stage.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev"
 }
 
-resource "cloudflare_zero_trust_access_policy" "workers_stage_constellation_ci" {
+resource "cloudflare_zero_trust_access_service_token" "lights_stage_smoke" {
+  account_id = var.cloudflare_account_id
+  name       = "constellation-lights-stage-smoke"
+  duration   = "8760h"
+}
+
+resource "cloudflare_zero_trust_access_policy" "lights_stage_smoke" {
   account_id       = var.cloudflare_account_id
-  name             = "staging Workers: constellation main-only CI"
+  name             = "Lights staging smoke"
   decision         = "non_identity"
   session_duration = "24h"
+
   include = [{
-    service_token = { token_id = cloudflare_zero_trust_access_service_token.workers_stage_constellation_ci.id }
+    service_token = {
+      token_id = cloudflare_zero_trust_access_service_token.lights_stage_smoke.id
+    }
   }]
 }
 
-resource "github_actions_environment_secret" "constellation_stage_smoke" {
-  provider    = github.agents_md
-  for_each    = toset(["STAGE_ACCESS_CLIENT_ID", "STAGE_ACCESS_CLIENT_SECRET"])
-  repository  = "constellation"
-  environment = github_repository_environment.workers_deploy_ejc3["constellation"].environment
-  secret_name = each.key
-  plaintext_value = {
-    STAGE_ACCESS_CLIENT_ID     = cloudflare_zero_trust_access_service_token.workers_stage_constellation_ci.client_id
-    STAGE_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.workers_stage_constellation_ci.client_secret
-  }[each.key]
+resource "cloudflare_zero_trust_access_application" "lights_stage_smoke" {
+  account_id       = var.cloudflare_account_id
+  name             = "Lights staging"
+  type             = "self_hosted"
+  domain           = local.lights_stage_hostname
+  session_duration = "24h"
+
+  policies = [
+    { id = cloudflare_zero_trust_access_policy.cc_games_allowed.id, precedence = 1 },
+    { id = cloudflare_zero_trust_access_policy.cc_games_service.id, precedence = 2 },
+    { id = cloudflare_zero_trust_access_policy.workers_stage_agents.id, precedence = 3 },
+    { id = cloudflare_zero_trust_access_policy.lights_stage_smoke.id, precedence = 4 },
+  ]
 }
 
-# Not a credential: the staging URL the smoke walks, from the Worker's name and the account's workers.dev subdomain.
-resource "github_actions_environment_variable" "constellation_stage_smoke" {
+resource "github_actions_environment_secret" "lights_stage_smoke_id" {
+  provider        = github.agents_md
+  repository      = "constellation"
+  environment     = github_repository_environment.workers_deploy_ejc3["constellation"].environment
+  secret_name     = "STAGE_ACCESS_CLIENT_ID"
+  plaintext_value = cloudflare_zero_trust_access_service_token.lights_stage_smoke.client_id
+
+  depends_on = [cloudflare_zero_trust_access_application.lights_stage_smoke]
+}
+
+resource "github_actions_environment_secret" "lights_stage_smoke_secret" {
+  provider        = github.agents_md
+  repository      = "constellation"
+  environment     = github_repository_environment.workers_deploy_ejc3["constellation"].environment
+  secret_name     = "STAGE_ACCESS_CLIENT_SECRET"
+  plaintext_value = cloudflare_zero_trust_access_service_token.lights_stage_smoke.client_secret
+
+  depends_on = [cloudflare_zero_trust_access_application.lights_stage_smoke]
+}
+
+# Not a credential: the page the smoke walks.
+resource "github_actions_environment_variable" "lights_stage_smoke_url" {
   provider      = github.agents_md
   repository    = "constellation"
   environment   = github_repository_environment.workers_deploy_ejc3["constellation"].environment
   variable_name = "LIGHTS_STAGE_URL"
-  value         = "https://lights-stage.${cloudflare_workers_subdomain.cc_games.subdomain}.workers.dev/"
+  value         = "https://${local.lights_stage_hostname}/"
 }
