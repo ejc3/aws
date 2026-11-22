@@ -140,19 +140,29 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile" {
 }
 
 # CreateFunction refuses an image unless the repository policy lets the Lambda service pull it for that function. Only the
-# stacks' tile functions (fcvm-lam-<fleet>-*, any version) qualify.
+# stacks' tile functions (fcvm-lam-<fleet>-*, any version) qualify. Staging CI (fcvm-fleet-ci.tf) is in another account, so
+# the repository admits its push here too.
 resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
   provider   = aws.fcvm_fleet_east1
   repository = aws_ecr_repository.fcvm_fleet_lambda_tile.name
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "LambdaPullsTheTileImage"
-      Effect    = "Allow"
-      Principal = { Service = "lambda.amazonaws.com" }
-      Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
-      Condition = { StringLike = { "aws:sourceArn" = values(local.fcvm_lambda_function_arns) } }
-    }]
+    Statement = [
+      {
+        Sid       = "LambdaPullsTheTileImage"
+        Effect    = "Allow"
+        Principal = { Service = "lambda.amazonaws.com" }
+        Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+        Condition = { StringLike = { "aws:sourceArn" = values(local.fcvm_lambda_function_arns) } }
+      },
+      {
+        Sid       = "StagingCiPushesTheLaneImage"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage"]
+      },
+    ]
   })
 }
 

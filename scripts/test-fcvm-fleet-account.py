@@ -488,9 +488,29 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', repo_policy)
         self.assertIn('Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', repo_policy)
         self.assertIn('"aws:sourceArn" = values(local.fcvm_lambda_function_arns)', repo_policy)
-        self.assertEqual(repo_policy.count('Effect'), 1)
+        self.assertIn('Sid       = "LambdaPullsTheTileImage"', repo_policy)
         # The spike's repository is adopted, not recreated.
         self.assertIn('import {\n  to = aws_ecr_repository.fcvm_fleet_lambda_tile\n  id = "fcvm-fleet/lambda-tile"\n}', self.source)
+
+    def test_staging_ci_pushes_and_records_the_lane_image_and_deletes_nothing(self):
+        # ejc3/fcvm .github/workflows/fleet-lambda-image.yml: the fleet-stage-deploy job pushes rev-<commit> and moves
+        # keep-built (fleet/lambda/release.py publish): push, read the image back, put a tag. Never delete an image.
+        ci = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        role = block('resource "aws_iam_role_policy" "fcvm_stage_ci"', ci)
+        lane = self.statement(role, "PushAndRecordTheLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', lane), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage",
+        ])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", lane)
+        repo_policy = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', self.source)
+        ci_pull = self.statement(repo_policy, "StagingCiPushesTheLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }", ci_pull)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', ci_pull), re.findall(r'"(ecr:[^"]+)"', lane))
+        self.assertNotRegex(role + repo_policy, r"ecr:(?:BatchDeleteImage|Delete|Set|Create|\*)")
+        secrets = block('resource "github_actions_environment_secret" "fcvm_stage"', ci)
+        self.assertIn('"LAMBDA_TILE_REPO"', secrets)
+        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url", secrets)
 
     def test_an_image_a_stack_runs_or_rolls_back_to_is_never_expired(self):
         # ejc3/fcvm fleet/lambda/release.py moves the keep- tags (each stack's current, previous, next); they are the only

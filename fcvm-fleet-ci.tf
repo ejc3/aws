@@ -92,6 +92,15 @@ resource "aws_iam_role_policy" "fcvm_stage_ci" {
         "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:DescribeImages"]
         Resource = aws_ecr_repository.fcvm_fleet_coordinator.arn
       },
+      # The Lambda tile's lane image (ejc3/fcvm .github/workflows/fleet-lambda-image.yml, fleet/lambda/release.py
+      # publish): push rev-<commit>, read it back, and move keep-built to it. No delete (fcvm-fleet-lambda.tf).
+      {
+        Sid    = "PushAndRecordTheLaneImage"
+        Effect = "Allow"
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage"]
+        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+      },
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_coordinator_release.arn },
       # The image release gate (fcvm-fleet-ami-pipeline.tf): status and exact-receipt smoke verdicts.
       { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_release_gate.arn },
@@ -279,11 +288,11 @@ resource "github_actions_environment_variable" "fcvm_stage" {
   value         = each.value
 }
 
-# The role ARN and the repository URL carry AWS account ids. A workflow step header prints vars.* values as
-# typed and Actions masks only secrets, so these two are secrets although neither is a credential.
+# The role ARN and the repository URLs carry AWS account ids. A workflow step header prints vars.* values as
+# typed and Actions masks only secrets, so these are secrets although none is a credential.
 resource "github_actions_environment_secret" "fcvm_stage" {
   provider    = github.agents_md
-  for_each    = toset(["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "AWS_ROLE_ARN", "COORDINATOR_REPO"])
+  for_each    = toset(["CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "AWS_ROLE_ARN", "COORDINATOR_REPO", "LAMBDA_TILE_REPO"])
   repository  = "fcvm"
   environment = github_repository_environment.fcvm_stage.environment
   secret_name = each.key
@@ -292,5 +301,6 @@ resource "github_actions_environment_secret" "fcvm_stage" {
     CF_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.fcvm_stage_ci.client_secret
     AWS_ROLE_ARN            = aws_iam_role.fcvm_stage_ci.arn
     COORDINATOR_REPO        = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
+    LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
   }[each.key]
 }
