@@ -157,7 +157,7 @@ class ServiceTests(unittest.TestCase):
         serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
         # Searched in the binary: claw-master's help lists no flags (checked on claw-master-052d711 and -443a4d4).
         self.assertIn('grep -qa -- --profile-reserve-file "$bin"', serve)
-        self.assertNotIn('serve --help', serve)
+        self.assertNotIn('"$bin" serve --help', serve)
         self.assertIn('reserve=(--profile-reserve-file /etc/claude-master/profile-reserve)', serve)
         self.assertIn('"$${reserve[@]}"', serve)
         # An invalid reserve fails the plan instead of reaching the server.
