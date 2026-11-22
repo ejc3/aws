@@ -10,8 +10,7 @@
 # reach no other model. In this account, where Haiku 5.5 is already subscribed and the box roles call it.
 #
 #   lights-stage   IAM user lights-vision-worker-stage; its key goes only into workers-stage/lights/terraform, which
-#                  scripts/workers-stage-secrets.sh loads into the Worker. Lights has no hand-set staging secrets yet,
-#                  so the loader reads this container alone for it.
+#                  scripts/workers-stage-secrets.sh loads alongside the inventory bindings from browserbase/credentials.
 #
 # The container holds LIGHTS_AWS_ACCESS_KEY_ID, LIGHTS_AWS_SECRET_ACCESS_KEY, LIGHTS_BEDROCK_REGION and
 # LIGHTS_BEDROCK_MODEL. The key is in Terraform state, as the moderation Workers' keys are.

@@ -1804,8 +1804,8 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
 - **Lights' photo reader on staging** (`lights-vision.tf`): the IAM user `lights-vision-worker-stage`, whose only grant is
   bedrock-haiku.tf's Haiku 5.5 statements, so the Worker `lights-stage` (ejc3/constellation `apps/lights-web`) can read a
   photo of a house. Its key is written to `workers-stage/lights/terraform` and loaded with
-  `scripts/workers-stage-secrets.sh lights`, which reads that container alone for this site (lights has no hand-set staging
-  secrets). The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
+  `scripts/workers-stage-secrets.sh lights`. The loader also reads `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID`
+  from this account's `browserbase/credentials` for the inventory check. Run it after `deploy-lights-web` finishes. The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
 - **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
   script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
   of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
