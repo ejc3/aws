@@ -325,10 +325,31 @@ class WorktreePruneTests(unittest.TestCase):
         with mock.patch.object(WORKER.sys, "argv", ["worker", "--list"]), \
              mock.patch.object(WORKER.pwd, "getpwuid", return_value=mock.Mock(pw_dir="/home/fixture")), \
              mock.patch.object(WORKER, "prune", side_effect=WORKER.Incomplete), \
+             mock.patch.object(WORKER.syslog, "syslog"), mock.patch.object(WORKER.syslog, "openlog"), \
              contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             self.assertEqual(WORKER.main(), 1)
         self.assertEqual(out.getvalue(), "")
         self.assertIn("unable to rank account completely", err.getvalue())
+
+    def test_failure_reason_is_available_in_the_account_journal_without_user_data(self):
+        import syslog
+        for error, reason in ((PermissionError(13, "private token", "/private/path"), "PermissionError errno=13"),
+                              (WORKER.Incomplete("command timed out"), "command timed out")):
+            with self.subTest(reason=reason), \
+                 mock.patch.object(WORKER.sys, "argv", ["worker", "--list"]), \
+                 mock.patch.object(WORKER.pwd, "getpwuid", return_value=mock.Mock(pw_dir="/home/fixture")), \
+                 mock.patch.object(WORKER, "prune", side_effect=error), \
+                 mock.patch.object(syslog, "openlog") as ident, mock.patch.object(syslog, "syslog") as journal, \
+                 contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(WORKER.main(), 1)
+                self.assertEqual(output.getvalue(), "")
+                ident.assert_called_once_with("nextjs-worktree-prune-worker")
+                level, message = journal.call_args.args
+                self.assertEqual(level, syslog.LOG_WARNING)
+                self.assertIn(reason, message)
+                self.assertRegex(message, r"main:[0-9]+")
+                self.assertNotIn("private", message)
+                self.assertNotIn("/home", message)
 
     def test_reader_aborts_when_stdout_exceeds_its_bound(self):
         with mock.patch.object(WORKER, "OUTPUT_LIMIT", 1024):
