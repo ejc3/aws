@@ -403,10 +403,11 @@ done
 [ $${#found[@]} -gt 0 ] || { echo "claw-master-serve: no subscription login under $profdir" >&2; exit 1; }
 args=("$${found[0]}")
 for p in "$${found[@]:1}"; do args+=(--next-profile "$p"); done
-# Held-back subscriptions, when the installed binary understands the flag (a convergence that could not install the
-# pinned release leaves an older binary, which must still start).
+# Held-back subscriptions, when the installed binary has the flag. Its help lists no flags (`serve --help` only says
+# --listen and --state-dir are required), so the binary itself is searched; a convergence that could not install the
+# pinned release leaves an older binary without it, which must still start.
 reserve=()
-if "$bin" serve --help 2>&1 | grep -q -- --profile-reserve-file; then reserve=(--profile-reserve-file /etc/claude-master/profile-reserve); fi
+if grep -qa -- --profile-reserve-file "$bin"; then reserve=(--profile-reserve-file /etc/claude-master/profile-reserve); fi
 exec "$bin" serve "$${args[@]}" \
   --listen ${local.claw_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
