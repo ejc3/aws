@@ -23,8 +23,8 @@ locals {
 
   fcvm_lambda_repo_name = "fcvm-fleet/lambda-tile"
   fcvm_lambda_repo_arn  = "arn:aws:ecr:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:repository/${local.fcvm_lambda_repo_name}"
-  # The lane image's mutable, never-expired tags: keep-<stack>-current and keep-<stack>-previous (ejc3/fcvm
-  # fleet/lambda/release.py).
+  # The lane image's mutable, never-expired tags: the keep- tags ejc3/fcvm fleet/lambda/release.py moves (each stack's
+  # current, previous and next image, and the newest build).
   fcvm_lambda_protected_tags = "keep-*"
 
   # Each stack's VPC in us-east-1, its coordinator task role and its certificate secret (fcvm-fleet.tf, fcvm-fleet-prod.tf).
@@ -85,8 +85,8 @@ locals {
 # ------------------------------------------------------------------------------------------------ the lane image
 # Created by fcvm-arm for the spike (2026-11-21) and adopted here, scanned on push. Both stacks pull from it, so what each
 # stack runs or can roll back to must outlive the other stack's pushes. ejc3/fcvm fleet/lambda/release.py marks those
-# images with four tags, keep-<stack>-current and keep-<stack>-previous for stage and prod (ejc3/fcvm fleet/PROTOCOL.md,
-# "Which lane image a stack runs"). They are the only tags that move; every other tag is immutable.
+# images with keep- tags, among them keep-<stack>-current and keep-<stack>-previous for stage and prod (ejc3/fcvm
+# fleet/PROTOCOL.md, "Which lane image a stack runs"). They are the only tags that move; every other tag is immutable.
 import {
   to = aws_ecr_repository.fcvm_fleet_lambda_tile
   id = "fcvm-fleet/lambda-tile"
@@ -112,7 +112,7 @@ resource "aws_ecr_repository" "fcvm_fleet_lambda_tile" {
 resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile" {
   provider   = aws.fcvm_fleet_east1
   repository = aws_ecr_repository.fcvm_fleet_lambda_tile.name
-  # Rule 1 selects every image with a protected tag and expires none of them (at most four images carry one), and an image a
+  # Rule 1 selects every image with a protected tag and expires none of them (fewer than ten images carry one), and an image a
   # rule's tags select is never expired by a lower-priority rule. Rule 2 counts every image and expires those outside the
   # newest five that no protected tag holds. ejc3/fcvm fleet/lambda/release.py LIFECYCLE is this policy, and its tests run a
   # model of it.

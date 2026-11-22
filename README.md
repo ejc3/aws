@@ -854,10 +854,10 @@ charges by these tags.
 
 fcvm-arm pushes the lane image to `fcvm-fleet/lambda-tile` through the fleet
 role. Both stacks pull from that one repository. Its lifecycle policy expires
-every image outside the newest five unless the image carries a `keep-` tag:
-`keep-<stack>-current` and `keep-<stack>-previous` for `stage` and `prod`, the
-image a stack runs and the one it can roll back to. Those are the only mutable
-tags. ejc3/fcvm `fleet/lambda/release.py` moves them (`select`, `promote`,
+every image outside the newest five unless the image carries a `keep-` tag,
+among them `keep-<stack>-current` and `keep-<stack>-previous` for `stage` and
+`prod`: the image a stack runs and the one it can roll back to. `keep-` tags are
+the only mutable ones. ejc3/fcvm `fleet/lambda/release.py` moves them (`select`, `promote`,
 `rollback`), and a stack's coordinator takes the lane image by digest. The
 repository, each stack's role and provider are in the pointer:
 
