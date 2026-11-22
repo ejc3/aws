@@ -221,8 +221,8 @@ resource "aws_budgets_budget" "fcvm_fleet_prod_daily" {
   depends_on = [aws_ce_cost_allocation_tag.purpose, aws_ce_cost_allocation_tag.fleet]
 }
 
-# Attached to a stack's coordinator task role only by the daily billing reconciler, for that stack's budget. A deny
-# wins over the role's own grants.
+# The daily billing reconciler attaches this deny to the over-budget stack's coordinator.
+# Keep the immutable IAM description to preserve active attachments when the policy document changes.
 resource "aws_iam_policy" "fcvm_fleet_spend_cap" {
   provider    = aws.fcvm_fleet
   name        = "fcvm-fleet-spend-cap"
@@ -230,9 +230,12 @@ resource "aws_iam_policy" "fcvm_fleet_spend_cap" {
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Sid      = "NoNewFleetSpend"
-      Effect   = "Deny"
-      Action   = ["ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances"]
+      Sid    = "NoNewFleetSpend"
+      Effect = "Deny"
+      Action = [
+        "ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances",
+        "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration", "lambda:PublishVersion",
+      ]
       Resource = "*"
     }]
   })

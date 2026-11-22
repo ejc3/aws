@@ -34,8 +34,10 @@ locals {
   # On-demand G vCPUs in us-east-1 (ejc3/fcvm#1257): the wall's host (96) and its replacement while the old one shuts
   # down (96), the EC2 tiles started on demand (8 x 4), and the gpubox test hosts and AMI builders that share the
   # region (96 each, four at once). At 384 the wall's host was refused with VcpuLimitExceeded for 13 minutes on two
-  # wakes of 2026-11-05 while two gpuboxes, an AMI builder and the tiles held the quota.
-  fcvm_fleet_on_demand_g_vcpus = 768
+  # wakes of 2026-11-05 while two gpuboxes, an AMI builder and the tiles held the quota. Plus each stack's Lambda tiles,
+  # whose Managed Instances are on-demand g4dn.xlarge in this account (fcvm-fleet-lambda.tf, 48 vCPUs a stack).
+  fcvm_fleet_on_demand_g_base_vcpus = 768
+  fcvm_fleet_on_demand_g_vcpus      = local.fcvm_fleet_on_demand_g_base_vcpus + 2 * local.fcvm_lambda_max_vcpus
 }
 
 resource "aws_organizations_organizational_unit" "fcvm_fleet" {
@@ -650,11 +652,22 @@ data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
   quota_code   = "L-DB2E81BA"
 }
 
+locals {
+  fcvm_fleet_on_demand_g_granted = data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value
+}
+
+# AWS accepts one open increase per quota. Keep the existing 768 request until AWS grants
+# it. The next apply can then request the full target, preserving any larger grant. AWS
+# can deny or partially grant either request; the data source is the effective quota.
 resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
   provider     = aws.fcvm_fleet_east1
   service_code = "ec2"
   quota_code   = "L-DB2E81BA"
-  value        = max(local.fcvm_fleet_on_demand_g_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value)
+  value = (
+    local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus
+    ? local.fcvm_fleet_on_demand_g_base_vcpus
+    : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted)
+  )
 }
 
 output "fcvm_fleet" {

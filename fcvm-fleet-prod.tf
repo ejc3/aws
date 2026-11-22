@@ -183,6 +183,7 @@ resource "aws_secretsmanager_secret_policy" "fcvm_fleet_prod_tls" {
         aws_iam_role.fcvm_fleet_prod_coordinator_task[0].arn,
         aws_iam_role.fcvm_fleet_prod_host[0].arn,
         aws_iam_role.fcvm_fleet_prod_tile[0].arn,
+        local.fcvm_lambda_tile_role_arns.prod,
         local.fcvm_fleet_access_role_arn,
       ] } }
     }]
