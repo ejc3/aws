@@ -115,6 +115,30 @@ class Cleanup(unittest.TestCase):
             cleaner.clean(self.volume, self.state, True, result)
             self.assertEqual(result["status"], "volume unavailable")
 
+    def test_signing_assets_hold_the_entire_cache(self):
+        retained = []
+        for suffix in (
+            "p8",
+            "P12",
+            "pfx",
+            "keychain",
+            "keychain-db",
+            "mobileprovision",
+            "provisionprofile",
+            "pem",
+            "key",
+            "cer",
+        ):
+            _, leaf = self.cache("project/dd-" + suffix)
+            signing_file = leaf / "nested" / ("signing." + suffix)
+            signing_file.write_bytes(b"test fixture")
+            for path in (signing_file, signing_file.parent):
+                os.utime(path, (self.old, self.old))
+            retained.append(signing_file)
+        self.assertEqual(self.clean(True)["paths"], [])
+        for path in retained:
+            self.assertEqual(path.read_bytes(), b"test fixture")
+
     def test_no_follow_symlinks_or_enter_project_source_archives_or_vm_paths(self):
         _, target = self.cache(".tart-kidsports/vms")
         _, temp = self.cache("tmp/build")

@@ -25,6 +25,20 @@ GIB = 1024**3
 LOW, TARGET = 100 * GIB, 150 * GIB
 AGE = 14 * 86400
 CACHES = tuple(map(Path, ("Build/Intermediates.noindex", "Index.noindex", "ModuleCache.noindex")))
+RETAINED_SUFFIXES = (
+    ".xcarchive",
+    ".xcresult",
+    ".p8",
+    ".p12",
+    ".pfx",
+    ".keychain",
+    ".keychain-db",
+    ".mobileprovision",
+    ".provisionprofile",
+    ".pem",
+    ".key",
+    ".cer",
+)
 PENDING = ".mac-artifact-clean-pending"
 EXCLUDE = {"tmp", "CoreSimulator", "node_modules", "lost+found", "SourcePackages"}
 APPLE_EPOCH = 978307200
@@ -177,7 +191,8 @@ def inspect_tree(fd, device, cutoff, remove=False):
             s = entry.stat(follow_symlinks=False)
             if s.st_dev != device or s.st_uid != os.getuid():
                 raise ValueError("different volume or owner in Xcode cache")
-            if entry.name == ".git" or entry.name.endswith((".xcarchive", ".xcresult", ".keychain-db", ".p8")):
+            name = entry.name.lower()
+            if name == ".git" or name.endswith(RETAINED_SUFFIXES):
                 raise ValueError("contains a retained artifact")
             if not remove and s.st_mtime > cutoff:
                 raise ValueError("recent file in Xcode cache")
