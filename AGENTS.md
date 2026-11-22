@@ -1604,9 +1604,8 @@ Available if a task needs them; neither needs a key on disk.
   Send the headers on curl's stdin, never as arguments (an argument is readable in `/proc/<pid>/cmdline`): `printf
   'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$ID" "$SECRET" | curl -H @-
   https://<site>-stage.<subdomain>.workers.dev/`, the two values from `get-secret-value` in the environment, never in a
-  file. It opens nothing else. Readable by dev-server-role (the secret's own resource policy), nextjs-dev-role for the
-  owner's container (nextjs-dev-fcvm-parity.tf; members are denied it) and admins. Rotate with `terraform apply
-  -replace=cloudflare_zero_trust_access_service_token.workers_stage_agents`.
+  file. The secret policy admits the metal role, the owner's `ct-ejc3` session while nextjs-ct serves, and admins.
+  Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.workers_stage_agents`.
 - **Turso API token**, metal boxes and the owner's nextjs-ct container. `turso/api-token` (us-west-1) holds the Turso platform API token (it can create
   and delete databases) (`dev-ai-services.tf`). Readable by dev-server-role, nextjs-dev-role (the owner's
   container; members are denied it) and admins. Export it as `TURSO_API_TOKEN` from `get-secret-value`; never into a file in a
