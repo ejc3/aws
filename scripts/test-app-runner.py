@@ -746,6 +746,59 @@ class LaunchTests(unittest.TestCase):
         app.ensure_runner = ensure
         return calls, app.reconcile(DOLPHIN, REPOS[DOLPHIN], ["subnet-a"]), scan_deadline
 
+    def test_reconcile_can_start_a_bounded_launch_late_in_a_short_repo_share(self):
+        app, ec2, *_ = load_app()
+        # Production: 120 s Lambda, 45 s reserve, five repo shares. Bucket reads spend 5 s
+        # and the first queue scan spends 6 s. A 13 s attempt fits the invocation, not the
+        # 8 s remaining in this repo's turn. A second job must wait for the next turn.
+        clock = [0.0]
+        app.time = types.SimpleNamespace(monotonic=lambda: clock[0], time=lambda: 0)
+        context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: (120 - clock[0]) * 1000)
+        repos, subnets = app.config()
+        repos = {DOLPHIN: repos[DOLPHIN], **{f"org/other-{i}": {} for i in range(4)}}
+        app.config = lambda: (repos, subnets)
+
+        def buckets(_):
+            clock[0] += 5
+            return [], []
+
+        def scan(repo, cfg, pat, running_on=None):
+            clock[0] += 6
+            return [("70", "l"), ("71", "l")]
+
+        run_instances = ec2.run_instances
+        def slow_launch(**kwargs):
+            clock[0] += app.LAUNCH_ATTEMPT_SECONDS
+            return run_instances(**kwargs)
+
+        deadlines = {}
+        real_reconcile = app.reconcile
+        def reconcile(repo, cfg, subnets):
+            deadlines[repo] = app.DEADLINE[0]
+            return real_reconcile(repo, cfg, subnets) if repo == DOLPHIN else {"repo": repo, "live": 0}
+
+        app.reconcile_buckets, app.queued_jobs = buckets, scan
+        ec2.run_instances, app.reconcile = slow_launch, reconcile
+        results = app.handler({"reconcile": True}, context)
+        self.assertEqual(len(ec2.launched), 1)
+        self.assertEqual(results[0]["outcomes"], {"launched": 1, "deferred": 1})
+        self.assertEqual(deadlines[DOLPHIN], 19, "bucket reads must count once")
+        self.assertEqual(set(deadlines), set(repos))
+        self.assertEqual(max(deadlines.values()), 75, "later shares must preserve the Lambda reserve")
+
+    def test_a_reconcile_without_room_before_the_reserve_leaves_queued_jobs_unclaimed(self):
+        app, ec2, *_ = load_app()
+        app.config = lambda: ({DOLPHIN: REPOS[DOLPHIN]}, [{"subnet_id": "subnet-a", "availability_zone": "az-a"}])
+        app.queued_jobs = lambda *args, **kwargs: [("70", "l"), ("71", "l")]
+        # Its only repo has a positive turn, but the whole invocation has only ten
+        # seconds before its handoff/metrics reserve, too little for RunInstances.
+        context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: (app.RESERVE_SECONDS + 10) * 1000)
+        result, = app.handler({"reconcile": True}, context)
+        self.assertEqual(result["outcomes"], {"deferred": 1})
+        self.assertEqual(ec2.launched, [])
+        self.assertEqual(app.fake_dynamo.items, {})
+        self.assertEqual(app.fake_dynamo.deleted, [], "the controller must not claim and release every waiting job")
+
     def test_a_backlog_stops_at_the_cap(self):
         app, *_ = load_app()
         calls, result, _ = self.backlog(app)

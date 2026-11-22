@@ -85,7 +85,7 @@ ec2 = boto3.client('ec2', region_name=REGION, config=BOUNDED)
 launch_ec2 = boto3.client('ec2', region_name=REGION, config=Config(
     connect_timeout=3, read_timeout=10, retries={'total_max_attempts': 1}))
 # RunInstances at its worst (connect + read above). An attempt starts only if this much of the
-# repo's share is left; RESERVE_SECONDS covers what may follow it past the deadline (below).
+# invocation's work budget is left and it is still the repo's turn to start a call.
 LAUNCH_ATTEMPT_SECONDS = 3 + 10
 ssm = boto3.client('ssm', region_name=REGION, config=BOUNDED)
 secrets = boto3.client('secretsmanager', region_name=REGION, config=BOUNDED)
@@ -659,12 +659,15 @@ def job_size(cfg, labels):
 # call. handler() gives each repo an equal share of the invocation's remaining time (minus a
 # reserve for publishing counts), and a repo's scan stops at its share.
 DEADLINE = [float('inf')]
+RECONCILE_END = [None]  # Absolute work deadline shared by the round's repo turns.
 RESERVE_SECONDS = 45
 
 
 def out_of_time(need=0.0):
-    """True once the repo's share is spent, or has less than `need` seconds left."""
-    return time.monotonic() + need >= DEADLINE[0]
+    """A call must start during its turn and fit before the invocation's reserve."""
+    t = time.monotonic()
+    work_end = DEADLINE[0] if RECONCILE_END[0] is None else RECONCILE_END[0]
+    return t >= DEADLINE[0] or t + need >= work_end
 
 
 # The deadline is enforced at the call, not only where each caller remembers to check: once a
@@ -937,10 +940,12 @@ def launch(repo, cfg, subnets, size, job_id, token, nonce):
     # reconcile sees any host that did start (its JobId tag) and launches only if none did.
     for subnet in subnets:
         for instance_type in cfg['sizes'][size]:
-            # Each attempt may take the launch client's full read timeout: none starts after
-            # the repo's deadline. Every earlier attempt was a capacity refusal, so nothing exists.
+            # Reserve one full bounded attempt before the invocation's cleanup time. It may
+            # finish past this repo's turn, but the next pool may not start then.
             if out_of_time(LAUNCH_ATTEMPT_SECONDS):
-                print(f'{repo}: out of time before a pool accepted job {job_id}; next round retries')
+                reason = ("repo turn ended" if time.monotonic() >= DEADLINE[0] else
+                          f"less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains")
+                print(f'{repo}: {reason}; deferring job {job_id} after {attempt} EC2 launch attempts')
                 return None, True
             attempt += 1
             try:
@@ -1441,7 +1446,9 @@ def reconcile_repo(repo, cfg, subnets, result):
         # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
         # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
         # oldest first, and the one that waits keeps its turn for the room the next host frees.
-        if out_of_time():
+        if out_of_time(LAUNCH_ATTEMPT_SECONDS):
+            print(f'{repo}: deferring queued launches for the next turn: the repo turn ended or '
+                  f'less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains')
             outcomes['deferred'] = outcomes.get('deferred', 0) + 1
             break
         outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
@@ -1831,28 +1838,33 @@ def rotated(order, round_no):
 
 def handler(event, context):
     started = time.monotonic()
+    RECONCILE_END[0] = None
     DEADLINE[0] = float('inf')
     repos, subnets = config()
     if event.get('reconcile') or event.get('source') == 'aws.events':
         # Each repo on its own: one repo's revoked token or GitHub timeout must not stop the
         # other's launches and reaping. The invocation still fails afterwards, for the alarm.
         results = []
-        # The buckets first, with no deadline of their own yet (each call is bounded): a round refills and drains
-        # every group even when nothing is queued.
+        # The Lambda clock already accounts for time spent. Take one work deadline before
+        # the bucket reads; apportion only the time actually left when each repo starts.
+        seconds = context.get_remaining_time_in_millis() / 1000 if context else 110
+        work_end = time.monotonic() + seconds - RESERVE_SECONDS
+        RECONCILE_END[0] = DEADLINE[0] = work_end
         buckets, failed = reconcile_buckets(repos)
         failed = [f'budget {group}' for group in failed]
-        remaining = (context.get_remaining_time_in_millis() / 1000 if context else 110) - RESERVE_SECONDS
         order = list(repos.items())
         order = rotated(order, int(time.time() // 120))
         for index, (repo, cfg) in enumerate(order):
-            share = max(0.0, remaining - (time.monotonic() - started)) / (len(order) - index)
-            DEADLINE[0] = time.monotonic() + share
+            t = time.monotonic()
+            share = max(0.0, work_end - t) / (len(order) - index)
+            DEADLINE[0] = t + share
             try:
                 results.append(reconcile(repo, cfg, subnets))
             except Exception as error:
                 failed.append(repo)
                 print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
                 results.append({'repo': repo, 'error': type(error).__name__})
+        RECONCILE_END[0] = None
         DEADLINE[0] = float('inf')
         publish_counts(results, buckets)
         if failed:
