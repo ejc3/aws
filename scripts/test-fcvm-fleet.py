@@ -974,7 +974,7 @@ class SecretTests(unittest.TestCase):
         self.assertIsNotNone(roles)
         self.assertEqual(set(re.findall(r"[\w.]+", roles[1])), {
             "aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
-            "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn",
+            "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage", "local.fcvm_fleet_access_role_arn",
         })
 
     def test_only_the_certificate_container_is_created_here(self):
@@ -1751,7 +1751,8 @@ class StageSubzoneCertificateTests(unittest.TestCase):
         principals = policy.split('"aws:PrincipalArn" = [', 1)[1].split("]", 1)[0]
         self.assertEqual(re.findall(r"[\w.\[\]]+(?=,)", principals),
                          ["aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
-                          "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_fleet_access_role_arn"])
+                          "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage",
+                          "local.fcvm_fleet_access_role_arn"])
         self.assertNotIn("prod", policy)
         # Empty or unverified secrets must block every consumer, including targeted template or role plans.
         guard = block('data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls"', STAGE_CERT)
@@ -1914,9 +1915,10 @@ class ProdStackTests(unittest.TestCase):
         sp = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_prod_tls"', PROD)
         self.assertIn('Effect    = "Deny"', sp)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', sp)
-        self.assertEqual(re.findall(r"^\s+(aws_iam_role\.\w+\[0\]\.arn|local\.\w+),$", sp, re.M),
+        self.assertEqual(re.findall(r"^\s+(aws_iam_role\.\w+\[0\]\.arn|local\.[\w.]+),$", sp, re.M),
                          ["aws_iam_role.fcvm_fleet_prod_coordinator_task[0].arn", "aws_iam_role.fcvm_fleet_prod_host[0].arn",
-                          "aws_iam_role.fcvm_fleet_prod_tile[0].arn", "local.fcvm_fleet_access_role_arn"])
+                          "aws_iam_role.fcvm_fleet_prod_tile[0].arn", "local.fcvm_lambda_tile_role_arns.prod",
+                          "local.fcvm_fleet_access_role_arn"])
         self.assertNotIn('"Allow"', sp)
 
     def test_the_prod_state_object_is_its_own_key_with_its_versions(self):

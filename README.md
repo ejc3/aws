@@ -832,39 +832,33 @@ confirm it observed the selection. Release and rollback use the fcvm repository'
 existing workflows. The jumpbox continues to own shared infrastructure, IAM and
 the production spending backstop.
 
-### GPU Lambda spike
+### Lambda tiles
 
-On ARM, read the spike inputs with the instance identity before assuming the fleet
-role. The project Terraform root can manage the private image repository
-`fcvm-fleet/lambda-tile`, the log group `/aws/lambda/fcvm-lambda-tile`, and the
-function `fcvm-lambda-tile` in `us-east-1`.
+Some of the wall's AWS tiles can run as GPU Lambda functions on Lambda Managed
+Instances (`fcvm-fleet-lambda.tf`; ejc3/fcvm fleet/PROTOCOL.md, "Lambda tile").
+Each stack has, in `us-east-1`, a capacity provider `fcvm-lam-<fleet>` (only
+`g4dn.xlarge`, at most 48 vCPUs), the functions' execution role and security
+group (both `fcvm-lam-<fleet>`, outbound 443 only), and log groups
+`/aws/lambda/fcvm-lam-<fleet>-<n>` for tiles 1 to 8. The coordinator creates one
+function per tile, `fcvm-lam-<fleet>-<n>`, publishes a new version for every
+launch, and deletes the functions when the fleet sleeps; its grants cover only
+its own stack's function names, execution role and capacity provider. An empty
+provider runs no instance. The coordinator runs Lambda tiles only with
+`--lambda aws` and `--lambda-tiles`, which this repository does not pass yet.
+
+fcvm-arm pushes the lane image to `fcvm-fleet/lambda-tile` through the fleet
+role. The repository, each stack's role and provider are in the pointer:
 
 ```bash
 aws ssm get-parameter --region us-west-1 --name /infra/fcvm-fleet \
   --query Parameter.Value --output text | jq .gpu_lambda
 ```
 
-Create the log group with retention and the same-account ECR repository with
-immutable tags and an image lifecycle policy before deploying the function.
-Use the execution role and capacity provider from the pointer. Creating the GPU
-function requires an AWS SDK or CLI whose CreateFunction supports
-`AcceleratorConfig.AcceleratorMemorySize`. The pinned Terraform AWS provider
-6.64.0 lacks this field on `aws_lambda_function`.
-
-The empty provider starts no hosts. It allows only `g4dn.xlarge` and caps the
-pool at 12 vCPUs, up to three T4 hosts. It accepts no inbound connections.
-Publishing a function version starts billable GPU capacity before the first
-invocation. Set that version to zero minimum and one maximum execution
-environment for this spike and invoke the published version through Lambda.
-The version limit controls execution environments; the provider cap applies
-across versions. Delete versions or the function after the test. With the fleet
-role, use `aws lambda list-function-versions-by-capacity-provider --capacity-provider-name fcvm-lambda-spike --region us-east-1`
-to check which published versions are still attached, then verify the provider drains.
-[AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html)
-
-At November 2026 us-east-1 Linux On-Demand prices, one running host costs about
-$0.58/hour including Lambda's 9.75% G-series management fee, or about $1.73/hour
-with all three running. Requests, storage and networking are additional.
+While a tile is assigned, Lambda keeps its previous instance running beside the
+current one, so a tile costs two `g4dn.xlarge` at the on-demand price plus
+Lambda's management fee. The instances count against the us-east-1 on-demand G
+and VT quota (`L-DB2E81BA`).
+[AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html),
 [AWS Lambda pricing](https://aws.amazon.com/lambda/pricing/)
 
 ### Production Spot interruption drill

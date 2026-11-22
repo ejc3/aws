@@ -28,6 +28,7 @@ resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls" {
         aws_iam_role.fcvm_fleet_coordinator_task.arn,
         aws_iam_role.fcvm_fleet_host.arn,
         aws_iam_role.fcvm_fleet_tile.arn,
+        local.fcvm_lambda_tile_role_arns.stage,
         local.fcvm_fleet_access_role_arn,
       ] } }
     }]

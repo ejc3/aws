@@ -34,8 +34,9 @@ locals {
   # On-demand G vCPUs in us-east-1 (ejc3/fcvm#1257): the wall's host (96) and its replacement while the old one shuts
   # down (96), the EC2 tiles started on demand (8 x 4), and the gpubox test hosts and AMI builders that share the
   # region (96 each, four at once). At 384 the wall's host was refused with VcpuLimitExceeded for 13 minutes on two
-  # wakes of 2026-11-05 while two gpuboxes, an AMI builder and the tiles held the quota.
-  fcvm_fleet_on_demand_g_vcpus = 768
+  # wakes of 2026-11-05 while two gpuboxes, an AMI builder and the tiles held the quota. Plus each stack's Lambda tiles,
+  # whose Managed Instances are on-demand g4dn.xlarge in this account (fcvm-fleet-lambda.tf, 48 vCPUs a stack).
+  fcvm_fleet_on_demand_g_vcpus = 768 + 2 * local.fcvm_lambda_max_vcpus
 }
 
 resource "aws_organizations_organizational_unit" "fcvm_fleet" {

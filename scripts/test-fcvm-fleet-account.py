@@ -363,38 +363,71 @@ class ObserveTests(unittest.TestCase):
 
 class LambdaGrantTests(unittest.TestCase):
     source = (ROOT / "fcvm-fleet-lambda.tf").read_text()
-    grant = block('resource "aws_iam_policy" "fcvm_fleet_terraform_lambda"', source)
+    coordinator = block('resource "aws_iam_policy" "fcvm_lambda_coordinator"', source)
+    push = block('resource "aws_iam_policy" "fcvm_fleet_terraform_lambda"', source)
 
-    def test_arm_can_deploy_one_private_function_without_the_capacity_operator_role(self):
-        self.assertIn('fcvm_lambda_name         = "fcvm-lambda-tile"', self.source)
-        self.assertIn('Resource = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"]', self.grant)
-        self.assertIn('"lambda:PublishVersion"', self.grant)
-        self.assertIn('"lambda:InvokeFunction"', self.grant)
-        self.assertIn('"lambda:PutFunctionScalingConfig"', self.grant)
-        self.assertNotRegex(self.grant, r'lambda:(?:\*|ListFunctions|.*FunctionUrl.*|AddPermission)|iam:(?:Create|Update|Put|Attach)')
-        passrole = self.grant.split('"iam:PassRole"', 1)[1].split("},", 1)[0]
-        self.assertIn('aws_iam_role.fcvm_fleet_lambda_tile.arn', passrole)
-        self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', passrole)
-        self.assertNotIn('fcvm_fleet_lambda_operator', self.grant)
-        self.assertNotIn('"iam:AWSServiceName"', block('resource "aws_iam_role_policy" "fcvm_fleet_terraform_gpubox"'))
+    def statement(self, policy, sid):
+        return re.split(r'Sid\s+= "' + sid + '"', policy, maxsplit=1)[1].split("},", 1)[0]
 
-    def test_only_central_terraform_can_change_the_three_host_gpu_ceiling(self):
-        provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
+    def test_the_coordinator_runs_only_its_own_stacks_functions(self):
+        # Exactly what ejc3/fcvm's LambdaDriver calls, on fcvm-lam-<fleet>-* only.
+        fns = self.statement(self.coordinator, "ItsTileFunctions")
+        self.assertCountEqual(re.findall(r'"(lambda:[^"]+)"', fns), [
+            "lambda:GetFunctionConfiguration", "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration",
+            "lambda:PublishVersion", "lambda:DeleteFunction", "lambda:TagResource",
+        ])
+        self.assertIn("Resource = [local.fcvm_lambda_function_arns[each.key]]", fns)
+        self.assertIn('function:fcvm-lam-${s.fleet}-*"', self.source)
+        self.assertNotRegex(self.coordinator, r'lambda:(?:\*|ListFunctions|.*FunctionUrl.*|AddPermission|InvokeFunction|(?:Create|Update|Delete)CapacityProvider)'
+                            r'|iam:(?:Create|Update|Put|Attach)|ecr:(?:Put|Set|Delete|Create)')
+
+    def test_each_stack_passes_only_its_own_role_and_provider(self):
+        cap = self.statement(self.coordinator, "ItsCapacityProvider")
+        self.assertIn('Action   = "lambda:PassCapacityProvider"', cap)
+        self.assertIn("Resource = aws_lambda_capacity_provider.fcvm_lambda[each.key].arn", cap)
+        role = self.statement(self.coordinator, "ItsExecutionRole")
+        self.assertIn('Action    = "iam:PassRole"', role)
+        self.assertIn("Resource  = aws_iam_role.fcvm_lambda_tile[each.key].arn", role)
+        self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', role)
+        att = block('resource "aws_iam_role_policy_attachment" "fcvm_lambda_coordinator"', self.source)
+        self.assertIn("role       = each.value.coordinator_role", att)
+        self.assertIn("coordinator_role = aws_iam_role.fcvm_fleet_coordinator_task.name", self.source)
+        self.assertIn("coordinator_role = aws_iam_role.fcvm_fleet_prod_coordinator_task[0].name", self.source)
+
+    def test_fcvm_arm_only_pushes_the_tile_image(self):
+        self.assertCountEqual(re.findall(r'"((?:ecr|lambda|iam|logs):[^"]+)"', self.push), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer", "ecr:GetAuthorizationToken",
+        ])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", self.push)
+        att = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_lambda"', self.source)
+        self.assertIn("role       = aws_iam_role.fcvm_fleet_terraform.name", att)
+
+    def test_the_ceiling_covers_three_instances_a_tile_and_only_terraform_sets_it(self):
+        provider = block('resource "aws_lambda_capacity_provider" "fcvm_lambda"', self.source)
+        self.assertIn("for_each = local.fcvm_lambda_stacks", provider)
         self.assertIn('allowed_instance_types = [local.fcvm_lambda_instance_type]', provider)
         self.assertRegex(self.source, r'fcvm_lambda_instance_type\s*= "g4dn.xlarge"')
         self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
-        self.assertRegex(provider, r'max_vcpu_count\s*= 12\b')
+        self.assertIn("max_vcpu_count = local.fcvm_lambda_max_vcpus", provider)
+        self.assertIn("fcvm_lambda_max_tiles = 4", self.source)
+        self.assertIn("fcvm_lambda_max_vcpus = local.fcvm_lambda_max_tiles * 3 * 4", self.source)
         self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
-        capacity_grants = [s for s in self.grant.split('\n      },') if re.search(r'"lambda:[^"]*CapacityProvider', s)]
-        self.assertEqual(len(capacity_grants), 1)
-        self.assertCountEqual(re.findall(r'"(lambda:[^"]+)"', capacity_grants[0]), [
-            "lambda:GetCapacityProvider", "lambda:ListFunctionVersionsByCapacityProvider", "lambda:PassCapacityProvider",
-        ])
-        self.assertRegex(capacity_grants[0], r'(?m)^ *Resource\s*= aws_lambda_capacity_provider\.fcvm_fleet_spike\.arn$')
-        security_group = block('resource "aws_security_group" "fcvm_fleet_lambda_tile"', self.source)
-        self.assertNotIn("ingress", security_group)
-        self.assertIn("aws_security_group.fcvm_fleet_lambda_tile.id", provider)
+        self.assertIn("security_group_ids = [aws_security_group.fcvm_lambda_tile[each.key].id]", provider)
+        self.assertNotRegex(self.source, r'lambda:(?:Create|Update|Delete)CapacityProvider')
+        self.assertNotIn("fcvm_fleet_spike", self.source)
         self.assertRegex(block('resource "aws_ssm_parameter" "fcvm_fleet"'), r'gpu_lambda\s*= local.fcvm_fleet_gpu_lambda')
+        # The instances are on-demand G in us-east-1: both stacks' ceilings are in the quota.
+        self.assertIn("fcvm_fleet_on_demand_g_vcpus = 768 + 2 * local.fcvm_lambda_max_vcpus", TF)
+
+    def test_tiles_only_dial_out(self):
+        sg = block('resource "aws_security_group" "fcvm_lambda_tile"', self.source)
+        self.assertNotIn("ingress", sg)
+        self.assertIn("vpc_id      = each.value.vpc_id", sg)
+        egress = sg.split("egress {", 1)[1]
+        self.assertIn("from_port        = 443", egress)
+        self.assertIn("to_port          = 443", egress)
+        self.assertIn('ipv6_cidr_blocks = ["::/0"]', egress)
 
     def test_gpu_subnets_must_be_offered_and_supported_by_lambda(self):
         zones = block('data "aws_availability_zones" "fcvm_lambda"', self.source)
@@ -404,34 +437,50 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn('values = [local.fcvm_lambda_instance_type]', offerings)
         self.assertIn('aws.fcvm_fleet_east1', zones)
         self.assertIn('aws.fcvm_fleet_east1', offerings)
-        selection = self.source.split("fcvm_lambda_subnets = [", 1)[1].split("]\n", 1)[0]
-        self.assertIn("for az, id in module.fcvm_fleet_east1.subnet_ids_by_az : id", selection)
+        selection = self.source.split("fcvm_lambda_subnets = {", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn("for az, id in s.subnet_ids_by_az : id", selection)
         self.assertIn("if contains(data.aws_availability_zones.fcvm_lambda.names, az)", selection)
         self.assertIn("&& contains(data.aws_ec2_instance_type_offerings.fcvm_lambda_gpu.locations, az)", selection)
-        provider = block('resource "aws_lambda_capacity_provider" "fcvm_fleet_spike"', self.source)
-        self.assertRegex(provider, r'subnet_ids\s*= local.fcvm_lambda_subnets')
-        self.assertIn('length(local.fcvm_lambda_subnets) > 0', provider)
+        self.assertIn("subnet_ids_by_az = module.fcvm_fleet_east1.subnet_ids_by_az", self.source)
+        self.assertIn("for m in module.fcvm_fleet_prod_east1 : \"prod\"", self.source)
+        provider = block('resource "aws_lambda_capacity_provider" "fcvm_lambda"', self.source)
+        self.assertIn("subnet_ids         = local.fcvm_lambda_subnets[each.key]", provider)
+        self.assertIn("length(local.fcvm_lambda_subnets[each.key]) > 0", provider)
 
-    def test_the_project_owns_exact_app_assets_without_changing_resource_policies(self):
-        runtime = block('resource "aws_iam_role_policy" "fcvm_fleet_lambda_tile_runtime"', self.source)
+    def test_a_tile_reads_its_own_stacks_certificate_and_writes_its_own_logs(self):
+        runtime = block('resource "aws_iam_role_policy" "fcvm_lambda_tile"', self.source)
         self.assertIn('["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', runtime)
-        self.assertIn('Resource = local.fcvm_lambda_repo_arn', runtime)
-        self.assertIn('Resource = "${local.fcvm_lambda_logs_arn}:log-stream:*"', runtime)
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", runtime)
+        self.assertIn("log-group:/aws/lambda/fcvm-lam-${each.value.fleet}-*:log-stream:*", runtime)
+        self.assertIn('Action   = "secretsmanager:GetSecretValue"', runtime)
+        self.assertIn("Resource = each.value.tls_secret_arn", runtime)
         self.assertNotIn('Resource = "*"', runtime)
-        self.assertIn('"ecr:CreateRepository"', self.grant)
-        self.assertIn('"logs:CreateLogGroup"', self.grant)
-        self.assertIn('Resource = local.fcvm_lambda_repo_arn', self.grant)
-        self.assertIn('Resource = [local.fcvm_lambda_logs_arn, "${local.fcvm_lambda_logs_arn}:*"]', self.grant)
-        self.assertNotRegex(self.grant, r'ecr:(?:\*|SetRepositoryPolicy)|logs:PutResourcePolicy')
+        self.assertNotIn("logs:CreateLogGroup", runtime)
+        self.assertIn("tls_secret_arn   = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn", self.source)
+        self.assertIn("tls_secret_arn   = aws_secretsmanager_secret.fcvm_fleet_prod_tls[0].arn", self.source)
+        # Each certificate's deny-by-default policy admits its own stack's tile role and no other.
+        stage = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', (ROOT / "fcvm-fleet-stage-cert.tf").read_text())
+        prod = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_prod_tls"', (ROOT / "fcvm-fleet-prod.tf").read_text())
+        self.assertIn("local.fcvm_lambda_tile_role_arns.stage,", stage)
+        self.assertNotIn("fcvm_lambda_tile_role_arns.prod", stage)
+        self.assertIn("local.fcvm_lambda_tile_role_arns.prod,", prod)
+        self.assertNotIn("fcvm_lambda_tile_role_arns.stage", prod)
+        logs = block('resource "aws_cloudwatch_log_group" "fcvm_lambda_tile"', self.source)
+        self.assertIn("retention_in_days = 14", logs)
+        self.assertIn('name              = "/aws/lambda/fcvm-lam-${each.value}-${split("-", each.key)[1]}"', logs)
 
-    def test_only_lambda_pulls_the_tile_image_for_the_tile_function(self):
+    def test_only_lambda_pulls_the_tile_image_for_the_tile_functions(self):
         repo_policy = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', self.source)
-        self.assertIn('repository = local.fcvm_lambda_repo_name', repo_policy)
+        self.assertIn('repository = aws_ecr_repository.fcvm_fleet_lambda_tile.name', repo_policy)
         self.assertIn('aws.fcvm_fleet_east1', repo_policy)
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', repo_policy)
         self.assertIn('Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', repo_policy)
-        self.assertIn('"aws:sourceArn" = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"]', repo_policy)
+        self.assertIn('"aws:sourceArn" = values(local.fcvm_lambda_function_arns)', repo_policy)
         self.assertEqual(repo_policy.count('Effect'), 1)
+        # The spike's repository is adopted, not recreated.
+        self.assertIn('import {\n  to = aws_ecr_repository.fcvm_fleet_lambda_tile\n  id = "fcvm-fleet/lambda-tile"\n}', self.source)
+        repo = block('resource "aws_ecr_repository" "fcvm_fleet_lambda_tile"', self.source)
+        self.assertIn('image_tag_mutability = "IMMUTABLE"', repo)
 
 
 class QuotaTests(unittest.TestCase):
