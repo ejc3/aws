@@ -268,6 +268,134 @@ PROD_ENV = {**ENV, "STACK": "prod", "CLUSTER": "fcvm-fleet-prod", "SERVICE": "fc
 PROD_OLD = PROD_ENV["FAMILY"]
 
 
+LANE_URL = "registry.example/fcvm-fleet/lambda-tile"
+LANE = "sha256:" + "e" * 64
+LANE_ENV = {**ENV, "LANE_REPOSITORY_URL": LANE_URL}
+
+
+class LaneECR:
+    """The lane repository (fcvm-fleet/lambda-tile, us-east-1): which digest keep-<stack>-current holds."""
+
+    def __init__(self, current=LANE, error=None):
+        self.current, self.error, self.calls = current, error, []
+
+    def describe_images(self, **kwargs):
+        self.calls.append(kwargs)
+        if self.error:
+            raise ClientError({"Error": {"Code": self.error, "Message": "secret detail"}})
+        return {"imageDetails": [{"imageDigest": self.current}]}
+
+
+class LaneReleaseTests(unittest.TestCase):
+    """A release may carry lambda_digest, the lane image staging selected (ejc3/fcvm fleet/coord/publish.py). The
+    function sets the coordinator's FLEET_LAMBDA_IMAGE to it only when keep-<stack>-current holds it, and refuses
+    and changes nothing otherwise. Without lambda_digest the release is exactly the one without a lane."""
+
+    def setUp(self):
+        self.aws, self.lane = AWS(), LaneECR()
+        p = patch.dict(os.environ, LANE_ENV)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def run_release(self, event):
+        return release.deploy(event, self.aws, self.aws, self.aws, self.aws, lane_ecr=self.lane)
+
+    def coordinator_env(self, definition):
+        container = next(c for c in definition["containerDefinitions"] if c["name"] == "coordinator")
+        return {e["name"]: e["value"] for e in container.get("environment", [])}
+
+    def test_a_release_without_a_lane_digest_is_exactly_todays(self):
+        result = self.run_release(EVENT)
+        self.assertEqual(result, {"status": "deployed", "taskDefinition": NEW, "digest": DIGEST})
+        self.assertEqual(self.lane.calls, [])
+        self.assertEqual(self.aws.registered, release.task_input(AWS().old, REPO + "@" + DIGEST))
+        self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, "pointer", "unlock"])
+
+    def test_a_selected_lane_image_is_set_with_the_coordinator_image(self):
+        result = self.run_release({**EVENT, "lambda_digest": LANE})
+        self.assertEqual(result, {"status": "deployed", "taskDefinition": NEW, "digest": DIGEST, "lambda_digest": LANE})
+        self.assertEqual(self.lane.calls, [{"repositoryName": "fcvm-fleet/lambda-tile",
+                                            "imageIds": [{"imageTag": "keep-stage-current"}]}])
+        env = self.coordinator_env(self.aws.registered)
+        self.assertEqual(env, {"STATE": "bucket", "FLEET_LAMBDA_IMAGE": LANE_URL + "@" + LANE})
+        # Everything else is today's registration.
+        today = release.task_input(AWS().old, REPO + "@" + DIGEST)
+        for c in self.aws.registered["containerDefinitions"]:
+            c.pop("environment", None)
+        for c in today["containerDefinitions"]:
+            c.pop("environment", None)
+        self.assertEqual(self.aws.registered, today)
+
+    def test_a_lane_digest_keep_current_does_not_hold_changes_nothing(self):
+        self.lane.current = "sha256:" + "f" * 64
+        with self.assertRaises(release.Refused) as refused:
+            self.run_release({**EVENT, "lambda_digest": LANE})
+        self.assertEqual(refused.exception.code, "lane-not-selected")
+        self.assertEqual(self.aws.calls, ["lock", "unlock"])
+        self.assertEqual(self.aws.arn, OLD)
+
+    def test_an_unreadable_lane_repository_changes_nothing(self):
+        for error in ("AccessDeniedException", "RepositoryNotFoundException", "ImageNotFoundException"):
+            with self.subTest(error=error):
+                self.setUp()
+                self.lane.error = error
+                with self.assertRaises(Exception):
+                    self.run_release({**EVENT, "lambda_digest": LANE})
+                self.assertEqual(self.aws.calls, ["lock", "unlock"])
+                self.assertEqual(self.aws.arn, OLD)
+        self.lane = LaneECR(current=None)
+        self.lane.describe_images = lambda **kwargs: {"imageDetails": []}
+        with self.assertRaises(release.Refused):
+            self.run_release({**EVENT, "lambda_digest": LANE})
+
+    def test_a_malformed_lane_digest_is_refused_before_anything(self):
+        for value in ("latest", "sha256:" + "E" * 64, None, 7):
+            with self.assertRaises(ValueError):
+                self.run_release({**EVENT, "lambda_digest": value})
+        self.assertEqual(self.aws.calls, [])
+        self.assertEqual(self.lane.calls, [])
+
+    def test_a_new_lane_image_with_the_same_coordinator_is_a_release(self):
+        self.aws.image = REPO + "@" + DIGEST
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        self.assertEqual(self.run_release({**EVENT, "lambda_digest": LANE})["status"], "deployed")
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
+        self.aws.calls = []
+        self.assertEqual(self.run_release({**EVENT, "lambda_digest": LANE})["status"], "unchanged")
+
+    def test_the_lane_action_reads_what_the_coordinator_runs(self):
+        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": None})
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
+        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": LANE})
+        self.assertEqual(self.aws.calls, [])
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"][-1]["value"] = "elsewhere@" + LANE
+        with self.assertRaises(release.Refused):
+            self.run_release({"action": "lane"})
+        with self.assertRaises(ValueError):
+            self.run_release({"action": "lane", "commit": "b" * 40})
+
+    def test_the_functions_read_only_the_lane_repository_and_name_it(self):
+        def block(text, header):
+            start = text.index(header)
+            return text[start:text.index("\n}\n", start) + 2]
+        for stack, path, role, function in (
+                ("stage", "fcvm-fleet-ci.tf", 'resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet"',
+                 'resource "aws_lambda_function" "fcvm_coordinator_release"'),
+                ("prod", "fcvm-fleet-prod-ci.tf", 'resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet"',
+                 'resource "aws_lambda_function" "fcvm_coordinator_release_prod"')):
+            with self.subTest(stack=stack):
+                tf = (ROOT / path).read_text()
+                policy = block(tf, role)
+                # One new statement: read the lane repository's images. Nothing writes to it.
+                lane = [line.strip() for line in policy.splitlines() if "fcvm_fleet_lambda_tile" in line]
+                self.assertEqual(lane, ['{ Effect = "Allow", Action = "ecr:DescribeImages", '
+                                        'Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn },'])
+                self.assertRegex(block(tf, function),
+                                 r"LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile\.repository_url")
+
+
 class ProdAWS(AWS):
     """Prod's service, its pointer history, the release record and the ActiveViewers metric."""
 
@@ -505,7 +633,7 @@ class Session:
     def __init__(self, aws):
         self.aws = aws
 
-    def client(self, name, config=None):
+    def client(self, name, config=None, region_name=None):
         return self.aws
 
 

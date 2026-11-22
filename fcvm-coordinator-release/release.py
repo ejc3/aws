@@ -1,5 +1,12 @@
 """Change only one fleet stack's coordinator image, serialized with Terraform's backend lock.
 
+A release may also carry `lambda_digest`, the Lambda tiles' lane image the stack's CI selected (ejc3/fcvm
+fleet/coord/publish.py, fleet/lambda/release.py). The function sets the coordinator's FLEET_LAMBDA_IMAGE to
+LANE_REPOSITORY_URL@lambda_digest only when the lane repository's keep-<stack>-current tag holds that digest, so CI
+cannot make a coordinator run an image nothing protects; when the repository cannot be read or the tag holds another
+digest, it refuses and changes nothing. A release without `lambda_digest` is the release without a lane. Read-only
+`lane` returns the lane digest the coordinator runs.
+
 One function per stack (STACK, CLUSTER, SERVICE, FAMILY): staging's (fcvm-fleet-ci.tf) and
 production's (fcvm-fleet-prod-ci.tf). Production adds:
 - a viewer hold: a release goes ahead only while the coordinator's ActiveViewers metric for
@@ -65,8 +72,33 @@ def stack():
     return name, os.environ["CLUSTER"], os.environ["SERVICE"], os.environ["FAMILY"]
 
 
-def task_input(response, image):
-    """Preserve the service's task configuration; replace exactly one container image."""
+LANE_VARIABLE = "FLEET_LAMBDA_IMAGE"
+LANE_REPOSITORY = "fcvm-fleet/lambda-tile"
+
+
+def lane_of(response):
+    """The lane digest the coordinator's FLEET_LAMBDA_IMAGE names, None without one, or a refusal."""
+    container = next(c for c in response["taskDefinition"]["containerDefinitions"] if c["name"] == "coordinator")
+    values = [e["value"] for e in container.get("environment", []) if e.get("name") == LANE_VARIABLE]
+    if not values:
+        return None
+    prefix = os.environ["LANE_REPOSITORY_URL"] + "@"
+    if len(values) != 1 or not values[0].startswith(prefix) or not DIGEST.fullmatch(values[0][len(prefix):]):
+        raise Refused("lane-invalid", "the coordinator's lane image is not a digest in the lane repository")
+    return values[0][len(prefix):]
+
+
+def lane_selected(lane_ecr, name, digest):
+    """Refuse unless the lane repository's keep-<stack>-current holds `digest`."""
+    rows = lane_ecr.describe_images(repositoryName=LANE_REPOSITORY,
+                                    imageIds=[{"imageTag": f"keep-{name}-current"}])["imageDetails"]
+    if len(rows) != 1 or rows[0].get("imageDigest") != digest:
+        raise Refused("lane-not-selected", f"keep-{name}-current does not hold the lane digest")
+
+
+def task_input(response, image, lane=None):
+    """Preserve the service's task configuration; replace exactly one container image, and with `lane`, the
+    coordinator's FLEET_LAMBDA_IMAGE."""
     old = response["taskDefinition"]
     if old["family"] != stack()[3]:
         raise ValueError("unexpected task family")
@@ -78,6 +110,9 @@ def task_input(response, image):
     for container in containers:
         if container["name"] == "coordinator":
             container["image"] = image
+            if lane is not None:
+                env = [e for e in container.get("environment", []) if e.get("name") != LANE_VARIABLE]
+                container["environment"] = env + [{"name": LANE_VARIABLE, "value": os.environ["LANE_REPOSITORY_URL"] + "@" + lane}]
     fields = ("family", "taskRoleArn", "executionRoleArn", "networkMode", "volumes",
               "placementConstraints", "requiresCompatibilities", "cpu", "memory",
               "pidMode", "ipcMode", "proxyConfiguration", "ephemeralStorage",
@@ -242,7 +277,7 @@ def candidate(ssm, ecr):
     return out
 
 
-def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 850_000, progress=None):
+def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 850_000, progress=None, lane_ecr=None):
     """Release one image. `progress["step"]` names the step that raised, for the failure result."""
     progress = {} if progress is None else progress
     progress["step"] = "input"
@@ -258,9 +293,18 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         return candidate(ssm, ecr)
     if name == "prod" and action == "record":
         return record(event, ssm)
-    allowed = {"commit", "digest", "force"} if name == "prod" else {"commit", "digest"}
+    if action == "lane":
+        if set(event) != {"action"}:
+            raise ValueError("lane takes no arguments")
+        progress["step"] = "lane"
+        current = service(ecs)
+        return {"status": "ok", "lambda_digest": lane_of(ecs.describe_task_definition(taskDefinition=current["taskDefinition"]))}
+    allowed = {"commit", "digest", "lambda_digest"} | ({"force"} if name == "prod" else set())
     if not set(event) <= allowed or "force" in event and event["force"] is not True:
         raise ValueError("a release takes a commit and a digest (and, in prod, force for a rollback)")
+    lane = event.get("lambda_digest")
+    if "lambda_digest" in event and not (isinstance(lane, str) and DIGEST.fullmatch(lane)):
+        raise ValueError("lambda_digest is an image digest")
     force = event.get("force") is True
     commit, digest = event.get("commit", ""), event.get("digest", "")
     if not isinstance(commit, str) or not isinstance(digest, str) \
@@ -309,17 +353,22 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         previous = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         if image_of(old) != previous:
             raise Refused("pointer-mismatch", "release pointer and running task disagree")
-        if previous == image:
+        if lane is not None:
+            # Under the lock and before any change: a lane digest CI selected, and nothing else.
+            progress["step"] = "lane"
+            lane_selected(lane_ecr, name, lane)
+            progress["step"] = "inspect"
+        if previous == image and (lane is None or lane_of(old) == lane):
             progress["step"] = "rollout"
             wait_for(ecs, old_arn, time.monotonic() + 60)
-            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest}
+            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest, **lane_result(lane)}
         if name == "prod" and not force:
             # Again under the lock, just before the change: the window to UpdateService is seconds.
             progress["step"] = "hold"
             waiting = held(cloudwatch)
             if waiting:
                 return waiting
-        definition = task_input(old, image)
+        definition = task_input(old, image, lane)
         # Bump the parameter version BEFORE the first ECS change. The ephemeral
         # Terraform guard then rejects older saved plans, even after rollback or
         # a failed registration that leaves the image value unchanged.
@@ -333,7 +382,7 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         wait_for(ecs, new_arn, time.monotonic() + min(480, max(5, remaining_ms() / 1000 - 240)))
         progress["step"] = "pointer"
         ssm.put_parameter(Name=parameter, Value=image, Type="String", Overwrite=True)
-        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest}
+        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane)}
     except Exception:
         if new_arn:
             failed_step, progress["step"] = progress["step"], "rollback"
@@ -347,6 +396,10 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         raise
     finally:
         unlock(ddb, table, lock_id, info, progress)
+
+
+def lane_result(lane):
+    return {} if lane is None else {"lambda_digest": lane}
 
 
 def unlock(ddb, table, lock_id, info, progress):
@@ -382,7 +435,8 @@ def lambda_handler(event, context):
         result = deploy(event, boto3.client("dynamodb", config=config), session.client("ecs", config=config),
                         session.client("ssm", config=config), session.client("ecr", config=config),
                         session.client("cloudwatch", config=config),
-                        remaining_ms=context.get_remaining_time_in_millis, progress=progress)
+                        remaining_ms=context.get_remaining_time_in_millis, progress=progress,
+                        lane_ecr=session.client("ecr", config=config, region_name="us-east-1"))
         print(json.dumps({k: result[k] for k in ("status", "reason") if k in result}))
         return result
     except Exception as error:

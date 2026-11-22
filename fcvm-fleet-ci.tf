@@ -214,6 +214,9 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet" {
         Condition = { StringEquals = { "ecs:CreateAction" = "RegisterTaskDefinition" } }
       },
       { Effect = "Allow", Action = "ecr:DescribeImages", Resource = aws_ecr_repository.fcvm_fleet_coordinator.arn },
+      # A release's lambda_digest must be what keep-<stack>-current holds (fcvm-coordinator-release/release.py).
+      # Read only: the function never writes to the lane repository.
+      { Effect = "Allow", Action = "ecr:DescribeImages", Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = aws_ssm_parameter.fcvm_coordinator_release.arn
@@ -245,11 +248,12 @@ resource "aws_lambda_function" "fcvm_coordinator_release" {
   source_code_hash               = data.archive_file.fcvm_coordinator_release.output_base64sha256
   environment {
     variables = {
-      RELEASE_ROLE    = aws_iam_role.fcvm_coordinator_release_fleet.arn
-      REPOSITORY_URL  = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
-      IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
-      LOCK_TABLE      = "ejc3-terraform-locks"
-      LOCK_ID         = local.fcvm_stage_lock_id
+      RELEASE_ROLE        = aws_iam_role.fcvm_coordinator_release_fleet.arn
+      REPOSITORY_URL      = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
+      LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
+      IMAGE_PARAMETER     = aws_ssm_parameter.fcvm_coordinator_release.name
+      LOCK_TABLE          = "ejc3-terraform-locks"
+      LOCK_ID             = local.fcvm_stage_lock_id
       # release.py serves one stack per function; production's is fcvm-fleet-prod-ci.tf.
       STACK   = "stage"
       CLUSTER = aws_ecs_cluster.fcvm_fleet.name
