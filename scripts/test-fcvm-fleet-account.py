@@ -491,8 +491,24 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertEqual(repo_policy.count('Effect'), 1)
         # The spike's repository is adopted, not recreated.
         self.assertIn('import {\n  to = aws_ecr_repository.fcvm_fleet_lambda_tile\n  id = "fcvm-fleet/lambda-tile"\n}', self.source)
+
+    def test_an_image_a_stack_runs_or_rolls_back_to_is_never_expired(self):
+        # ejc3/fcvm fleet/lambda/release.py moves keep-<stack>-current and keep-<stack>-previous; they are the only
+        # mutable tags, and its LIFECYCLE (whose tests model this policy) is the policy below.
+        self.assertIn('fcvm_lambda_protected_tags = "keep-*"', self.source)
         repo = block('resource "aws_ecr_repository" "fcvm_fleet_lambda_tile"', self.source)
-        self.assertIn('image_tag_mutability = "IMMUTABLE"', repo)
+        self.assertIn('image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"', repo)
+        self.assertRegex(repo, r'image_tag_mutability_exclusion_filter \{\s+filter\s+= local.fcvm_lambda_protected_tags\s+'
+                         r'filter_type = "WILDCARD"\s+\}')
+        policy = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile"', self.source)
+        rules = re.findall(r"rulePriority = (\d+)(.*?)action\s+= \{ type = \"expire\" \}", policy, re.S)
+        self.assertEqual([p for p, _ in rules], ["1", "2"])
+        # Rule 1 selects every protected image and expires none: at most four carry a protected tag. An image a rule's tags
+        # select is never expired by a lower-priority rule.
+        self.assertRegex(rules[0][1], r'tagStatus\s+= "tagged"\s+tagPatternList = \[local.fcvm_lambda_protected_tags\]\s+'
+                         r'countType\s+= "imageCountMoreThan"\s+countNumber\s+= 100\s+\}')
+        # Rule 2 keeps cleaning up: every image outside the newest five that no protected tag holds.
+        self.assertIn('selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 5 }', rules[1][1])
 
 
 class QuotaTests(unittest.TestCase):

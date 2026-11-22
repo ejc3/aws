@@ -848,12 +848,18 @@ provider runs no instance. The coordinator runs Lambda tiles only with
 When the daily spending backstop trips, the affected coordinator cannot create
 tile functions, change their configuration or publish new versions. It can still
 inspect and delete its functions to release capacity.
-Before enabling Lambda tiles, have the coordinator tag each function with
-`Purpose=fcvm-fleet-tile` alongside its existing `Fleet` tag. The daily
-budgets filter charges by these tags.
+The coordinator tags each function with `Purpose=fcvm-fleet-tile` and its
+`Fleet` (ejc3/fcvm `src/fleet/coord/lambda.rs`). The daily budgets filter
+charges by these tags.
 
 fcvm-arm pushes the lane image to `fcvm-fleet/lambda-tile` through the fleet
-role. The repository, each stack's role and provider are in the pointer:
+role. Both stacks pull from that one repository. Its lifecycle policy expires
+every image outside the newest five unless the image carries a `keep-` tag:
+`keep-<stack>-current` and `keep-<stack>-previous` for `stage` and `prod`, the
+image a stack runs and the one it can roll back to. Those are the only mutable
+tags. ejc3/fcvm `fleet/lambda/release.py` moves them (`select`, `promote`,
+`rollback`), and a stack's coordinator takes the lane image by digest. The
+repository, each stack's role and provider are in the pointer:
 
 ```bash
 aws ssm get-parameter --region us-west-1 --name /infra/fcvm-fleet \
