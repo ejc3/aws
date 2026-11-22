@@ -53,14 +53,25 @@ def directory(path, device):
         return False
 
 
-def children(parent, device):
+def derived_name(name):
+    name = name.lower()
+    return name.startswith(("dd", ".derived", "deriveddata")) or name.endswith("-dd")
+
+
+def children(parent, device, derived_only=False):
     try:
-        entries = list(parent.iterdir())
+        with os.scandir(parent) as entries:
+            for entry in entries:
+                name = entry.name
+                if name in EXCLUDE or (name.startswith(".") and name != ".derived"):
+                    continue
+                if derived_only and not derived_name(name):
+                    continue
+                p = parent / name
+                if entry.is_dir(follow_symlinks=False) and directory(p, device):
+                    yield p
     except (FileNotFoundError, PermissionError):
         return
-    for p in entries:
-        if p.name not in EXCLUDE and (not p.name.startswith(".") or p.name == ".derived") and directory(p, device):
-            yield p
 
 
 def read_plist(path, device):
@@ -116,7 +127,9 @@ def candidate(root, relative, device, cutoff):
 def candidates(volume, device, cutoff):
     found = []
     for project in children(volume, device):
-        roots = [project, *children(project, device)]
+        central_dir = project == volume / "DerivedData"
+        roots = [project] if derived_name(project.name) else []
+        roots.extend(children(project, device, derived_only=not central_dir))
         # Several apps put their per-job caches in build/ or apps/native/build/.
         # Inspect only these known containers; the rest of each project stays unvisited.
         for parts in (("build",), ("apps", "native", "build")):
@@ -126,12 +139,9 @@ def candidates(volume, device, cutoff):
                 if not directory(container, device):
                     break
             else:
-                roots.extend(children(container, device))
+                roots.extend(children(container, device, derived_only=True))
         for root in roots:
-            name = root.name.lower()
-            central = project == volume / "DerivedData" and root.parent == project
-            if not central and not (name.startswith(("dd", ".derived", "deriveddata")) or name.endswith("-dd")):
-                continue
+            central = central_dir and root.parent == project
             for relative in CACHES:
                 entry = candidate(root, relative, device, cutoff)
                 if entry and (central or project in entry[2].parents):
@@ -170,8 +180,12 @@ def build_slots(state):
     # Long scans and the actual removal run outside the build slots.
     folder = state.parent / "mac-build"
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
-    files = {folder / "slot.1", folder / "slot.2"}
-    files.update(p for p in folder.glob("slot.*") if p.suffix[1:].isdigit())
+    # Build commands hold this shared across exec, independently of their slot count or custom state directory.
+    # Also honor the slot files of builds already running when the new wrapper was installed.
+    files = {folder / "admission.lock"}
+    for legacy in {folder, Path(os.environ.get("MAC_STATE_DIR", state.parent)) / "mac-build"}:
+        files.update(p for p in legacy.glob("slot.*") if p.suffix[1:].isdigit())
+    files.update((folder / "slot.1", folder / "slot.2"))
     with contextlib.ExitStack() as locks:
         for path in sorted(files):
             file = locks.enter_context(path.open("a"))

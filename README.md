@@ -1404,8 +1404,9 @@ On EJ's MacBook, the hourly Scratch cleaner starts when free space drops below
 `ModuleCache.noindex` from recognized Xcode DerivedData directories, oldest first,
 until the drive has 150 GiB free or the eligible list is exhausted. The cleaner
 checks that Scratch is mounted, that the build is inactive, and that its artifacts
-have been unused for at least 14 days. An active host build slot briefly defers
-automatic cleanup.
+have been unused for at least 14 days. Managed builds hold a shared lock for their
+lifetime, including commands with custom slot counts or state directories.
+Cleanup takes it exclusively for the final activity check and cache rename.
 
 From fcvm-arm or nextjs-dev, run `ssh mac mac-artifact-clean` for a dry run.
 Use `ssh mac mac-artifact-clean --apply` to apply the same policy immediately.
@@ -1414,7 +1415,8 @@ Regular MacBook setup installs the user LaunchAgent. To install or update just t
 run `scripts/mac-setup.sh mac --artifact-cleaner-only`. Setup enrolls the mounted
 external APFS volume's UUID in `~/.config/mac-setup/scratch-volume-uuid` before
 scheduling cleanup. If the disk is absent on first install, mount it and rerun that
-command. Later runs clean only the enrolled volume.
+command. It also installs the matching `mac-build` wrapper. Existing build slots
+remain protected during the upgrade. Later runs clean only the enrolled volume.
 
 Simulator devices are on the drive too: `~/Library/Developer/CoreSimulator/Devices` is a
 symlink to `/Volumes/Scratch/CoreSimulator/Devices` (moved 2026-10-27, when they held 72 GB

@@ -70,7 +70,9 @@ def enroll(pin, volume, cleaner):
 
 def main(source, volume=Path("/Volumes/Scratch")):
     home = Path.home()
-    cleaner = home / ".local/bin/mac-artifact-clean"
+    bin_dir = home / ".local/bin"
+    install(bin_dir / "mac-build", (source / "bin/mac-build").read_bytes(), 0o755)
+    cleaner = bin_dir / "mac-artifact-clean"
     install(cleaner, (source / "bin/mac-artifact-clean").read_bytes(), 0o755)
     if not enroll(home / ".config/mac-setup/scratch-volume-uuid", volume, cleaner):
         return

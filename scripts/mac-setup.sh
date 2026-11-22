@@ -40,7 +40,7 @@ entry='/bin/zsh "$d/install.zsh"'
 files=(install.zsh set-zshenv.sh bin/mac-build bin/mac-build-shim)
 if [[ -n $cleaner_only ]]; then
   [[ $alias_ = mac && -z $update ]] || usage
-  files=()
+  files=(bin/mac-build)
   entry='/usr/bin/python3 "$d/install-artifact-cleaner.py"'
 elif [[ $alias_ = mini ]]; then
   [[ -z $update ]] || usage

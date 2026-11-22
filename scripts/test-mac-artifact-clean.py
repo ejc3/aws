@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Offline Scratch cleanup with real directory trees and simulated disk pressure."""
 
+from contextlib import ExitStack
 import datetime
+import fcntl
 import importlib.machinery
 import importlib.util
 import os
 from pathlib import Path
 import plistlib
+import select
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -104,6 +108,17 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(self.clean(True, busy=check_busy)["paths"], [str(eligible)])
         self.assertTrue(all(p.exists() for p in (busy_leaf, fresh_leaf, bad_leaf)))
 
+    def test_discovery_filters_project_children_by_name_before_requesting_metadata(self):
+        root, leaf = self.cache("project/dd-old")
+        unrelated = root.parent / "renders"
+        unrelated.mkdir()
+        (root.parent / "swift-test.log").touch()
+        with patch.object(cleaner, "directory", wraps=cleaner.directory) as check:
+            rows = cleaner.candidates(self.volume, self.device, self.start - cleaner.AGE)
+        self.assertIn(leaf, [r / c for _, r, _, c in rows])
+        checked = {call.args[0] for call in check.call_args_list}
+        self.assertTrue({unrelated, root.parent / "swift-test.log"}.isdisjoint(checked))
+
     def test_no_walk_above_watermark_or_with_scratch_unmounted(self):
         with patch.object(cleaner, "candidates", side_effect=AssertionError("unnecessary scan")):
             self.assertEqual(self.clean(True, lambda _: cleaner.LOW)["status"], "healthy")
@@ -198,6 +213,43 @@ class Cleanup(unittest.TestCase):
             self.assertTrue(locked)
             self.assertEqual(self.clean(True)["status"], "host build active")
         self.assertTrue(leaf.exists())
+
+    def test_real_build_in_a_new_third_slot_respects_cleanup_across_state_directories(self):
+        home = self.volume.parent / "home"
+        self.state = home / ".local/state/mac-artifact-clean"
+        self.state.mkdir(parents=True)
+        custom = self.volume.parent / "custom"
+        slots = custom / "mac-build"
+        slots.mkdir(parents=True)
+        _, leaf = self.cache("project/dd")
+        env = dict(os.environ, HOME=str(home), MAC_STATE_DIR=str(custom), MAC_BUILD_SLOTS="3")
+        env.pop("MAC_BUILD_SLOT", None)
+        build = Path(__file__).parent / "mac/bin/mac-build"
+        child = "import os, sys; print(os.environ['MAC_BUILD_SLOT'], flush=True); sys.stdin.read(1)"
+        with (slots / "slot.1").open("w") as first, (slots / "slot.2").open("w") as second:
+            for slot in (first, second):
+                fcntl.flock(slot, fcntl.LOCK_EX)
+            with ExitStack() as processes:
+                with cleaner.build_slots(self.state) as clean_idle:
+                    self.assertTrue(clean_idle)
+                    p = subprocess.Popen(
+                        [build, sys.executable, "-c", child],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        env=env,
+                    )
+                    processes.callback(p.communicate, b"x", timeout=5)
+                    self.assertFalse(select.select([p.stdout], [], [], 1)[0], "build started during cleanup")
+                self.assertTrue(select.select([p.stdout], [], [], 5)[0])
+                self.assertEqual(p.stdout.readline(), b"3\n")
+                self.assertEqual(self.clean(True)["status"], "host build active")
+                self.assertTrue(leaf.exists())
+            self.assertEqual(p.returncode, 0)
+            with patch.dict(os.environ, {"MAC_STATE_DIR": str(custom)}):
+                self.assertEqual(
+                    self.clean(True)["status"], "host build active", "legacy custom slots remain protected"
+                )
+        self.assertEqual(self.clean(True)["paths"], [str(leaf)])
 
     def test_interrupted_pressure_cycle_continues_above_low_watermark(self):
         _, leaf = self.cache("p/dd")

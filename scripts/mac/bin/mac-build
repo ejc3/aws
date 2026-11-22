@@ -31,7 +31,14 @@ if (@ARGV && $ARGV[0] eq '--status') {
 @ARGV or do { print STDERR "usage: mac-build COMMAND [ARGS...] | mac-build --status\n"; exit 2 };
 exec { $ARGV[0] } @ARGV or exit 127 if defined $ENV{MAC_BUILD_SLOT};
 
-$^F = 1023;    # keep the slot's descriptor open across exec: COMMAND holds the lock, not this script
+$^F = 1023;    # COMMAND inherits both its slot and its shared cleanup lock.
+# The cleaner takes this lock exclusively during its final holder check and rename.
+# Builds may choose different slot directories or counts, but still share this per-login lock.
+my $admission_dir = "$ENV{HOME}/.local/state/mac-build";
+make_path($admission_dir, { mode => 0700 });
+sysopen(my $admission, "$admission_dir/admission.lock", O_RDWR | O_CREAT, 0600)
+    or die "mac-build: open cleanup lock: $!\n";
+flock($admission, LOCK_SH) or die "mac-build: lock cleanup admission: $!\n";
 my ($held, $said);
 until ($held) {
     for my $n (1 .. $slots) {

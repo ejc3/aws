@@ -674,6 +674,8 @@ class ScratchCleanerInstall(Base):
         super().setUp()
         self.stage = self.temp / "source"
         (self.stage / "bin").mkdir(parents=True)
+        self.build_helper = self.stage / "bin/mac-build"
+        self.build_helper.write_bytes((BIN / "mac-build").read_bytes())
         self.payload = self.stage / "bin/mac-artifact-clean"
         self.payload.write_text("import os\ndef volume_id(path): return os.environ['SCRATCH_UUID']\n")
         self.volume = self.temp.resolve() / "Scratch"
@@ -691,13 +693,14 @@ class ScratchCleanerInstall(Base):
             'case "$1:$2" in\n'
             '  print:"$DOMAIN") test -z "${NO_GUI:-}";;\n'
             '  print:"$DOMAIN"/*) test -e "$LOADED";;\n'
-            '  bootstrap:"$DOMAIN") test -z "${FAIL_BOOTSTRAP:-}" && touch "$LOADED";;\n'
+            '  bootstrap:"$DOMAIN") test -z "${FAIL_BOOTSTRAP:-}" && test -x "$HOME/.local/bin/mac-build"'
+            ' && cmp -s "$BUILD_SOURCE" "$HOME/.local/bin/mac-build" && touch "$LOADED";;\n'
             '  *) exit 87;;\nesac\n'
         )
         launchctl.chmod(0o755)
         self.env.update(HOME=str(self.home), PATH=str(self.temp) + os.pathsep + self.env["PATH"],
                         CALLS=str(self.launches), DOMAIN=self.domain, LOADED=str(self.temp / "loaded"),
-                        SCRATCH_UUID=self.volume_id, MOUNTED="1")
+                        SCRATCH_UUID=self.volume_id, MOUNTED="1", BUILD_SOURCE=str(self.build_helper))
 
     def install(self):
         driver = """
@@ -724,7 +727,12 @@ with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
         self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
         self.assertTrue(os.access(cleaner, os.X_OK))
         self.payload.write_text(self.payload.read_text() + "# new version\n")
-        result = self.install()
+        installed_build = self.home / ".local/bin/mac-build"
+        with installed_build.open("rb") as previous:
+            self.build_helper.write_bytes(self.build_helper.read_bytes() + b"# updated build gate\n")
+            result = self.install()
+            self.assertNotEqual(os.fstat(previous.fileno()).st_ino, installed_build.stat().st_ino)
+        self.assertEqual(installed_build.read_bytes(), self.build_helper.read_bytes())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
         mutations = [line for line in self.launches.read_text().splitlines() if not line.startswith("print ")]
@@ -810,7 +818,7 @@ class Files(unittest.TestCase):
             for args, names, flag in [
                 (["mini"], build, "--build-only"),
                 ([], build | desktop | cleaner, ""),
-                (["mac", "--artifact-cleaner-only"], cleaner, ""),
+                (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
                 (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
