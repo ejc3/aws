@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Install the MacBook's hourly Scratch cleaner for the current login."""
+
+import os
+from pathlib import Path
+import plistlib
+import runpy
+import subprocess
+import sys
+import tempfile
+from xml.parsers.expat import ExpatError
+
+
+LABEL = "com.ccgames.mac-artifact-clean"
+
+
+def install(path, contents, mode, create_once=False):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if create_once and os.path.lexists(path):
+        return False
+    if path.is_file() and path.read_bytes() == contents and (path.stat().st_mode & 0o777) == mode:
+        return False
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as output:
+        tmp = Path(output.name)
+        try:
+            output.write(contents)
+            output.flush()
+            os.fchmod(output.fileno(), mode)
+            if create_once:
+                try:
+                    os.link(tmp, path)
+                except FileExistsError:
+                    return False
+            else:
+                os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+    return True
+
+
+def loaded(service):
+    return (
+        subprocess.run(
+            ["launchctl", "print", service],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        ).returncode
+        == 0
+    )
+
+
+def enroll(pin, volume, cleaner):
+    try:
+        if not volume.is_mount() or volume.resolve(strict=True) != volume:
+            raise ValueError(f"{volume} is not a real mount point")
+        observed = runpy.run_path(str(cleaner))["volume_id"](volume)
+    except (OSError, ValueError, plistlib.InvalidFileException, ExpatError, subprocess.SubprocessError) as error:
+        print(
+            f"Scratch cleaner held. {error}. "
+            "Connect the Scratch disk and rerun scripts/mac-setup.sh mac --artifact-cleaner-only."
+        )
+        return False
+    # A concurrent setup can win enrollment; compare its complete pin before scheduling.
+    install(pin, (observed + "\n").encode("ascii"), 0o600, create_once=True)
+    if pin.is_symlink() or not pin.is_file() or pin.read_text().strip().lower() != observed:
+        print(f"Scratch cleaner held. {volume} does not match the UUID enrolled in {pin}.")
+        return False
+    return True
+
+
+def main(source, volume=Path("/Volumes/Scratch")):
+    home = Path.home()
+    cleaner = home / ".local/bin/mac-artifact-clean"
+    install(cleaner, (source / "bin/mac-artifact-clean").read_bytes(), 0o755)
+    if not enroll(home / ".config/mac-setup/scratch-volume-uuid", volume, cleaner):
+        return
+    plist = home / "Library/LaunchAgents" / (LABEL + ".plist")
+    changed = install(
+        plist,
+        plistlib.dumps(
+            {
+                "Label": LABEL,
+                "ProgramArguments": [str(cleaner), "--apply"],
+                "StartInterval": 3600,
+                "ProcessType": "Background",
+            }
+        ),
+        0o644,
+    )
+
+    domain = "gui/" + str(os.getuid())
+    if not loaded(domain):
+        print("Scratch cleaner installed. The hourly schedule starts at the next graphical login.")
+    elif not loaded(domain + "/" + LABEL):
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True)
+        print("Scratch cleaner installed and scheduled hourly.")
+    elif changed:
+        print("Scratch cleaner updated. The loaded job picks up the new schedule at the next login.")
+    else:
+        print("Scratch cleaner is installed and scheduled hourly.")
+
+
+if __name__ == "__main__":
+    main(Path(sys.argv[1]))

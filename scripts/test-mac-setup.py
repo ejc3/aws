@@ -536,7 +536,6 @@ class PeekabooInstall(unittest.TestCase):
         log = shlex.quote(str(self.log))
         self.stub("curl", f'echo "curl $*" >> {log}\nurl=""; out=""\nwhile [ $# -gt 0 ]; do case "$1" in -o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done\n'
                           f'cp "{self.releases}/$(basename "$url")" "$out"')
-        self.stub("shasum", 'sha256sum "$3"')
         # --verify fails for any path listed in self.broken (a damaged install), passes otherwise.
         self.broken = self.temp / "broken"
         self.stub("codesign", f'case "$1" in -dv) echo "TeamIdentifier=$(cat {shlex.quote(str(self.team))})" >&2;; '
@@ -670,6 +669,110 @@ class PeekabooInstall(unittest.TestCase):
         self.assertFalse(self.app.exists())
 
 
+class ScratchCleanerInstall(Base):
+    def setUp(self):
+        super().setUp()
+        self.stage = self.temp / "source"
+        (self.stage / "bin").mkdir(parents=True)
+        self.payload = self.stage / "bin/mac-artifact-clean"
+        self.payload.write_text("import os\ndef volume_id(path): return os.environ['SCRATCH_UUID']\n")
+        self.volume = self.temp.resolve() / "Scratch"
+        self.volume.mkdir()
+        self.volume_id = "173177ab-a223-40c5-a955-21506cc53942"
+        self.domain = "gui/" + str(os.getuid())
+        self.label = "com.ccgames.mac-artifact-clean"
+        self.home = self.temp / "Mac user & work"
+        self.plist = self.home / "Library" / "LaunchAgents" / (self.label + ".plist")
+        self.pin = self.home / ".config/mac-setup/scratch-volume-uuid"
+        self.launches = self.temp / "launches"
+        launchctl = self.temp / "launchctl"
+        launchctl.write_text(
+            '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
+            'case "$1:$2" in\n'
+            '  print:"$DOMAIN") test -z "${NO_GUI:-}";;\n'
+            '  print:"$DOMAIN"/*) test -e "$LOADED";;\n'
+            '  bootstrap:"$DOMAIN") test -z "${FAIL_BOOTSTRAP:-}" && touch "$LOADED";;\n'
+            '  *) exit 87;;\nesac\n'
+        )
+        launchctl.chmod(0o755)
+        self.env.update(HOME=str(self.home), PATH=str(self.temp) + os.pathsep + self.env["PATH"],
+                        CALLS=str(self.launches), DOMAIN=self.domain, LOADED=str(self.temp / "loaded"),
+                        SCRATCH_UUID=self.volume_id, MOUNTED="1")
+
+    def install(self):
+        driver = """
+import os, runpy, sys
+from pathlib import Path
+from unittest.mock import patch
+with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
+    runpy.run_path(sys.argv[1])["main"](Path(sys.argv[2]), Path(sys.argv[3]))
+"""
+        return self.run_("python3", "-c", driver, ROOT / "scripts/mac/install-artifact-cleaner.py",
+                         self.stage, self.volume)
+
+    def test_installs_hourly_agent_and_updates_helper_without_running_or_restarting_it(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cleaner = self.home / ".local/bin/mac-artifact-clean"
+        plist = plistlib.loads(self.plist.read_bytes())
+        self.assertEqual(plist["Label"], self.label)
+        self.assertEqual(plist["ProgramArguments"], [str(cleaner), "--apply"])
+        self.assertEqual(plist["StartInterval"], 3600)
+        self.assertEqual(plist["ProcessType"], "Background")
+        self.assertNotIn("StandardOutPath", plist)
+        self.assertNotIn("StandardErrorPath", plist)
+        self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
+        self.assertTrue(os.access(cleaner, os.X_OK))
+        self.payload.write_text(self.payload.read_text() + "# new version\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
+        mutations = [line for line in self.launches.read_text().splitlines() if not line.startswith("print ")]
+        self.assertEqual(mutations, [f"bootstrap {self.domain} {self.plist}"])
+
+    def test_missing_or_symlinked_mount_never_enrolls_or_creates_a_login_agent(self):
+        self.env["MOUNTED"] = "0"
+        self.assertIn("held", self.install().stdout)
+        self.assertFalse(self.pin.exists())
+        self.assertFalse(self.plist.exists())
+        self.assertFalse(self.launches.exists())
+        self.env["MOUNTED"] = "1"
+        original = self.volume
+        self.volume = self.temp / "fake-mount"
+        self.volume.symlink_to(original, target_is_directory=True)
+        self.assertIn("held", self.install().stdout)
+        self.assertFalse(self.pin.exists())
+        self.volume = original
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.pin.read_text(), self.volume_id + "\n")
+        self.assertTrue(self.plist.is_file())
+
+    def test_existing_pin_accepts_case_and_never_changes_on_replacement(self):
+        self.pin.parent.mkdir(parents=True)
+        original = self.volume_id.upper() + "\n"
+        self.pin.write_text(original)
+        self.env["SCRATCH_UUID"] = "3b4a366f-2741-4273-bf8a-b457cf96aa59"
+        self.assertIn("does not match", self.install().stdout)
+        self.assertEqual(self.pin.read_text(), original)
+        self.assertFalse(self.plist.exists())
+        self.assertFalse(self.launches.exists())
+        self.env["SCRATCH_UUID"] = self.volume_id
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(self.plist.is_file())
+        self.assertEqual(self.pin.read_text(), original)
+
+    def test_logged_out_install_activates_at_next_login_and_bootstrap_errors_surface(self):
+        self.env["NO_GUI"] = "1"
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.plist.exists())
+        self.assertIn("next graphical login", result.stdout)
+        self.assertNotIn("bootstrap", self.launches.read_text())
+        del self.env["NO_GUI"]
+        self.env["FAIL_BOOTSTRAP"] = "1"
+        self.assertNotEqual(self.install().returncode, 0)
+
+
 class Files(unittest.TestCase):
     def test_syntax(self):
         for f in (BIN / "mac-build-shim", BIN / "peekaboo", ROOT / "scripts" / "mac" / "set-zshenv.sh",
@@ -685,7 +788,7 @@ class Files(unittest.TestCase):
     def test_the_setup_script_ships_every_tool(self):
         setup = (ROOT / "scripts" / "mac-setup.sh").read_text()
         install = (ROOT / "scripts" / "mac" / "install.zsh").read_text()
-        for f in sorted(p.name for p in BIN.iterdir()):
+        for f in sorted(p.name for p in BIN.iterdir() if p.is_file()):
             self.assertIn(f"bin/{f}", setup)
             self.assertIn(f, install)
         self.assertIn('/bin/sh "$src/peekaboo-install.sh" --update-running', install)
@@ -703,9 +806,11 @@ class Files(unittest.TestCase):
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo"}
+            cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             for args, names, flag in [
                 (["mini"], build, "--build-only"),
-                ([], build | desktop, ""),
+                ([], build | desktop | cleaner, ""),
+                (["mac", "--artifact-cleaner-only"], cleaner, ""),
                 (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
@@ -714,14 +819,21 @@ class Files(unittest.TestCase):
                 remote = (dest / "args").read_text().splitlines()
                 self.assertEqual(remote[-2], args[0] if args else "mac")
                 self.assertIn(f'"$d" {flag};', remote[-1])
+                if "--artifact-cleaner-only" in args:
+                    self.assertIn('/usr/bin/python3 "$d/install-artifact-cleaner.py"', remote[-1])
+                    self.assertNotIn("install.zsh", remote[-1])
             (dest / "args").unlink()
-            result = subprocess.run([str(setup), "mini", "--update-peekaboo"], env=env, capture_output=True)
-            self.assertEqual(result.returncode, 2)
-            self.assertFalse((dest / "args").exists())
+            for args in (["mini", "--update-peekaboo"], ["mini", "--artifact-cleaner-only"],
+                         ["colton-mac", "--artifact-cleaner-only"],
+                         ["mac", "--update-peekaboo", "--artifact-cleaner-only"]):
+                result = subprocess.run([str(setup), *args], env=env, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse((dest / "args").exists())
 
     def test_peekaboo_is_pinned_to_the_release_and_the_wrapper_follows_cli_current(self):
         text = (ROOT / "scripts" / "mac" / "peekaboo-install.sh").read_text()
-        pin = lambda name: re.search(rf"^{name}=(\S+)", text, re.M).group(1)
+        def pin(name):
+            return re.search(rf"^{name}=(\S+)", text, re.M).group(1)
         # v4.9.5 of openclaw/Peekaboo: its checksums.txt and SIGNING-MANIFEST.json.
         self.assertEqual(pin("VERSION"), "4.9.5")
         self.assertEqual(pin("TEAM"), "FWJYW4S8P8")

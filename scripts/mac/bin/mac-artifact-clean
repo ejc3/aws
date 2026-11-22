@@ -1,0 +1,423 @@
+#!/usr/bin/python3
+"""Reclaim old Xcode build caches on the MacBook's external Scratch volume."""
+
+import argparse
+import contextlib
+import datetime
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import uuid
+from xml.parsers.expat import ExpatError
+
+SCRATCH = Path("/Volumes/Scratch")
+STATE = Path.home() / ".local/state/mac-artifact-clean"
+PIN = Path.home() / ".config/mac-setup/scratch-volume-uuid"
+GIB = 1024**3
+LOW, TARGET = 100 * GIB, 150 * GIB
+AGE = 14 * 86400
+CACHES = tuple(map(Path, ("Build/Intermediates.noindex", "Index.noindex", "ModuleCache.noindex")))
+PENDING = ".mac-artifact-clean-pending"
+EXCLUDE = {"tmp", "CoreSimulator", "node_modules", "lost+found", "SourcePackages"}
+APPLE_EPOCH = 978307200
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+
+def directory(path, device):
+    try:
+        s = path.lstat()
+        return stat.S_ISDIR(s.st_mode) and s.st_dev == device and s.st_uid == os.getuid()
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
+def children(parent, device):
+    try:
+        entries = list(parent.iterdir())
+    except (FileNotFoundError, PermissionError):
+        return
+    for p in entries:
+        if p.name not in EXCLUDE and (not p.name.startswith(".") or p.name == ".derived") and directory(p, device):
+            yield p
+
+
+def read_plist(path, device):
+    s = path.lstat()
+    if s.st_dev != device or s.st_uid != os.getuid() or not stat.S_ISREG(s.st_mode) or s.st_size > 8 * 1024 * 1024:
+        raise ValueError("unexpected plist")
+    with path.open("rb") as f:
+        return plistlib.load(f)
+
+
+def candidate(root, relative, device, cutoff):
+    leaf = root / relative
+    if not directory(leaf.parent, device) or not directory(leaf, device):
+        return None
+    try:
+        logdir = root / "Logs" / "Build"
+        if not directory(root / "Logs", device) or not directory(logdir, device):
+            return None
+        info_path, log_path = root / "info.plist", logdir / "LogStoreManifest.plist"
+        info = read_plist(info_path, device)
+        workspace = Path(info["WorkspacePath"])
+        if not workspace.is_absolute() or workspace.suffix not in {".xcodeproj", ".xcworkspace"}:
+            return None
+        logs = read_plist(log_path, device)["logs"]
+        if not isinstance(logs, dict) or not logs:
+            return None
+        stopped = [float(v["timeStoppedRecording"]) for v in logs.values()]
+        if not all(
+            math.isfinite(end) and 0 < float(v["timeStartedRecording"]) <= end
+            for v, end in zip(logs.values(), stopped)
+        ):
+            return None
+        accessed = info["LastAccessedDate"].replace(tzinfo=datetime.timezone.utc).timestamp()
+        latest = max(
+            accessed, max(stopped) + APPLE_EPOCH, *(p.lstat().st_mtime for p in (info_path, log_path, leaf))
+        )
+        if latest <= cutoff:
+            return latest, root, workspace, relative
+    except (
+        OSError,
+        AttributeError,
+        OverflowError,
+        TypeError,
+        ValueError,
+        KeyError,
+        ExpatError,
+        plistlib.InvalidFileException,
+    ):
+        pass
+    return None
+
+
+def candidates(volume, device, cutoff):
+    found = []
+    for project in children(volume, device):
+        roots = [project, *children(project, device)]
+        # Several apps put their per-job caches in build/ or apps/native/build/.
+        # Inspect only these known containers; the rest of each project stays unvisited.
+        for parts in (("build",), ("apps", "native", "build")):
+            container = project
+            for part in parts:
+                container /= part
+                if not directory(container, device):
+                    break
+            else:
+                roots.extend(children(container, device))
+        for root in roots:
+            name = root.name.lower()
+            central = project == volume / "DerivedData" and root.parent == project
+            if not central and not (name.startswith(("dd", ".derived", "deriveddata")) or name.endswith("-dd")):
+                continue
+            for relative in CACHES:
+                entry = candidate(root, relative, device, cutoff)
+                if entry and (central or project in entry[2].parents):
+                    found.append(entry)
+    return sorted(found)
+
+
+def active(root, workspace):
+    # Inspect the operating user's open files and build arguments, never print them.
+    # Listing file descriptors is bounded by open files, unlike lsof +D on a large cache.
+    lsof = subprocess.run(
+        ["/usr/sbin/lsof", "-nP", "-F0n", "-u", str(os.getuid())], capture_output=True, check=True, timeout=30
+    )
+    if lsof.stderr or not lsof.stdout:
+        raise RuntimeError("could not verify open files")
+    paths = set()
+    own_pid = b"p" + str(os.getpid()).encode()
+    own_file = False
+    for field in lsof.stdout.split(b"\0"):
+        field = field.lstrip(b"\n")
+        if field.startswith(b"p"):
+            own_file = field == own_pid
+        elif field.startswith(b"n/") and not own_file:
+            paths.add(field[1:])
+    args = subprocess.check_output(["/bin/ps", "-axww", "-o", "command="], timeout=15)
+    for p in (root, workspace):
+        name = os.fsencode(p)
+        if name in args or any(path == name or path.startswith(name + b"/") for path in paths):
+            return True
+    return False
+
+
+@contextlib.contextmanager
+def build_slots(state):
+    # Block new managed host builds only during the final holder check and rename.
+    # Long scans and the actual removal run outside the build slots.
+    folder = state.parent / "mac-build"
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    files = {folder / "slot.1", folder / "slot.2"}
+    files.update(p for p in folder.glob("slot.*") if p.suffix[1:].isdigit())
+    with contextlib.ExitStack() as locks:
+        for path in sorted(files):
+            file = locks.enter_context(path.open("a"))
+            try:
+                fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+
+
+def inspect_tree(fd, device, cutoff, remove=False):
+    """Check before detaching. Delete through no-follow directory descriptors on the original device."""
+    total = 0
+    with os.scandir(fd) as entries:
+        for entry in entries:
+            s = entry.stat(follow_symlinks=False)
+            if s.st_dev != device or s.st_uid != os.getuid():
+                raise ValueError("different volume or owner in Xcode cache")
+            if entry.name == ".git" or entry.name.endswith((".xcarchive", ".xcresult", ".keychain-db", ".p8")):
+                raise ValueError("contains a retained artifact")
+            if not remove and s.st_mtime > cutoff:
+                raise ValueError("recent file in Xcode cache")
+            total += s.st_blocks * 512
+            if stat.S_ISDIR(s.st_mode):
+                child = os.open(entry.name, DIR_FLAGS, dir_fd=fd)
+                try:
+                    opened = os.fstat(child)
+                    if (opened.st_dev, opened.st_ino) != (s.st_dev, s.st_ino):
+                        raise ValueError("directory changed during inspection")
+                    total += inspect_tree(child, device, cutoff, remove)
+                finally:
+                    os.close(child)
+                if remove:
+                    os.rmdir(entry.name, dir_fd=fd)
+            elif remove:
+                os.unlink(entry.name, dir_fd=fd)
+    return total
+
+
+def save(path, record):
+    temp = path.with_suffix(".tmp")
+    with temp.open("w") as f:
+        json.dump(record, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temp, path)
+    fd = os.open(path.parent, DIR_FLAGS)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def cache_parent(volume, device, root, relative):
+    if relative not in CACHES:
+        raise ValueError("unrecognized Xcode cache")
+    parts = root.relative_to(volume).parts
+    if (
+        not parts
+        or ".." in parts
+        or (len(parts) > 2 and parts[1:-1] not in (("build",), ("apps", "native", "build")))
+    ):
+        raise ValueError("invalid DerivedData path")
+    fd = os.open(volume, DIR_FLAGS)
+    try:
+        for part in (*parts, *relative.parent.parts):
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            s = os.fstat(fd)
+            if s.st_dev != device or s.st_uid != os.getuid():
+                raise ValueError("unexpected build directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def volume_id(volume):
+    # The BSD device number can change when the same external disk is reattached.
+    raw = subprocess.check_output(["/usr/sbin/diskutil", "info", "-plist", str(volume)], timeout=15)
+    info = plistlib.loads(raw)
+    if (
+        volume.is_symlink()
+        or not os.path.ismount(volume)
+        or info.get("MountPoint") != str(volume)
+        or info.get("FilesystemType") != "apfs"
+        or info.get("Internal") is not False
+        or not info.get("VolumeUUID")
+    ):
+        raise ValueError("could not identify mounted Scratch volume")
+    return str(uuid.UUID(info["VolumeUUID"]))
+
+
+def finish(volume, device, identity, journal):
+    record = json.loads(journal.read_text())
+    if record["volume"] != identity:
+        raise ValueError("pending cache belongs to a different Scratch volume")
+    root, relative = Path(record["root"]), Path(record["cache"])
+    try:
+        parent = cache_parent(volume, device, root, relative)
+    except FileNotFoundError:
+        # The owning project or its Build directory has already been removed.
+        journal.unlink()
+        return
+    try:
+        try:
+            fd = os.open(PENDING, DIR_FLAGS, dir_fd=parent)
+        except FileNotFoundError:
+            # Interrupted before rename or after rmdir. The original name is never deleted here.
+            journal.unlink()
+            return
+        try:
+            s = os.fstat(fd)
+            if (s.st_dev, s.st_ino, s.st_uid) != (device, record["inode"], os.getuid()):
+                raise ValueError("detached cache identity changed")
+            pending = root / relative.parent / PENDING
+            if active(pending, pending):
+                return False
+            inspect_tree(fd, device, None, remove=True)
+        finally:
+            os.close(fd)
+        os.rmdir(PENDING, dir_fd=parent)
+        journal.unlink()
+    finally:
+        os.close(parent)
+
+
+def space(volume):
+    return shutil.disk_usage(volume).free
+
+
+def clean(volume, state, apply, result):
+    if volume.is_symlink() or not os.path.ismount(volume):
+        result["status"] = "volume unavailable"
+        return
+    fd = os.open(volume, DIR_FLAGS)
+    try:
+        clean_mounted(volume, fd, state, apply, result)
+    finally:
+        os.close(fd)
+
+
+def clean_mounted(volume, fd, state, apply, result):
+    device = os.fstat(fd).st_dev
+    result["free_before"] = result["free_after"] = free = space(fd)
+    pressure = state / "pressure"
+    if free >= LOW and not pressure.exists():
+        result["status"] = "healthy"
+        return
+    identity = volume_id(volume)
+    if PIN.is_symlink() or not PIN.is_file() or identity != PIN.read_text().strip().lower():
+        result["status"] = "unrecognized Scratch volume"
+        return
+    if free >= TARGET:
+        if apply:
+            pressure.unlink(missing_ok=True)
+        result["status"] = "healthy"
+        return
+    if apply:
+        pressure.touch(exist_ok=True)
+        with build_slots(state) as idle:
+            if not idle:
+                result["status"] = "host build active"
+                return
+    journal = state / "pending.json"
+    if apply and journal.exists():
+        if finish(volume, device, identity, journal) is False:
+            result["status"] = "detached cache still in use"
+            return
+        result["free_after"] = free = space(fd)
+    cutoff = time.time() - AGE
+    for _, root, workspace, relative in candidates(volume, device, cutoff):
+        if free >= TARGET:
+            break
+        try:
+            parent = cache_parent(volume, device, root, relative)
+        except (FileNotFoundError, PermissionError):
+            continue
+        try:
+            leaf_fd = os.open(relative.name, DIR_FLAGS, dir_fd=parent)
+            try:
+                original = os.fstat(leaf_fd)
+                estimate = inspect_tree(leaf_fd, device, cutoff)
+            finally:
+                os.close(leaf_fd)
+            if not estimate:
+                continue
+            if apply:
+                with build_slots(state) as idle:
+                    if not idle:
+                        result["status"] = "host build active"
+                        return
+                    result["free_after"] = free = space(fd)
+                    if free >= TARGET:
+                        break
+                    if active(root, workspace) or not candidate(root, relative, device, cutoff):
+                        continue
+                    current = os.stat(relative.name, dir_fd=parent, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (device, original.st_ino):
+                        continue
+                    if os.path.lexists(root / relative.parent / PENDING):
+                        continue
+                    save(
+                        journal,
+                        {"root": str(root), "cache": str(relative), "volume": identity, "inode": original.st_ino},
+                    )
+                    os.rename(relative.name, PENDING, src_dir_fd=parent, dst_dir_fd=parent)
+                if finish(volume, device, identity, journal) is False:
+                    result["status"] = "detached cache still in use"
+                    return
+                result["free_after"] = free = space(fd)
+            else:
+                if active(root, workspace):
+                    continue
+                free += estimate
+            result["paths"].append(str(root / relative))
+            print(
+                f"{'removed' if apply else 'eligible'} {estimate / GIB:.2f} GiB of blocks: {root / relative}",
+                flush=True,
+            )
+        except (FileNotFoundError, PermissionError, ValueError) as error:
+            if journal.exists():
+                raise
+            print(f"held {root}: {error}", file=sys.stderr)
+        finally:
+            os.close(parent)
+    if apply and free >= TARGET:
+        pressure.unlink(missing_ok=True)
+    result["status"] = (
+        ("target reached" if free >= TARGET else "eligible caches exhausted") if apply else "preview"
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--apply", action="store_true", help="remove eligible Xcode caches under disk pressure")
+    args = parser.parse_args()
+    os.umask(0o077)
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another cleanup is running.")
+            return 0
+        result = {"at": datetime.datetime.now(datetime.timezone.utc).isoformat(), "paths": []}
+        try:
+            clean(SCRATCH, STATE, args.apply, result)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
+            result["status"] = "error"
+            print(f"mac-artifact-clean: {error}", file=sys.stderr)
+        if args.apply:
+            save(STATE / "last-run.json", result)
+        print(f"{result['status']}. {len(result['paths'])} caches.")
+        if "free_before" in result:
+            print(f"Free space: {result['free_before'] / GIB:.1f} -> {result['free_after'] / GIB:.1f} GiB.")
+        return int(result["status"] == "error")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
