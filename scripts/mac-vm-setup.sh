@@ -12,7 +12,7 @@
 # pool of GitHub Actions runners named mini-<n> in dolphin-labs-hq's Default group. An eligible private
 # repository can select any runner in the shared iOS pool or require the mini using its host label.
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
-# and reach the VM on stdin only. A runner already registered is left alone.
+# and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
 # On the mini (ssh <mini>), as its login user, with Tart at ~/.local/bin/tart (README "The Mac mini"):
 #   * clones the VM from the base image pinned below, by digest, and sizes it (ci 9 cores / 36 GB / 200 GB disk, skevh
@@ -35,6 +35,8 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CI_ORG=dolphin-labs-hq
 CI_LABELS=gww-ios,mini,ios-pool
 CI_COUNT=4
+SIMULATOR_RUNNER=mini-4
+SIMULATOR_LABEL=mini-simulator
 # The runner, pinned: dolphin-labs' ci-vm.sh's version and the SHA-256 GitHub publishes for it.
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
@@ -244,9 +246,41 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
 ")"
 for i in $(seq 1 "$CI_COUNT"); do
   name="mini-$i"
-  if on_host "\$HOME/.local/bin/tart exec $VM test -f /Users/admin/runners/$name/.runner"; then
+  labels=$CI_LABELS
+  if [[ $name == "$SIMULATOR_RUNNER" ]]; then
+    labels+=",$SIMULATOR_LABEL"
+    # One listener must serve every simulator-testing job across repositories. Refuse a conflicting
+    # assignment rather than modifying another operator's runner.
+    slot=$(gh api --paginate "orgs/$CI_ORG/actions/runners?per_page=100" --jq "
+      .runners[] | any(.labels[]; (.name | ascii_downcase) == \"$SIMULATOR_LABEL\") as \$holds
+      | select(.name == \"$name\" or \$holds) | [.id,.name,.status,.busy,\$holds] | @tsv")
+    IFS=$'\t' read -r slot_id slot_name slot_status slot_busy slot_labeled <<< "$slot"
+    if [[ -n $slot && ( $slot_name != "$name" || $slot == *$'\n'* ) ]]; then
+      echo "$SIMULATOR_LABEL has a conflicting registration; check the organization runners" >&2; exit 1
+    fi
+  fi
+  registration="/Users/admin/runners/$name/.runner"
+  # A failed SSH or guest command must not be mistaken for a missing registration.
+  registered=$(in_ci "if test -f '$registration'; then echo yes; else echo no; fi")
+  case "$registered" in yes|no) ;; *) echo "could not check $name's registration" >&2; exit 1 ;; esac
+  if [[ $registered == yes ]]; then
+    if [[ $name == "$SIMULATOR_RUNNER" ]]; then
+      # The runner's JSON may start with a UTF-8 BOM. Use its actual id even after a rebuild.
+      runner_id=$(on_host "\$HOME/.local/bin/tart exec $VM cat $registration" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin.buffer)["agentId"])')
+      [[ $runner_id =~ ^[1-9][0-9]*$ && $runner_id == "$slot_id" ]] ||
+        { echo "GitHub registration does not match $registration" >&2; exit 1; }
+      if [[ $slot_labeled == false ]]; then
+        gh api -X POST "orgs/$CI_ORG/actions/runners/$runner_id/labels" -f "labels[]=$SIMULATOR_LABEL" --silent
+      fi
+    fi
     echo "   $name: already registered"
     continue
+  fi
+  if [[ $name == "$SIMULATOR_RUNNER" && -n $slot ]]; then
+    # A rebuilt guest can reclaim its own offline registration. Leave an active listener running.
+    [[ $slot_status == offline && $slot_busy == false ]] ||
+      { echo "$name is in use; check the organization registration before replacing it" >&2; exit 1; }
   fi
   # A token per runner (they last an hour), on stdin from here on: ssh -> tart exec -> config.sh. Minted first, so a
   # refusal (no admin:org) stops here instead of handing config.sh an empty token.
@@ -258,10 +292,10 @@ for i in $(seq 1 "$CI_COUNT"); do
       token=\$(cat)
       mkdir -p ~/runners/$name && cd ~/runners/$name
       [ -x ./config.sh ] || tar xzf ../actions-runner-osx-arm64-$RUNNER_VERSION.tar.gz
-      ./config.sh --unattended --url https://github.com/$CI_ORG --token \"\$token\" --name $name --labels $CI_LABELS --work _work --replace >/dev/null
+      ./config.sh --unattended --url https://github.com/$CI_ORG --token \"\$token\" --name $name --labels $labels --work _work --replace >/dev/null
       ./svc.sh install >/dev/null
       ./svc.sh start >/dev/null
     ")"
   unset token
-  echo "   $name: registered at $CI_ORG ($CI_LABELS)"
+  echo "   $name: registered at $CI_ORG ($labels)"
 done
