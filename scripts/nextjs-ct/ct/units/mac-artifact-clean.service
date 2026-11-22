@@ -1,0 +1,9 @@
+[Unit]
+Description=Reclaim old Xcode build caches on the MacBook Scratch drive
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ejc3
+ExecStart=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=15 mac mac-artifact-clean --apply

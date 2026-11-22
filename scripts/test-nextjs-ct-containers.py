@@ -768,8 +768,7 @@ class MacTests(unittest.TestCase):
 
     def test_provision_configures_each_listed_mac_and_nothing_else(self):
         prov = (CT / "provision").read_text()
-        loop = prov[prov.index("while read -r alias secret; do"):]
-        loop = loop[:loop.index("\n", loop.index("done < <(cfg --arg u \"$U\" '.users[$u].macs")) + 1]
+        loop = prov[prov.index("# The Macs this account reaches"):prov.index("# Of those, the Windows PCs")]
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / "config.json").write_text(json.dumps({"users": {
@@ -781,27 +780,36 @@ class MacTests(unittest.TestCase):
             for u in ("ejc3", "colton", "connor"):
                 out = d / f"{u}.out"
                 script = f'CONFIG={d}/config.json; SHARED={d}; U={u}; export OUT={out}\nwarn() {{ echo "$*" >&2; }}\n' \
-                    + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + loop
+                    + 'cfg() { jq -r "$@" "$CONFIG"; }\nsystemctl() { echo "$*" >> "$OUT"; }\n' + loop
                 subprocess.run(["bash", "-c", script], check=True)
                 got[u] = sorted(out.read_text().splitlines()) if out.exists() else []
-        self.assertEqual(got["ejc3"], ["ejc3 colton-mac colton-mac-ssh-access-nextjs-ejc3", "ejc3 mac macbook-ssh-access-nextjs-ejc3"])
+        self.assertEqual(got["ejc3"], ["ejc3 colton-mac colton-mac-ssh-access-nextjs-ejc3",
+                                       "ejc3 mac macbook-ssh-access-nextjs-ejc3", "enable --now mac-artifact-clean.timer"])
         self.assertEqual(got["colton"], ["colton colton-mac colton-mac-ssh-access-nextjs-colton"])
         self.assertEqual(got["connor"], [])
 
     def test_a_failed_mac_setup_fails_provision(self):
         """warn's FAILED=1 must reach provision's own shell (no pipeline subshell), so the container is not marked ready."""
         prov = (CT / "provision").read_text()
-        loop = prov[prov.index("while read -r alias secret; do"):]
-        loop = loop[:loop.index("\n", loop.index("done < <(cfg")) + 1]
+        loop = prov[prov.index("# The Macs this account reaches"):prov.index("# Of those, the Windows PCs")]
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             (d / "config.json").write_text(json.dumps({"users": {"ejc3": {"macs": {"mac": "s"}}}}))
             (d / "snippets").mkdir()
             (d / "snippets" / "mac-ssh.sh").write_text("exit 1\n")
             script = f'CONFIG={d}/config.json; SHARED={d}; U=ejc3; FAILED=""\nwarn() {{ FAILED=1; }}\n' \
-                + 'cfg() { jq -r "$@" "$CONFIG"; }\n' + loop + 'echo "FAILED=$FAILED"\n'
+                + 'cfg() { jq -r "$@" "$CONFIG"; }\nsystemctl() { echo "$*" >&2; }\n' + loop + 'echo "FAILED=$FAILED"\n'
             r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         self.assertIn("FAILED=1", r.stdout)
+        self.assertIn("disable --now mac-artifact-clean.timer", r.stderr)
+
+    def test_mac_cleanup_timer_uses_the_owners_existing_remote_login(self):
+        service = (CT / "units/mac-artifact-clean.service").read_text().splitlines()
+        self.assertIn("User=ejc3", service)
+        self.assertIn("ExecStart=/usr/bin/ssh -T -o BatchMode=yes -o ConnectTimeout=15 mac mac-artifact-clean --apply", service)
+        timer = (CT / "units/mac-artifact-clean.timer").read_text().splitlines()
+        self.assertIn("OnCalendar=hourly", timer)
+        self.assertIn("Persistent=true", timer)
 
     def test_containers_get_the_jumpboxes_terraform(self):
         """The version main.tf requires (both jumpboxes, drift.yml); a full sha256 of the arm64 zip."""

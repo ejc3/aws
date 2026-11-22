@@ -6,6 +6,7 @@ import datetime
 import fcntl
 import importlib.machinery
 import importlib.util
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -118,6 +119,22 @@ class Cleanup(unittest.TestCase):
         self.assertIn(leaf, [r / c for _, r, _, c in rows])
         checked = {call.args[0] for call in check.call_args_list}
         self.assertTrue({unrelated, root.parent / "swift-test.log"}.isdisjoint(checked))
+
+    def test_failed_run_records_the_operating_system_error_for_the_operator(self):
+        error = PermissionError(1, "Operation not permitted", str(self.volume))
+        previous_umask = os.umask(0o077)
+        self.addCleanup(os.umask, previous_umask)
+        with (
+            patch.object(cleaner, "STATE", self.state),
+            patch.object(cleaner, "clean", side_effect=error),
+            patch.object(sys, "argv", ["mac-artifact-clean", "--apply"]),
+        ):
+            self.assertEqual(cleaner.main(), 1)
+        receipt = self.state / "last-run.json"
+        result = json.loads(receipt.read_text())
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["error"], str(error))
+        self.assertEqual(receipt.stat().st_mode & 0o077, 0)
 
     def test_no_walk_above_watermark_or_with_scratch_unmounted(self):
         with patch.object(cleaner, "candidates", side_effect=AssertionError("unnecessary scan")):

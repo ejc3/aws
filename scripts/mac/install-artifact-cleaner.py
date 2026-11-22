@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the MacBook's hourly Scratch cleaner for the current login."""
+"""Install the MacBook's Scratch cleaner for its existing Remote Login route."""
 
 import os
 from pathlib import Path
@@ -60,7 +60,7 @@ def enroll(pin, volume, cleaner):
             "Connect the Scratch disk and rerun scripts/mac-setup.sh mac --artifact-cleaner-only."
         )
         return False
-    # A concurrent setup can win enrollment; compare its complete pin before scheduling.
+    # A concurrent setup can win enrollment. Compare its complete pin before reporting success.
     install(pin, (observed + "\n").encode("ascii"), 0o600, create_once=True)
     if pin.is_symlink() or not pin.is_file() or pin.read_text().strip().lower() != observed:
         print(f"Scratch cleaner held. {volume} does not match the UUID enrolled in {pin}.")
@@ -74,32 +74,16 @@ def main(source, volume=Path("/Volumes/Scratch")):
     install(bin_dir / "mac-build", (source / "bin/mac-build").read_bytes(), 0o755)
     cleaner = bin_dir / "mac-artifact-clean"
     install(cleaner, (source / "bin/mac-artifact-clean").read_bytes(), 0o755)
-    if not enroll(home / ".config/mac-setup/scratch-volume-uuid", volume, cleaner):
-        return
+    # The GUI agent lacks macOS removable-volume access. Its replacement runs the
+    # cleaner through the same Remote Login account that already builds on Scratch.
     plist = home / "Library/LaunchAgents" / (LABEL + ".plist")
-    changed = install(
-        plist,
-        plistlib.dumps(
-            {
-                "Label": LABEL,
-                "ProgramArguments": [str(cleaner), "--apply"],
-                "StartInterval": 3600,
-                "ProcessType": "Background",
-            }
-        ),
-        0o644,
-    )
-
-    domain = "gui/" + str(os.getuid())
-    if not loaded(domain):
-        print("Scratch cleaner installed. The hourly schedule starts at the next graphical login.")
-    elif not loaded(domain + "/" + LABEL):
-        subprocess.run(["launchctl", "bootstrap", domain, str(plist)], check=True)
-        print("Scratch cleaner installed and scheduled hourly.")
-    elif changed:
-        print("Scratch cleaner updated. The loaded job picks up the new schedule at the next login.")
-    else:
-        print("Scratch cleaner is installed and scheduled hourly.")
+    if plist.exists():
+        service = f"gui/{os.getuid()}/{LABEL}"
+        if loaded(service):
+            subprocess.run(["launchctl", "bootout", service], check=True)
+        plist.unlink(missing_ok=True)
+    if enroll(home / ".config/mac-setup/scratch-volume-uuid", volume, cleaner):
+        print("Scratch cleaner installed for Remote Login.")
 
 
 if __name__ == "__main__":

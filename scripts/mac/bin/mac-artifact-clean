@@ -444,6 +444,7 @@ def main():
             clean(SCRATCH, STATE, args.apply, result)
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
             result["status"] = "error"
+            result["error"] = str(error)
             print(f"mac-artifact-clean: {error}", file=sys.stderr)
         if args.apply:
             save(STATE / "last-run.json", result)
