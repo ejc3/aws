@@ -72,14 +72,14 @@ resource "cloudflare_zero_trust_access_application" "workers_stage" {
   ]
 }
 
-# Agents on the metal boxes: a service token of their own, so an agent can open a staging Worker it just deployed and
-# check it, as the owner does in a browser. Admitted by a non_identity policy on this application only, so it opens the
-# staging Workers and nothing else (not *.cc-games.dev, unlike the cc-games automation token). Readers: dev-server-role
-# (the metal boxes) and the administration set. Not nextjs-dev-role: every account there has sudo. Revoking it touches
-# no other token. The grant is the secret's own resource policy, not one on the role: dev-server-role's inline policies
-# are at IAM's 10,240-character limit. The secret is outside workers-stage/, which holds the Workers' own runtime secrets
-# (scripts/workers-stage-secrets.sh), and its Terraform names avoid the workers_stage prefix that
-# scripts/test-workers-stage-secrets.py keeps free of Terraform-held values.
+# Agents use this service token to check deployed staging Workers. The secret's policy grants reads to the
+# metal role and the owner's broker-issued Next.js container session. Keeping the grant here also keeps
+# the member session policies and the metal role's inline policies within their IAM size limits.
+# The secret is outside workers-stage/, which holds the Workers' own runtime secrets.
+locals {
+  stage_workers_owner_session_id = "${aws_iam_role.nextjs_dev.unique_id}:ct-ejc3"
+}
+
 resource "cloudflare_zero_trust_access_service_token" "workers_stage_agents" {
   account_id = var.cloudflare_account_id
   name       = "workers-stage-agents"
@@ -126,12 +126,24 @@ resource "aws_secretsmanager_secret_policy" "stage_workers_agent_access" {
         Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
       },
       {
-        Sid       = "OnlyAdministrationAndMetalBoxes"
+        Sid       = "OwnerContainerRead"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.nextjs_dev.arn }
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
+        Condition = { StringEquals = { "aws:userid" = local.stage_workers_owner_session_id } }
+      },
+      {
+        Sid       = "OnlyAdministrationMetalAndOwnerCanRead"
         Effect    = "Deny"
         Principal = "*"
         Action    = "secretsmanager:GetSecretValue"
         Resource  = aws_secretsmanager_secret.stage_workers_agent_access.arn
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } }
+        # Both tests must match for the deny. On rollback to the shared host, remove the owner exception.
+        Condition = merge(
+          { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } },
+          local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.stage_workers_owner_session_id } } : {},
+        )
       },
     ]
   })

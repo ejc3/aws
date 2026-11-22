@@ -61,6 +61,25 @@ class AccessTests(unittest.TestCase):
         self.assertIn("prevent_destroy = true", self.ACCESS)
 
 
+class AgentSecretTests(unittest.TestCase):
+    POLICY = block("resource", "aws_secretsmanager_secret_policy", "stage_workers_agent_access")
+
+    def test_nextjs_read_is_bound_to_the_brokers_owner_session(self):
+        self.assertIn('stage_workers_owner_session_id = "${aws_iam_role.nextjs_dev.unique_id}:ct-ejc3"', TF)
+        owner = self.POLICY.split('Sid       = "OwnerContainerRead"', 1)[1].split('Sid ', 1)[0]
+        self.assertIn('Effect    = "Allow"', owner)
+        self.assertIn('Principal = { AWS = aws_iam_role.nextjs_dev.arn }', owner)
+        self.assertIn('Action    = "secretsmanager:GetSecretValue"', owner)
+        self.assertIn('StringEquals = { "aws:userid" = local.stage_workers_owner_session_id }', owner)
+
+    def test_deny_only_exempts_the_owner_while_containers_serve(self):
+        deny = self.POLICY.split('Sid       = "OnlyAdministrationMetalAndOwnerCanRead"', 1)[1]
+        self.assertIn('Effect    = "Deny"', deny)
+        self.assertIn('Principal = "*"', deny)
+        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) }', deny)
+        self.assertIn('local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.stage_workers_owner_session_id } } : {}', deny)
+
+
 class UrlSwitchTests(unittest.TestCase):
     SUB = block("resource", "cloudflare_workers_script_subdomain", "stage")
 
