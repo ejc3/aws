@@ -73,16 +73,19 @@ instance next to it and copy just the files:
 6. **Keep only what is actually gone:** compare the list with the live box over ssh (jumpbox to dev box is allowed).
 7. **Pack straight to S3:** `tar -C /mnt/restored -czf - -T list | aws s3 cp - s3://<bucket>/<name>.tar.gz
    --expected-size <bytes>`, all through SSM `send-command` (put long scripts in a file and pass them with `jq
-   --rawfile`).
-8. **Hand it to the dev box without new grants:** a presigned URL from the jumpbox session (`aws s3 presign`, an hour),
-   which the box downloads with `curl` and unpacks into `~/recovered-<what>/`. A dev box never gets a role, key or
-   policy into the recovery account.
+   --rawfile`). Reading a restored disk runs at about 100 MB a minute; #988's 208 folders (3.9 GB packed, 11 GB
+   unpacked) took about an hour. tar skips sockets, which is fine.
+8. **Hand it to the dev box without new grants:** a presigned URL from the jumpbox session (`aws s3 presign
+   --expires-in 3600`), sent on stdin so it never sits in an argument list: `printf 'url = "%s"\n' "$url" | ssh <box>
+   'curl -fsS -K - -o /tmp/x.tar.gz && mkdir -p ~/recovered-<what> && tar -C ~/recovered-<what> -xzf /tmp/x.tar.gz'`.
+   A dev box never gets a role, key or policy into the recovery account. Check the box's free disk first.
 
 ## 4. Clean up, and say so on the issue
 
-Delete, in the recovery account: the instance, the security group, the instance profile and role, the bucket
-(objects first), any snapshot you started, any transfer KMS key (schedule deletion), and the restored volume once the
-requester confirms. Access Analyzer reports a KMS key shared across accounts and CloudTrail reports the role creation:
+Delete, in the recovery account: detach the restored volume (`detach-volume --force`) and terminate the instance,
+then the security group, the instance profile and role (remove the role from the profile, delete the inline policy,
+detach the managed one), the bucket (objects first), any snapshot you started, any transfer KMS key (schedule
+deletion), and the restored volume once the requester confirms. Access Analyzer reports a KMS key shared across accounts and CloudTrail reports the role creation:
 both are your own steps, triaged as such in the watch's alert step.
 
 Post on the issue: which point (date) was used, what was restored, where it is, what could not be recovered (anything
