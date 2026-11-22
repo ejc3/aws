@@ -61,37 +61,45 @@ if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; 
     problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
   elif [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && [ -z "$(git status --porcelain)" ]; then
     # The full plan takes 10-15 minutes, so the hook never waits for it. It judges by the last
-    # FINISHED check of this exact origin/main (publish-applied-status.sh writes
-    # "main=<sha> checked_at=<UTC> terraform_exit=<rc>" as the log's first line) and, when that is
-    # missing, older than ${refresh_after}s or for another commit, starts a fresh check detached.
-    # One background check at a time (flock -n); it inits first, since a merge can add a module.
+    # FINISHED check of this exact origin/main: publish-applied-status.sh writes
+    # "main=<sha> checked_at=<UTC> terraform_exit=<rc>" as the log's first line (atomically, and only
+    # once Terraform ran), and the background job records its own exit in background.rc, so a check
+    # that failed before planning (init, STS) is not silent. A missing result, one for another commit,
+    # a failed or drifted one, or one older than VERIFY_DRIFT_REFRESH_SECONDS starts a fresh check,
+    # detached, one at a time (flock -o: the lock is not inherited by Terraform or its providers).
     state="${XDG_STATE_HOME:-$HOME/.local/state}/aws-applied-status"
     tflog="$state/last-plan.log"
     refresh_after=${VERIFY_DRIFT_REFRESH_SECONDS:-1800}
-    trust_for=${VERIFY_DRIFT_TRUST_SECONDS:-21600}
     main_sha=$(git rev-parse origin/main)
-    last_main="" last_at="" last_rc=""
+    last_main="" last_at="" last_rc="" bg_main="" bg_rc=""
     if [ -r "$tflog" ]; then
       read -r last_main last_at last_rc < <(head -n 1 "$tflog" |
         sed -nE 's/^main=([0-9a-f]{40}) checked_at=([0-9TZ:-]+) terraform_exit=([0-9]+)$/\1 \2 \3/p')
     fi
+    if [ -r "$state/background.rc" ]; then
+      read -r bg_main bg_rc < <(sed -nE 's/^([0-9a-f]{40}) ([0-9]+)$/\1 \2/p' "$state/background.rc")
+    fi
     age=""
     if [ "$last_main" = "$main_sha" ] && last_epoch=$(date -u -d "$last_at" +%s 2>/dev/null); then
       age=$(($(date +%s) - last_epoch))
-    fi
-    if [ -n "$age" ] && [ "$age" -le "$trust_for" ]; then
       if [ "$last_rc" -eq 2 ]; then
-        problems+=("Terraform drift: live AWS does not match config (check of $(date -u -d "$last_at" +%H:%MZ)). Review $tflog and apply or reconcile the intended change.")
+        problems+=("Terraform drift: live AWS does not match config (check of $last_at). Review $tflog and apply or reconcile the intended change.")
       elif [ "$last_rc" -ne 0 ] && [ "$last_rc" -ne 75 ]; then
-        problems+=("Terraform status check failed (exit $last_rc, check of $(date -u -d "$last_at" +%H:%MZ)). Look for the latest run in $tflog.")
+        problems+=("Terraform status check failed (exit $last_rc, check of $last_at). Look for the latest run in $tflog.")
       fi
     fi
-    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ]; then
+    if [ "$bg_main" = "$main_sha" ] && [ "${bg_rc:-0}" -ne 0 ] && [ "$bg_rc" -ne 2 ] && [ "$bg_rc" -ne 75 ] &&
+      { [ -z "$age" ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
+      problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) before it wrote a result. See $state/background.log.")
+    fi
+    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ]; then
       mkdir -p "$state"
-      setsid -f bash -c 'exec 9>"$1/background.lock"; flock -n 9 || exit 0
-        { TF_RUN_LOCK_NOWAIT=1 terraform init -input=false -lockfile=readonly >/dev/null &&
-          bash scripts/publish-applied-status.sh --if-idle; } >"$1/background.log" 2>&1' _ "$state" </dev/null >/dev/null 2>&1
-      echo "verify-consistent: drift check for ${main_sha:0:7} started in the background ($state/background.log)" >&2
+      setsid -f flock -n -o "$state/background.lock" bash -c 'cd "$1" || exit 0; rc=0
+        { if [ -d .terraform ]; then TF_RUN_LOCK_NOWAIT=1 terraform init -input=false -lockfile=readonly >/dev/null; fi &&
+          bash scripts/publish-applied-status.sh --if-idle; } >"$2/background.log" 2>&1 || rc=$?
+        printf "%s %s\n" "$3" "$rc" >"$2/background.rc.tmp" && mv -f "$2/background.rc.tmp" "$2/background.rc"' \
+        _ "$root" "$state" "$main_sha" </dev/null >/dev/null 2>&1
+      echo "verify-consistent: requested a background drift check of ${main_sha:0:7} ($state/background.log)" >&2
     fi
   fi
 fi

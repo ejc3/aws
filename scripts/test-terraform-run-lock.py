@@ -305,7 +305,7 @@ class WiringTests(unittest.TestCase):
         self.assertIn("bash scripts/publish-applied-status.sh --if-idle", HOOK)
         self.assertNotIn("terraform plan ", HOOK)
         self.assertIn("setsid -f", HOOK)  # detached: the hook never waits for the plan
-        self.assertIn("flock -n 9", HOOK)  # one background check at a time
+        self.assertIn("flock -n -o", HOOK)  # one background check at a time; Terraform does not inherit the lock
 
     def test_the_association_runs_daily_on_every_admin_box(self):
         self.assertIn('schedule_expression = "rate(1 day)"', TF)
@@ -325,25 +325,28 @@ class StopHookBackgroundTests(unittest.TestCase):
         self.repo = self.tmp / "repo"
         (self.repo / ".claude/hooks").mkdir(parents=True)
         (self.repo / ".claude/hooks/verify-consistent.sh").write_text(HOOK)
+        (self.repo / ".gitignore").write_text(".terraform/\n")
         (self.repo / "scripts").mkdir()
-        # A stand-in publisher: records that it ran, then takes a while, as the real plan does.
+        # A stand-in publisher: records that it ran, takes a while as the real plan does, exits as told.
         (self.repo / "scripts/publish-applied-status.sh").write_text(
-            '#!/bin/bash\necho "$(date +%s) publish $*" >> "$MARK"\nsleep "${PUBLISH_SLEEP:-0}"\n')
+            '#!/bin/bash\necho "$(date +%s) publish $*" >> "$MARK"\nsleep "${PUBLISH_SLEEP:-0}"\nexit "${PUBLISH_RC:-0}"\n')
         git("-c", "user.name=t", "-c", "user.email=t@example.com", "add", "-A", cwd=self.repo)
         git("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init", cwd=self.repo)
         git("push", "-q", "origin", "main", cwd=self.repo)
+        (self.repo / ".terraform").mkdir()  # an initialized checkout, as on a jumpbox
         self.sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, capture_output=True, text=True).stdout.strip()
         bindir = self.tmp / "bin"
         bindir.mkdir()
         (bindir / "terraform").write_text('#!/bin/bash\necho "terraform $*" >> "$MARK"\n')
         (bindir / "terraform").chmod(0o755)
-        self.state = self.tmp / "state"
+        self.state = self.tmp / "state" / "aws-applied-status"
+        self.lock = self.state / "background.lock"
         self.mark = self.tmp / "mark"
-        self.env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", XDG_STATE_HOME=str(self.state),
-                        CLAUDE_PROJECT_DIR=str(self.repo), MARK=str(self.mark), PUBLISH_SLEEP="20")
+        self.env = dict(os.environ, PATH=f"{bindir}:{os.environ['PATH']}", XDG_STATE_HOME=str(self.tmp / "state"),
+                        CLAUDE_PROJECT_DIR=str(self.repo), MARK=str(self.mark), PUBLISH_SLEEP="0")
 
     def tearDown(self):
-        subprocess.run(["pkill", "-f", str(self.repo / "scripts/publish-applied-status.sh")], capture_output=True)
+        self.wait_idle()
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def run_hook(self):
@@ -353,58 +356,94 @@ class StopHookBackgroundTests(unittest.TestCase):
         return r, time.monotonic() - start
 
     def last_check(self, sha, rc, seconds_ago=0):
-        d = self.state / "aws-applied-status"
-        d.mkdir(parents=True, exist_ok=True)
+        self.state.mkdir(parents=True, exist_ok=True)
         at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
-        (d / "last-plan.log").write_text(f"main={sha} checked_at={at} terraform_exit={rc}\nplan output\n")
+        (self.state / "last-plan.log").write_text(f"main={sha} checked_at={at} terraform_exit={rc}\nplan output\n")
 
-    def wait_for_publish(self):
+    def publishes(self):
+        return self.mark.read_text().count("publish --if-idle") if self.mark.exists() else 0
+
+    def wait_idle(self):
+        """Until no background check holds the lock (each finishes on its own: PUBLISH_SLEEP is short)."""
+        for _ in range(200):
+            if not self.lock.exists() or subprocess.run(["flock", "-n", str(self.lock), "true"]).returncode == 0:
+                return
+            time.sleep(0.1)
+
+    def started(self):
         for _ in range(100):
-            if self.mark.exists() and "publish --if-idle" in self.mark.read_text():
+            if self.publishes():
                 return True
             time.sleep(0.1)
         return False
 
     def test_no_result_returns_at_once_and_starts_one_background_check(self):
+        self.env["PUBLISH_SLEEP"] = "3"
         r, took = self.run_hook()
         self.assertLess(took, 10, "the hook waited for the plan")
         self.assertEqual(r.stdout, "", "no finished result must not block")
-        self.assertTrue(self.wait_for_publish(), "no background check started")
+        self.assertTrue(self.started(), "no background check started")
         self.assertIn("terraform init -input=false -lockfile=readonly", self.mark.read_text())
         self.run_hook()  # a second stop while the first check runs starts no second one
-        time.sleep(1)
-        self.assertEqual(self.mark.read_text().count("publish --if-idle"), 1)
+        self.wait_idle()
+        self.assertEqual(self.publishes(), 1)
 
-    def test_a_fresh_drift_result_for_this_main_blocks_without_rechecking(self):
+    def test_an_uninitialized_checkout_is_not_initialized_by_the_hook(self):
+        (self.repo / ".terraform").rmdir()
+        self.run_hook()
+        self.assertTrue(self.started())
+        self.wait_idle()
+        self.assertNotIn("terraform init", self.mark.read_text())
+
+    def test_a_drift_result_for_this_main_blocks_and_rechecks(self):
         self.last_check(self.sha, 2)
         r, _ = self.run_hook()
         self.assertIn('"decision":"block"', r.stdout)
         self.assertIn("Terraform drift", r.stdout)
-        time.sleep(1)
-        self.assertFalse(self.mark.exists(), "a fresh result needs no new check")
+        self.assertTrue(self.started(), "a drift result is re-checked, so a fix clears it")
 
-    def test_a_clean_fresh_result_passes(self):
+    def test_an_old_drift_result_for_this_main_still_blocks(self):
+        self.last_check(self.sha, 2, seconds_ago=7 * 3600)
+        r, _ = self.run_hook()
+        self.assertIn("Terraform drift", r.stdout)
+
+    def test_a_clean_fresh_result_passes_without_rechecking(self):
         self.last_check(self.sha, 0)
         r, _ = self.run_hook()
         self.assertEqual(r.stdout, "")
+        time.sleep(1)
+        self.assertEqual(self.publishes(), 0)
 
-    def test_a_result_for_another_commit_or_too_old_never_blocks_and_refreshes(self):
-        self.env["PUBLISH_SLEEP"] = "0"  # each check finishes, releasing the one-at-a-time lock
+    def test_a_clean_result_older_than_the_refresh_interval_is_rechecked(self):
+        self.last_check(self.sha, 0, seconds_ago=3600)
+        r, _ = self.run_hook()
+        self.assertEqual(r.stdout, "")
+        self.assertTrue(self.started())
+
+    def test_a_result_for_another_commit_never_blocks_and_refreshes(self):
         self.last_check("0" * 40, 2)
         r, _ = self.run_hook()
         self.assertEqual(r.stdout, "")
-        self.assertTrue(self.wait_for_publish())
-        lock = self.state / "aws-applied-status/background.lock"
-        for _ in range(100):  # the first check has ended once its lock is free again
-            if subprocess.run(["flock", "-n", str(lock), "true"]).returncode == 0:
-                break
-            time.sleep(0.1)
-        self.mark.unlink()
-        self.last_check(self.sha, 2, seconds_ago=7 * 3600)  # past the six hours a result is trusted
+        self.assertTrue(self.started())
+
+    def test_a_background_check_that_fails_before_planning_blocks_the_next_stop(self):
+        self.env["PUBLISH_RC"] = "1"  # e.g. STS or init failed: no header is written
         r, _ = self.run_hook()
         self.assertEqual(r.stdout, "")
-        self.assertTrue(self.wait_for_publish())
+        self.assertTrue(self.started())
+        self.wait_idle()
+        r, _ = self.run_hook()
+        self.assertIn('"decision":"block"', r.stdout)
+        self.assertIn("background drift check", r.stdout)
+        self.assertIn("exit 1", r.stdout)
 
+    def test_a_busy_or_ineligible_check_does_not_block(self):
+        self.env["PUBLISH_RC"] = "75"
+        self.run_hook()
+        self.assertTrue(self.started())
+        self.wait_idle()
+        r, _ = self.run_hook()
+        self.assertEqual(r.stdout, "")
 
 
 def render_association_script():
