@@ -1400,9 +1400,11 @@ which every `xcodebuild` without `-derivedDataPath` then uses. On this Mac:
 internal disk.
 
 On EJ's MacBook, the hourly Scratch cleaner starts when free space drops below
-100 GiB. It removes `Build/Intermediates.noindex`, `Index.noindex` and
-`ModuleCache.noindex` from recognized Xcode DerivedData directories, oldest first,
-until the drive has 150 GiB free or the eligible list is exhausted. The cleaner
+100 GiB. It removes `Build/Intermediates.noindex`, `Index.noindex`,
+`ModuleCache.noindex` and `SDKExplicitPrecompiledModules` from recognized
+Xcode DerivedData directories, oldest first, until the drive has 150 GiB free
+or the eligible list is exhausted. An SDK module cache qualifies only when every
+entry is a regular compiled module (`.pcm`, `.swiftmodule`) or timestamp file. The cleaner
 checks that Scratch is mounted, that the build is inactive, and that its artifacts
 have been unused for at least 14 days. Managed builds hold a shared lock for their
 lifetime, including commands with custom slot counts or state directories.
