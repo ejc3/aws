@@ -259,6 +259,39 @@ class Cleanup(unittest.TestCase):
         self.assertEqual(result["paths"], [str(leaf)])
         self.assertFalse((self.state / "pressure").exists())
 
+    def test_explicit_sdk_cache_requires_a_flat_directory_of_old_compiled_files(self):
+        valid, _ = self.cache("project/dd-releasetest")
+        sdk = valid / "SDKExplicitPrecompiledModules"
+        sdk.mkdir()
+        for name in ("Foundation-ABC.pcm", "UIKit.swiftmodule", "modules.timestamp"):
+            f = sdk / name
+            f.write_text("compiled output")
+            os.utime(f, (self.old, self.old))
+        os.utime(sdk, (self.old, self.old))
+
+        held = []
+        for name in ("notes.txt", "nested.pcm", "alias.pcm", "recent.swiftmodule"):
+            root, _ = self.cache("project/dd-" + name)
+            folder = root / sdk.name
+            folder.mkdir()
+            entry = folder / name
+            if name == "nested.pcm":
+                entry.mkdir()
+            elif name == "alias.pcm":
+                entry.symlink_to(sdk / "Foundation-ABC.pcm")
+            else:
+                entry.write_text("keep")
+            if name != "recent.swiftmodule":
+                os.utime(entry, (self.old, self.old), follow_symlinks=False)
+            os.utime(folder, (self.old, self.old))
+            held.append(entry)
+
+        self.assertIn(str(sdk), self.clean(False)["paths"])
+        self.assertTrue(sdk.exists())
+        self.assertIn(str(sdk), self.clean(True)["paths"])
+        self.assertFalse(sdk.exists())
+        self.assertTrue(all(os.path.lexists(entry) for entry in held))
+
     def test_generated_index_and_compiler_cache_but_not_dependency_checkouts(self):
         root, leaf = self.cache("p/dd")
         for name in ("Index.noindex", "ModuleCache.noindex", "SourcePackages"):

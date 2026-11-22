@@ -24,7 +24,8 @@ PIN = Path.home() / ".config/mac-setup/scratch-volume-uuid"
 GIB = 1024**3
 LOW, TARGET = 100 * GIB, 150 * GIB
 AGE = 14 * 86400
-CACHES = tuple(map(Path, ("Build/Intermediates.noindex", "Index.noindex", "ModuleCache.noindex")))
+SDK_MODULES = Path("SDKExplicitPrecompiledModules")
+CACHES = (Path("Build/Intermediates.noindex"), Path("Index.noindex"), Path("ModuleCache.noindex"), SDK_MODULES)
 RETAINED_SUFFIXES = (
     ".xcarchive",
     ".xcresult",
@@ -197,7 +198,7 @@ def build_slots(state):
         yield True
 
 
-def inspect_tree(fd, device, cutoff, remove=False):
+def inspect_tree(fd, device, cutoff, remove=False, *, sdk_modules=False):
     """Check before detaching. Delete through no-follow directory descriptors on the original device."""
     total = 0
     with os.scandir(fd) as entries:
@@ -206,6 +207,10 @@ def inspect_tree(fd, device, cutoff, remove=False):
             if s.st_dev != device or s.st_uid != os.getuid():
                 raise ValueError("different volume or owner in Xcode cache")
             name = entry.name.lower()
+            if sdk_modules and (
+                not stat.S_ISREG(s.st_mode) or not name.endswith((".pcm", ".swiftmodule", ".timestamp"))
+            ):
+                raise ValueError("unrecognized entry in precompiled SDK modules")
             if name == ".git" or name.endswith(RETAINED_SUFFIXES):
                 raise ValueError("contains a retained artifact")
             if not remove and s.st_mtime > cutoff:
@@ -307,7 +312,7 @@ def finish(volume, device, identity, journal):
             pending = root / relative.parent / PENDING
             if active(pending, pending):
                 return False
-            inspect_tree(fd, device, None, remove=True)
+            inspect_tree(fd, device, None, remove=True, sdk_modules=relative == SDK_MODULES)
         finally:
             os.close(fd)
         os.rmdir(PENDING, dir_fd=parent)
@@ -371,7 +376,7 @@ def clean_mounted(volume, fd, state, apply, result):
             leaf_fd = os.open(relative.name, DIR_FLAGS, dir_fd=parent)
             try:
                 original = os.fstat(leaf_fd)
-                estimate = inspect_tree(leaf_fd, device, cutoff)
+                estimate = inspect_tree(leaf_fd, device, cutoff, sdk_modules=relative == SDK_MODULES)
             finally:
                 os.close(leaf_fd)
             if not estimate:
