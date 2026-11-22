@@ -1564,6 +1564,10 @@ def reconcile(repo, cfg, subnets):
         print(f'{repo}: reconcile stopped at its time share, before {stop}')
         result['stopped'] = 'no time left'
         return result
+    except Exception as error:
+        # The round still publishes what its scan saw (OldestQueuedSeconds); nothing else of a failed repo is counted.
+        error.queued = {k: result[k] for k in ('label', 'oldest_queued_s') if k in result}
+        raise
 
 
 def reconcile_repo(repo, cfg, subnets, result):
@@ -1630,37 +1634,34 @@ def reconcile_repo(repo, cfg, subnets, result):
     # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
     busy = frozenset(name for name, runner in runners.items() if runner.get('busy') and name in running_on)
     scanned, outcome_of = SCANNED.pop(repo, None), {}
-    for job_id, size in jobs:
-        # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
-        # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
-        # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
-        # oldest first, and the one that waits keeps its turn for the room the next host frees.
-        if out_of_time(LAUNCH_ATTEMPT_SECONDS):
-            print(f'{repo}: deferring queued launches for the next turn: the repo turn ended or '
-                  f'less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains')
-            outcomes['deferred'] = outcomes.get('deferred', 0) + 1
-            break
-        outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        outcome_of[job_id] = outcome
-        result['live'] = len(live)
-        if cfg.get('vcpus'):
-            result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
-        if outcome in ('cap', 'deferred'):
-            break
-    if scanned:
-        # After the launches: a job found but not launched for (no outcome, cap, deferred, failed) holds the cursor.
-        cursor = next_cursor(scanned, {job for job, _ in jobs if outcome_of.get(job) in (None, 'cap', 'deferred', 'failed')})
-        if cursor != scanned['read']:
-            save_scan_cursor(repo, cursor)
-        # The oldest queued job no live host covers (ensure_runner's 'exists' rule), for OldestQueuedSeconds. A job GitHub
-        # still lists as queued while its own host runs it (issue #531) is covered, so it does not count: no in-progress job
-        # names that host, so it is not in `busy`, which holds only hosts running another job. Nor does one the listing
-        # still calls queued after its host finished it, which ensure_runner found 'not queued' in GitHub's own record.
-        covered = {tag(i, 'JobId') for i in live if i['InstanceId'] not in busy}
-        result['label'] = cfg['label']
-        result['oldest_queued_s'] = int(max([age for job, age in scanned['ages'].items()
-                                             if job not in covered and outcome_of.get(job) != 'not queued'], default=0))
+    try:
+        for job_id, size in jobs:
+            # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
+            # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
+            # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
+            # oldest first, and the one that waits keeps its turn for the room the next host frees.
+            if out_of_time(LAUNCH_ATTEMPT_SECONDS):
+                print(f'{repo}: deferring queued launches for the next turn: the repo turn ended or '
+                      f'less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains')
+                outcomes['deferred'] = outcomes.get('deferred', 0) + 1
+                break
+            try:
+                outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
+            except OutOfTime:
+                raise   # the round ran out, not the job: it keeps its place
+            except Exception:
+                outcome_of[job_id] = 'error'   # this job, not the scan: it must not hold the cursor every round
+                raise
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            outcome_of[job_id] = outcome
+            result['live'] = len(live)
+            if cfg.get('vcpus'):
+                result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
+            if outcome in ('cap', 'deferred'):
+                break
+    finally:
+        if scanned:
+            record_scan(repo, cfg, scanned, jobs, outcome_of, live, busy, result)
     # Jobs lost with a reclaimed spot host, after the launches: a rerun can wait a round, a queued job should not.
     reruns = reconcile_reruns(repo, cfg)
     if reruns:
@@ -1668,6 +1669,25 @@ def reconcile_repo(repo, cfg, subnets, result):
         print(f'{repo}: spot reruns {reruns}')
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
     return result
+
+
+def record_scan(repo, cfg, scanned, jobs, outcome_of, live, busy, result):
+    """After the launches, even ones cut short by the time share or an error: store the scan cursor and the round's
+    OldestQueuedSeconds. A job found but not reached (no outcome), or waiting at a cap or deferred, holds the cursor
+    (next_cursor); one that failed or raised does not, so a job no pool can ever serve cannot stop the scan for good.
+    The cursor write is skipped once the repo's turn is over (save_scan_cursor), and the next round then re-reads from
+    where this one started."""
+    cursor = next_cursor(scanned, {job for job, _ in jobs if outcome_of.get(job) in (None, 'cap', 'deferred')})
+    if cursor != scanned['read']:
+        save_scan_cursor(repo, cursor)
+    # The oldest queued job no live host covers (ensure_runner's 'exists' rule). A job GitHub still lists as queued while
+    # its own host runs it (issue #531) is covered, so it does not count: no in-progress job names that host, so it is not
+    # in `busy`, which holds only hosts running another job. Nor does one the listing still calls queued after its host
+    # finished it, which ensure_runner found 'not queued' in GitHub's own record.
+    covered = {tag(i, 'JobId') for i in live if i['InstanceId'] not in busy}
+    result['label'] = cfg['label']
+    result['oldest_queued_s'] = int(max([age for job, age in scanned['ages'].items()
+                                         if job not in covered and outcome_of.get(job) != 'not queued'], default=0))
 
 
 def reconcile_buckets(repos):
@@ -2076,7 +2096,7 @@ def handler(event, context):
             except Exception as error:
                 failed.append(repo)
                 print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
-                results.append({'repo': repo, 'error': type(error).__name__})
+                results.append({'repo': repo, 'error': type(error).__name__, **getattr(error, 'queued', {})})
         RECONCILE_END[0] = None
         DEADLINE[0] = float('inf')
         publish_counts(results, buckets)

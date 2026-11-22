@@ -832,8 +832,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
   so jobs it finds always have time to launch). A scan that stops at that budget resumes next round after the last run
   whose jobs it read completely and whose found jobs all got a host or were covered (one cursor per repo and status,
-  `scan/<repo>` in the budget table, moved after the launches; a job left waiting at a cap, deferred or refused by every
-  pool keeps it, so the next round reads that job again before newer runs) and wraps to the
+  `scan/<repo>` in the budget table, moved after the launches, also when they stop at the time share or an error; a job
+  left waiting at a cap, deferred or not reached keeps it, so the next round reads that job again before newer runs,
+  while one refused by every pool or whose launch raised does not, so it cannot stop the scan) and wraps to the
   oldest run past the newest, so a job in a run of a status with N runs, k of which a round reads (at least one), is
   reached within 2 x ceil(N / k) rounds: the status that goes first alternates by round. Before, every round read the
   same oldest runs again, and on 2026-11-22 a dolphin job past them waited 16:04 to 19:59 while later jobs ran (issue #991).

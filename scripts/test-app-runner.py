@@ -1337,6 +1337,67 @@ class Issue991Tests(unittest.TestCase):
         self.assertEqual(app.next_cursor(scanned, {"2"}), {"queued": ("a", 1)})
         self.assertEqual(app.next_cursor(scanned, set()), {})
 
+    def test_a_job_that_fails_every_round_does_not_stop_the_scan(self):
+        # No pool ever serves job 10010 (run 1001): 'failed' every time it is tried. The scan still reaches the 24th run
+        # within the bound, ceil(30 / 5) rounds.
+        app, ec2, *_ = load_app()
+        read = self.queue(app)
+        real = ec2.run_instances
+        def run_instances(**kw):
+            if {t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"] == "10010":
+                raise Refused("InsufficientInstanceCapacity")
+            return real(**kw)
+        ec2.run_instances = run_instances
+        cfg, rounds = dict(REPOS[COLTON], max=100), 0
+        while 1023 not in read and rounds < 10:
+            result = app.reconcile(COLTON, cfg, SUBNETS)
+            rounds += 1
+            if rounds == 1:
+                self.assertEqual(result["outcomes"], {"launched": 4, "failed": 1})
+        self.assertLessEqual(rounds, math.ceil(self.RUNS / 5))
+
+    def test_an_error_launching_one_job_still_moves_the_cursor_past_it(self):
+        app, ec2, *_ = load_app()
+        read = self.queue(app)
+        real = app.ensure_runner
+        def ensure_runner(repo, cfg, subnets, pat, job_id, *args, **kw):
+            if job_id == "10010":
+                raise RuntimeError("GitHub 503")
+            return real(repo, cfg, subnets, pat, job_id, *args, **kw)
+        app.ensure_runner = ensure_runner
+        cfg = dict(REPOS[COLTON], max=100)
+        with self.assertRaises(RuntimeError):
+            app.reconcile(COLTON, cfg, SUBNETS)
+        # Round 1 reached 10000 (launched) and 10010 (raised); 10020 onwards were never tried and hold the cursor there.
+        self.assertEqual(json.loads(app.fake_dynamo.state[f"scan/{COLTON}"]["after"]["S"]),
+                         {"queued": ["2026-09-27T10:01:00Z", 1001]})
+        self.assertEqual(app.reconcile(COLTON, cfg, SUBNETS)["outcomes"], {"launched": 5})
+        self.assertEqual(read[5:], [1002, 1003, 1004, 1005, 1006], "the next round moved on past the run that raised")
+
+    def test_a_round_cut_short_still_publishes_its_oldest_queued_job(self):
+        for stop in ("out of time", "launch error"):
+            app, ec2, *_ = load_app()
+            self.queue(app)   # five cc-games jobs, queued 45 minutes ago
+            real, calls = app.ensure_runner, []
+            def ensure_runner(repo, *args, **kw):
+                calls.append(repo)
+                if len(calls) == 2:
+                    raise app.OutOfTime("RunInstances") if stop == "out of time" else app.LaunchRefused("refused")
+                return real(repo, *args, **kw)
+            app.ensure_runner = ensure_runner
+            app.config = lambda: ({COLTON: REPOS[COLTON]}, SUBNETS)
+            if stop == "out of time":
+                (result,) = app.handler({"reconcile": True}, None)
+                self.assertEqual(result["stopped"], "no time left")
+            else:
+                with self.assertRaises(RuntimeError):
+                    app.handler({"reconcile": True}, None)
+            _, data = app.fake_cloudwatch.metrics[-1]
+            oldest = {d["Dimensions"][0]["Value"]: d["Value"] for d in data if d["MetricName"] == "OldestQueuedSeconds"}
+            self.assertEqual(oldest, {"cc-games": 45 * 60}, stop)
+            if stop == "launch error":
+                self.assertNotIn("ALL", {d["Dimensions"][0]["Value"] for d in data if d["MetricName"] == "LiveRunners"})
+
     def test_a_scan_that_reads_every_run_starts_from_the_oldest_next_round(self):
         app, *_ = load_app()
         self.RUNS = 3
