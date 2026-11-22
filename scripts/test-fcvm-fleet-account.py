@@ -424,6 +424,15 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn('Resource = [local.fcvm_lambda_logs_arn, "${local.fcvm_lambda_logs_arn}:*"]', self.grant)
         self.assertNotRegex(self.grant, r'ecr:(?:\*|SetRepositoryPolicy)|logs:PutResourcePolicy')
 
+    def test_only_lambda_pulls_the_tile_image_for_the_tile_function(self):
+        repo_policy = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', self.source)
+        self.assertIn('repository = local.fcvm_lambda_repo_name', repo_policy)
+        self.assertIn('aws.fcvm_fleet_east1', repo_policy)
+        self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', repo_policy)
+        self.assertIn('Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', repo_policy)
+        self.assertIn('"aws:sourceArn" = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"]', repo_policy)
+        self.assertEqual(repo_policy.count('Effect'), 1)
+
 
 class QuotaTests(unittest.TestCase):
     def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):

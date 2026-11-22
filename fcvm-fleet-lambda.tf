@@ -23,7 +23,8 @@ locals {
 }
 
 # The execution role writes its own log streams and permits same-account Lambda image retrieval
-# from the one spike repository. ARM has no permission to change a repository policy.
+# from the one spike repository. ARM has no permission to change a repository policy, so the
+# repository policy Lambda needs to pull the image is set here (below).
 resource "aws_iam_role" "fcvm_fleet_lambda_tile" {
   provider = aws.fcvm_fleet
   name     = local.fcvm_lambda_name
@@ -52,6 +53,24 @@ resource "aws_iam_role_policy" "fcvm_fleet_lambda_tile_runtime" {
         Resource = local.fcvm_lambda_repo_arn
       },
     ]
+  })
+}
+
+# CreateFunction refuses an image unless the repository policy lets the Lambda service pull it:
+# Lambda writes that policy itself only for a caller holding ecr:SetRepositoryPolicy, which ARM
+# does not. ARM creates the repository (fcvm-lambda-tile-deploy); this sets only its policy.
+resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
+  provider   = aws.fcvm_fleet_east1
+  repository = local.fcvm_lambda_repo_name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "LambdaPullsTheTileImage"
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+      Condition = { StringLike = { "aws:sourceArn" = [local.fcvm_lambda_function_arn, "${local.fcvm_lambda_function_arn}:*"] } }
+    }]
   })
 }
 
