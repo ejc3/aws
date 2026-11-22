@@ -67,6 +67,11 @@ elif "workers-stage/" in a:
     if p is None:
         sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
     print(p)
+elif "--secret-id browserbase/credentials " in a:
+    p = os.environ.get("FAKE_BROWSERBASE")
+    if p is None:
+        sys.stderr.write("An error occurred (ResourceNotFoundException)\n"); sys.exit(254)
+    print(p)
 elif "dolphin-maps/musickit" in a:
     p = os.environ.get("FAKE_MUSICKIT")
     if p is None:
@@ -104,7 +109,7 @@ class LoaderTests(unittest.TestCase):
     def run_loader(self, *args, stage_json=None, managed_json=json.dumps(MANAGED), **extra_env):
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
                    NPX_STDIN=str(self.stdin), NPX_ENV=str(self.env), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile")
-        for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "FAKE_ASSUME_FAILS", "FAKE_ASSUME_MALFORMED", "AWS_DEFAULT_PROFILE"):
+        for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "FAKE_ASSUME_FAILS", "FAKE_ASSUME_MALFORMED", "AWS_DEFAULT_PROFILE", "FAKE_BROWSERBASE"):
             env.pop(k, None)
         env.update(extra_env)
         for name, value in (("FAKE_STAGE_JSON", stage_json), ("FAKE_MANAGED_JSON", managed_json)):
@@ -222,27 +227,57 @@ class LoaderTests(unittest.TestCase):
     LIGHTS = {"LIGHTS_AWS_ACCESS_KEY_ID": "AKIAFAKELIGHTS000001", "LIGHTS_AWS_SECRET_ACCESS_KEY": "lights-secret-0123",
               "LIGHTS_BEDROCK_REGION": "us-west-2", "LIGHTS_BEDROCK_MODEL": "us.anthropic.claude-haiku-5-5"}
 
-    def test_lights_loads_terraforms_container_alone_into_lights_stage(self):
-        r, out = self.run_loader("lights", stage_json=None, managed_json=json.dumps(self.LIGHTS))
+    BROWSERBASE = {"BROWSERBASE_API_KEY": "test-browserbase-key", "BROWSERBASE_PROJECT_ID": "test-browserbase-project"}
+
+    def test_lights_loads_managed_settings_and_only_the_two_browserbase_bindings(self):
+        shared = {**self.BROWSERBASE, "PRIVATE_OTHER_SERVICE": "private-test-value"}
+        r, out = self.run_loader("lights", managed_json=json.dumps(self.LIGHTS), FAKE_BROWSERBASE=json.dumps(shared))
         self.assertEqual(r.returncode, 0, out)
-        self.assertEqual(json.loads(self.stdin.read_text()), self.LIGHTS)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**self.LIGHTS, **self.BROWSERBASE})
         calls = "\n".join(self.aws_calls()) + " "
+        self.assertIn("--region us-west-1 --secret-id browserbase/credentials ", calls)
         self.assertIn("--secret-id workers-stage/lights/terraform ", calls)
         self.assertNotIn("--secret-id workers-stage/lights ", calls)
         self.assertIn("--name lights-stage", self.log.read_text())
         self.assertFalse([c for c in self.aws_calls() if "assume-role" in c])
-        for secret in ("lights-secret-0123", "AKIAFAKELIGHTS000001"):
-            self.assertNotIn(secret, out)
+        for secret in ("lights-secret-0123", "AKIAFAKELIGHTS000001", *shared.values()):
+            self.assertNotIn(secret, out + calls + self.log.read_text())
+
+    def test_lights_rejects_an_unavailable_or_invalid_shared_credential(self):
+        inputs = [None, "{", "null", "[]"]
+        for name in self.BROWSERBASE:
+            inputs.append(json.dumps({k: v for k, v in self.BROWSERBASE.items() if k != name}))
+            for invalid in (False, " ", "[SENSITIVE]"):
+                inputs.append(json.dumps({**self.BROWSERBASE, name: invalid}))
+        for payload in inputs:
+            with self.subTest(payload=payload):
+                env = {} if payload is None else {"FAKE_BROWSERBASE": payload}
+                r, out = self.run_loader("lights", managed_json=json.dumps(self.LIGHTS), **env)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("browserbase/credentials" if payload is None else "BROWSERBASE_", out)
+                self.assertFalse(self.log.exists())
+                for secret in self.BROWSERBASE.values():
+                    self.assertNotIn(secret, out)
+
+    def test_lights_rejects_duplicated_browserbase_ownership(self):
+        for name, value in self.BROWSERBASE.items():
+            with self.subTest(name=name):
+                managed = {**self.LIGHTS, name: value}
+                r, out = self.run_loader("lights", managed_json=json.dumps(managed), FAKE_BROWSERBASE=json.dumps(self.BROWSERBASE))
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(name + " is in both containers", out)
+                self.assertNotIn(value, out)
+                self.assertFalse(self.log.exists())
 
     def test_lights_refuses_a_missing_name_or_container_before_cloudflare(self):
         for name in self.LIGHTS:
             with self.subTest(name=name):
                 partial = {k: v for k, v in self.LIGHTS.items() if k != name}
-                r, out = self.run_loader("lights", managed_json=json.dumps(partial))
+                r, out = self.run_loader("lights", managed_json=json.dumps(partial), FAKE_BROWSERBASE=json.dumps(self.BROWSERBASE))
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn(name, out)
                 self.assertFalse(self.log.exists(), "a missing name must not reach Wrangler")
-        r, out = self.run_loader("lights", managed_json=None)
+        r, out = self.run_loader("lights", managed_json=None, FAKE_BROWSERBASE=json.dumps(self.BROWSERBASE))
         self.assertEqual(r.returncode, 1, out)
         self.assertIn("workers-stage/lights/terraform", out)
         self.assertFalse(self.log.exists(), "wrangler must not run")
@@ -304,6 +339,7 @@ class LoaderTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, out)
             self.assertFalse([c for c in self.aws_calls() if "musickit" in c], site)
             self.assertNotIn("MUSICKIT", self.stdin.read_text())
+            self.assertFalse([c for c in self.aws_calls() if "browserbase/credentials" in c], site)
 
     def test_dolphin_maps_loads_without_a_musickit_value_and_refuses_a_denied_read(self):
         payload = {"AUTH_SECRET": "dolphin-value-0123456789"}

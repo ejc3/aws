@@ -8,8 +8,8 @@
 # (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
 # administration; every other site's container is in this account. A site whose Worker also gets values Terraform makes
 # (dolphin-maps: the moderation key, dolphin-maps-moderation.tf) has a second container, workers-stage/SITE/terraform, beside
-# it; the two are merged, and a name in both refuses the whole load. lights has only that second container (the photo
-# reader's Bedrock key, lights-vision.tf), so for it the hand-set one is not read. The result is piped to `wrangler secret bulk`, so no
+# it. Lights reads its Bedrock settings from that managed container and its two inventory bindings from the shared
+# browserbase/credentials in this account. A name in both refuses the whole load. The result is piped to `wrangler secret bulk`, so no
 # value is on a command line, in a file or in this script's output; only names are printed. Run it AFTER the site's own
 # deploy has finished: a secret change made while a deploy is uploading can be lost when that deploy activates.
 # dolphin-maps also gets dolphin-maps/musickit (Apple Music's developer-token key, dolphin-maps-musickit.tf), kept in THIS
@@ -24,11 +24,10 @@ ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 
 DOLPHIN_ACCOUNT_ID=484888470752
 MANAGED_CONTAINER="" # set: workers-stage/SITE/terraform exists too (Terraform writes it)
-MANAGED_ONLY=""      # set: the site has no hand-set container, only Terraform's (lights: lights-vision.tf)
 case "$SITE" in
   dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
   dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;
-  lights) SOURCE_ACCOUNT="" MANAGED_CONTAINER=1 MANAGED_ONLY=1 ;;
+  lights) SOURCE_ACCOUNT="" MANAGED_CONTAINER=1 ;;
   *) SOURCE_ACCOUNT="" ;;
 esac
 
@@ -66,8 +65,18 @@ read_or_say() {
     return 1
   fi
 }
-OUT_OF_BAND=""
-if [[ -z "$MANAGED_ONLY" ]]; then
+if [[ "$SITE" == lights ]]; then
+  # The shared credential may hold fields for other consumers. Select the two Lights uses
+  # before the common validation and collision checks, and keep their values off the command line.
+  OUT_OF_BAND=$(read_or_say browserbase/credentials | python3 -c '
+import json, sys
+try:
+    source = json.load(sys.stdin)
+    print(json.dumps({k: source[k] for k in ("BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID")}))
+except (ValueError, TypeError, KeyError):
+    sys.exit("browserbase/credentials must contain BROWSERBASE_API_KEY and BROWSERBASE_PROJECT_ID")
+') || exit 1
+else
   OUT_OF_BAND=$(read_or_say "workers-stage/$SITE") || exit 1
 fi
 MANAGED=""
@@ -101,7 +110,7 @@ JSON=$(OUT_OF_BAND="$OUT_OF_BAND" MANAGED="$MANAGED" MUSICKIT="$MUSICKIT" python
 import json, os, re, sys
 merged = {}
 for label in ("OUT_OF_BAND", "MANAGED"):
-    if not os.environ[label] and (label == "MANAGED" or sys.argv[1] == "lights"):
+    if not os.environ[label] and label == "MANAGED":
         continue
     try:
         d = json.loads(os.environ[label])
