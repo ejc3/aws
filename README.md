@@ -1373,7 +1373,7 @@ managed block holds the same two keys.
 | Connector token | `~/.cloudflared/macbook-ssh.token`, mode 600 (from `macbook-ssh-tunnel-token`) | connector setup |
 | Connector | `~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`, log `~/Library/Logs/macbook-ssh/cloudflared.log` | remotely managed (connector setup) |
 | Scratch drive | `/Volumes/Scratch` (external APFS, 1.8 TB) | see below |
-| Scratch cleanup | `~/.local/bin/mac-artifact-clean` and user LaunchAgent `com.ccgames.mac-artifact-clean` | hourly on EJ's MacBook |
+| Scratch cleanup | `~/.local/bin/mac-artifact-clean` via Remote Login | hourly timer in EJ's Next.js container |
 
 ##### MacBook: The scratch drive
 
@@ -1413,12 +1413,14 @@ Cleanup takes it exclusively for the final activity check and cache rename.
 From fcvm-arm or nextjs-dev, run `ssh mac mac-artifact-clean` for a dry run.
 Use `ssh mac mac-artifact-clean --apply` to apply the same policy immediately.
 The most recent applied check is recorded in `~/.local/state/mac-artifact-clean/last-run.json`.
-Regular MacBook setup installs the user LaunchAgent. To install or update just the cleaner,
-run `scripts/mac-setup.sh mac --artifact-cleaner-only`. Setup enrolls the mounted
-external APFS volume's UUID in `~/.config/mac-setup/scratch-volume-uuid` before
-scheduling cleanup. If the disk is absent on first install, mount it and rerun that
-command. It also installs the matching `mac-build` wrapper. Existing build slots
-remain protected during the upgrade. Later runs clean only the enrolled volume.
+The `mac-artifact-clean.timer` systemd timer in the `ejc3` Next.js container
+runs that same SSH command hourly. Remote Login has macOS permission to access the
+external volume. The container’s journal records scheduling and connection failures.
+To install or update the Mac-side commands, run `scripts/mac-setup.sh mac --artifact-cleaner-only`.
+Setup enrolls the mounted external APFS volume's UUID in `~/.config/mac-setup/scratch-volume-uuid`.
+If the disk is absent on first install, mount it and rerun that command. Setup also
+installs the matching `mac-build` wrapper. Existing builds keep their slots during the upgrade.
+Later runs clean only the enrolled volume.
 
 Simulator devices are on the drive too: `~/Library/Developer/CoreSimulator/Devices` is a
 symlink to `/Volumes/Scratch/CoreSimulator/Devices` (moved 2026-10-27, when they held 72 GB

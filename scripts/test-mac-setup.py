@@ -691,16 +691,14 @@ class ScratchCleanerInstall(Base):
         launchctl.write_text(
             '#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\n'
             'case "$1:$2" in\n'
-            '  print:"$DOMAIN") test -z "${NO_GUI:-}";;\n'
             '  print:"$DOMAIN"/*) test -e "$LOADED";;\n'
-            '  bootstrap:"$DOMAIN") test -z "${FAIL_BOOTSTRAP:-}" && test -x "$HOME/.local/bin/mac-build"'
-            ' && cmp -s "$BUILD_SOURCE" "$HOME/.local/bin/mac-build" && touch "$LOADED";;\n'
+            '  bootout:"$DOMAIN"/*) test -z "${FAIL_BOOTOUT:-}" && rm "$LOADED";;\n'
             '  *) exit 87;;\nesac\n'
         )
         launchctl.chmod(0o755)
         self.env.update(HOME=str(self.home), PATH=str(self.temp) + os.pathsep + self.env["PATH"],
                         CALLS=str(self.launches), DOMAIN=self.domain, LOADED=str(self.temp / "loaded"),
-                        SCRATCH_UUID=self.volume_id, MOUNTED="1", BUILD_SOURCE=str(self.build_helper))
+                        SCRATCH_UUID=self.volume_id, MOUNTED="1")
 
     def install(self):
         driver = """
@@ -713,17 +711,11 @@ with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
         return self.run_("python3", "-c", driver, ROOT / "scripts/mac/install-artifact-cleaner.py",
                          self.stage, self.volume)
 
-    def test_installs_hourly_agent_and_updates_helper_without_running_or_restarting_it(self):
+    def test_updates_the_remote_login_cleaner_and_build_gate_without_a_gui_job(self):
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         cleaner = self.home / ".local/bin/mac-artifact-clean"
-        plist = plistlib.loads(self.plist.read_bytes())
-        self.assertEqual(plist["Label"], self.label)
-        self.assertEqual(plist["ProgramArguments"], [str(cleaner), "--apply"])
-        self.assertEqual(plist["StartInterval"], 3600)
-        self.assertEqual(plist["ProcessType"], "Background")
-        self.assertNotIn("StandardOutPath", plist)
-        self.assertNotIn("StandardErrorPath", plist)
+        self.assertFalse(self.plist.exists())
         self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
         self.assertTrue(os.access(cleaner, os.X_OK))
         self.payload.write_text(self.payload.read_text() + "# new version\n")
@@ -735,8 +727,7 @@ with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
         self.assertEqual(installed_build.read_bytes(), self.build_helper.read_bytes())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(cleaner.read_bytes(), self.payload.read_bytes())
-        mutations = [line for line in self.launches.read_text().splitlines() if not line.startswith("print ")]
-        self.assertEqual(mutations, [f"bootstrap {self.domain} {self.plist}"])
+        self.assertFalse(self.launches.exists())
 
     def test_missing_or_symlinked_mount_never_enrolls_or_creates_a_login_agent(self):
         self.env["MOUNTED"] = "0"
@@ -753,7 +744,7 @@ with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
         self.volume = original
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.pin.read_text(), self.volume_id + "\n")
-        self.assertTrue(self.plist.is_file())
+        self.assertFalse(self.plist.exists())
 
     def test_existing_pin_accepts_case_and_never_changes_on_replacement(self):
         self.pin.parent.mkdir(parents=True)
@@ -766,19 +757,24 @@ with patch.object(Path, "is_mount", return_value=os.environ["MOUNTED"] == "1"):
         self.assertFalse(self.launches.exists())
         self.env["SCRATCH_UUID"] = self.volume_id
         self.assertEqual(self.install().returncode, 0)
-        self.assertTrue(self.plist.is_file())
+        self.assertFalse(self.plist.exists())
         self.assertEqual(self.pin.read_text(), original)
 
-    def test_logged_out_install_activates_at_next_login_and_bootstrap_errors_surface(self):
-        self.env["NO_GUI"] = "1"
-        result = self.install()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(self.plist.exists())
-        self.assertIn("next graphical login", result.stdout)
-        self.assertNotIn("bootstrap", self.launches.read_text())
-        del self.env["NO_GUI"]
-        self.env["FAIL_BOOTSTRAP"] = "1"
+    def test_upgrade_retires_only_the_legacy_job_even_with_the_drive_disconnected(self):
+        self.plist.parent.mkdir(parents=True)
+        self.plist.write_text("legacy job")
+        other = self.plist.with_name("other.plist")
+        other.touch()
+        Path(self.env["LOADED"]).touch()
+        self.env["MOUNTED"] = "0"
+        self.env["FAIL_BOOTOUT"] = "1"
         self.assertNotEqual(self.install().returncode, 0)
+        self.assertTrue(self.plist.exists())
+        del self.env["FAIL_BOOTOUT"]
+        self.assertEqual(self.install().returncode, 0)
+        self.assertFalse(self.plist.exists())
+        self.assertTrue(other.exists())
+        self.assertEqual(self.launches.read_text().splitlines()[-1], f"bootout {self.domain}/{self.label}")
 
 
 class Files(unittest.TestCase):
