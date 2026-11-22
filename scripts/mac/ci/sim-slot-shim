@@ -1,0 +1,28 @@
+#!/bin/sh
+# Installed as /usr/local/bin/xcodebuild on the CI VM. The real tool is always called by absolute path.
+real=${SIM_REAL_XCODEBUILD:-/usr/bin/xcodebuild}
+skip_value=false
+for arg in "$@"; do
+  if "$skip_value"; then
+    skip_value=false
+    continue
+  fi
+  case "$arg" in
+    test|test-without-building)
+      exec "${MAC_BUILD:-/usr/local/libexec/mini-simulator/mac-build}" --simulator "$real" "$@"
+      ;;
+    # A scheme, target, path or other option value named "test" is not an action. Flags such as
+    # -quiet and -disable-concurrent-destination-testing take no value and leave the next action visible.
+    -project|-target|-workspace|-scheme|-configuration|-sdk|-arch|-xcconfig|-toolchain|\
+    -destination|-destination-timeout|-derivedDataPath|-resultBundlePath|-resultBundleVersion|\
+    -resultStreamPath|-archivePath|-exportPath|-exportOptionsPlist|-testPlan|-xctestrun|\
+    -maximum-concurrent-test-device-destinations|-maximum-concurrent-test-simulator-destinations|\
+    -parallel-testing-enabled|-parallel-testing-worker-count|-maximum-parallel-testing-workers|\
+    -testLanguage|-testRegion|-test-timeouts-enabled|-default-test-execution-time-allowance|\
+    -maximum-test-execution-time-allowance|-test-iterations|-test-repetition-relaunch-enabled|\
+    -enableCodeCoverage|-enableAddressSanitizer|-enableThreadSanitizer|-enableUndefinedBehaviorSanitizer|\
+    -jobs|-clonedSourcePackagesDirPath|-packageCachePath|-scmProvider|-authenticationKeyPath|\
+    -authenticationKeyID|-authenticationKeyIssuerID) skip_value=true ;;
+  esac
+done
+exec "$real" "$@"

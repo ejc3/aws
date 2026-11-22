@@ -1,5 +1,6 @@
 #!/usr/bin/perl
-# mac-build [--status] | mac-build COMMAND [ARGS...]
+# mac-build [--simulator] --status | mac-build [--simulator] COMMAND [ARGS...]
+# --simulator uses the CI VM's separate test slot pool and nesting marker.
 #
 # At most MAC_BUILD_SLOTS (default 2) heavy builds at once on the MacBook. COMMAND runs once it
 # holds a slot (an flock on ~/.local/state/mac-build/slot.N, held by COMMAND and its children and
@@ -14,9 +15,15 @@ use warnings;
 use Fcntl qw(:flock O_RDWR O_CREAT);
 use File::Path qw(make_path);
 
-my $dir = ($ENV{MAC_STATE_DIR} // "$ENV{HOME}/.local/state") . "/mac-build";
+my $sim = (@ARGV && $ARGV[0] eq '--simulator');
+shift @ARGV if $sim;
+my $slot_env = $sim ? 'MAC_SIMULATOR_SLOT' : 'MAC_BUILD_SLOT';
+my $state = $sim ? ($ENV{CI_SIM_STATE_DIR} // "$ENV{HOME}/.local/state/sim-slots")
+                 : ($ENV{MAC_STATE_DIR} // "$ENV{HOME}/.local/state");
+my $dir = "$state/mac-build";
 make_path($dir, { mode => 0700 });
-my $slots = ($ENV{MAC_BUILD_SLOTS} // '2') =~ /^([1-9]\d*)$/ ? $1 : 2;
+my $limit = $sim ? $ENV{CI_SIM_SLOTS} : $ENV{MAC_BUILD_SLOTS};
+my $slots = ($limit // '2') =~ /^([1-9]\d*)$/ ? $1 : 2;
 
 if (@ARGV && $ARGV[0] eq '--status') {
     for my $n (1 .. $slots) {
@@ -29,7 +36,7 @@ if (@ARGV && $ARGV[0] eq '--status') {
     exit 0;
 }
 @ARGV or do { print STDERR "usage: mac-build COMMAND [ARGS...] | mac-build --status\n"; exit 2 };
-exec { $ARGV[0] } @ARGV or exit 127 if defined $ENV{MAC_BUILD_SLOT};
+exec { $ARGV[0] } @ARGV or exit 127 if defined $ENV{$slot_env};
 
 $^F = 1023;    # COMMAND inherits both its slot and its shared cleanup lock.
 # The cleaner takes this lock exclusively during its final holder check and rename.
@@ -47,7 +54,7 @@ until ($held) {
             truncate($fh, 0); seek($fh, 0, 0);
             my $what = join(' ', @ARGV); $what = substr($what, 0, 160);
             syswrite($fh, sprintf("pid %d since %s: %s (in %s)\n", $$, scalar localtime, $what, $ENV{PWD} // '?'));
-            $ENV{MAC_BUILD_SLOT} = $n;
+            $ENV{$slot_env} = $n;
             $held = $fh;
             last;
         }

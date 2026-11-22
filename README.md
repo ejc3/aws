@@ -1729,15 +1729,19 @@ job that boots an iOS simulator. A single runner executes one job at a time acro
 repositories. General builds and archives can still use all four mini runners. Setup adds a missing
 simulator label to the existing registration through GitHub, preserving its other labels and active job.
 
-The label is opt-in, so a job that boots a simulator without it can still run beside three others. The
-setup therefore also caps simulator test runs for every job on the VM. `xcodebuild test` and `test-without-building`
-go through `mac-build`'s slots, two at a time (`CI_SIM_SLOTS`), and a third waits, saying so once in its log. The shim,
-`scripts/mac/bin/sim-slot-shim`, is first on each runner's PATH (its `.path`, as `~/.local/sim-shims/xcodebuild`). Builds and
-archives don't take a slot. `MAC_STATE_DIR=~/.local/state/sim-slots ~/.local/bin/mac-build --status`, in the VM, shows
-who holds the slots. Why two: on 2026-11-22, with simulator jobs on all four runners, the VM's 9 CPUs were at loads of
-137 to 1022 in a dolphin-maps ScreenTour's hang samples. The app under test had 0 to 10% of the CPU, and the tour
-failed on main-thread hangs that were the VM's, not the app's. Two is the starting cap, not yet measured. Check the load
-in the next tours' hang samples, and change `CI_SIM_SLOTS` in the shim with that evidence.
+Jobs that call `xcodebuild test` or `test-without-building` through PATH share two
+test slots across all four mini runners. The third test command waits. Builds,
+archives, and `build-for-testing` continue immediately. This caps concurrent test
+commands; Xcode can start multiple simulators inside one command. A direct call
+to `/usr/bin/xcodebuild` or `xcrun xcodebuild` also bypasses the PATH shim.
+
+With four simultaneous simulator jobs, a Dolphin Maps ScreenTour on 2026-11-22
+recorded VM loads of 137 to 1022 and 0–10% CPU for the app under test. Two slots
+is the initial limit. Compare subsequent hang samples before changing
+`CI_SIM_SLOTS`. In the VM, `/usr/local/libexec/mini-simulator/mac-build --simulator --status`
+shows the test slot holders. To update the shim on a running CI VM without touching
+registrations or restarting listeners, run `scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots`
+from the Mac on its LAN. The runners already search `/usr/local/bin` ahead of `/usr/bin`.
 
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
