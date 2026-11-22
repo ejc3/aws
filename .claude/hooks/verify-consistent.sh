@@ -90,9 +90,9 @@ if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; 
     fi
     if [ "$bg_main" = "$main_sha" ] && [ "${bg_rc:-0}" -ne 0 ] && [ "$bg_rc" -ne 2 ] && [ "$bg_rc" -ne 75 ] &&
       { [ -z "$age" ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
-      problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) before it wrote a result. See $state/background.log.")
+      problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) after its last result. See $state/background.log; the next stop retries it.")
     fi
-    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ]; then
+    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ] || [ "$state/background.rc" -nt "$tflog" ]; then
       mkdir -p "$state"
       setsid -f flock -n -o "$state/background.lock" bash -c 'cd "$1" || exit 0; rc=0
         { if [ -d .terraform ]; then TF_RUN_LOCK_NOWAIT=1 terraform init -input=false -lockfile=readonly >/dev/null; fi &&

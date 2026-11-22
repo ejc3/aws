@@ -306,6 +306,9 @@ class WiringTests(unittest.TestCase):
         self.assertNotIn("terraform plan ", HOOK)
         self.assertIn("setsid -f", HOOK)  # detached: the hook never waits for the plan
         self.assertIn("flock -n -o", HOOK)  # one background check at a time; Terraform does not inherit the lock
+        # The hook reads the header publish-applied-status.sh writes; the two must not drift apart.
+        self.assertIn("printf 'main=%s checked_at=%s terraform_exit=%s\\n'", (ROOT / "scripts/publish-applied-status.sh").read_text())
+        self.assertIn("s/^main=([0-9a-f]{40}) checked_at=([0-9TZ:-]+) terraform_exit=([0-9]+)$/", HOOK)
 
     def test_the_association_runs_daily_on_every_admin_box(self):
         self.assertIn('schedule_expression = "rate(1 day)"', TF)
@@ -436,6 +439,11 @@ class StopHookBackgroundTests(unittest.TestCase):
         self.assertIn('"decision":"block"', r.stdout)
         self.assertIn("background drift check", r.stdout)
         self.assertIn("exit 1", r.stdout)
+        for _ in range(100):  # the retry starts detached
+            if self.publishes() >= 2:
+                break
+            time.sleep(0.1)
+        self.assertGreaterEqual(self.publishes(), 2, "a failed check is retried at the next stop")
 
     def test_a_busy_or_ineligible_check_does_not_block(self):
         self.env["PUBLISH_RC"] = "75"
