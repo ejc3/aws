@@ -918,9 +918,11 @@ a week, so a quiet stretch banks room for a busy day.
   starts full. Time that moved backwards counts as no time. A gap longer than 3 hours (the controller was not running)
   counts as 3 hours: no host outlives 3 hours, so none can be owed for longer, and the refill lost for a longer outage
   errs on the safe side.
-- **What it bounds.** Over the long run, burst spend averages at most $50 a day per group. In any one day a group can
-  burst through at most its full bucket plus that day's refill, about $150, so a quiet weekend banks room for a busy
-  Monday. Over any 7 days it is at most $350 of refill plus whatever was banked at the start, so up to $450. Two limits:
+- **What it bounds.** Over the long run, burst spend averages at most the group's daily budget ($50; dolphin $80). In any
+  one day a group can burst through at most its full bucket plus that day's refill, about $150 (dolphin $240), so a
+  quiet weekend banks room for a busy Monday. Over any 7 days it is at most 7 days of refill plus whatever was banked at
+  the start, so up to $450 (dolphin $720). A dolphin burst day alone can exceed the account's `ec2-daily` budget alert
+  ($150, `cost-alerts.tf`); that alert then reports a burst the bucket allowed. Two limits:
   - **Throttled, a group spends at most its refill, about $50 a day.** Imagine throttled holds at most 72 vCPUs on 8
     hosts ($2.07/h) against a refill of $2.08/h, and the dolphin repos together 115 on 14 ($3.33/h) against their $3.33/h. The exception is the
     hosts launched in burst, which run on after a throttle until their jobs end (3 hours at most) while the level is
