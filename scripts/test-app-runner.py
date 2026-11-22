@@ -266,7 +266,7 @@ class FakeSecrets:
 class FakeGitHub:
     def __init__(self):
         self.calls, self.runs, self.jobs, self.runners, self.job_status = [], {}, {}, {}, {}
-        self.created = {}
+        self.created, self.job_details = {}, {}
         # run id -> {"status", "conclusion", "run_attempt"}; a rerun GitHub accepts starts the run's next attempt.
         self.run_info, self.reruns, self.rerun_refusal, self.rerun_lost = {}, [], None, False
 
@@ -303,7 +303,7 @@ class FakeGitHub:
         m = re.match(r"/repos/(.+?)/actions/jobs/(\d+)$", path)
         if m:
             return {"id": int(m.group(2)), "status": self.job_status.get(int(m.group(2)), "queued"),
-                    "created_at": self.created.get(int(m.group(2)), NOW.isoformat())}
+                    "created_at": self.created.get(int(m.group(2)), NOW.isoformat()), **self.job_details.get(int(m.group(2)), {})}
         m = re.match(r"/repos/(.+?)/actions/runs/(\d+)/jobs", path)
         if m:
             return {"jobs": self.jobs.get(int(m.group(2)), [])}
@@ -2504,6 +2504,67 @@ class BudgetLaunchTests(unittest.TestCase):
         self.assertEqual(self.ensure(fresh, FILMS, 870, "xl")[0], "launched")
         self.assertEqual([fresh.tag(i, "JobId") for i in ec2new.instances if
                           i["State"]["Name"] in fresh.LIVE_STATES], ["870"])
+
+    def test_reconcile_serves_the_reserved_job_even_outside_its_workflow_scan(self):
+        for listed in (True, False):
+            with self.subTest(reserved_job_listed=listed):
+                app, ec2 = load_budget_app()
+                bucket(app, "dolphin", 5, throttled=True)
+                ec2.instances += aged(FILMS, ["xl"], 1)
+                labels = ["self-hosted", "dolphin", "l"]
+                app.github.created[90] = (NOW - timedelta(hours=2)).isoformat()
+                app.github.job_details[90] = {"labels": labels}
+                self.assertEqual(self.ensure(app, DOLPHIN, 90, "l")[0], "cap")
+                # 32 of 68 vCPUs in use: either l fits, but the younger job cannot take the owner's share.
+                ec2.instances = aged(FILMS, ["l"], 1)
+                app.github.runs[DOLPHIN, "queued"] = [101, 102, 103]
+                if not listed:
+                    app.SCAN_CALL_BUDGET = 3
+                app.github.jobs[101] = [{"id": 50, "status": "queued", "labels": labels}]
+                app.github.jobs[103] = [{"id": 90, "status": "queued", "labels": labels}]
+                with mock.patch.object(app.time, "time", return_value=0):
+                    result = app.reconcile(DOLPHIN, BUDGET_REPOS[DOLPHIN], SUBNETS)
+                self.assertEqual(any("/runs/103/jobs?" in path for _, path, _ in app.github.calls), listed)
+                self.assertEqual(result["outcomes"], {"launched": 1, "cap": 1})
+                self.assertEqual([app.tag(h, "JobId") for h in ec2.instances if app.tag(h, "Repo") == DOLPHIN], ["90"])
+                self.assertEqual(app.fake_dynamo.deleted, [(DOLPHIN, "90")])
+                self.assertFalse(app.fake_dynamo.items)
+
+    def test_queue_scan_only_prioritizes_a_live_matching_reservation_for_its_repo(self):
+        for problem in ("expired", "sibling", "malformed", "assigned", "completed", "missing", "labels", "size"):
+            with self.subTest(problem=problem):
+                app, ec2 = load_budget_app()
+                cfg = BUDGET_REPOS[DOLPHIN]
+                ec2.instances += aged(FILMS, ["xl"], 1)
+                bucket(app, "dolphin", 5, throttled=True)
+                self.assertEqual(self.ensure(app, DOLPHIN, 90, "l")[0], "cap")
+                row = app.fake_dynamo.waiting["waiting/dolphin"]
+                labels = ["self-hosted", "dolphin", "l"]
+                app.github.job_details[90] = {"labels": labels}
+                app.github.runs[DOLPHIN, "queued"] = [101]
+                app.github.jobs[101] = [{"id": 50, "status": "queued", "labels": labels}]
+                if problem == "expired":
+                    app.now = lambda: NOW + timedelta(seconds=app.GROUP_WAIT_SECONDS)
+                elif problem == "sibling":
+                    row["repo"]["S"] = FILMS
+                elif problem == "malformed":
+                    del row["created"]
+                elif problem == "assigned":
+                    app.github.job_details[90]["runner_name"] = "i-running"
+                elif problem == "completed":
+                    app.github.job_status[90] = "completed"
+                elif problem == "missing":
+                    original = app.github
+                    def missing(method, path, pat):
+                        if path.endswith("/jobs/90"):
+                            raise urllib.error.HTTPError(path, 404, "gone", {}, None)
+                        return original(method, path, pat)
+                    app.github = missing
+                elif problem == "labels":
+                    app.github.job_details[90]["labels"] = ["ubuntu-latest"]
+                elif problem == "size":
+                    app.github.job_details[90]["labels"] = ["self-hosted", "dolphin", "s"]
+                self.assertEqual(app.queued_jobs(DOLPHIN, cfg, "PAT"), [("50", "l")])
 
     def test_wait_releases_on_cancellation_or_expiry_and_an_older_waiter_wins(self):
         for release in ("cancel", "expire"):

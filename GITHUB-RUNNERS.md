@@ -773,7 +773,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   the safe side. The reconcile takes jobs oldest first and stops at the first that waits, so a smaller job behind it does
   not take the room it is next for. When a shared budget group is throttled, a job that cannot fit reserves
   its size across repositories, ordered by GitHub job creation time and then job ID. Both queued webhooks and
-  reconciliation read the same DynamoDB reservation. Later jobs can still use any spare capacity beyond it.
+  reconciliation read the same DynamoDB reservation. Its owner repository looks up the reserved job directly
+  before scanning workflow pages, validates its labels and puts it first for normal launch admission. Later
+  jobs can still use any spare capacity beyond it.
   The controller checks whether the reserved job is still queued before holding another job back. A reservation
   expires after eight minutes without renewal. Running jobs finish normally and the group's vCPU cap still applies.
   A repo without `max_vcpus` is capped by hosts alone, as before.
