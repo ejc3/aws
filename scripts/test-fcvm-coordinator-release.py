@@ -376,6 +376,13 @@ class LaneReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_release({"action": "lane", "commit": "b" * 40})
 
+    def test_the_lane_action_never_waits_for_the_lock(self):
+        # Read only: it answers while a release or a Terraform run holds the backend lock (never "busy").
+        self.aws.lock = "another operator"
+        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": None})
+        self.assertEqual(self.aws.lock, "another operator")
+        self.assertEqual(self.aws.calls, [])
+
     def test_the_functions_read_only_the_lane_repository_and_name_it(self):
         def block(text, header):
             start = text.index(header)
