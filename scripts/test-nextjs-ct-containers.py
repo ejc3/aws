@@ -217,6 +217,24 @@ class HostScriptTests(unittest.TestCase):
         size = len(json.dumps({"Version": "2012-10-17", "Statement": other}, separators=(",", ":")))
         self.assertLess(size, 5800, size)
 
+    def test_family_signing_identity_is_limited_to_the_owner_session(self):
+        policy = (ROOT / "family-apple-signing.tf").read_text()
+        self.assertIn('family_apple_owner_session = "${aws_iam_role.nextjs_dev.unique_id}:ct-ejc3"', policy)
+        allow, deny = policy.split('Sid       = "OwnerContainerReadAndSet"', 1)[1].split(
+            'Sid       = "OnlyAdministrationAndOwnerCanAccessIdentity"', 1)
+        self.assertIn('Effect    = "Allow"', allow)
+        self.assertIn('Principal = { AWS = aws_iam_role.nextjs_dev.arn }', allow)
+        self.assertIn('"aws:userid" = local.family_apple_owner_session', allow)
+        self.assertIn('StringEquals =', allow)
+        self.assertEqual(set(re.findall(r'"secretsmanager:(\w+)"', allow)), {"GetSecretValue", "PutSecretValue"})
+        self.assertIn('Effect    = "Deny"', deny)
+        self.assertIn('Principal = "*"', deny)
+        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals }', deny)
+        self.assertIn('local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.family_apple_owner_session } } : {}', deny)
+        self.assertEqual(set(re.findall(r'"secretsmanager:(\w+)"', deny)),
+                         {"GetSecretValue", "PutSecretValue", "UpdateSecret", "UpdateSecretVersionStage"})
+        self.assertNotIn('resource "aws_secretsmanager_secret_version"', policy)
+
     def test_members_machine_tokens_are_readable_only_from_their_own_containers(self):
         # Security review of #510: every container's session is nextjs-dev-role, which reads every nextjs token for the
         # members' machines. ejc3's are owner-only (above); colton's (Colton's Mac) and colin's (Colin's PC) are each
