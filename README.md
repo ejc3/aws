@@ -1700,6 +1700,11 @@ the build tools and a signing keychain in the guest, then registers each missing
 `dolphin-labs-hq` organization. GitHub supplies `self-hosted`, `macOS` and `ARM64`. The script adds
 `ios-pool`, `mini` and the legacy `gww-ios` label. Registration uses the operator's org-admin GitHub login.
 
+Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini-simulator]` for each
+job that boots an iOS simulator. A single runner executes one job at a time across all eligible
+repositories. General builds and archives can still use all four mini runners. Setup adds a missing
+simulator label to the existing registration through GitHub, preserving its other labels and active job.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
