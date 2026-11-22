@@ -36,10 +36,10 @@ locals {
     UNIT
     cat > "$d/timer" <<'UNIT'
     [Unit]
-    Description=Nightly Next.js worktree cleanup
+    Description=Hourly Next.js worktree cleanup
 
     [Timer]
-    OnCalendar=*-*-* 10:30:00 UTC
+    OnCalendar=*-*-* *:30:00 UTC
     Persistent=false
 
     [Install]

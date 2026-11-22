@@ -2245,8 +2245,10 @@ by then, the project is published again. It runs on every setup run, in `setup-s
 the health check, and nightly from `ndev-prune.timer`; `sudo ndev-prune` runs it
 immediately. DNS needs nothing because each zone has a single wildcard record.
 
-**Nightly disk cleanup.** At 10:30 UTC, `nextjs-worktree-prune.timer` checks the
-disk for the host's `ubuntu` account and every running Next.js account container.
+**Hourly disk cleanup.** At 30 minutes past each UTC hour, `nextjs-worktree-prune.timer`
+checks the disk for the host's `ubuntu` account and every running Next.js account
+container. After downtime, it resumes at the next half hour. A shared lock prevents
+overlap with a manual cleanup.
 It checks for merged linked Git worktrees only when at least 90% of blocks or
 inodes are unavailable, or fewer than 20 GiB are available. It removes the oldest
 eligible worktrees across the accounts it could fully rank, then stops when

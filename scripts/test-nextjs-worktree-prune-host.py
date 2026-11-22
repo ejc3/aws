@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -19,6 +20,17 @@ SPEC.loader.exec_module(host)
 
 
 class HostCleanup(unittest.TestCase):
+    def test_installed_calendar_checks_on_consecutive_hours_across_midnight(self):
+        installer = (Path(__file__).resolve().parents[1] / "nextjs-worktree-prune.tf").read_text()
+        calendar = next(line.strip().removeprefix("OnCalendar=") for line in installer.splitlines()
+                        if line.strip().startswith("OnCalendar="))
+        schedule = subprocess.check_output(
+            ["systemd-analyze", "calendar", "--base-time=2026-11-22 22:31:00 UTC", "--iterations=3", calendar],
+            text=True, env={**os.environ, "TZ": "UTC", "LC_ALL": "C"},
+        )
+        for when in ("2026-11-22 23:30:00", "2026-11-23 00:30:00", "2026-11-23 01:30:00"):
+            self.assertIn(when, schedule)
+
     def test_oldest_across_accounts_and_stop_on_relief(self):
         calls = []
         listings = {
