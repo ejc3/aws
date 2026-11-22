@@ -371,9 +371,15 @@ fi
 # The Macs this account reaches (`ssh mac`, `ssh colton-mac`), each through Cloudflare Access with the account's own
 # token (config.json users.<u>.macs; mac-ssh-client.tf). A key for a Mac with make_key is made as the account if missing.
 # Fed by process substitution, not a pipe: warn's FAILED=1 must reach this shell, or a failed Mac setup reads as ready.
+mac_cleanup_timer=disable
 while read -r alias secret; do
-  bash "$SHARED/snippets/mac-ssh.sh" "$U" "$alias" "$secret" || warn "ssh $alias config failed"
+  bash "$SHARED/snippets/mac-ssh.sh" "$U" "$alias" "$secret" || { warn "ssh $alias config failed"; continue; }
+  if [ "$alias" = mac ]; then mac_cleanup_timer=enable; fi
 done < <(cfg --arg u "$U" '.users[$u].macs // {} | to_entries[] | "\(.key) \(.value)"')
+# Remote Login is the Mac identity with permission to read the removable Scratch drive.
+if [ "$U" = ejc3 ]; then
+  systemctl "$mac_cleanup_timer" --now mac-artifact-clean.timer || warn "could not $mac_cleanup_timer MacBook Scratch cleanup"
+fi
 # Of those, the Windows PCs whose Windows-MCP (screenshots, clicks, typing) this account's Claude Code gets
 # (config.json users.<u>.windows_mcp; colin-pc-ssh.tf): mcp-remote from its lockfile, the bridge, and the Claude entry.
 while read -r alias; do
