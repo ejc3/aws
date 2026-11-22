@@ -16,19 +16,20 @@ copies it to the recovery account's **logically air-gapped vault `ejc3-backup-re
 deletes the processing copy. So the us-west-1 vaults look nearly empty: **search the recovery vault first.**
 
 ```bash
-# A one-hour session in the recovery (dev-staging) account; keep it in the environment, never on disk.
-c=$(aws sts assume-role --role-arn arn:aws:iam::<recovery account>:role/OrganizationAccountAccessRole \
-  --role-session-name restore --duration-seconds 3600 --query Credentials --output json)
-export AWS_ACCESS_KEY_ID=$(jq -r .AccessKeyId <<<"$c") AWS_SECRET_ACCESS_KEY=$(jq -r .SecretAccessKey <<<"$c") \
-  AWS_SESSION_TOKEN=$(jq -r .SessionToken <<<"$c") AWS_DEFAULT_REGION=us-east-1; unset c
-aws backup list-recovery-points-by-backup-vault --backup-vault-name ejc3-backup-recovery \
+# A profile for the recovery (dev-staging) account: each command assumes the role afresh from the instance role,
+# so nothing expires mid-restore and no credential is exported or written down. Add once to ~/.aws/config:
+#   [profile recovery]
+#   role_arn = arn:aws:iam::<recovery account>:role/OrganizationAccountAccessRole
+#   credential_source = Ec2InstanceMetadata
+#   region = us-east-1
+aws --profile recovery backup list-recovery-points-by-backup-vault --backup-vault-name ejc3-backup-recovery \
   --query "RecoveryPoints[?contains(ResourceArn,'<vol-id>')].[CreationDate,CalculatedLifecycle.DeleteAt,RecoveryPointArn]" \
   --output text | sort
 ```
 
 - The recovery account id is `aws organizations list-accounts` (dev-staging). `<vol-id>` is the **source** volume:
   a box's root changes when it is moved or rebuilt, so check the volume it had on the date wanted (CloudTrail
-  `CreateVolume`/`AttachVolume`, or `describe-recovery-point` on a candidate shows `volumeId` in its restore metadata).
+  `CreateVolume`/`AttachVolume`, or `get-recovery-point-restore-metadata` on a candidate shows its `volumeId`).
 - Retention, by the point's UTC date: the 1st of a month 365 days, other Sundays 30 days, other days 7 days. Losses
   are usually noticed late: the newest point **before** the loss is often a weekly or monthly one, and its
   `DeleteAt` may be close. Note it before anything else.
@@ -37,16 +38,22 @@ aws backup list-recovery-points-by-backup-vault --backup-vault-name ejc3-backup-
 
 ## 2. Beat the deadline first: restore to a volume
 
+**Ask the owner first.** Everything from here creates resources by CLI (a volume, then a role, a security group, an
+instance and a bucket in the recovery account), outside Terraform. That is the documented break-glass exception for
+recovery, not a routine change: present the point found (its date and `DeleteAt`), what will be created and roughly
+what it costs, and get the owner's approval in the current conversation before the first create. Tag everything with
+the incident so the cleanup finds it.
+
 A restored EBS volume outlives its recovery point, so this one call removes any expiry pressure. Restore in the
 recovery account, with the settings the monthly restore tests use:
 
 ```bash
-aws backup start-restore-job --recovery-point-arn <arn> --resource-type EBS \
+aws --profile recovery backup start-restore-job --recovery-point-arn <arn> --resource-type EBS \
   --iam-role-arn arn:aws:iam::<recovery account>:role/fleet-backup-detached-restore-test \
   --idempotency-token <issue>-<date> \
   --metadata '{"availabilityZone":"us-east-1a","volumeType":"gp3","encrypted":"true","kmsKeyId":"arn:aws:kms:us-east-1:<recovery account>:alias/aws/ebs"}'
-aws backup describe-restore-job --restore-job-id <id>     # COMPLETED in about 10 minutes; CreatedResourceArn = the volume
-aws ec2 create-tags --resources <vol> --tags Key=Incident,Value=<repo>-<issue>
+aws --profile recovery backup describe-restore-job --restore-job-id <id>     # COMPLETED in about 10 minutes; CreatedResourceArn = the volume
+aws --profile recovery ec2 create-tags --resources <vol> --tags Key=Incident,Value=<repo>-<issue>
 ```
 
 The volume is encrypted with the recovery account's default EBS key, which cannot be shared across accounts.
@@ -75,17 +82,19 @@ instance next to it and copy just the files:
    --expected-size <bytes>`, all through SSM `send-command` (put long scripts in a file and pass them with `jq
    --rawfile`). Reading a restored disk runs at about 100 MB a minute; #988's 208 folders (3.9 GB packed, 11 GB
    unpacked) took about an hour. tar skips sockets, which is fine.
-8. **Hand it to the dev box without new grants:** a presigned URL from the jumpbox session (`aws s3 presign
-   --expires-in 3600`), sent on stdin so it never sits in an argument list: `printf 'url = "%s"\n' "$url" | ssh <box>
-   'curl -fsS -K - -o /tmp/x.tar.gz && mkdir -p ~/recovered-<what> && tar -C ~/recovered-<what> -xzf /tmp/x.tar.gz'`.
-   A dev box never gets a role, key or policy into the recovery account. Check the box's free disk first.
+8. **Hand it to the dev box without new grants:** a presigned URL made immediately before the handoff (`aws --profile
+   recovery s3 presign --expires-in 3600`; a URL lives no longer than the session that signed it), sent on stdin so it
+   never sits in an argument list, into a private temporary file that is removed after unpacking:
+   `printf 'url = "%s"\n' "$url" | ssh <box> 'umask 077; t=$(mktemp); curl -fsS -K - -o "$t" && mkdir -p
+   ~/recovered-<what> && tar -C ~/recovered-<what> -xzf "$t"; rm -f "$t"'`. A dev box never gets a role, key or policy
+   into the recovery account. Check the box's free disk first.
 
 ## 4. Clean up, and say so on the issue
 
 Delete, in the recovery account: detach the restored volume (`detach-volume --force`) and terminate the instance,
 then the security group, the instance profile and role (remove the role from the profile, delete the inline policy,
-detach the managed one), the bucket (objects first), any snapshot you started, any transfer KMS key (schedule
-deletion), and the restored volume once the requester confirms. Access Analyzer reports a KMS key shared across accounts and CloudTrail reports the role creation:
+detach the managed one), the bucket (objects first), any snapshot or transfer KMS key left from an attempt to move the
+whole disk (schedule the key's deletion), and the restored volume once the requester confirms. Access Analyzer reports a KMS key shared across accounts and CloudTrail reports the role creation:
 both are your own steps, triaged as such in the watch's alert step.
 
 Post on the issue: which point (date) was used, what was restored, where it is, what could not be recovered (anything
