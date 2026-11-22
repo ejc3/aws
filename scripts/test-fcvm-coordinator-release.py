@@ -293,6 +293,9 @@ class LaneReleaseTests(unittest.TestCase):
 
     def setUp(self):
         self.aws, self.lane = AWS(), LaneECR()
+        # The coordinator repository: the release's commit tag names DIGEST; a digest lookup names commit b.
+        self.aws.describe_images = lambda **kwargs: {"imageDetails": [{
+            "imageDigest": kwargs["imageIds"][0].get("imageDigest", DIGEST), "imageTags": ["b" * 40]}]}
         p = patch.dict(os.environ, LANE_ENV)
         p.start()
         self.addCleanup(p.stop)
@@ -365,10 +368,12 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(self.run_release({**EVENT, "lambda_digest": LANE})["status"], "unchanged")
 
     def test_the_lane_action_reads_what_the_coordinator_runs(self):
-        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": None})
+        self.assertEqual(self.run_release({"action": "lane"}),
+                         {"status": "ok", "lambda_digest": None, "commits": ["b" * 40]})
         self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
             {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
-        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": LANE})
+        self.assertEqual(self.run_release({"action": "lane"}),
+                         {"status": "ok", "lambda_digest": LANE, "commits": ["b" * 40]})
         self.assertEqual(self.aws.calls, [])
         self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"][-1]["value"] = "elsewhere@" + LANE
         with self.assertRaises(release.Refused):
@@ -376,10 +381,23 @@ class LaneReleaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.run_release({"action": "lane", "commit": "b" * 40})
 
+    def test_the_lane_action_names_the_commits_of_the_running_coordinator_image(self):
+        # ejc3/fcvm orders releases with it: a release of an ancestor of what staging runs is skipped.
+        asked = []
+        self.aws.describe_images = lambda **kwargs: asked.append(kwargs) or {"imageDetails": [{
+            "imageDigest": "sha256:" + "c" * 64, "imageTags": ["b" * 40, "d" * 40, "latest"]}]}
+        self.assertEqual(self.run_release({"action": "lane"})["commits"], ["b" * 40, "d" * 40])
+        self.assertEqual(asked, [{"repositoryName": "fcvm-fleet/coordinator", "imageIds": [{"imageDigest": "sha256:" + "c" * 64}]}])
+        # A running image that is not a digest in the coordinator repository is refused, not guessed at.
+        self.aws.image = "elsewhere@sha256:" + "c" * 64
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        with self.assertRaises(release.Refused):
+            self.run_release({"action": "lane"})
+
     def test_the_lane_action_never_waits_for_the_lock(self):
         # Read only: it answers while a release or a Terraform run holds the backend lock (never "busy").
         self.aws.lock = "another operator"
-        self.assertEqual(self.run_release({"action": "lane"}), {"status": "ok", "lambda_digest": None})
+        self.assertEqual(self.run_release({"action": "lane"})["status"], "ok")
         self.assertEqual(self.aws.lock, "another operator")
         self.assertEqual(self.aws.calls, [])
 

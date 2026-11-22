@@ -5,7 +5,8 @@ fleet/coord/publish.py, fleet/lambda/release.py). The function sets the coordina
 LANE_REPOSITORY_URL@lambda_digest only when the lane repository's keep-<stack>-current tag holds that digest, so CI
 cannot make a coordinator run an image nothing protects; when the repository cannot be read or the tag holds another
 digest, it refuses and changes nothing. A release without `lambda_digest` is the release without a lane. Read-only
-`lane` returns the lane digest the coordinator runs.
+`lane` returns the lane digest the coordinator runs and the commit tags of its coordinator image, which CI uses to
+skip a release of an ancestor of what runs.
 
 One function per stack (STACK, CLUSTER, SERVICE, FAMILY): staging's (fcvm-fleet-ci.tf) and
 production's (fcvm-fleet-prod-ci.tf). Production adds:
@@ -297,8 +298,9 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         if set(event) != {"action"}:
             raise ValueError("lane takes no arguments")
         progress["step"] = "lane"
-        current = service(ecs)
-        return {"status": "ok", "lambda_digest": lane_of(ecs.describe_task_definition(taskDefinition=current["taskDefinition"]))}
+        running = ecs.describe_task_definition(taskDefinition=service(ecs)["taskDefinition"])
+        return {"status": "ok", "lambda_digest": lane_of(running),
+                "commits": commits_of(ecr, pointer_digest(image_of(running)))}
     allowed = {"commit", "digest", "lambda_digest"} | ({"force"} if name == "prod" else set())
     if not set(event) <= allowed or "force" in event and event["force"] is not True:
         raise ValueError("a release takes a commit and a digest (and, in prod, force for a rollback)")
