@@ -142,6 +142,8 @@ class FakeDynamo:
         self.buckets, self.bucket_reads, self.bucket_writes, self.conflicts, self.rival = {}, [], [], 0, None
         self.reruns = {}
         self.waiting = {}
+        # The controller's other items in the budget table: scan/<repo> (queue scan cursors) and pools/refused.
+        self.state = {}
 
     def put_rerun(self, Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames):
         assert ConditionExpression == "attribute_not_exists(job)", ConditionExpression
@@ -167,6 +169,9 @@ class FakeDynamo:
         if Key["group"]["S"].startswith("waiting/"):
             item = self.waiting.get(Key["group"]["S"])
             return {"Item": dict(item)} if item else {}
+        if Key["group"]["S"].startswith(("scan/", "pools/")):
+            item = self.state.get(Key["group"]["S"])
+            return {"Item": json.loads(json.dumps(item))} if item else {}
         self.bucket_reads.append(Key["group"]["S"])
         item = self.buckets.get(Key["group"]["S"])
         return {"Item": json.loads(json.dumps(item))} if item else {}
@@ -179,6 +184,10 @@ class FakeDynamo:
             if group.startswith("waiting/"):
                 assert ConditionExpression is None
                 self.waiting[group] = dict(Item)
+                return
+            if group.startswith(("scan/", "pools/")):
+                assert ConditionExpression is None
+                self.state[group] = json.loads(json.dumps(Item))
                 return
             self.bucket_writes.append(Item)
             if self.conflicts:
@@ -1195,6 +1204,192 @@ class ReconcileTests(unittest.TestCase):
         self.assertEqual(ec2.terminated, [])
         self.assertEqual(app.github.calls, [], "no GitHub request may start after the deadline")
         self.assertEqual(len(keep), 2, "hosts not reaped this round still count as live")
+
+
+class Issue991Tests(unittest.TestCase):
+    """Issue #991: a pool out of capacity, a queue scan that never reached a job, and nothing that said a job waited."""
+
+    def deliver(self, app, job, labels=("self-hosted", "cc-games", "xl")):
+        return app.handler({"repo": COLTON, "action": "queued", "workflow_job": {"id": job, "labels": list(labels)}}, None)
+
+    def zone_refuses(self, ec2, subnet):
+        """Every pool in `subnet` answers InsufficientInstanceCapacity."""
+        real = ec2.run_instances
+        def run_instances(**kw):
+            if kw["NetworkInterfaces"][0]["SubnetId"] == subnet:
+                ec2.attempts = getattr(ec2, "attempts", []) + [kw]
+                raise Refused("InsufficientInstanceCapacity")
+            return real(**kw)
+        ec2.run_instances = run_instances
+
+    @staticmethod
+    def pools(attempts):
+        return [(kw["InstanceType"], kw["NetworkInterfaces"][0]["SubnetId"]) for kw in attempts]
+
+    def test_a_zone_out_of_capacity_moves_to_the_other_zone_and_the_next_launch_starts_there(self):
+        app, ec2, *_ = load_app()
+        self.zone_refuses(ec2, "subnet-c")
+        self.assertEqual(self.deliver(app, 7)["outcome"], "launched")
+        self.assertEqual(self.pools(ec2.attempts), [("c7a.16xlarge", "subnet-c"), ("c7i.16xlarge", "subnet-c"),
+                                                    ("c7a.16xlarge", "subnet-a")], "every type in us-west-1c, then us-west-1a")
+        # Remembered across launches (and repos): the next launch tries us-west-1a first and needs one attempt.
+        ec2.attempts = []
+        self.assertEqual(self.deliver(app, 8)["outcome"], "launched")
+        self.assertEqual(self.pools(ec2.attempts), [("c7a.16xlarge", "subnet-a")])
+        stored = json.loads(app.fake_dynamo.state["pools/refused"]["pools"]["S"])
+        self.assertEqual(set(stored), {"c7a.16xlarge@us-west-1c", "c7i.16xlarge@us-west-1c"})
+        # Refused pools go last, not away: once us-west-1a refuses too, us-west-1c is still tried.
+        ec2.refuse = {"c7a.16xlarge", "c7i.16xlarge"}
+        ec2.attempts = []
+        self.assertEqual(self.deliver(app, 9)["outcome"], "failed")
+        self.assertEqual(self.pools(ec2.attempts), [("c7a.16xlarge", "subnet-a"), ("c7i.16xlarge", "subnet-a"),
+                                                    ("c7a.16xlarge", "subnet-c"), ("c7i.16xlarge", "subnet-c")])
+
+    def test_a_refused_type_moves_to_the_next_type_and_is_forgotten_after_ten_minutes(self):
+        app, ec2, *_ = load_app()
+        ec2.refuse = {"c7a.8xlarge"}
+        labels = ("self-hosted", "cc-games", "l")
+        self.assertEqual(self.deliver(app, 7, labels)["outcome"], "launched")
+        self.assertEqual(self.pools(ec2.attempts), [("c7a.8xlarge", "subnet-c"), ("c7i.8xlarge", "subnet-c")])
+        ec2.attempts = []
+        self.assertEqual(self.deliver(app, 8, labels)["outcome"], "launched")
+        self.assertEqual(self.pools(ec2.attempts), [("c7i.8xlarge", "subnet-c")], "the refused type is not tried first again")
+        ec2.refuse, ec2.attempts = set(), []
+        app.now = lambda: NOW + timedelta(seconds=app.REFUSED_POOL_SECONDS + 1)
+        self.assertEqual(self.deliver(app, 9, labels)["outcome"], "launched")
+        self.assertEqual(self.pools(ec2.attempts), [("c7a.8xlarge", "subnet-c")], "after the window the usual order is back")
+
+    # ---- the queue scan resumes where it stopped
+    RUNS = 30
+
+    def queue(self, app, created=NOW - timedelta(minutes=45)):
+        """RUNS queued runs, one cc-games `s` job each, and a scan budget of one run page plus five runs' jobs."""
+        app.SCAN_CALL_BUDGET = 6
+        app.time = types.SimpleNamespace(monotonic=time.monotonic, time=lambda: 0)   # queued runs go first
+        fake, read = app.github, []
+        def github(method, path, pat, body=None):
+            m = re.match(r"/repos/.+?/actions/runs\?status=(\w+)", path)
+            if m:
+                runs = [{"id": 1000 + n, "created_at": f"2026-09-27T10:{n:02d}:00Z"} for n in range(self.RUNS)]
+                runs = runs if m.group(1) == "queued" else []
+                return {"total_count": len(runs), "workflow_runs": runs[::-1]}   # newest first, as GitHub lists them
+            m = re.match(r"/repos/.+?/actions/runs/(\d+)/jobs", path)
+            if m:
+                read.append(int(m.group(1)))
+                return {"jobs": [{"id": int(m.group(1)) * 10, "status": "queued", "created_at": created.isoformat(),
+                                  "labels": ["self-hosted", "cc-games", "s"]}]}
+            return fake(method, path, pat, body)
+        app.github = github
+        return read
+
+    def test_the_scan_resumes_where_it_stopped_and_reaches_a_job_beyond_its_budget(self):
+        app, *_ = load_app()
+        read = self.queue(app)
+        cfg = dict(REPOS[COLTON], max=100)
+        target, rounds = 1023, []   # the 24th oldest run: five rounds in, at five runs a round
+        for n in range(1, 8):
+            before = len(read)
+            app.reconcile(COLTON, cfg, SUBNETS)
+            rounds.append(read[before:])
+            if target in rounds[-1]:
+                break
+        self.assertEqual(rounds[0], [1000, 1001, 1002, 1003, 1004], "the first round starts at the oldest run")
+        self.assertEqual(rounds[1], [1005, 1006, 1007, 1008, 1009], "the next round resumes after it")
+        # The bound: 2 x ceil(N / k) rounds, N runs, k a round; queued goes first in every round here, so ceil(N / k).
+        self.assertLessEqual(len(rounds), math.ceil(self.RUNS / 5))
+        self.assertEqual(len(rounds), 5)
+        # Past the newest run the scan wraps to the oldest.
+        app.reconcile(COLTON, cfg, SUBNETS)
+        before = len(read)
+        app.reconcile(COLTON, cfg, SUBNETS)
+        self.assertEqual(read[before:], [1000, 1001, 1002, 1003, 1004])
+
+    def test_a_wrapped_scan_still_returns_its_jobs_oldest_run_first(self):
+        app, *_ = load_app()
+        read = self.queue(app)
+        app.fake_dynamo.state[f"scan/{COLTON}"] = {"group": {"S": f"scan/{COLTON}"},
+                                                  "after": {"S": json.dumps({"queued": ["2026-09-27T10:27:00Z", 1027]})}}
+        jobs = app.queued_jobs(COLTON, REPOS[COLTON], "PAT")
+        self.assertEqual(read, [1028, 1029, 1000, 1001, 1002])
+        self.assertEqual([j for j, _ in jobs], ["10000", "10010", "10020", "10280", "10290"])
+        self.assertEqual(app.SCANNED[COLTON]["cursor"], {"queued": ("2026-09-27T10:02:00Z", 1002)})
+
+    def test_a_scan_that_reads_every_run_starts_from_the_oldest_next_round(self):
+        app, *_ = load_app()
+        self.RUNS = 3
+        read = self.queue(app)
+        app.fake_dynamo.state[f"scan/{COLTON}"] = {"group": {"S": f"scan/{COLTON}"},
+                                                  "after": {"S": json.dumps({"queued": ["2026-09-27T10:00:00Z", 1000]})}}
+        app.reconcile(COLTON, dict(REPOS[COLTON], max=100), SUBNETS)
+        self.assertEqual(read, [1001, 1002, 1000])
+        self.assertEqual(json.loads(app.fake_dynamo.state[f"scan/{COLTON}"]["after"]["S"]), {})
+
+    # ---- OldestQueuedSeconds
+    def test_the_oldest_queued_job_without_a_host_is_published_per_label(self):
+        app, ec2, *_ = load_app()
+        self.queue(app, created=NOW - timedelta(minutes=45))
+        cfg = dict(REPOS[COLTON], max=0)   # at its cap: nothing launches, the jobs wait
+        result = app.reconcile(COLTON, cfg, SUBNETS)
+        self.assertEqual((result["label"], result["oldest_queued_s"]), ("cc-games", 45 * 60))
+        # A job a live host covers does not count: the scan's five jobs all get hosts, then nothing is waiting.
+        cfg["max"] = 100
+        app.SCANNED.clear()
+        app.fake_dynamo.state.clear()
+        app.reconcile(COLTON, cfg, SUBNETS)
+        app.fake_dynamo.state.clear()   # the same five runs again
+        self.assertEqual(app.reconcile(COLTON, cfg, SUBNETS)["oldest_queued_s"], 0)
+        # Repos sharing a label publish one series, the older job's age; one series per label.
+        app.publish_counts([{"repo": DOLPHIN, "live": 0, "label": "dolphin", "oldest_queued_s": 120},
+                            {"repo": "dolphin-labs-hq/dolphin-maps", "live": 0, "label": "dolphin", "oldest_queued_s": 2400},
+                            {"repo": COLTON, "live": 0, "label": "cc-games", "oldest_queued_s": 0}])
+        _, data = app.fake_cloudwatch.metrics[-1]
+        oldest = {d["Dimensions"][0]["Value"]: (d["Value"], d["Unit"]) for d in data if d["MetricName"] == "OldestQueuedSeconds"}
+        self.assertEqual(oldest, {"dolphin": (2400, "Seconds"), "cc-games": (0, "Seconds")})
+        self.assertTrue(all(len(d["Dimensions"]) == 1 for d in data if d["MetricName"] == "OldestQueuedSeconds"))
+
+    def test_an_unreadable_cursor_or_pool_list_falls_back_to_the_old_order(self):
+        app, ec2, *_ = load_app()
+        read = self.queue(app)
+        real = app.fake_dynamo.get_item
+        def get_item(TableName, Key, ConsistentRead=False):
+            if Key["group"]["S"].startswith(("scan/", "pools/")):
+                raise Refused("ProvisionedThroughputExceededException")
+            return real(TableName, Key, ConsistentRead)
+        app.fake_dynamo.get_item = get_item
+        app.fake_dynamo.state[f"scan/{COLTON}"] = {"group": {"S": f"scan/{COLTON}"},
+                                                  "after": {"S": json.dumps({"queued": ["2026-09-27T10:27:00Z", 1027]})}}
+        result = app.reconcile(COLTON, dict(REPOS[COLTON], max=100), SUBNETS)
+        self.assertEqual(read, [1000, 1001, 1002, 1003, 1004], "from the oldest run, as before cursors")
+        self.assertEqual(result["outcomes"], {"launched": 5})
+        self.assertEqual(self.pools(ec2.attempts[:1]), [("c7a.2xlarge", "subnet-c")])
+
+    def test_a_job_github_lists_as_queued_while_its_own_host_runs_it_does_not_count(self):
+        # Issue #531: the listing can say queued for half an hour while the job's own host runs it.
+        app, ec2, *_ = load_app()
+        self.RUNS = 1
+        self.queue(app)
+        ec2.instances.append(instance("i-own", COLTON, "10000", 2, size="s"))
+        result = app.reconcile(COLTON, dict(REPOS[COLTON], max=100), SUBNETS)
+        self.assertEqual(result["oldest_queued_s"], 0)
+
+    def test_the_queued_too_long_alarm_is_per_label_on_the_runner_alarm_topic(self):
+        alarm = re.search(r'resource "aws_cloudwatch_metric_alarm" "app_runner_queued_too_long" \{.*?\n\}', APP_TF, re.S).group()
+        for line in ('for_each            = var.enable_github_runner ? toset([for c in values(local.runner_app_config) : c.label]) : toset([])',
+                     'namespace           = "GitHubAppRunner"', 'metric_name         = "OldestQueuedSeconds"',
+                     "dimensions          = { Label = each.key }", 'statistic           = "Maximum"',
+                     "threshold           = 30 * 60", 'comparison_operator = "GreaterThanThreshold"',
+                     'treat_missing_data  = "notBreaching"'):
+            self.assertIn(line, alarm)
+        # The topic every other app runner alarm uses.
+        too_many = re.search(r'resource "aws_cloudwatch_metric_alarm" "too_many_app_runners" \{.*?\n\}', APP_TF, re.S).group()
+        topic = re.search(r"alarm_actions\s+= (\[.*\])", too_many).group(1)
+        self.assertEqual(topic, "[aws_sns_topic.cost_alerts.arn]")
+        self.assertIn(f"alarm_actions       = {topic}", alarm)
+        self.assertIn(f"ok_actions          = {topic}", alarm)
+        source = APP.read_text()
+        self.assertIn("'MetricName': 'OldestQueuedSeconds', 'Dimensions': [{'Name': 'Label', 'Value': label}]", source)
+        # Its state lives in the budget table, which the controller may already read and write, and nowhere new.
+        self.assertIn('Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]\n        Resource = aws_dynamodb_table.runner_app_budget[0].arn', APP_TF)
 
 
 class BootstrapTests(unittest.TestCase):

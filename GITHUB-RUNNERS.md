@@ -736,8 +736,12 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   in that mode the shared label shares no runner, cap or token. `ejc3/imagine` asks for
   `[self-hosted, imagine, s]` and `[self-hosted, imagine, l]`;
   `ejc3/constellation` for `[self-hosted, constellation, xl]` (its Rust suite) and `l` or `s`.
-- **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets. It falls
+- **Pools.** Each size tries c7a, c7i, c8i, c6a and c6i spot across the runner subnets (us-west-1c, then us-west-1a). It falls
   to the next pool only on capacity refusals (`InsufficientInstanceCapacity`, `Unsupported`, ...).
+  A pool (type and zone) that refused goes to the back of the order for ten minutes, for every repo and round
+  (`pools/refused` in the budget table), so the next launch starts with one that has not just said no; refused pools are
+  still tried, last. On 2026-11-22 (issue #991) c7a in us-west-1c refused about 108 launches in four hours, and each of
+  them tried it first before the c7i that then launched.
   A response-less error, throttling or a 5xx may have created an instance, so it stops the round and
   keeps the claim. No pool is tried after the repo's reconcile deadline. Any other error (`UnauthorizedOperation`, a bad image, a quota) is definite: the
   claim is released and the error raised, so `github-app-runner-errors` fires.
@@ -795,7 +799,12 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Alarms.** Each reconcile publishes `GitHubAppRunner/LiveRunners` per repo, and in total
   (`Repo=ALL`) only when every repo was counted: a total that counted a skipped or failed repo as
   zero would hide its hosts. It also publishes `GitHubAppRunner/LiveVcpus`, the vCPUs of those hosts, per repo, and per
-  budget group `BucketLevelUsd`, `Throttled` (0 or 1) and `SpendUsd7d`.
+  budget group `BucketLevelUsd`, `Throttled` (0 or 1) and `SpendUsd7d`. Per runner label (`cc-games`, `dolphin`,
+  `imagine`, `constellation`; the dolphin repos share one) it publishes `OldestQueuedSeconds`: the age of the oldest
+  queued job the round's scans found with no live host covering it, 0 when none (a job GitHub still lists as queued while
+  its own host runs it, issue #531, is covered). `github-app-runner-queued-too-long-<label>` fires when that is over 30
+  minutes in any 5-minute period of the last 30, and clears after 30 minutes without one; it is the controller's own
+  view, so it needs nothing in GitHub Actions to run.
   `too-many-app-runners` fires above the combined cap: the sum of the most hosts each served repo may hold in any mode
   (`peak_max`: a budgeted repo's burst ceiling of 64, else its `max`; 264 today, 328 once constellation or dolphin-family
   is served, 392 with both).
@@ -820,7 +829,12 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   page back, reading each run's jobs as it goes, so the oldest queued job is reached however many
   newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
-  so jobs it finds always have time to launch), launches for queued jobs that have no host,
+  so jobs it finds always have time to launch). A scan that stops at that budget resumes next round after the last run
+  whose jobs it read completely (one cursor per repo and status, `scan/<repo>` in the budget table) and wraps to the
+  oldest run past the newest, so a job in a run of a status with N runs, k of which a round reads (at least one), is
+  reached within 2 x ceil(N / k) rounds: the status that goes first alternates by round. Before, every round read the
+  same oldest runs again, and on 2026-11-22 a dolphin job past them waited 16:04 to 19:59 while later jobs ran (issue #991).
+  The jobs found still launch oldest run first. It launches for queued jobs that have no host,
   oldest first, stopping at the repo's cap or the end of its share. The share is enforced at the
   call: once it is spent no AWS call (a botocore `before-call` hook) or GitHub request starts,
   except the credential handoff after an accepted launch and claim releases, and every call is
