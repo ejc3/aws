@@ -783,12 +783,12 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     cursor per status), and wraps to the oldest run once it passes the newest, so a job far down a long list is still
     reached: within 2 x ceil(N / k) rounds for a status with N runs, k >= 1 of which a round reads (a status goes first
     every other round). Without that, every round read the same oldest runs again and a job past them was never seen
-    (issue #991). The jobs found are still returned oldest run first. What the scan saw is left in SCANNED[repo]: the
-    cursor to store, and the age of each queued job found, for OldestQueuedSeconds.
+    (issue #991). The jobs found are still returned oldest run first. What the scan saw is left in SCANNED[repo] for
+    reconcile_repo(), which moves the cursor only once the launches are done (next_cursor): past no run holding a job
+    that still waits, so a job the round found but could not launch is read again first, before newer runs.
     """
     found, seen, runs_seen, budget = [], set(), set(), [SCAN_CALL_BUDGET]
-    cursor, ages = scan_cursor(repo), {}
-    read = dict(cursor)
+    cursor, ages, runs, done, ended = scan_cursor(repo), {}, {}, {}, {}
     group = cfg.get('budget_group')
     if group and len(group_repos(group, repos := config()[0])) > 1 and not out_of_time():
         waiter = active_group_wait(group, repos)
@@ -810,7 +810,7 @@ def queued_jobs(repo, cfg, pat, running_on=None):
                 dynamodb.put_item(TableName=BUDGET_TABLE, Item={'group': {'S': 'waiting/' + group}})
     statuses = ('queued', 'in_progress') if int(time.time() // 120) % 2 == 0 else ('in_progress', 'queued')
     for status in statuses:
-        complete, every_run, last_done, batch = [False], True, None, []
+        complete, every_run, batch, done[status] = [False], True, [], []
         for run in runs_oldest_first(repo, status, pat, budget, cursor.get(status), complete):
             if run['id'] in runs_seen:
                 continue
@@ -831,17 +831,33 @@ def queued_jobs(repo, cfg, pat, running_on=None):
                 if size:
                     batch.append((run_key(run), str(job['id']), size))
                     ages[str(job['id'])] = queued_age(job)
+                    runs[str(job['id'])] = (status, run_key(run))
             if listed[0]:
-                last_done = run_key(run)
+                done[status].append(run_key(run))
             else:
                 every_run = False
-        if complete[0] and every_run:
-            cursor.pop(status, None)   # read to the end: the next round starts from the oldest run again
-        elif last_done is not None:
-            cursor[status] = last_done
+        ended[status] = complete[0] and every_run
         found += [(job_id, size) for _, job_id, size in sorted(batch, key=lambda b: b[0])]
-    SCANNED[repo] = {'cursor': cursor, 'read': read, 'ages': ages}
+    SCANNED[repo] = {'read': cursor, 'ages': ages, 'runs': runs, 'done': done, 'ended': ended}
     return found
+
+
+def next_cursor(scanned, waiting):
+    """Where the next round's scan starts, per status: after the last run read completely, in this round's scan order,
+    before the first run holding a job in `waiting` (found but not launched or covered: it waited at a cap, was deferred,
+    or every pool refused it, or the round ended before it). A status read to its end with nothing waiting starts again
+    from the oldest run; one whose first run read still holds a waiting job keeps its cursor."""
+    cursor = dict(scanned['read'])
+    held = {scanned['runs'][job] for job in waiting if job in scanned['runs']}
+    for status, keys in scanned['done'].items():
+        stop = next((i for i, key in enumerate(keys) if (status, key) in held), None)
+        if stop is None and scanned['ended'].get(status):
+            cursor.pop(status, None)
+        elif stop is None and keys:
+            cursor[status] = keys[-1]
+        elif stop:
+            cursor[status] = keys[stop - 1]
+    return cursor
 
 
 # Where each repo's last queue scan stopped, one item per repo in BUDGET_TABLE: {"queued": [created_at, run id], ...}.
@@ -1613,16 +1629,7 @@ def reconcile_repo(repo, cfg, subnets, result):
         DEADLINE[0] = share_end
     # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
     busy = frozenset(name for name, runner in runners.items() if runner.get('busy') and name in running_on)
-    scanned = SCANNED.pop(repo, None)
-    if scanned:
-        if scanned['cursor'] != scanned['read']:
-            save_scan_cursor(repo, scanned['cursor'])
-        # The oldest queued job no live host covers (ensure_runner's 'exists' rule), for OldestQueuedSeconds. A job GitHub
-        # still lists as queued while its own host runs it (issue #531) is covered, so it does not count: no in-progress job
-        # names that host, so it is not in `busy`, which holds only hosts running another job.
-        covered = {tag(i, 'JobId') for i in live if i['InstanceId'] not in busy}
-        result['label'] = cfg['label']
-        result['oldest_queued_s'] = int(max([age for job, age in scanned['ages'].items() if job not in covered], default=0))
+    scanned, outcome_of = SCANNED.pop(repo, None), {}
     for job_id, size in jobs:
         # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
         # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
@@ -1635,11 +1642,25 @@ def reconcile_repo(repo, cfg, subnets, result):
             break
         outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
         outcomes[outcome] = outcomes.get(outcome, 0) + 1
+        outcome_of[job_id] = outcome
         result['live'] = len(live)
         if cfg.get('vcpus'):
             result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
         if outcome in ('cap', 'deferred'):
             break
+    if scanned:
+        # After the launches: a job found but not launched for (no outcome, cap, deferred, failed) holds the cursor.
+        cursor = next_cursor(scanned, {job for job, _ in jobs if outcome_of.get(job) in (None, 'cap', 'deferred', 'failed')})
+        if cursor != scanned['read']:
+            save_scan_cursor(repo, cursor)
+        # The oldest queued job no live host covers (ensure_runner's 'exists' rule), for OldestQueuedSeconds. A job GitHub
+        # still lists as queued while its own host runs it (issue #531) is covered, so it does not count: no in-progress job
+        # names that host, so it is not in `busy`, which holds only hosts running another job. Nor does one the listing
+        # still calls queued after its host finished it, which ensure_runner found 'not queued' in GitHub's own record.
+        covered = {tag(i, 'JobId') for i in live if i['InstanceId'] not in busy}
+        result['label'] = cfg['label']
+        result['oldest_queued_s'] = int(max([age for job, age in scanned['ages'].items()
+                                             if job not in covered and outcome_of.get(job) != 'not queued'], default=0))
     # Jobs lost with a reclaimed spot host, after the launches: a rerun can wait a round, a queued job should not.
     reruns = reconcile_reruns(repo, cfg)
     if reruns:

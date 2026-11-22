@@ -804,7 +804,8 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   queued job the round's scans found with no live host covering it, 0 when none (a job GitHub still lists as queued while
   its own host runs it, issue #531, is covered). `github-app-runner-queued-too-long-<label>` fires when that is over 30
   minutes in any 5-minute period of the last 30, and clears after 30 minutes without one; it is the controller's own
-  view, so it needs nothing in GitHub Actions to run.
+  view, so it needs nothing in GitHub Actions to run. It can clear and fire again for one job when a full turn of the
+  scan takes longer than 30 minutes, since the job is seen only on the rounds that read its run.
   `too-many-app-runners` fires above the combined cap: the sum of the most hosts each served repo may hold in any mode
   (`peak_max`: a budgeted repo's burst ceiling of 64, else its `max`; 264 today, 328 once constellation or dolphin-family
   is served, 392 with both).
@@ -830,7 +831,9 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
   newer runs there are (at most 120 GitHub calls a round, and each repo gets an equal share of
   the invocation's time, first repo alternating; the scan takes at most half of a repo's share,
   so jobs it finds always have time to launch). A scan that stops at that budget resumes next round after the last run
-  whose jobs it read completely (one cursor per repo and status, `scan/<repo>` in the budget table) and wraps to the
+  whose jobs it read completely and whose found jobs all got a host or were covered (one cursor per repo and status,
+  `scan/<repo>` in the budget table, moved after the launches; a job left waiting at a cap, deferred or refused by every
+  pool keeps it, so the next round reads that job again before newer runs) and wraps to the
   oldest run past the newest, so a job in a run of a status with N runs, k of which a round reads (at least one), is
   reached within 2 x ceil(N / k) rounds: the status that goes first alternates by round. Before, every round read the
   same oldest runs again, and on 2026-11-22 a dolphin job past them waited 16:04 to 19:59 while later jobs ran (issue #991).

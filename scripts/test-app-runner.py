@@ -1312,7 +1312,30 @@ class Issue991Tests(unittest.TestCase):
         jobs = app.queued_jobs(COLTON, REPOS[COLTON], "PAT")
         self.assertEqual(read, [1028, 1029, 1000, 1001, 1002])
         self.assertEqual([j for j, _ in jobs], ["10000", "10010", "10020", "10280", "10290"])
-        self.assertEqual(app.SCANNED[COLTON]["cursor"], {"queued": ("2026-09-27T10:02:00Z", 1002)})
+        self.assertEqual(app.next_cursor(app.SCANNED[COLTON], set()), {"queued": ("2026-09-27T10:02:00Z", 1002)})
+
+    def test_jobs_a_round_found_but_could_not_launch_are_read_again_before_newer_runs(self):
+        app, ec2, *_ = load_app()
+        read = self.queue(app)
+        cfg = dict(REPOS[COLTON], max=2)
+        result = app.reconcile(COLTON, cfg, SUBNETS)
+        self.assertEqual(read, [1000, 1001, 1002, 1003, 1004])
+        self.assertEqual(result["outcomes"], {"launched": 2, "cap": 1})
+        # The cursor moves past the two runs whose jobs got hosts, and no further.
+        stored = json.loads(app.fake_dynamo.state[f"scan/{COLTON}"]["after"]["S"])
+        self.assertEqual(stored, {"queued": ["2026-09-27T10:01:00Z", 1001]})
+        # Next round: the waiting jobs' runs come first, and the freed slot goes to the oldest of them, not a newer run.
+        before, launched = len(read), len(ec2.launched)
+        app.reconcile(COLTON, dict(cfg, max=3), SUBNETS)
+        self.assertEqual(read[before:], [1002, 1003, 1004, 1005, 1006])
+        (kw,) = ec2.launched[launched:]
+        self.assertEqual({t["Key"]: t["Value"] for t in kw["TagSpecifications"][0]["Tags"]}["JobId"], "10020")
+        # A round stopped short (deferred) or cut off before any outcome holds the cursor the same way.
+        scanned = {"read": {}, "runs": {"1": ("queued", ("a", 1)), "2": ("queued", ("b", 2))},
+                   "done": {"queued": [("a", 1), ("b", 2)]}, "ended": {"queued": True}}
+        self.assertEqual(app.next_cursor(scanned, {"1"}), {})
+        self.assertEqual(app.next_cursor(scanned, {"2"}), {"queued": ("a", 1)})
+        self.assertEqual(app.next_cursor(scanned, set()), {})
 
     def test_a_scan_that_reads_every_run_starts_from_the_oldest_next_round(self):
         app, *_ = load_app()
@@ -1362,6 +1385,21 @@ class Issue991Tests(unittest.TestCase):
         self.assertEqual(read, [1000, 1001, 1002, 1003, 1004], "from the oldest run, as before cursors")
         self.assertEqual(result["outcomes"], {"launched": 5})
         self.assertEqual(self.pools(ec2.attempts[:1]), [("c7a.2xlarge", "subnet-c")])
+
+    def test_a_listed_queued_job_whose_record_says_it_is_not_queued_does_not_count(self):
+        # Issue #531 the other way round: the listing still says queued after the job's ephemeral host finished it and
+        # terminated. ensure_runner asks GitHub's own record ('not queued'); the metric must not publish its full age.
+        app, ec2, *_ = load_app()
+        fake = app.github
+        self.RUNS = 1
+        self.queue(app)
+        done = instance("i-done", COLTON, "10000", 20, size="s")
+        done["State"]["Name"] = "terminated"
+        ec2.instances.append(done)
+        fake.job_status[10000] = "completed"
+        result = app.reconcile(COLTON, dict(REPOS[COLTON], max=100), SUBNETS)
+        self.assertEqual(result["outcomes"], {"not queued": 1})
+        self.assertEqual(result["oldest_queued_s"], 0)
 
     def test_a_job_github_lists_as_queued_while_its_own_host_runs_it_does_not_count(self):
         # Issue #531: the listing can say queued for half an hour while the job's own host runs it.
