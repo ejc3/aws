@@ -84,6 +84,21 @@ locals {
   # new subscription needs no edit here (claw-master-add-start / -finish below, or scripts/claw-master-login.sh --server).
   claw_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"]
 
+  # Held-back subscriptions (claw-master --profile-reserve-file, ejc3/CLIProxyAPI#38; owner, 2026-11-22). A reserve of N
+  # keeps the last N% of that subscription's weekly allowance: once its weekly usage reaches (100 - N)%, the pool treats
+  # it as out, as if Anthropic had refused it (100: the pool never uses it). With last_resort = true it is instead ranked
+  # after every other subscription past that point, used only when all the others are out, still before the paid
+  # API-key backup. Below the point the normal draining rules apply. An apply rewrites /etc/claude-master/profile-reserve
+  # and the running server picks it up within about two minutes, with no restart.
+  claw_master_profile_reserve = {
+    "claude-colton-renewed-20261112" = { reserve = 100, last_resort = false }
+  }
+  claw_master_profile_reserve_file = join("", concat(
+    ["# PROFILE=N[ last-resort], written by Terraform from local.claw_master_profile_reserve (claw-master-server.tf)\n"],
+    [for p in sort(keys(local.claw_master_profile_reserve)) :
+    "${p}=${local.claw_master_profile_reserve[p].reserve}${local.claw_master_profile_reserve[p].last_resort ? " last-resort" : ""}\n"],
+  ))
+
   claw_master_admin_cidrs = concat(
     var.enable_jumpbox ? ["${aws_instance.jumpbox[0].private_ip}/32"] : [],
     var.enable_jumpbox_2 ? ["${aws_instance.jumpbox_2[0].private_ip}/32"] : [],
@@ -388,12 +403,16 @@ done
 [ $${#found[@]} -gt 0 ] || { echo "claw-master-serve: no subscription login under $profdir" >&2; exit 1; }
 args=("$${found[0]}")
 for p in "$${found[@]:1}"; do args+=(--next-profile "$p"); done
+# Held-back subscriptions, when the installed binary understands the flag (a convergence that could not install the
+# pinned release leaves an older binary, which must still start).
+reserve=()
+if "$bin" serve --help 2>&1 | grep -q -- --profile-reserve-file; then reserve=(--profile-reserve-file /etc/claude-master/profile-reserve); fi
 exec "$bin" serve "$${args[@]}" \
   --listen ${local.claw_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
   --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels \
-  --instance claw-master-$color $balancer
+  --instance claw-master-$color $balancer "$${reserve[@]}"
 EOF
 chmod 0755 /usr/local/bin/claw-master-serve
 
@@ -407,6 +426,12 @@ if [ ! -e /etc/claude-master/account-labels ]; then
 fi
 chown root:claude-master /etc/claude-master/account-labels
 chmod 0640 /etc/claude-master/account-labels
+
+# Held-back subscriptions (local.claw_master_profile_reserve), rewritten by every convergence with one rename, so the
+# server never reads a half-written file.
+tmp=$(mktemp /etc/claude-master/.profile-reserve.XXXXXX)
+printf '%s' '${base64encode(local.claw_master_profile_reserve_file)}' | base64 -d > "$tmp"
+chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" /etc/claude-master/profile-reserve
 
 # Run by systemd as root before each start (ExecStartPre=-+ in the unit) and every 10 minutes by its timer;
 # the running server reloads the file when it changes. It never stops a start: without a value, when the
@@ -1026,6 +1051,14 @@ resource "terraform_data" "claw_master_server_converge" {
     type     = aws_instance.claw_master_server[0].instance_type
     script   = sha256(local.claw_master_server_user_data)
     helper   = filesha256("${path.module}/scripts/ssm-claw-master-server.sh")
+  }
+
+  lifecycle {
+    precondition {
+      condition = alltrue([for p, r in local.claw_master_profile_reserve :
+      can(regex("^[a-z0-9][a-z0-9-]*$", p)) && floor(r.reserve) == r.reserve && r.reserve >= 0 && r.reserve <= 100])
+      error_message = "local.claw_master_profile_reserve: each key is a profile name ([a-z0-9-]) and each reserve a whole number 0..100; claw-master would refuse the file and keep the old reserves."
+    }
   }
 
   provisioner "local-exec" {
