@@ -845,6 +845,12 @@ launch, and deletes the functions when the fleet sleeps; its grants cover only
 its own stack's function names, execution role and capacity provider. An empty
 provider runs no instance. The coordinator runs Lambda tiles only with
 `--lambda aws` and `--lambda-tiles`, which this repository does not pass yet.
+When the daily spending backstop trips, the affected coordinator cannot create
+tile functions, change their configuration or publish new versions. It can still
+inspect and delete its functions to release capacity.
+Before enabling Lambda tiles, have the coordinator tag each function with
+`Purpose=fcvm-fleet-tile` alongside its existing `Fleet` tag. The daily
+budgets filter charges by these tags.
 
 fcvm-arm pushes the lane image to `fcvm-fleet/lambda-tile` through the fleet
 role. The repository, each stack's role and provider are in the pointer:
@@ -860,6 +866,12 @@ Lambda's management fee. The instances count against the us-east-1 on-demand G
 and VT quota (`L-DB2E81BA`).
 [AWS GPU Lambda guide](https://docs.aws.amazon.com/lambda/latest/dg/lambda-managed-instances-gpu.html),
 [AWS Lambda pricing](https://aws.amazon.com/lambda/pricing/)
+
+Terraform manages each capacity provider through a CloudFormation stack so it
+can propagate `Purpose=fcvm-fleet-tile` and `Fleet=<fleet>` to the EC2 instances,
+EBS volumes and network interfaces Lambda creates. The provider carries the
+same tags. The existing daily budget uses these tags to attribute GPU usage to
+the correct stack.
 
 ### Production Spot interruption drill
 

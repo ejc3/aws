@@ -862,10 +862,13 @@ class SpendBackstopTests(unittest.TestCase):
 
     def test_the_backstop_denies_only_new_launches_to_the_coordinator(self):
         cap = block('resource "aws_iam_policy" "fcvm_fleet_spend_cap"', BUDGET)
-        self.assertIn('Effect   = "Deny"', cap)
-        self.assertIn('Action   = ["ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances"]', cap)
-        for kept in ("TerminateInstances", "StopInstances", "Describe"):
-            self.assertNotIn(kept, cap)
+        self.assertRegex(cap, r'Effect\s*=\s*"Deny"')
+        self.assertRegex(cap, r'Resource\s*=\s*"\*"')
+        actions = re.search(r'Action\s*=\s*\[([^\]]+)\]', cap).group(1)
+        self.assertCountEqual(re.findall(r'"([^"]+)"', actions), [
+            "ec2:RunInstances", "ec2:CreateFleet", "ec2:StartInstances",
+            "lambda:CreateFunction", "lambda:UpdateFunctionConfiguration", "lambda:PublishVersion",
+        ])
         self.assertNotIn('resource "aws_budgets_budget_action"', BUDGET)  # unsupported for DAILY
         grant = block('resource "aws_iam_role_policy" "fcvm_fleet_budget_action"', BUDGET)
         self.assertIn('Action    = ["iam:AttachRolePolicy", "iam:DetachRolePolicy"]', grant)

@@ -384,13 +384,14 @@ class LambdaGrantTests(unittest.TestCase):
     def test_each_stack_passes_only_its_own_role_and_provider(self):
         cap = self.statement(self.coordinator, "ItsCapacityProvider")
         self.assertIn('Action   = "lambda:PassCapacityProvider"', cap)
-        self.assertIn("Resource = aws_lambda_capacity_provider.fcvm_lambda[each.key].arn", cap)
+        self.assertIn('Resource = aws_cloudformation_stack.fcvm_lambda[each.key].outputs["CapacityProviderArn"]', cap)
         role = self.statement(self.coordinator, "ItsExecutionRole")
         self.assertIn('Action    = "iam:PassRole"', role)
         self.assertIn("Resource  = aws_iam_role.fcvm_lambda_tile[each.key].arn", role)
         self.assertIn('"iam:PassedToService" = "lambda.amazonaws.com"', role)
         att = block('resource "aws_iam_role_policy_attachment" "fcvm_lambda_coordinator"', self.source)
         self.assertIn("role       = each.value.coordinator_role", att)
+        self.assertIn("depends_on = [aws_iam_policy.fcvm_fleet_spend_cap]", att)
         self.assertIn("coordinator_role = aws_iam_role.fcvm_fleet_coordinator_task.name", self.source)
         self.assertIn("coordinator_role = aws_iam_role.fcvm_fleet_prod_coordinator_task[0].name", self.source)
 
@@ -404,21 +405,32 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn("role       = aws_iam_role.fcvm_fleet_terraform.name", att)
 
     def test_the_ceiling_covers_three_instances_a_tile_and_only_terraform_sets_it(self):
-        provider = block('resource "aws_lambda_capacity_provider" "fcvm_lambda"', self.source)
+        provider = block('resource "aws_cloudformation_stack" "fcvm_lambda"', self.source)
         self.assertIn("for_each = local.fcvm_lambda_stacks", provider)
-        self.assertIn('allowed_instance_types = [local.fcvm_lambda_instance_type]', provider)
+        self.assertRegex(provider, r'AllowedInstanceTypes\s*= \[local.fcvm_lambda_instance_type\]')
         self.assertRegex(self.source, r'fcvm_lambda_instance_type\s*= "g4dn.xlarge"')
-        self.assertRegex(provider, r'scaling_mode\s*= "Auto"')
-        self.assertIn("max_vcpu_count = local.fcvm_lambda_max_vcpus", provider)
+        self.assertRegex(provider, r'ScalingMode\s*= "Auto"')
+        self.assertRegex(provider, r'MaxVCpuCount\s*= local.fcvm_lambda_max_vcpus')
         self.assertIn("fcvm_lambda_max_tiles = 4", self.source)
         self.assertIn("fcvm_lambda_max_vcpus = local.fcvm_lambda_max_tiles * 3 * 4", self.source)
-        self.assertIn('capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
-        self.assertIn("security_group_ids = [aws_security_group.fcvm_lambda_tile[each.key].id]", provider)
+        self.assertIn('CapacityProviderOperatorRoleArn = aws_iam_role.fcvm_fleet_lambda_operator.arn', provider)
+        self.assertRegex(provider, r'SecurityGroupIds\s*= \[aws_security_group.fcvm_lambda_tile\[each.key\].id\]')
         self.assertNotRegex(self.source, r'lambda:(?:Create|Update|Delete)CapacityProvider')
         self.assertNotIn("fcvm_fleet_spike", self.source)
         self.assertRegex(block('resource "aws_ssm_parameter" "fcvm_fleet"'), r'gpu_lambda\s*= local.fcvm_fleet_gpu_lambda')
         # The instances are on-demand G in us-east-1: both stacks' ceilings are in the quota.
-        self.assertIn("fcvm_fleet_on_demand_g_vcpus = 768 + 2 * local.fcvm_lambda_max_vcpus", TF)
+        self.assertRegex(TF, r"fcvm_fleet_on_demand_g_vcpus\s*= local\.fcvm_fleet_on_demand_g_base_vcpus \+ 2 \* local\.fcvm_lambda_max_vcpus")
+
+    def test_managed_gpu_resources_carry_their_stacks_existing_budget_tags(self):
+        provider = block('resource "aws_cloudformation_stack" "fcvm_lambda"', self.source)
+        self.assertIn('Type = "AWS::Lambda::CapacityProvider"', provider)
+        self.assertNotIn('resource "aws_lambda_capacity_provider"', self.source)
+        self.assertRegex(provider, r'PropagateTags = \{\s+Mode\s*= "Explicit"\s+ExplicitTags\s*= local.fcvm_lambda_billing_tags\[each.key\]\s+\}')
+        self.assertRegex(provider, r'\bTags\s*= local.fcvm_lambda_billing_tags\[each.key\]')
+        self.assertRegex(self.source, r'fcvm_lambda_billing_tags = \{\s+for k, s in local.fcvm_lambda_stacks : k => \[\s+'
+                         r'\{ Key = "Purpose", Value = "fcvm-fleet-tile" \},\s+\{ Key = "Fleet", Value = s.fleet \}')
+        self.assertIn('"Fn::GetAtt" = ["Provider", "Arn"]', provider)
+        self.assertIn('aws_cloudformation_stack.fcvm_lambda[k].outputs["CapacityProviderArn"]', self.source)
 
     def test_tiles_only_dial_out(self):
         sg = block('resource "aws_security_group" "fcvm_lambda_tile"', self.source)
@@ -443,8 +455,8 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn("&& contains(data.aws_ec2_instance_type_offerings.fcvm_lambda_gpu.locations, az)", selection)
         self.assertIn("subnet_ids_by_az = module.fcvm_fleet_east1.subnet_ids_by_az", self.source)
         self.assertIn("for m in module.fcvm_fleet_prod_east1 : \"prod\"", self.source)
-        provider = block('resource "aws_lambda_capacity_provider" "fcvm_lambda"', self.source)
-        self.assertIn("subnet_ids         = local.fcvm_lambda_subnets[each.key]", provider)
+        provider = block('resource "aws_cloudformation_stack" "fcvm_lambda"', self.source)
+        self.assertRegex(provider, r'SubnetIds\s*= local.fcvm_lambda_subnets\[each.key\]')
         self.assertIn("length(local.fcvm_lambda_subnets[each.key]) > 0", provider)
 
     def test_a_tile_reads_its_own_stacks_certificate_and_writes_its_own_logs(self):
@@ -484,6 +496,20 @@ class LambdaGrantTests(unittest.TestCase):
 
 
 class QuotaTests(unittest.TestCase):
+    def test_on_demand_waits_for_the_open_base_request_and_preserves_larger_grants(self):
+        self.assertRegex(TF, r"fcvm_fleet_on_demand_g_base_vcpus\s*= 768\b")
+        source = block('data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1"')
+        quota = block('resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1"')
+        for section in (source, quota):
+            self.assertIn('provider     = aws.fcvm_fleet_east1', section)
+            self.assertIn('quota_code   = "L-DB2E81BA"', section)
+        self.assertIn("fcvm_fleet_on_demand_g_granted = data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value", TF)
+        self.assertIn(
+            "value = ( local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus "
+            "? local.fcvm_fleet_on_demand_g_base_vcpus : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted) )",
+            " ".join(quota.split()),
+        )
+
     def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
         # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
         self.assertIn("fcvm_fleet_spot_g_vcpus = 480", TF)

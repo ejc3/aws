@@ -45,6 +45,13 @@ locals {
       }
     },
   )
+  # Both AWS Budgets filters use these cost-allocation tags on the billed resources.
+  fcvm_lambda_billing_tags = {
+    for k, s in local.fcvm_lambda_stacks : k => [
+      { Key = "Purpose", Value = "fcvm-fleet-tile" },
+      { Key = "Fleet", Value = s.fleet },
+    ]
+  }
   # A stack's functions, by name prefix: fcvm-lam-<fleet>-<n>, and their versions.
   fcvm_lambda_function_arns = {
     for k, s in local.fcvm_lambda_stacks : k => "arn:aws:lambda:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:function:fcvm-lam-${s.fleet}-*"
@@ -66,7 +73,7 @@ locals {
     stacks = {
       for k, s in local.fcvm_lambda_stacks : k => {
         execution_role_arn    = aws_iam_role.fcvm_lambda_tile[k].arn
-        capacity_provider_arn = aws_lambda_capacity_provider.fcvm_lambda[k].arn
+        capacity_provider_arn = aws_cloudformation_stack.fcvm_lambda[k].outputs["CapacityProviderArn"]
       }
     }
   }
@@ -227,7 +234,7 @@ resource "aws_security_group" "fcvm_lambda_tile" {
   for_each    = local.fcvm_lambda_stacks
   provider    = aws.fcvm_fleet_east1
   name        = "fcvm-lam-${each.value.fleet}"
-  description = "The ${each.value.fleet} fleet's Lambda tiles: outbound HTTPS only"
+  description = "Fleet Lambda tiles - outbound HTTPS only"
   vpc_id      = each.value.vpc_id
   egress {
     protocol         = "tcp"
@@ -258,25 +265,47 @@ data "aws_ec2_instance_type_offerings" "fcvm_lambda_gpu" {
 
 # One per stack, so neither stack's tiles can take the other's capacity. The ceiling is set here because IAM cannot cap
 # MaxVCpuCount in a CreateCapacityProvider call, and the coordinators hold no grant to create or change a provider.
-resource "aws_lambda_capacity_provider" "fcvm_lambda" {
+# The pinned AWS provider does not expose PropagateTags. CloudFormation owns the provider so the
+# existing daily budgets count its managed EC2 instances, disks and interfaces from their creation.
+resource "aws_cloudformation_stack" "fcvm_lambda" {
   for_each = local.fcvm_lambda_stacks
   provider = aws.fcvm_fleet_east1
   name     = "fcvm-lam-${each.value.fleet}"
-  vpc_config {
-    subnet_ids         = local.fcvm_lambda_subnets[each.key]
-    security_group_ids = [aws_security_group.fcvm_lambda_tile[each.key].id]
-  }
-  permissions_config {
-    capacity_provider_operator_role_arn = aws_iam_role.fcvm_fleet_lambda_operator.arn
-  }
-  instance_requirements {
-    architectures          = ["x86_64"]
-    allowed_instance_types = [local.fcvm_lambda_instance_type]
-  }
-  capacity_provider_scaling_config {
-    scaling_mode   = "Auto"
-    max_vcpu_count = local.fcvm_lambda_max_vcpus
-  }
+
+  template_body = jsonencode({
+    Resources = {
+      Provider = {
+        Type = "AWS::Lambda::CapacityProvider"
+        Properties = {
+          CapacityProviderName = "fcvm-lam-${each.value.fleet}"
+          VpcConfig = {
+            SubnetIds        = local.fcvm_lambda_subnets[each.key]
+            SecurityGroupIds = [aws_security_group.fcvm_lambda_tile[each.key].id]
+          }
+          PermissionsConfig = {
+            CapacityProviderOperatorRoleArn = aws_iam_role.fcvm_fleet_lambda_operator.arn
+          }
+          InstanceRequirements = {
+            Architectures        = ["x86_64"]
+            AllowedInstanceTypes = [local.fcvm_lambda_instance_type]
+          }
+          CapacityProviderScalingConfig = {
+            ScalingMode  = "Auto"
+            MaxVCpuCount = local.fcvm_lambda_max_vcpus
+          }
+          Tags = local.fcvm_lambda_billing_tags[each.key]
+          PropagateTags = {
+            Mode         = "Explicit"
+            ExplicitTags = local.fcvm_lambda_billing_tags[each.key]
+          }
+        }
+      }
+    }
+    Outputs = {
+      CapacityProviderArn = { Value = { "Fn::GetAtt" = ["Provider", "Arn"] } }
+    }
+  })
+
   lifecycle {
     precondition {
       condition     = length(local.fcvm_lambda_subnets[each.key]) > 0
@@ -311,7 +340,7 @@ resource "aws_iam_policy" "fcvm_lambda_coordinator" {
         Sid      = "ItsCapacityProvider"
         Effect   = "Allow"
         Action   = "lambda:PassCapacityProvider"
-        Resource = aws_lambda_capacity_provider.fcvm_lambda[each.key].arn
+        Resource = aws_cloudformation_stack.fcvm_lambda[each.key].outputs["CapacityProviderArn"]
       },
       {
         Sid       = "ItsExecutionRole"
@@ -336,6 +365,8 @@ resource "aws_iam_role_policy_attachment" "fcvm_lambda_coordinator" {
   provider   = aws.fcvm_fleet
   role       = each.value.coordinator_role
   policy_arn = aws_iam_policy.fcvm_lambda_coordinator[each.key].arn
+  # A stack whose cutoff is already attached must deny Lambda launches before it gains the grant.
+  depends_on = [aws_iam_policy.fcvm_fleet_spend_cap]
 }
 
 # ------------------------------------------------------------------------------------------------ the spike, gone
