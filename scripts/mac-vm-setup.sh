@@ -11,6 +11,7 @@
 # in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
 # pool of GitHub Actions runners named mini-<n> in dolphin-labs-hq's Default group. An eligible private
 # repository can select any runner in the shared iOS pool or require the mini using its host label.
+# It also caps simulator test runs on the VM at two at a time (scripts/mac/bin/sim-slot-shim, first on each runner's PATH).
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
 # and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
@@ -230,6 +231,23 @@ in_ci "
   echo '   signing keychain ready'
 "
 
+# Simulator slots (README, "The CI VM's runners"): at most two simulator test runs at once on this VM, whichever
+# repository's job asks. `xcodebuild test` and `test-without-building` go through mac-build's slots by the shim
+# scripts/mac/bin/sim-slot-shim, first on the runners' PATH; builds and archives run at once. In ~/.zprofile too, so a
+# runner registered below (its .path is the login shell's PATH) starts with it.
+tar -C "$ROOT/scripts/mac/bin" -cf - mac-build sim-slot-shim |
+  on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' '
+    set -e
+    d=$(mktemp -d)
+    tar -C "$d" -xf -
+    mkdir -p ~/.local/bin ~/.local/sim-shims
+    install -m 755 "$d/mac-build" "$d/sim-slot-shim" ~/.local/bin/
+    rm -rf "$d"
+    ln -sfn ../bin/sim-slot-shim ~/.local/sim-shims/xcodebuild
+    grep -q "/.local/sim-shims" ~/.zprofile 2>/dev/null || echo "export PATH=\"\$HOME/.local/sim-shims:\$PATH\"" >> ~/.zprofile
+    echo "   simulator slots: xcodebuild test and test-without-building take one of 2"
+  ')"
+
 echo "runners 2/2 registrations"
 on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
   set -e
@@ -298,4 +316,30 @@ for i in $(seq 1 "$CI_COUNT"); do
     ")"
   unset token
   echo "   $name: registered at $CI_ORG ($labels)"
+done
+
+# Every runner's PATH with the simulator slots' shim first. A runner reads its .path when it starts, so one whose
+# .path changed is restarted here if GitHub says it is idle; a busy one is named, to restart once its job ends.
+for i in $(seq 1 "$CI_COUNT"); do
+  name="mini-$i"
+  changed=$(in_ci '
+    p=$HOME/runners/'"$name"'/.path
+    if [ -f "$p" ] && ! grep -q "/.local/sim-shims" "$p"; then
+      printf "%s:%s\n" "$HOME/.local/sim-shims" "$(cat "$p")" > "$p.new" && mv -f "$p.new" "$p" && echo yes
+    else
+      echo no
+    fi')
+  case "$changed" in
+    no) echo "   $name: the simulator slots are on its PATH"; continue ;;
+    yes) ;;
+    *) echo "could not check $name's PATH" >&2; exit 1 ;;
+  esac
+  busy=$(gh api --paginate "orgs/$CI_ORG/actions/runners?per_page=100" --jq ".runners[] | select(.name == \"$name\") | .busy")
+  if [[ $busy == false ]]; then
+    in_ci "cd ~/runners/$name && ./svc.sh stop >/dev/null && ./svc.sh start >/dev/null"
+    echo "   $name: the simulator slots put on its PATH; restarted"
+  else
+    echo "   $name: the simulator slots put on its PATH; it is busy, so restart it once its job ends: in the VM," \
+      "cd ~/runners/$name && ./svc.sh stop && ./svc.sh start" >&2
+  fi
 done

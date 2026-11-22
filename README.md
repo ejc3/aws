@@ -1729,6 +1729,16 @@ job that boots an iOS simulator. A single runner executes one job at a time acro
 repositories. General builds and archives can still use all four mini runners. Setup adds a missing
 simulator label to the existing registration through GitHub, preserving its other labels and active job.
 
+The label is opt-in, so a job that boots a simulator without it can still run beside three others. The
+setup therefore also caps simulator test runs for every job on the VM. `xcodebuild test` and `test-without-building`
+go through `mac-build`'s slots, two at a time (`CI_SIM_SLOTS`), and a third waits, saying so once in its log. The shim,
+`scripts/mac/bin/sim-slot-shim`, is first on each runner's PATH (its `.path`, as `~/.local/sim-shims/xcodebuild`). Builds and
+archives don't take a slot. `MAC_STATE_DIR=~/.local/state/sim-slots ~/.local/bin/mac-build --status`, in the VM, shows
+who holds the slots. Why two: on 2026-11-22, with simulator jobs on all four runners, the VM's 9 CPUs were at loads of
+137 to 1022 in a dolphin-maps ScreenTour's hang samples. The app under test had 0 to 10% of the CPU, and the tour
+failed on main-thread hangs that were the VM's, not the app's. Two is the starting cap, not yet measured. Check the load
+in the next tours' hang samples, and change `CI_SIM_SLOTS` in the shim with that evidence.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
