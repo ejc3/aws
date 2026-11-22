@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Exercise the mini VM's registration loop with fake SSH and GitHub clients."""
 
+import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import tempfile
 import unittest
@@ -11,13 +13,17 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("mac-vm-setup.sh")
 FAKE = r'''#!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, tarfile
 from pathlib import Path
 config = json.loads(os.environ["FAKE_RUNNERS"])
 args = sys.argv[1:]
 if Path(sys.argv[0]).name == "ssh":
     cmd = args[-1].replace("\\", "")
-    if "Print :CFBundleShortVersionString" in cmd:
+    if "install-ci-sim-slots.sh" in cmd:
+        with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
+            assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "install-ci-sim-slots.sh"}
+        print("test: installed CI test slots")
+    elif "Print :CFBundleShortVersionString" in cmd:
         print("27.0\n27A123")
     elif ".ci-vm-copied 2>" in cmd:
         print("27.0 27A123")
@@ -48,7 +54,7 @@ else:
 
 
 class MiniRunnerRouting(unittest.TestCase):
-    def run_setup(self, **config):
+    def run_setup(self, mode="--runners", **config):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             for tool in ("gh", "ssh"):
@@ -59,17 +65,24 @@ class MiniRunnerRouting(unittest.TestCase):
             calls.touch()
             env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"],
                        FAKE_RUNNERS=json.dumps(config), CALLS=str(calls))
-            result = subprocess.run(["bash", SCRIPT, "ci", "--lan", "test", "--runners"],
+            result = subprocess.run(["bash", SCRIPT, "ci", "--lan", "test", mode],
                                     env=env, capture_output=True, text=True, timeout=30)
             return result, calls.read_text().splitlines()
 
     def test_fresh_labels_keep_all_four_eligible_for_general_jobs(self):
         result, calls = self.run_setup(fresh=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("test: installed CI test slots", result.stdout)
         self.assertEqual(calls, [
             "mini-1 gww-ios,mini,ios-pool", "mini-2 gww-ios,mini,ios-pool",
             "mini-3 gww-ios,mini,ios-pool", "mini-4 gww-ios,mini,ios-pool,mini-simulator",
         ])
+
+    def test_slot_update_needs_no_registration_or_vm_setup(self):
+        result, calls = self.run_setup(mode="--simulator-slots")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "test: installed CI test slots")
+        self.assertEqual(calls, [])
 
     def test_existing_label_is_added_to_the_registered_id_without_replacing_it(self):
         result, calls = self.run_setup()
@@ -95,6 +108,96 @@ class MiniRunnerRouting(unittest.TestCase):
                 result, calls = self.run_setup(fresh=True, slot=f"717\t{state}\tfalse")
                 self.assertEqual(result.returncode == 0, allowed, result.stderr)
                 self.assertEqual(any(c.startswith("mini-4 ") for c in calls), allowed)
+
+
+class SimulatorSlots(unittest.TestCase):
+    def setUp(self):
+        workspace = tempfile.TemporaryDirectory()
+        self.addCleanup(workspace.cleanup)
+        self.root = Path(workspace.name)
+        self.prefix = self.root / "local"
+        self.shim = self.prefix / "bin/xcodebuild"
+        self.mac_build = self.prefix / "libexec/mini-simulator/mac-build"
+        self.installer = SCRIPT.parent / "mac/install-ci-sim-slots.sh"
+        self.real = self.root / "real-xcodebuild"
+        self.real.write_text("#!/usr/bin/env python3\n"
+                             "import os, sys, json\n"
+                             "print(json.dumps([os.getenv('MAC_BUILD_SLOT'), os.getenv('MAC_SIMULATOR_SLOT'), sys.argv[1:]]))\n")
+        self.real.chmod(0o755)
+        self.env = dict(os.environ, HOME=str(self.root), SIM_REAL_XCODEBUILD=str(self.real),
+                        MAC_BUILD=str(self.mac_build), CI_SIM_SLOTS="1")
+        for key in ("MAC_BUILD_SLOT", "MAC_SIMULATOR_SLOT", "MAC_STATE_DIR", "CI_SIM_STATE_DIR"):
+            self.env.pop(key, None)
+
+    def install(self):
+        return subprocess.run(["sh", self.installer, self.prefix], capture_output=True, text=True)
+
+    def test_install_is_idempotent_and_preserves_an_unmanaged_xcodebuild(self):
+        self.shim.parent.mkdir(parents=True)
+        self.shim.write_text("existing binary")
+        self.assertNotEqual(self.install().returncode, 0)
+        self.assertEqual(self.shim.read_text(), "existing binary")
+        self.assertFalse(self.mac_build.exists())
+        self.shim.unlink()
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.shim.resolve(), self.mac_build.with_name("sim-slot-shim"))
+
+    def test_test_actions_take_slots_and_other_actions_pass_through(self):
+        self.assertEqual(self.install().returncode, 0)
+        for args, needs_slot in [
+            (["-scheme", "test", "build-for-testing"], False),
+            (["build", "-scheme", "test"], False),
+            (["archive", "-archivePath", "test"], False),
+            (["-list", "-json"], False),
+            (["-disable-concurrent-destination-testing", "test"], True),
+            (["-workspace", "Maps.xcworkspace", "-scheme", "Maps", "test-without-building", "-only-testing:MapUITests/Tour"], True),
+            (["-quiet", "-destination", "platform=iOS Simulator,name=iPhone", "test"], True),
+        ]:
+            with self.subTest(args=args):
+                data = subprocess.check_output([self.shim, *args], env=self.env, text=True, timeout=5)
+                general, simulator, forwarded = json.loads(data)
+                self.assertIsNone(general)
+                self.assertEqual(simulator, "1" if needs_slot else None)
+                self.assertEqual(forwarded, args)
+
+    def test_occupied_test_slots_hold_tests_but_allow_builds(self):
+        self.assertEqual(self.install().returncode, 0)
+        # Hold both default slots as concurrent test commands would. Builds must still run,
+        # and releasing one slot must admit exactly the same waiting invocation.
+        env = self.env.copy()
+        env.pop("CI_SIM_SLOTS")
+        slots = self.root / ".local/state/sim-slots/mac-build"
+        slots.mkdir(parents=True)
+        with (slots / "slot.1").open("w") as first, (slots / "slot.2").open("w") as second:
+            fcntl.flock(first, fcntl.LOCK_EX)
+            fcntl.flock(second, fcntl.LOCK_EX)
+            with subprocess.Popen([self.shim, "test"], env=env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as waiting:
+                try:
+                    self.assertTrue(select.select([waiting.stderr], [], [], 5)[0], "test command never reported waiting")
+                    self.assertIn("waiting for one of 2", waiting.stderr.readline())
+                    self.assertIsNone(waiting.poll())
+                    result = subprocess.check_output([self.shim, "build"], env=env, text=True, timeout=5)
+                    self.assertEqual(json.loads(result), [None, None, ["build"]])
+                    fcntl.flock(second, fcntl.LOCK_UN)
+                    output, _ = waiting.communicate(timeout=8)
+                    self.assertEqual(waiting.returncode, 0)
+                    self.assertEqual(json.loads(output), [None, "2", ["test"]])
+                finally:
+                    if waiting.poll() is None:
+                        waiting.kill()
+                        waiting.wait()
+
+    def test_simulator_and_general_build_slots_are_independent(self):
+        self.assertEqual(self.install().returncode, 0)
+        # The outer general build must still acquire a simulator slot; two nested simulator
+        # wrappers must reuse their single slot instead of waiting on themselves.
+        for cmd in ([self.mac_build, self.shim, "test"],
+                    [self.mac_build, "--simulator", self.mac_build, self.shim, "test"]):
+            with self.subTest(cmd=cmd):
+                data = subprocess.check_output(cmd, env=self.env, text=True, timeout=5)
+                self.assertEqual(json.loads(data), ["1", "1", ["test"]])
 
 
 if __name__ == "__main__":

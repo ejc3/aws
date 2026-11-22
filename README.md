@@ -1735,6 +1735,20 @@ job that boots an iOS simulator. A single runner executes one job at a time acro
 repositories. General builds and archives can still use all four mini runners. Setup adds a missing
 simulator label to the existing registration through GitHub, preserving its other labels and active job.
 
+Jobs that call `xcodebuild test` or `test-without-building` through PATH share two
+test slots across all four mini runners. The third test command waits. Builds,
+archives, and `build-for-testing` continue immediately. This caps concurrent test
+commands; Xcode can start multiple simulators inside one command. A direct call
+to `/usr/bin/xcodebuild` or `xcrun xcodebuild` also bypasses the PATH shim.
+
+With four simultaneous simulator jobs, a Dolphin Maps ScreenTour on 2026-11-22
+recorded VM loads of 137 to 1022 and 0–10% CPU for the app under test. Two slots
+is the initial limit. Compare subsequent hang samples before changing
+`CI_SIM_SLOTS`. In the VM, `/usr/local/libexec/mini-simulator/mac-build --simulator --status`
+shows the test slot holders. To update the shim on a running CI VM without touching
+registrations or restarting listeners, run `scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots`
+from the Mac on its LAN. The runners already search `/usr/local/bin` ahead of `/usr/bin`.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to

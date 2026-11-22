@@ -11,6 +11,7 @@
 # in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
 # pool of GitHub Actions runners named mini-<n> in dolphin-labs-hq's Default group. An eligible private
 # repository can select any runner in the shared iOS pool or require the mini using its host label.
+# To install only the test slots on a running CI VM: scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots.
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
 # and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
@@ -41,26 +42,45 @@ SIMULATOR_LABEL=mini-simulator
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
 
-usage() { echo "usage: mac-vm-setup.sh ci|skevh --lan SSH_DEST [--runners]" >&2; exit 2; }
+usage() { echo "usage: mac-vm-setup.sh ci|skevh --lan SSH_DEST [--runners|--simulator-slots]" >&2; exit 2; }
 VM=${1:-}
 shift || true
 LAN=""
 RUNNERS=""
+SLOTS_ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --lan) [ $# -ge 2 ] || usage; LAN=$2; shift 2 ;;
     --runners) RUNNERS=1; shift ;;
+    --simulator-slots) SLOTS_ONLY=1; shift ;;
     *) usage ;;
   esac
 done
 [[ $LAN =~ ^[A-Za-z0-9][A-Za-z0-9.@_-]*$ ]] || usage
-[ -z "$RUNNERS" ] || [ "$VM" = ci ] || usage
+[ -z "$RUNNERS$SLOTS_ONLY" ] || [ "$VM" = ci ] || usage
+[ -z "$RUNNERS" ] || [ -z "$SLOTS_ONLY" ] || usage
 case "$VM" in
   ci) CPU=9 MEMORY_MB=36864 DISK_GB=200 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro' ;;
   skevh) CPU=4 MEMORY_MB=16384 DISK_GB=100 DIRS='' ;;
   *) usage ;;
 esac
 on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "$@"; }
+
+# Existing listeners already search /usr/local/bin. Updating the tools there also works during a job.
+install_sim_slots() {
+  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim install-ci-sim-slots.sh |
+    on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' '
+      set -e
+      d=$(mktemp -d)
+      trap "rm -rf -- \"$d\"" EXIT
+      tar -C "$d" -xf -
+      sudo /bin/sh "$d/install-ci-sim-slots.sh"
+    ')"
+}
+if [ -n "$SLOTS_ONLY" ]; then
+  install_sim_slots
+  exit 0
+fi
 
 # Steve's keys, read from Terraform's declaration so this stays in step with nextjs-dev's (one key per line).
 OWNER_KEYS=""
@@ -229,6 +249,8 @@ in_ci "
   security default-keychain -d user -s \$kc
   echo '   signing keychain ready'
 "
+
+install_sim_slots
 
 echo "runners 2/2 registrations"
 on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
