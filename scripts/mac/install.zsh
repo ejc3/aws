@@ -79,6 +79,11 @@ if [ -r "$dd_file" ]; then
   fi
 fi
 
+# Only the MacBook alias receives the mac-artifact-clean installer and payload.
+if [[ -f $src/install-artifact-cleaner.py ]]; then
+  /usr/bin/python3 "$src/install-artifact-cleaner.py" "$src"
+fi
+
 # The pinned Peekaboo app and CLI, and its LaunchAgent (the wrapper above runs its CLI).
 if [ "$mode" = --update-peekaboo ]; then
   /bin/sh "$src/peekaboo-install.sh" --update-running

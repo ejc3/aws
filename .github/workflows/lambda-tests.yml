@@ -244,7 +244,9 @@ jobs:
       - name: "Astryx Swift TestFlight invitations Terraform (public through a bypass for exactly its host, a managed Turnstile widget, KV limits, the App Manager key only, off until its secret exists)"
         run: python3 -S -B scripts/test-astryx-join.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
-        run: python3 -S -B scripts/test-mac-setup.py
+        run: |
+          python3 -S -B scripts/test-mac-setup.py
+          python3 -S -B scripts/test-mac-artifact-clean.py
       - name: Mac mini simulator runner routing
         run: python3 -S -B scripts/test-mac-vm-runners.py
       - name: Mac pbox explicit paid-lease approval, discovery and isolated workspaces (offline)
