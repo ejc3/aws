@@ -565,6 +565,92 @@ class BuildOutputTests(Fixture):
         with self.assertRaises(WORKER.NotIdle):
             WORKER.survey(self.home, path, self.uid, device, cutoff, WORKER.clock() + 60)
 
+    def test_nested_clone_keeps_the_whole_worktree(self):
+        path = self.build_worktree("nested")
+        nested = path / "vendor/lib"
+        self.git(self.home, "init", "-q", "-b", "main", str(nested))
+        (nested / "target").mkdir()
+        (nested / "target/tracked.txt").write_text("the nested clone tracks this")
+        self.git(nested, "add", "target/tracked.txt")
+        self.git(nested, "-c", "user.name=F", "-c", "user.email=f@example.com", "commit", "-qm", "nested")
+        # The outer worktree ignores vendor/lib/target and tracks nothing there.
+        self.assertTrue(WORKER.build_ignored(self.home, path, "vendor/lib/target"))
+        # A repository inside a build directory keeps that directory only.
+        other = self.build_worktree("git-dependency")
+        self.git(self.home, "init", "-q", str(other / "node_modules/pkg"))
+        result = self.builds()
+        self.assertEqual((result["worktrees"], result["dirs"]), (1, 3))
+        self.assertTrue((nested / "target/tracked.txt").exists())
+        self.assertTrue(self.kept(path))
+        self.assertTrue((other / "node_modules/pkg/.git").exists())
+        self.assertFalse((other / "target").exists())
+
+    def test_running_executable_or_mapped_library_keeps_the_worktree(self):
+        running, mapped, idle = (self.build_worktree(n) for n in ("running", "mapped", "idle"))
+        (running / "target/debug/app").write_bytes(b"\x7fELF")
+        for pid, link in (("2147483646", running / "target/debug/app"), ("2147483645", None)):
+            proc = self.proc / pid
+            (proc / "fd").mkdir(parents=True)
+            (proc / "status").write_text(f"Uid:\t{self.uid}\t{self.uid}\t{self.uid}\t{self.uid}\n")
+            (proc / "cwd").symlink_to("/")
+            if link:
+                (proc / "exe").symlink_to(link)
+        library = mapped / "node_modules/pkg/addon.node"
+        library.write_bytes(b"\x7fELF")
+        (self.proc / "2147483645/maps").write_text(
+            f"7f0000000000-7f0000001000 r-xp 00000000 08:01 12345    {library} (deleted)\n"
+            "7f0000002000-7f0000003000 rw-p 00000000 00:00 0 \n")
+        result = self.builds()
+        self.assertEqual(result["worktrees"], 1)
+        self.assertTrue(self.kept(running) and self.kept(mapped))
+        self.assertFalse((idle / "node_modules").exists())
+
+    def test_directory_swapped_between_survey_and_removal_is_kept(self):
+        for replacement in ("symlink", "directory"):
+            with self.subTest(replacement=replacement):
+                path = self.build_worktree(f"swap-{replacement}")
+                victim = self.home / f"victim-{replacement}"
+                self.output(self.home, victim.name)
+                measure, swapped = WORKER.measure, []
+
+                def swap(directory, device, end):
+                    # Measuring the first directory is the last step before
+                    # its recheck; swap it out then.
+                    size = measure(directory, device, end)
+                    if not swapped:
+                        swapped.append(directory)
+                        directory.rename(path / "moved-away")
+                        if replacement == "symlink":
+                            directory.symlink_to(victim)
+                        else:
+                            directory.mkdir()
+                            (directory / "artifact.bin").write_text("new")
+                    return size
+
+                with mock.patch.object(WORKER, "measure", swap):
+                    result = self.builds()
+                self.assertEqual(result["dirs"], 0)
+                self.assertTrue((victim / "artifact.bin").exists())
+                self.assertTrue((path / "moved-away").is_dir())
+                self.assertTrue((swapped[0] / "artifact.bin").exists())
+                self.assertTrue(self.kept(path), "no removal after a failed recheck")
+                self.git(self.repo, "worktree", "remove", "--force", str(path))
+
+    def test_unremovable_file_is_reported_once_and_the_run_goes_on(self):
+        stuck, other = self.build_worktree("stuck"), self.build_worktree("other")
+        locked = stuck / "target/debug/root-owned"
+        locked.mkdir()
+        (locked / "file").write_text("rm cannot remove this")
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        result = self.builds()
+        self.assertEqual((result["status"], result["failed"], result["worktrees"], result["dirs"]),
+                         ("done", 1, 2, 7))
+        self.assertTrue((locked / "file").exists())
+        for gone in ("node_modules", ".next", "packages/web/node_modules"):
+            self.assertFalse((stuck / gone).exists(), gone)
+        self.assertFalse((other / "target").exists())
+
     def test_main_checkout_is_untouched(self):
         self.output(self.repo, "node_modules/pkg", "target/debug")
         linked = self.build_worktree("linked")

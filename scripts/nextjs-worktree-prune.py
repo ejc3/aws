@@ -238,8 +238,13 @@ def merged(home, repo, head, ref, tip, origin):
     return False
 
 
-def protected_paths(home, uid, inspect_all=False):
-    """Protect kernel paths and ndev registrations; production inspects every UID."""
+def protected_paths(home, uid, inspect_all=False, mapped=False):
+    """Protect kernel paths and ndev registrations; production inspects every UID.
+
+    With mapped (the build pass), each process's executable and the files it
+    has mapped (/proc/<pid>/maps) count too, so a binary running from target/
+    or a library loaded from node_modules keeps its worktree.
+    """
     reserved = set()
     active = set()
     # Mounts can share st_dev (bind mounts); protect the mountpoint itself as
@@ -262,13 +267,25 @@ def protected_paths(home, uid, inspect_all=False):
                     if str(uid) not in owner:
                         continue
                 with os.scandir(proc / "fd") as descriptors:
-                    for link in itertools.chain((proc / "cwd",), (Path(e.path) for e in descriptors)):
-                        try:
-                            target = Path(os.readlink(link).removesuffix(" (deleted)"))
-                        except FileNotFoundError:
-                            continue
-                        if target.is_absolute() and under(target, home):
-                            active.add(target)
+                    links = (proc / "cwd", *((proc / "exe",) if mapped else ()), *(Path(e.path) for e in descriptors))
+                for link in links:
+                    try:
+                        target = Path(os.readlink(link).removesuffix(" (deleted)"))
+                    except FileNotFoundError:
+                        continue
+                    if target.is_absolute() and under(target, home):
+                        active.add(target)
+                if mapped:
+                    try:
+                        with (proc / "maps").open("rb") as maps:
+                            for line in maps:
+                                fields = line.rstrip(b"\n").split(None, 5)
+                                if len(fields) == 6 and fields[5].startswith(b"/"):
+                                    target = Path(os.fsdecode(fields[5]).removesuffix(" (deleted)"))
+                                    if under(target, home):
+                                        active.add(target)
+                    except FileNotFoundError:
+                        pass  # a kernel thread, a fixture, or the process exited
             except (FileNotFoundError, ProcessLookupError):
                 continue  # The process or descriptor exited during inspection.
 
@@ -539,13 +556,17 @@ def build_ignored(home, path, relative):
             and git(home, path, "--literal-pathspecs", "ls-files", "-z", "--", name) == b"")
 
 
-def survey(home, path, uid, device, cutoff, end):
+def survey(home, path, uid, device, cutoff, end, verified=(), ask=None):
     """List a worktree's removable build directories, proving every other file idle.
 
     Returns [(relative path, (st_dev, st_ino))]. Raises NotIdle when a file
-    outside those directories was modified since the cutoff, the tree crosses a
-    filesystem or cannot be read, and Incomplete when the time budget runs
-    out. Reads metadata only and follows no symlink.
+    outside those directories was modified since the cutoff, a directory below
+    the root holds a .git entry (a nested clone answers ignore questions for
+    itself, not the outer worktree), the tree crosses a filesystem or cannot be
+    read, and Incomplete when the time budget runs out. Reads metadata only
+    and follows no symlink. A recheck passes the first survey's result as
+    verified: those directories, at the same inode, are not asked about again,
+    except ask, the one about to be removed.
     """
     found = []
     entries = 0
@@ -562,6 +583,8 @@ def survey(home, path, uid, device, cutoff, end):
                 raise NotIdle
             if clock() >= end:
                 raise Incomplete("build survey timed out")
+            if name == ".git" and depth:
+                raise NotIdle
             try:
                 info = os.stat(name, dir_fd=fd, follow_symlinks=False)
             except OSError as error:
@@ -572,9 +595,10 @@ def survey(home, path, uid, device, cutoff, end):
                 if not listed_dir:
                     raise NotIdle  # replaced while listing
                 relative = Path(top, name).relative_to(path)
+                key = (relative, (info.st_dev, info.st_ino))
                 if (name in BUILD_NAMES and depth < BUILD_DEPTH and info.st_uid == uid
-                        and build_ignored(home, path, relative)):
-                    found.append((relative, (info.st_dev, info.st_ino)))
+                        and (key in verified and relative != ask or build_ignored(home, path, relative))):
+                    found.append(key)
                 else:
                     descend.append(name)
             # Any other entry, a symlink included, is a file that must be idle.
@@ -590,7 +614,10 @@ def reraise(error):
 
 
 def measure(directory, device, end):
-    """Bytes removing a directory frees: entries with no other hard link. None if unsure."""
+    """Bytes removing a directory frees: entries with no other hard link.
+
+    None if unsure, including a .git entry anywhere inside (a repository).
+    """
     try:
         info = directory.lstat()
         total = info.st_blocks * 512
@@ -598,6 +625,8 @@ def measure(directory, device, end):
             for name in itertools.chain(directories, files):
                 if clock() >= end:
                     raise Incomplete("build measurement timed out")
+                if name == ".git":
+                    return None
                 entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
                 if entry.st_dev != device:
                     return None
@@ -653,7 +682,7 @@ def builds(home, uid, apply, after=None, *, inspect_all=False):
                 if after is None or key > after:
                     candidates.append((key, path, info[0]))
     candidates.sort()
-    paths = protected_paths(home, uid, inspect_all)
+    paths = protected_paths(home, uid, inspect_all, mapped=True)
     result["status"] = "done"
     for key, path, admin in candidates:
         # Always take one candidate, so every pass advances the cursor.
@@ -677,23 +706,27 @@ def builds(home, uid, apply, after=None, *, inspect_all=False):
             if clock() >= end + DELETE_SECONDS:
                 stop = True
                 break
-            # Recheck just before removing: the same real directory, still
-            # ignored and untracked, the worktree's Git files unchanged, and no
-            # process, mount or published site in the worktree.
-            try:
-                same = owned(directory, uid, device) and inode(directory) == expected
-            except OSError:
-                same = False
-            if not (same and git_idle(home, path, admin, uid, device, cutoff) == key[0]
-                    and build_ignored(home, path, relative)
-                    and not protected(path, protected_paths(home, uid, inspect_all))):
-                break
             try:
                 size = measure(directory, device, end + DELETE_SECONDS)
                 if size is None:
                     continue
+                # The recheck is the last step before removal: survey again (the
+                # same real, ignored, untracked directory by inode; every other
+                # file still idle; no nested clone), the worktree's Git use
+                # unchanged, and no process, mapping, mount or published site in it.
+                try:
+                    current = survey(home, path, uid, device, cutoff, end + DELETE_SECONDS, found, relative)
+                    same = owned(directory, uid, device) and inode(directory) == expected
+                except (NotIdle, OSError):
+                    break
+                if not ((relative, expected) in current and same
+                        and git_idle(home, path, admin, uid, device, cutoff) == key[0]
+                        and not protected(path, protected_paths(home, uid, inspect_all, mapped=True))):
+                    break
                 if apply and run(home, ["/usr/bin/rm", "-rf", "--one-file-system", "--", os.fspath(directory)],
                                  timeout=DELETE_SECONDS) is None:
+                    # rm removed what the account may remove; the rest (a
+                    # root-owned subdirectory, say) stays. Count it once, go on.
                     result["failed"] += 1
                     continue
             except Incomplete:

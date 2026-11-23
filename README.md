@@ -2308,8 +2308,11 @@ disk, owned by `ubuntu`, ignored by Git and holding no tracked file. A worktree
 qualifies only when it is not locked, not marked interactive, not in use, its
 `HEAD` commit and newest `HEAD` reflog entry are over 7 days old, and no other
 file in it was modified in 7 days (file mtime; not the index's time, which any
-`git status` rewrites, nor ctime, which any new hard link changes). Each directory is checked again just before `rm -rf
---one-file-system` removes it as `ubuntu`. The run logs counts and sizes only,
+`git status` rewrites, nor ctime, which any new hard link changes). A worktree
+holding a nested clone (a `.git` entry below its root) is skipped, and a process
+running or mapping a file from it counts as use. Each directory is measured, then
+the whole check runs again, and only then does `rm -rf --one-file-system` remove
+it as `ubuntu`; a directory `rm` cannot fully remove is counted once. The run logs counts and sizes only,
 starts no new pass after 35 minutes, and the preview reports what it would free.
 
 **Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
