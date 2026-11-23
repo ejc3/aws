@@ -1981,6 +1981,33 @@ Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the 
 - **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - Not yet covered: security monitoring like the Dolphin account's.
 
+### One account per app: modules/app-account, and the Family account (family-account.tf)
+
+Each app moves to a member account of its own (ejc3/constellation `docs/APP-ACCOUNTS.md`), built by one call of
+`modules/app-account`, which is what `astryx-account.tf` and `astryx-stage.tf` build for Astryx, generalised. Family is the
+first: `family`, in OU `Family`, root address the `family_account` key of `people/addresses`. What runs inside is
+ejc3/constellation's `infra/apps/family` (from its `infra/modules/app`), applied there with `family-terraform`.
+
+- **The module builds:** the account (`close_on_deletion = false`, `prevent_destroy`) and its OU; the guardrail SCP on that
+  OU only (the app's region, global services exempt; no leaving the organization; no IAM users, keys or console passwords;
+  no buckets elsewhere), ordered after the organization's policy types because the root id comes from
+  `aws_organizations_organization.security`; the account's public access block; `<app>-terraform-state-<id>`;
+  `<app>-terraform` (AdministratorAccess there, one-hour sessions) trusting dev-server-role pinned to fcvm-arm's instance
+  and nextjs-dev-role; a monthly budget emailing the owner (80% actual, 100% forecast); `/infra/<app>` (no credentials).
+- **Grants:** two statements per app in `assume-constellation-terraform` (assume the role, read the pointer; fcvm-arm's pin)
+  and two in `nextjs-dev-fcvm-parity.tf`; members' sessions deny `sts:AssumeRole` and every app pointer
+  (`OwnerOnlyApplyPointers` in `nextjs-ct-user-data.tf`, one statement for all of them).
+- **Staging host (optional):** a remote-managed tunnel whose token goes into the app's account as `<app>/nonprod/tunnel`, one
+  hostname, Access on the sign-in path only (also required at the connector), the API's own paths bypassed for its tokens,
+  zero-cache for the rest, a 404 for anything else. `login_path` must be a plain path, so no metacharacter can make the
+  connector's Access rule miss. Family: `family-sync-stage.dolphin-labs.dev`, sign-in at `/family/native/login` for the
+  family allowlist, `^/(family/(v1|native)/|healthz$)` to the API on :8081, zero-cache on :4848; the API's `/family/zero/*`
+  (zero-cache's calls on the task's localhost) is never routed.
+- **First apply** of a new account: the account first (`-target=module.<app>_account.aws_organizations_account.this`), then
+  everything, as for every account.
+- **Tests:** `scripts/test-app-account.py` (offline) pins the module and Family's call, including Family's regexes against
+  its real routes.
+
 ### Sending as the Dolphin Labs work address (dolphin-labs-email-send.tf)
 
 The ej alias on dolphin-labs.dev receives through Cloudflare Email Routing (`dolphin-labs-email.tf`) and sends through
