@@ -260,6 +260,8 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet" {
     Version = "2012-10-17"
     Statement = [
       { Effect = "Allow", Action = "ecs:DescribeServices", Resource = aws_ecs_service.fcvm_fleet_prod_coordinator[0].id },
+      # Staging's service, read only: the candidate's lane image is the one staging's running task names.
+      { Effect = "Allow", Action = "ecs:DescribeServices", Resource = aws_ecs_service.fcvm_fleet_coordinator.id },
       {
         Effect = "Allow", Action = "ecs:UpdateService", Resource = aws_ecs_service.fcvm_fleet_prod_coordinator[0].id
         Condition = {
@@ -332,6 +334,8 @@ resource "aws_lambda_function" "fcvm_coordinator_release_prod" {
       LANE_REPOSITORY_URL   = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
       IMAGE_PARAMETER       = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
       STAGE_IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
+      STAGE_CLUSTER         = aws_ecs_cluster.fcvm_fleet.name
+      STAGE_SERVICE         = aws_ecs_service.fcvm_fleet_coordinator.name
       RELEASE_RECORD        = aws_ssm_parameter.fcvm_prod_release_record[0].name
       METRICS_NAMESPACE     = "FCVM/Fleet"
       METRIC_FLEET          = local.fcvm_fleet_prod_stack.fleet

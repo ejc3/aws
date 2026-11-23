@@ -97,7 +97,7 @@ def lane_selected(lane_ecr, name, digest):
         raise Refused("lane-not-selected", f"keep-{name}-current does not hold the lane digest")
 
 
-def task_input(response, image, lane=None):
+def task_input(response, image, lane=None, clear=False):
     """Preserve the service's task configuration; replace exactly one container image, and with `lane`, the
     coordinator's FLEET_LAMBDA_IMAGE."""
     old = response["taskDefinition"]
@@ -111,9 +111,10 @@ def task_input(response, image, lane=None):
     for container in containers:
         if container["name"] == "coordinator":
             container["image"] = image
-            if lane is not None:
+            if lane is not None or clear:
                 env = [e for e in container.get("environment", []) if e.get("name") != LANE_VARIABLE]
-                container["environment"] = env + [{"name": LANE_VARIABLE, "value": os.environ["LANE_REPOSITORY_URL"] + "@" + lane}]
+                container["environment"] = env + ([] if clear else [
+                    {"name": LANE_VARIABLE, "value": os.environ["LANE_REPOSITORY_URL"] + "@" + lane}])
     fields = ("family", "taskRoleArn", "executionRoleArn", "networkMode", "volumes",
               "placementConstraints", "requiresCompatibilities", "cpu", "memory",
               "pidMode", "ipcMode", "proxyConfiguration", "ephemeralStorage",
@@ -272,13 +273,24 @@ def record(event, ssm):
     return {"status": "recorded"}
 
 
-def candidate(ssm, ecr):
-    """Staging's and prod's coordinator images and the release record, for the promotion."""
+def running_lane(ecs, cluster, name):
+    """The lane digest a stack's running coordinator task names (FLEET_LAMBDA_IMAGE), or None."""
+    result = ecs.describe_services(cluster=cluster, services=[name])
+    if result.get("failures") or len(result.get("services", [])) != 1:
+        raise Refused("service-unavailable", "service unavailable")
+    return lane_of(ecs.describe_task_definition(taskDefinition=result["services"][0]["taskDefinition"]))
+
+
+def candidate(ssm, ecr, ecs):
+    """Staging's and prod's coordinator images, the lane image each running task names, and the release record,
+    for the promotion. What a stack runs comes from its task; the lane repository's tags only protect images."""
     out = {"status": "ok"}
+    services = {"stage": (os.environ["STAGE_CLUSTER"], os.environ["STAGE_SERVICE"]),
+                "prod": (os.environ["CLUSTER"], os.environ["SERVICE"])}
     for name, parameter in (("stage", os.environ["STAGE_IMAGE_PARAMETER"]), ("prod", os.environ["IMAGE_PARAMETER"])):
         value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         digest = pointer_digest(value)
-        out[name] = {"digest": digest, "commits": commits_of(ecr, digest)}
+        out[name] = {"digest": digest, "commits": commits_of(ecr, digest), "lambda_digest": running_lane(ecs, *services[name])}
     out["release"] = load_record(ssm)
     return out
 
@@ -296,7 +308,7 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
     if name == "prod" and action == "candidate":
         if set(event) != {"action"}:
             raise ValueError("candidate takes no arguments")
-        return candidate(ssm, ecr)
+        return candidate(ssm, ecr, ecs)
     if name == "prod" and action == "record":
         return record(event, ssm)
     if action == "lane":
@@ -310,8 +322,10 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
     if not set(event) <= allowed or "force" in event and event["force"] is not True:
         raise ValueError("a release takes a commit and a digest (and, in prod, force for a rollback)")
     lane = event.get("lambda_digest")
-    if "lambda_digest" in event and not (isinstance(lane, str) and DIGEST.fullmatch(lane)):
-        raise ValueError("lambda_digest is an image digest")
+    # lambda_digest null: return to running no lane image (ejc3/fcvm's rollback to a set that ran none).
+    clear = "lambda_digest" in event and lane is None
+    if "lambda_digest" in event and not clear and not (isinstance(lane, str) and DIGEST.fullmatch(lane)):
+        raise ValueError("lambda_digest is an image digest, or null to remove the lane image")
     force = event.get("force") is True
     commit, digest = event.get("commit", ""), event.get("digest", "")
     if not isinstance(commit, str) or not isinstance(digest, str) \
@@ -365,17 +379,17 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
             progress["step"] = "lane"
             lane_selected(lane_ecr, name, lane)
             progress["step"] = "inspect"
-        if previous == image and (lane is None or lane_of(old) == lane):
+        if previous == image and (lane is None and not clear or lane_of(old) == lane):
             progress["step"] = "rollout"
             wait_for(ecs, old_arn, time.monotonic() + 60)
-            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest, **lane_result(lane)}
+            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest, **lane_result(lane, clear)}
         if name == "prod" and not force:
             # Again under the lock, just before the change: the window to UpdateService is seconds.
             progress["step"] = "hold"
             waiting = held(cloudwatch)
             if waiting:
                 return waiting
-        definition = task_input(old, image, lane)
+        definition = task_input(old, image, lane, clear)
         # Bump the parameter version BEFORE the first ECS change. The ephemeral
         # Terraform guard then rejects older saved plans, even after rollback or
         # a failed registration that leaves the image value unchanged.
@@ -389,7 +403,7 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         wait_for(ecs, new_arn, time.monotonic() + min(480, max(5, remaining_ms() / 1000 - 240)))
         progress["step"] = "pointer"
         ssm.put_parameter(Name=parameter, Value=image, Type="String", Overwrite=True)
-        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane)}
+        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane, clear)}
     except Exception:
         if new_arn:
             failed_step, progress["step"] = progress["step"], "rollback"
@@ -405,8 +419,8 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         unlock(ddb, table, lock_id, info, progress)
 
 
-def lane_result(lane):
-    return {} if lane is None else {"lambda_digest": lane}
+def lane_result(lane, clear=False):
+    return {"lambda_digest": None} if clear else {} if lane is None else {"lambda_digest": lane}
 
 
 def unlock(ddb, table, lock_id, info, progress):
