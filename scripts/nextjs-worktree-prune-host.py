@@ -39,7 +39,13 @@ def pressured():
             or fs.f_files > 0 and fs.f_favail * 10 <= fs.f_files)
 
 
-def managed_accounts():
+def managed_accounts(host_only=False):
+    if host_only:
+        # A host without nextjs-ct (fcvm-metal-arm) has one account and no
+        # machines. Refuse a Next.js host so its containers are never skipped.
+        if CONFIG.exists() or CONFIG.is_symlink():
+            raise ValueError("host-only mode on a managed container host")
+        return ["ubuntu"]
     with CONFIG.open("rb") as f:
         data = f.read(1024 * 1024 + 1)
     if len(data) > 1024 * 1024:
@@ -235,6 +241,8 @@ def clean(accounts, query, pressure, apply, busy_accounts):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="remove eligible worktrees while disk is pressured")
+    parser.add_argument("--host-only", action="store_true",
+                        help="clean only the host's ubuntu account; for hosts without nextjs-ct")
     args = parser.parse_args()
     if os.geteuid():
         parser.exit(2, "nextjs-worktree-prune: run the host driver as root\n")
@@ -243,7 +251,7 @@ def main():
         if not pressured():
             print("nextjs-worktree-prune: disk has enough space; skipped")
             return
-        clean(managed_accounts(), query_worker, pressured, args.apply, host_busy_accounts)
+        clean(managed_accounts(args.host_only), query_worker, pressured, args.apply, host_busy_accounts)
     except IncompleteAccounts:
         parser.exit(1, "nextjs-worktree-prune: cleanup incomplete; see account results above\n")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:

@@ -2297,6 +2297,9 @@ upstream default branch or a verified GitHub merge of the exact worktree head.
 `sudo nextjs-worktree-prune` previews the job without removing anything. The
 dedicated SSM association installs the timer without rerunning Next.js setup
 or starting cleanup during installation.
+fcvm-metal-arm runs the same job for its `ubuntu` account only, as
+`fcvm-worktree-prune.timer` (`--host-only`: no containers, no `machinectl`), from
+its own association; `sudo fcvm-worktree-prune --host-only` previews it there.
 
 **Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
 every 30 seconds. The recorder keeps bounded, root-only files in

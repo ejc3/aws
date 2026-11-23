@@ -131,6 +131,29 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertTrue(self.repo.exists())
         self.assertIn(b"refs/heads/older", self.git(self.repo, "show-ref", "refs/heads/older"))
 
+    def test_host_without_ndev_publishing_still_ranks_and_removes(self):
+        # fcvm-metal-arm has no /var/lib/ndev: nothing is published there.
+        merged = self.worktree("merged")
+        self.commit(merged)
+        self.git(self.repo, "merge", "-qm", "merge", "--no-ff", "merged")
+        self.push()
+        with mock.patch.object(WORKER, "PUBLISHED", self.base / "absent/instances"):
+            candidates = self.list()
+            self.assertEqual(len(candidates), 1)
+            self.assertEqual(self.remove(candidates[0]["token"]), {"status": "removed"})
+        self.assertFalse(merged.exists())
+
+    def test_dangling_publishing_link_still_stops_the_listing(self):
+        merged = self.worktree("merged")
+        self.commit(merged)
+        self.git(self.repo, "merge", "-qm", "merge", "--no-ff", "merged")
+        self.push()
+        link = self.base / "dangling"
+        link.symlink_to(self.base / "absent")
+        with mock.patch.object(WORKER, "PUBLISHED", link), self.assertRaises(OSError):
+            self.list()
+        self.assertTrue(merged.exists())
+
     def test_local_state_locks_and_active_paths_are_protected(self):
         paths = {name: self.worktree(name) for name in
                  ("ignored", "untracked", "dirty", "locked", "interactive",
