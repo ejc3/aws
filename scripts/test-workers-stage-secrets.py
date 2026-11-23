@@ -3,7 +3,9 @@
 administrators-only container per site, Terraform never holding a value of one (dolphin-maps' second container,
 workers-stage/dolphin-maps/terraform, is Terraform's own: dolphin-maps-moderation.tf), and a loader that is run here for real
 against stub `aws` and `npx` so it passes the JSON through untouched (merging the two containers where a site has both),
-refuses a placeholder or a name in both before calling Cloudflare, and prints names, never values."""
+refuses a placeholder or a name in both before calling Cloudflare, and prints names, never values. dolphin-labs' second
+container, workers-stage/dolphin-labs/terraform (dolphin-labs-stage-fantasy.tf), holds FANTASY_ACCESS_AUD, written from the
+hostname-level Access application's aud."""
 import json
 import os
 import re
@@ -21,6 +23,7 @@ SITES = ["colton-games", "imagine", "nest-step", "remote-claw"]
 DOLPHIN_SITES = ["dolphin-films", "dolphin-labs", "dolphin-maps"]
 DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
 ALL_TF = "\n".join(p.read_text() for p in ROOT.glob("*.tf"))
+FANTASY_TF = (ROOT / "dolphin-labs-stage-fantasy.tf").read_text()
 
 
 def code(text):
@@ -48,6 +51,56 @@ class ContainerTests(unittest.TestCase):
         self.assertNotRegex(ALL_TF, r'(data|ephemeral)\s+"aws_secretsmanager_secret_version"\s+"[^"]*workers_stage')
         self.assertNotRegex(ALL_TF, r'resource\s+"aws_secretsmanager_secret_version"\s+"workers_stage')
         self.assertNotIn("secret_string", code(TF))
+
+
+def block(text, kind, name):
+    m = re.search(r'^%s "%s" \{\n.*?^\}\n' % (re.escape(kind), re.escape(name)), code(text) + "\n", re.M | re.S)
+    assert m, (kind, name)
+    return m.group()
+
+
+class FantasyAudTests(unittest.TestCase):
+    """workers-stage/dolphin-labs/terraform: FANTASY_ACCESS_AUD for the fantasy draft room, from Terraform."""
+
+    def test_every_resource_is_in_the_dolphin_account(self):
+        found = re.findall(r'^resource "(aws_\w+)" "(\w+)" \{\n(.*?)^\}', code(FANTASY_TF), re.M | re.S)
+        self.assertEqual(sorted(k for k, _, _ in found), ["aws_secretsmanager_secret", "aws_secretsmanager_secret_policy",
+                                                          "aws_secretsmanager_secret_version"])
+        for kind, name, body in found:
+            self.assertRegex(body, r"(?m)^  provider\s+= aws\.dolphin$", "%s.%s" % (kind, name))
+        self.assertIn('dolphin_labs_stage_fantasy_container = "workers-stage/dolphin-labs/terraform"', FANTASY_TF)
+        self.assertIn("name                    = local.dolphin_labs_stage_fantasy_container", FANTASY_TF)
+
+    def test_the_container_is_administration_only(self):
+        pol = block(FANTASY_TF, 'resource "aws_secretsmanager_secret_policy"', "dolphin_labs_stage_terraform")
+        self.assertIn('Effect    = "Deny"', pol)
+        self.assertIn('Principal = "*"', pol)
+        self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue"]', pol)
+        self.assertIn('Condition = { ArnNotLike = { "aws:PrincipalArn" = local.dolphin_maps_moderation_admins } }', pol)
+        self.assertIn("block_public_policy = true", pol)
+        self.assertNotRegex(code(FANTASY_TF), r"dev_server|nextjs_dev|sts:AssumeRole")
+
+    def test_the_value_is_the_hostname_applications_aud_and_nothing_else(self):
+        ver = block(FANTASY_TF, 'resource "aws_secretsmanager_secret_version"', "dolphin_labs_stage_terraform")
+        self.assertIn("secret_id = aws_secretsmanager_secret.dolphin_labs_stage_terraform.id", ver)
+        names = re.findall(r"^\s+([A-Z][A-Z0-9_]*)\s+=\s+(.+)$", ver, re.M)
+        self.assertEqual(names, [("FANTASY_ACCESS_AUD", "cloudflare_zero_trust_access_application.dolphin_labs_stage_check.aud")])
+        # Not the shared Worker-native application: hostname-level Access wins on the Worker's own hostname.
+        self.assertNotIn("cloudflare_zero_trust_access_application.workers_stage.aud", code(FANTASY_TF))
+        # The precondition ties it to the application on the Worker's own hostname.
+        self.assertIn('cloudflare_zero_trust_access_application.dolphin_labs_stage_check.domain == "${local.dolphin_labs_stage_fantasy_worker}.cc-games.workers.dev"', ver)
+        check = (ROOT / "dolphin-labs-stage-check.tf").read_text()
+        self.assertIn('domain           = "dolphin-labs-stage.cc-games.workers.dev"', check)
+        self.assertIn('dolphin_labs_stage_fantasy_worker    = "dolphin-labs-stage"', FANTASY_TF)
+
+    def test_no_aud_literal_is_committed(self):
+        for name in ("dolphin-labs-stage-fantasy.tf", "scripts/workers-stage-secrets.sh"):
+            self.assertNotRegex((ROOT / name).read_text(), r"\b[0-9a-f]{64}\b", name)
+        self.assertNotRegex(ALL_TF, r'FANTASY_ACCESS_AUD\s*=\s*"')
+
+    def test_dolphin_aws_keeps_the_out_of_band_container_and_this_repo_only_the_terraform_one(self):
+        self.assertNotRegex(ALL_TF, r'"workers-stage/dolphin-labs"')
+        self.assertEqual(ALL_TF.count('"workers-stage/dolphin-labs/terraform"'), 1)
 
 
 FAKE_AWS = r'''#!/usr/bin/env python3
@@ -106,7 +159,12 @@ class LoaderTests(unittest.TestCase):
     MANAGED = {"MODERATION_AWS_ACCESS_KEY_ID": "AKIAFAKEMODERATION01", "MODERATION_AWS_SECRET_ACCESS_KEY": "moderation-secret-0123",
                "MODERATION_AWS_REGION": "us-west-1", "MODERATION_TEXT_REGION": "us-west-2"}
 
-    def run_loader(self, *args, stage_json=None, managed_json=json.dumps(MANAGED), **extra_env):
+    FANTASY = {"FANTASY_ACCESS_AUD": "test-fantasy-audience"}
+    DEFAULT = object()
+
+    def run_loader(self, *args, stage_json=None, managed_json=DEFAULT, **extra_env):
+        if managed_json is self.DEFAULT:
+            managed_json = json.dumps(self.FANTASY if args[:1] == ("dolphin-labs",) else self.MANAGED)
         env = dict(os.environ, PATH="%s:%s" % (self.tmp, os.environ["PATH"]), NPX_LOG=str(self.log),
                    NPX_STDIN=str(self.stdin), NPX_ENV=str(self.env), AWS_LOG=str(self.aws_log), AWS_PROFILE="example-profile")
         for k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "FAKE_ASSUME_FAILS", "FAKE_ASSUME_MALFORMED", "AWS_DEFAULT_PROFILE", "FAKE_BROWSERBASE"):
@@ -174,7 +232,7 @@ class LoaderTests(unittest.TestCase):
             calls = self.aws_calls()
             self.assertIn("sts assume-role --role-arn %s" % DOLPHIN_ROLE, calls[0])
             read = [c for c in calls if "workers-stage/%s" % site in c]
-            self.assertEqual(len(read), 2 if site == "dolphin-maps" else 1, calls)
+            self.assertEqual(len(read), 1 if site == "dolphin-films" else 2, calls)
             for each in read:
                 self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=- DEFAULT=-", each)  # the assumed session, no profile
             token = [c for c in calls if "cloudflare-workers-deploy-token" in c]
@@ -192,12 +250,39 @@ class LoaderTests(unittest.TestCase):
         self.assertIn("--secret-id workers-stage/dolphin-maps/terraform ", "\n".join(self.aws_calls()) + " ")
         for secret in ("moderation-secret-0123", "AKIAFAKEMODERATION01"):
             self.assertNotIn(secret, out)
-        for site in ("dolphin-labs", "imagine"):
+        for site in ("dolphin-films", "imagine"):
             self.aws_log.unlink(missing_ok=True)
             r, out = self.run_loader(site, stage_json=json.dumps(payload))
             self.assertEqual(r.returncode, 0, out)
             self.assertEqual(json.loads(self.stdin.read_text()), payload)
             self.assertFalse([c for c in self.aws_calls() if "/terraform" in c], site)
+
+    def test_dolphin_labs_merges_the_fantasy_audience_from_terraforms_container(self):
+        payload = {"AUTH_SECRET": "dolphin-value-0123456789"}
+        r, out = self.run_loader("dolphin-labs", stage_json=json.dumps(payload))
+        self.assertEqual(r.returncode, 0, out)
+        self.assertEqual(json.loads(self.stdin.read_text()), {**payload, **self.FANTASY})
+        reads = [c for c in self.aws_calls() if "--secret-id workers-stage/dolphin-labs/terraform " in c + " "]
+        self.assertEqual(len(reads), 1, self.aws_calls())
+        self.assertIn("KEY=ASIAFAKEDOLPHIN PROFILE=- DEFAULT=-", reads[0])  # read in the Dolphin account
+        self.assertIn("secret bulk --name dolphin-labs-stage", self.log.read_text())
+        self.assertNotIn("test-fantasy-audience", out)
+        stage = SCRIPT.read_text()
+        self.assertIn("dolphin-labs | dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;", stage)
+
+    def test_dolphin_labs_refuses_the_audience_out_of_band_or_missing(self):
+        both = {"AUTH_SECRET": "x-0123456789", "FANTASY_ACCESS_AUD": "out-of-band-audience"}
+        r, out = self.run_loader("dolphin-labs", stage_json=json.dumps(both))
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("FANTASY_ACCESS_AUD is in both containers", out)
+        r, out = self.run_loader("dolphin-labs", stage_json=json.dumps({"AUTH_SECRET": "x-0123456789"}),
+                                 managed_json=json.dumps({"OTHER_NAME": "x-0123456789"}))
+        self.assertNotEqual(r.returncode, 0, out)
+        self.assertIn("missing required names: FANTASY_ACCESS_AUD", out)
+        r, out = self.run_loader("dolphin-labs", stage_json=json.dumps({"AUTH_SECRET": "x-0123456789"}), managed_json=None)
+        self.assertEqual(r.returncode, 1, out)
+        self.assertIn("workers-stage/dolphin-labs/terraform", out)
+        self.assertFalse(self.log.exists(), "wrangler must not run")
 
     def test_dolphin_maps_refuses_a_name_in_both_and_a_missing_terraform_container(self):
         both = {"AUTH_SECRET": "x-0123456789", "MODERATION_AWS_REGION": "us-west-1"}
