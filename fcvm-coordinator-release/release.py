@@ -29,7 +29,7 @@ import uuid
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 CONDITION_FAILED = "ConditionalCheckFailedException"
 COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -280,7 +280,8 @@ def running_lane(ecs, cluster, name, image):
     if result.get("failures") or len(result.get("services", [])) != 1:
         raise Refused("service-unavailable", "service unavailable")
     current = result["services"][0]
-    if len(current.get("deployments", [])) != 1:
+    deployments = current.get("deployments", [])
+    if len(deployments) != 1 or deployments[0].get("rolloutState") != "COMPLETED":
         raise Refused("not-idle", "the service is rolling out")
     definition = ecs.describe_task_definition(taskDefinition=current["taskDefinition"])
     if image_of(definition) != image:
@@ -299,10 +300,11 @@ def candidate(ssm, ecr, ecs):
         digest = pointer_digest(value)
         out[name] = {"digest": digest, "commits": commits_of(ecr, digest)}
         # Per stack, so the record (which the manual rollback reads with the prod lane off) never depends on it:
-        # ejc3/fcvm's decide refuses on a lane_error.
+        # ejc3/fcvm's decide refuses on a lane_error. A timeout or endpoint error (BotoCoreError) and a task
+        # definition without a coordinator container (StopIteration) or a field (KeyError) are "unreadable".
         try:
             out[name]["lambda_digest"] = running_lane(ecs, *services[name], value)
-        except (Refused, ClientError) as error:
+        except (Refused, ClientError, BotoCoreError, StopIteration, KeyError) as error:
             out[name].update({"lambda_digest": None, "lane_error": error_code(error) or "unreadable"})
     out["release"] = load_record(ssm)
     return out

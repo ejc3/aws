@@ -18,9 +18,13 @@ class ClientError(Exception):
         self.response = response
 
 
+class BotoCoreError(Exception):
+    pass
+
+
 stubs = {"boto3": types.ModuleType("boto3"), "botocore": types.ModuleType("botocore"),
          "botocore.config": types.SimpleNamespace(Config=object),
-         "botocore.exceptions": types.SimpleNamespace(ClientError=ClientError)}
+         "botocore.exceptions": types.SimpleNamespace(ClientError=ClientError, BotoCoreError=BotoCoreError)}
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("release", ROOT / "fcvm-coordinator-release/release.py")
 release = importlib.util.module_from_spec(spec)
@@ -585,6 +589,42 @@ class ProdReleaseTests(unittest.TestCase):
         self.assertEqual((result["stage"]["lambda_digest"], result["stage"]["lane_error"]), (None, "service-unavailable"))
         self.assertNotIn("lane_error", result["prod"])
         self.assertIsNone(result["release"])
+
+    def test_a_lane_read_that_fails_outside_aws_is_a_per_stack_error(self):
+        # A timeout or endpoint error (not a ClientError), or a task definition without a coordinator container,
+        # leaves the answer ok with the record in it: the manual rollback reads the record this way.
+        real_services, real_definition = self.aws.describe_services, self.aws.describe_task_definition
+        def timeout(**kwargs):
+            if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
+                raise BotoCoreError("read timeout")
+            return real_services(**kwargs)
+        self.aws.describe_services = timeout
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("release", result)
+        self.assertEqual((result["stage"]["lambda_digest"], result["stage"]["lane_error"]), (None, "unreadable"))
+        self.assertNotIn("lane_error", result["prod"])
+        self.aws.describe_services = real_services
+        def no_coordinator(**kwargs):
+            answer = copy.deepcopy(real_definition(**kwargs))
+            for container in answer["taskDefinition"]["containerDefinitions"]:
+                container["name"] = "other"
+            return answer
+        self.aws.describe_task_definition = no_coordinator
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("release", result)
+        self.assertEqual((result["prod"]["lane_error"], result["stage"]["lane_error"]), ("unreadable", "unreadable"))
+
+    def test_a_single_deployment_still_rolling_out_is_not_idle(self):
+        real = self.aws.describe_services
+        def rolling(**kwargs):
+            answer = real(**kwargs)
+            answer["services"][0]["deployments"] = [{"rolloutState": "IN_PROGRESS"}]
+            return answer
+        self.aws.describe_services = rolling
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual((result["stage"]["lane_error"], result["prod"]["lane_error"]), ("not-idle", "not-idle"))
 
     def test_candidate_refuses_a_lane_image_from_a_task_its_pointer_does_not_name(self):
         # Prod's pointer names one image, its service runs another (a release in progress or rolled back).
