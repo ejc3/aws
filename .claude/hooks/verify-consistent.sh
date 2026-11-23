@@ -60,15 +60,46 @@ if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; 
   if [ "$branch" = main ] && [ "$(git rev-list --count HEAD..origin/main 2>/dev/null)" -gt 0 ]; then
     problems+=("Local main is behind origin/main. Fast-forward it (git merge --ff-only origin/main) so the drift check plans what is applied.")
   elif [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)" ] && [ -z "$(git status --porcelain)" ]; then
-    # This command independently verifies the jumpbox and latest origin/main.
-    # Busy locks and ineligible hosts skip. Results and raw logs stay distinct.
-    bash scripts/publish-applied-status.sh --if-idle >&2
-    rc=$?
-    tflog="${XDG_STATE_HOME:-$HOME/.local/state}/aws-applied-status/last-plan.log"
-    if [ "$rc" -eq 2 ]; then
-      problems+=("Terraform drift: live AWS does not match config. Review $tflog and apply or reconcile the intended change.")
-    elif [ "$rc" -ne 0 ] && [ "$rc" -ne 75 ]; then
-      problems+=("Terraform status check failed (exit $rc). Look for the latest run in $tflog or see the command diagnostic.")
+    # The full plan takes 10-15 minutes, so the hook never waits for it. It judges by the last
+    # FINISHED check of this exact origin/main: publish-applied-status.sh writes
+    # "main=<sha> checked_at=<UTC> terraform_exit=<rc>" as the log's first line (atomically, and only
+    # once Terraform ran), and the background job records its own exit in background.rc, so a check
+    # that failed before planning (init, STS) is not silent. A missing result, one for another commit,
+    # a failed or drifted one, or one older than VERIFY_DRIFT_REFRESH_SECONDS starts a fresh check,
+    # detached, one at a time (flock -o: the lock is not inherited by Terraform or its providers).
+    state="${XDG_STATE_HOME:-$HOME/.local/state}/aws-applied-status"
+    tflog="$state/last-plan.log"
+    refresh_after=${VERIFY_DRIFT_REFRESH_SECONDS:-1800}
+    main_sha=$(git rev-parse origin/main)
+    last_main="" last_at="" last_rc="" bg_main="" bg_rc=""
+    if [ -r "$tflog" ]; then
+      read -r last_main last_at last_rc < <(head -n 1 "$tflog" |
+        sed -nE 's/^main=([0-9a-f]{40}) checked_at=([0-9TZ:-]+) terraform_exit=([0-9]+)$/\1 \2 \3/p')
+    fi
+    if [ -r "$state/background.rc" ]; then
+      read -r bg_main bg_rc < <(sed -nE 's/^([0-9a-f]{40}) ([0-9]+)$/\1 \2/p' "$state/background.rc")
+    fi
+    age=""
+    if [ "$last_main" = "$main_sha" ] && last_epoch=$(date -u -d "$last_at" +%s 2>/dev/null); then
+      age=$(($(date +%s) - last_epoch))
+      if [ "$last_rc" -eq 2 ]; then
+        problems+=("Terraform drift: live AWS does not match config (check of $last_at). Review $tflog and apply or reconcile the intended change.")
+      elif [ "$last_rc" -ne 0 ] && [ "$last_rc" -ne 75 ]; then
+        problems+=("Terraform status check failed (exit $last_rc, check of $last_at). Look for the latest run in $tflog.")
+      fi
+    fi
+    if [ "$bg_main" = "$main_sha" ] && [ "${bg_rc:-0}" -ne 0 ] && [ "$bg_rc" -ne 2 ] && [ "$bg_rc" -ne 75 ] &&
+      { [ -z "$age" ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
+      problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) after its last result. See $state/background.log; the next stop retries it.")
+    fi
+    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ] || [ "$state/background.rc" -nt "$tflog" ]; then
+      mkdir -p "$state"
+      setsid -f flock -n -o "$state/background.lock" bash -c 'cd "$1" || exit 0; rc=0
+        { if [ -d .terraform ]; then TF_RUN_LOCK_NOWAIT=1 terraform init -input=false -lockfile=readonly >/dev/null; fi &&
+          bash scripts/publish-applied-status.sh --if-idle; } >"$2/background.log" 2>&1 || rc=$?
+        printf "%s %s\n" "$3" "$rc" >"$2/background.rc.tmp" && mv -f "$2/background.rc.tmp" "$2/background.rc"' \
+        _ "$root" "$state" "$main_sha" </dev/null >/dev/null 2>&1
+      echo "verify-consistent: requested a background drift check of ${main_sha:0:7} ($state/background.log)" >&2
     fi
   fi
 fi

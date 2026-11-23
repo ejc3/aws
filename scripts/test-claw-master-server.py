@@ -143,6 +143,26 @@ class ServiceTests(unittest.TestCase):
         self.assertNotRegex(TF, r"--backup-api-key")
         self.assertNotRegex(TF, r">\s*/(tmp|var|etc)[^\n]*key")
 
+    def test_held_back_subscriptions_reach_the_server_safely(self):
+        # The reserve map renders PROFILE=N[ last-resort] lines; the owner's first one drains normally to 70% and keeps its last 30% for when every other one is out (owner, 2026-11-23).
+        body = re.search(r"claw_master_profile_reserve = \{(.*?)\n  \}", TF, re.S).group(1)
+        self.assertIn('"claude-colton-renewed-20261112" = { reserve = 30, last_resort = true }', body)
+        self.assertIn('" last-resort"', TF)
+        # The file is replaced by one rename (never read half-written) and readable by the server's group only.
+        boot = TF[TF.index("# Held-back subscriptions (local.claw_master_profile_reserve)"):]
+        self.assertIn("mktemp /etc/claude-master/.profile-reserve.", boot)
+        self.assertIn('mv -f "$tmp" /etc/claude-master/profile-reserve', boot)
+        self.assertIn('chmod 0640 "$tmp"', boot)
+        # The flag goes only to a binary that has it, so an older binary left by a failed install still starts.
+        serve = TF[TF.index("cat > /usr/local/bin/claw-master-serve"):TF.index("chmod 0755 /usr/local/bin/claw-master-serve")]
+        # Searched in the binary: claw-master's help lists no flags (checked on claw-master-052d711 and -443a4d4).
+        self.assertIn('grep -qa -- --profile-reserve-file "$bin"', serve)
+        self.assertNotIn('"$bin" serve --help', serve)
+        self.assertIn('reserve=(--profile-reserve-file /etc/claude-master/profile-reserve)', serve)
+        self.assertIn('"$${reserve[@]}"', serve)
+        # An invalid reserve fails the plan instead of reaching the server.
+        self.assertIn("r.reserve >= 0 && r.reserve <= 100", TF)
+
     def test_the_rendered_script_is_valid_bash(self):
         m = re.search(r"claw_master_server_user_data = <<SCRIPT\n(.*?)\nSCRIPT", TF, re.S)
         self.assertTrue(m)
@@ -153,6 +173,7 @@ class ServiceTests(unittest.TestCase):
         text = re.sub(r"\$\{local\.claw_master_server_ip\}", "10.0.1.50", text)
         text = re.sub(r"\$\{local\.claw_master_server_port\}", "8443", text)
         text = re.sub(r"\$\{var\.aws_region\}", "us-west-1", text)
+        text = re.sub(r"\$\{base64encode\(.*?\)\}", "eA==", text)
         text = re.sub(r"\$\{join\(.*\)\}", "x", text)
         text = re.sub(r"\$\{substr\(.*?\)\}", "0" * 16, text)
         text = re.sub(r"\$\{local\.claw_master_profiles\[0\]\}", "claude-connor", text)

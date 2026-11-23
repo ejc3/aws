@@ -567,6 +567,10 @@ class LaneRepositoryPerStackTests(unittest.TestCase):
         # Staging's repository admits staging's CI; prod's admits nothing of staging's.
         self.assertIn("Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }", stage)
         self.assertNotRegex(prod, r"fcvm_stage_ci|fcvm_fleet_coordinator_task\b|fcvm_fleet_terraform")
+        # Exactly one statement, for the Lambda service only: no AWS principal, no wildcard.
+        self.assertEqual(prod.count("Effect"), 1)
+        self.assertNotIn("AWS =", prod)
+        self.assertNotRegex(prod, r'Principal\s*=\s*"\*"')
 
     def test_a_stack_pulls_only_from_its_own_repository(self):
         self.assertRegex(self.source, r'fcvm_lambda_repositories = merge\(\s+\{ stage = aws_ecr_repository.fcvm_fleet_lambda_tile \},\s+'

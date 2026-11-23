@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Offline acceptance tests for the host's account ordering and output boundary."""
+import base64
 import contextlib
+import gzip
+import hashlib
 import importlib.util
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
+import textwrap
 import sys
 import tempfile
 import unittest
@@ -17,6 +22,34 @@ SPEC = importlib.util.spec_from_file_location(
 host = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = host
 SPEC.loader.exec_module(host)
+ROOT = Path(__file__).resolve().parents[1]
+TF = (ROOT / "nextjs-worktree-prune.tf").read_text()
+
+
+def tf_block(kind, name):
+    """One top-level block of the .tf file, through its closing brace at column 0."""
+    match = re.search(rf'^{kind} "aws_ssm_association" "{name}" {{\n(.*?)^}}\n', TF, re.S | re.M)
+    assert match, name
+    return match[1]
+
+
+def render_installer(job):
+    """Render the installer heredoc as Terraform would for one job (gzip bytes aside)."""
+    jobs = dict(re.findall(r'^    (\w+) += (\{.*\})$', TF, re.M))
+    fields = dict(re.findall(r'(\w+) = "([^"]*)"', jobs[job]))
+    text = TF.split("key => <<-SH\n", 1)[1].split("\n    SH\n", 1)[0] + "\n"
+    text = textwrap.dedent(text)
+
+    def script(name):
+        return ROOT / "scripts" / name
+
+    text = re.sub(r'\$\{base64gzip\(file\("\$\{path\.module\}/scripts/([^"]+)"\)\)\}',
+                  lambda m: base64.b64encode(gzip.compress(script(m[1]).read_bytes())).decode(), text)
+    text = re.sub(r'\$\{filesha256\("\$\{path\.module\}/scripts/([^"]+)"\)\}',
+                  lambda m: hashlib.sha256(script(m[1]).read_bytes()).hexdigest(), text)
+    text = re.sub(r"\$\{job\.(\w+)\}", lambda m: fields[m[1]], text)
+    assert "${" not in text and "%{" not in text, "unrendered Terraform interpolation"
+    return text
 
 
 class HostCleanup(unittest.TestCase):
@@ -30,6 +63,95 @@ class HostCleanup(unittest.TestCase):
         )
         for when in ("2026-11-22 23:30:00", "2026-11-23 00:30:00", "2026-11-23 01:30:00"):
             self.assertIn(when, schedule)
+
+    def test_each_installer_is_valid_shell_and_pins_the_script_pair(self):
+        for job in ("nextjs", "fcvm"):
+            text = render_installer(job)
+            subprocess.run(["sh", "-n"], input=text, text=True, check=True)
+            for name in ("nextjs-worktree-prune-host.py", "nextjs-worktree-prune.py"):
+                digest = hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
+                # Once for the install check, once in the entry wrapper's check.
+                self.assertEqual(text.count(digest), 2, (job, name))
+            # The installer touches only its own files and timer: no package
+            # manager, and no restart of any other unit.
+            self.assertIsNone(re.search(r"\b(apt|apt-get|dpkg|snap)\b", text), job)
+            self.assertEqual(re.findall(r"systemctl (\S+)", text),
+                             ["daemon-reload", "enable", "is-enabled", "is-active", "show"])
+
+    def test_nextjs_job_is_unchanged_and_fcvm_job_is_host_only(self):
+        nextjs, fcvm = render_installer("nextjs"), render_installer("fcvm")
+        self.assertIn("ExecStart=/usr/local/sbin/nextjs-worktree-prune --apply\n", nextjs)
+        self.assertIn("/run/nextjs-worktree-prune.lock", nextjs)
+        self.assertNotIn("fcvm", nextjs)
+        self.assertIn("ExecStart=/usr/local/sbin/fcvm-worktree-prune --apply --host-only\n", fcvm)
+        for unit in ("/etc/systemd/system/fcvm-worktree-prune.service",
+                     "/etc/systemd/system/fcvm-worktree-prune.timer", "/run/fcvm-worktree-prune.lock",
+                     "Nice=15", "IOSchedulingClass=idle", "NoNewPrivileges=yes", "TimeoutStartSec=45min",
+                     "systemctl enable --now fcvm-worktree-prune.timer"):
+            self.assertIn(unit, fcvm)
+        self.assertNotIn("/etc/systemd/system/nextjs-worktree-prune", fcvm)
+        # The driver loads its worker from this one path on both hosts.
+        self.assertIn(str(host.WORKER), fcvm)
+
+    def test_fcvm_association_targets_only_fcvm_arm(self):
+        block = tf_block("resource", "fcvm_arm_worktree_prune")
+        self.assertIn("count = var.enable_firecracker_instance ? 1 : 0", block)
+        self.assertEqual(re.findall(r"values += (.*)", block), ["[aws_instance.firecracker_dev[0].id]"])
+        self.assertIn('commands         = local.worktree_prune_install["fcvm"]', block)
+        nextjs = tf_block("resource", "nextjs_worktree_prune")
+        self.assertEqual(re.findall(r"values += (.*)", nextjs), ["[local.nextjs_live_instance.id]"])
+        self.assertIn('commands         = local.worktree_prune_install["nextjs"]', nextjs)
+
+    def test_host_only_cleans_ubuntu_without_machinectl(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            host, "CONFIG", Path(temp) / "absent.json"
+        ), patch.object(host.subprocess, "run", side_effect=AssertionError("machinectl called")), patch.object(
+            host.subprocess, "Popen", side_effect=AssertionError("command run")
+        ):
+            self.assertEqual(host.managed_accounts(host_only=True), ["ubuntu"])
+            # Only ubuntu is cleaned, so no host process scan is needed either.
+            with patch.object(host, "PROC", Path(temp) / "no-proc"):
+                self.assertEqual(host.host_busy_accounts(["ubuntu"]), set())
+            seen = []
+            with patch.object(sys, "argv", ["driver", "--apply", "--host-only"]), patch.object(
+                host.os, "geteuid", return_value=0
+            ), patch.object(host, "pressured", return_value=True), patch.object(
+                host, "clean", side_effect=lambda accounts, *rest: seen.append((accounts, rest[2]))
+            ), patch.object(
+                host, "clean_builds", side_effect=lambda query, pressure, apply, deadline: seen.append(("builds", apply))
+            ):
+                host.main()
+            # The build-output pass follows the merged-worktree pass.
+            self.assertEqual(seen, [(["ubuntu"], True), ("builds", True)])
+
+    def test_host_only_refuses_a_container_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.write_text('{"users":{"ejc3":{}}}', encoding="utf-8")
+            with patch.object(host, "CONFIG", config), patch.object(
+                host.subprocess, "run", side_effect=AssertionError("machinectl called")
+            ), self.assertRaisesRegex(ValueError, "host-only"):
+                host.managed_accounts(host_only=True)
+
+    def test_without_host_only_a_missing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            host, "CONFIG", Path(temp) / "absent.json"
+        ), patch.object(sys, "argv", ["driver", "--apply"]), patch.object(
+            host.os, "geteuid", return_value=0
+        ), patch.object(host, "pressured", return_value=True), patch.object(
+            host, "clean", side_effect=AssertionError("cleaned without an account list")
+        ), patch.object(host.subprocess, "run", side_effect=AssertionError("machinectl called")), \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as stop:
+            host.main()
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("stopped (FileNotFoundError)", err.getvalue())
+
+    def test_host_only_refuses_a_dangling_config_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.symlink_to(Path(temp) / "missing.json")
+            with patch.object(host, "CONFIG", config), self.assertRaisesRegex(ValueError, "host-only"):
+                host.managed_accounts(host_only=True)
 
     def test_oldest_across_accounts_and_stop_on_relief(self):
         calls = []
@@ -130,6 +252,84 @@ class HostCleanup(unittest.TestCase):
                 ("ubuntu", "--list"), ("ejc3", "--list"), ("connor", "--list"),
                 ("connor", "--remove", "c" * 64), ("ubuntu", "--remove", "a" * 64),
             ])
+
+    def test_nextjs_mode_never_runs_the_build_pass(self):
+        for argv in (["driver", "--apply"], ["driver"]):
+            seen = []
+            with patch.object(sys, "argv", argv), patch.object(host.os, "geteuid", return_value=0), patch.object(
+                host, "pressured", return_value=True
+            ), patch.object(host, "managed_accounts", return_value=["ubuntu", "ejc3"]), patch.object(
+                host, "clean", side_effect=lambda accounts, *rest: seen.append(accounts)
+            ), patch.object(host, "clean_builds", side_effect=AssertionError("build pass on Next.js")):
+                host.main()
+            self.assertEqual(seen, [["ubuntu", "ejc3"]])
+
+    def test_host_only_on_a_nextjs_host_stops_before_the_build_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.write_text('{"users":{"ejc3":{}}}', encoding="utf-8")
+            with patch.object(sys, "argv", ["driver", "--apply", "--host-only"]), patch.object(
+                host.os, "geteuid", return_value=0
+            ), patch.object(host, "CONFIG", config), patch.object(host, "pressured", return_value=True), \
+                    patch.object(host, "clean_builds", side_effect=AssertionError("build pass on Next.js")), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stop:
+                host.main()
+            self.assertEqual(stop.exception.code, 1)
+
+    @staticmethod
+    def build_answer(status, next_=None, **counts):
+        return {"status": status, "next": next_, **{k: counts.get(k, 0) for k in host.BUILD_COUNTS}}
+
+    def test_build_pass_follows_the_cursor_and_stops_when_pressure_clears(self):
+        calls = []
+        pressure = [True, True, False]
+        answers = [self.build_answer("more", "1:" + "a" * 64, worktrees=2, dirs=3, bytes=10),
+                   self.build_answer("more", "2:" + "b" * 64, worktrees=1, dirs=1, bytes=5, failed=1)]
+
+        def query(account, *argv):
+            calls.append((account, *argv))
+            return answers.pop(0)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            totals = host.clean_builds(query, lambda: pressure.pop(0), True, float("inf"))
+        self.assertEqual(calls, [("ubuntu", "--clean-builds"), ("ubuntu", "--clean-builds", "--after", "1:" + "a" * 64)])
+        self.assertEqual(totals, {"worktrees": 3, "dirs": 4, "bytes": 15, "failed": 1})
+        self.assertIn("build output healthy: 3 worktrees, 4 directories, 15 bytes", out.getvalue())
+
+    def test_build_preview_only_counts_and_ignores_pressure(self):
+        calls = []
+
+        def query(account, *argv):
+            calls.append(argv)
+            return self.build_answer("done", worktrees=4, dirs=9, bytes=2 * 1024**3)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            host.clean_builds(query, lambda: self.fail("preview checked pressure"), False, float("inf"))
+        self.assertEqual(calls, [("--builds",)])
+        self.assertIn("4 worktrees, 9 directories, 2147483648 bytes (2.0 GiB) removable", out.getvalue())
+
+    def test_build_pass_stops_at_its_deadline(self):
+        now = [0]
+
+        def query(account, *argv):
+            now[0] = host.BUILD_DEADLINE
+            return self.build_answer("more", "1:" + "a" * 64)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            host.clean_builds(query, lambda: True, True, host.BUILD_DEADLINE, clock=lambda: now[0])
+        self.assertIn("build output out of time", out.getvalue())
+
+    def test_build_pass_refuses_bad_or_stalled_answers(self):
+        cursor = "1:" + "a" * 64
+        for answers in ([{"status": "done"}], [self.build_answer("removed")],
+                        [self.build_answer("done", worktrees=-1)], [self.build_answer("done", bytes=True)],
+                        [self.build_answer("done", "/home/ubuntu/src/x")], [self.build_answer("more")],
+                        [self.build_answer("more", cursor), self.build_answer("more", cursor)]):
+            with self.subTest(answers=answers), contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaises(ValueError):
+                host.clean_builds(lambda *_: answers.pop(0), lambda: True, True, float("inf"))
 
     def test_untrusted_stdout_is_bounded_before_json_parsing(self):
         with tempfile.TemporaryDirectory() as temp:
