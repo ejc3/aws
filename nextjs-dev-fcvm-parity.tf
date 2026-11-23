@@ -142,6 +142,19 @@ resource "aws_iam_policy" "nextjs_dev_fcvm_parity" {
         Resource = aws_ssm_parameter.astryx.arn
       },
       {
+        # Apply ejc3/constellation's infra/apps/family (family-account.tf): its apply role trusts nextjs-dev-role too.
+        Sid      = "FamilyApply"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = module.family_account.terraform_role_arn
+      },
+      {
+        Sid      = "FamilyPointer"
+        Effect   = "Allow"
+        Action   = "ssm:GetParameter"
+        Resource = module.family_account.pointer_arn
+      },
+      {
         # EC2 service quotas and their request history (dev-instance-common.tf's dev-service-quotas-read).
         Sid      = "ReadEc2Quotas"
         Effect   = "Allow"
