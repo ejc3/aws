@@ -4,6 +4,9 @@ output "account_id" {
 output "terraform_role_arn" {
   value = aws_iam_role.terraform.arn
 }
+output "pointer_name" {
+  value = aws_ssm_parameter.pointer.name
+}
 output "pointer_arn" {
   value = aws_ssm_parameter.pointer.arn
 }

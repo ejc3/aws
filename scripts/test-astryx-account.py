@@ -111,7 +111,7 @@ class ApplyRoleTests(unittest.TestCase):
         self.assertIn("Resource = aws_iam_role.astryx_terraform.arn", PARITY.split('Sid      = "AstryxApply"', 1)[1].split("},", 1)[0])
         self.assertIn("Resource = aws_ssm_parameter.astryx.arn", PARITY.split('Sid      = "AstryxPointer"', 1)[1].split("},", 1)[0])
         member = CT.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
-        self.assertIn("aws_ssm_parameter.astryx.arn", member)
+        self.assertIn("aws_ssm_parameter.astryx.name", member)
         owner_only_roles = member.split('Sid      = "OwnerOnlyRoles"', 1)[1].split("}", 1)[0]
         self.assertIn('Action   = "sts:AssumeRole"', owner_only_roles)
         self.assertIn('Resource = "*"', owner_only_roles)
