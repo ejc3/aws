@@ -2206,6 +2206,13 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   it activates). Take values from the real source, never from Vercel: a variable of type `sensitive` is never returned by any
   Vercel API, and `vercel env pull` writes the text `[SENSITIVE]` in its place. Use the site's non-production values where it
   has them (its own OAuth client, the non-production database) and fresh random ones where a value only has to be unguessable.
+  Two sites also get values Terraform makes, in a second container `workers-stage/<site>/terraform` in the Dolphin account
+  that the loader merges (refusing a name in both): dolphin-maps its moderation key (`dolphin-maps-moderation.tf`) and
+  dolphin-labs `FANTASY_ACCESS_AUD`, which the fantasy draft room checks Access tokens against: the AUD tag of the
+  hostname-level application on `dolphin-labs-stage.cc-games.workers.dev` (`dolphin-labs-stage-check.tf`; it takes precedence
+  over the Worker-native gate), written from that application's `aud`, never a literal (`dolphin-labs-stage-fantasy.tf`). Neither
+  name goes in the out-of-band container, and dolphin-aws does not manage either `/terraform` container. Order: apply, then
+  `scripts/workers-stage-secrets.sh dolphin-labs` after the site's deploy has finished (again if the application is re-created).
 - **AWS holds a record of every site's Vercel environment, too** (`vercel-env-secrets.tf`): `vercel-env/<site>/<target>`, one
   administration-only container per project per target (JSON name to value), so Vercel is not the only holder of a site's
   credentials. Vercel never returns a `sensitive` variable after it is saved, so `scripts/vercel-env-capture.py SITE TARGET` reads

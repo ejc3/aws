@@ -7,8 +7,9 @@
 # workers-stage-secrets.tf). Dolphin's sites (dolphin-labs, dolphin-films, dolphin-maps) keep theirs in the Dolphin account
 # (dolphin-labs-hq/dolphin-aws, secrets.tf), read through OrganizationAccountAccessRole from this account's
 # administration; every other site's container is in this account. A site whose Worker also gets values Terraform makes
-# (dolphin-maps: the moderation key, dolphin-maps-moderation.tf) has a second container, workers-stage/SITE/terraform, beside
-# it. Lights reads its Bedrock settings from that managed container and its two inventory bindings from the shared
+# (dolphin-maps: the moderation key, dolphin-maps-moderation.tf; dolphin-labs: FANTASY_ACCESS_AUD, the Access audience of
+# its hostname, dolphin-labs-stage-fantasy.tf) has a second container, workers-stage/SITE/terraform, beside it. Lights reads
+# its Bedrock settings from that managed container and its two inventory bindings from the shared
 # browserbase/credentials in this account. A name in both refuses the whole load. The result is piped to `wrangler secret bulk`, so no
 # value is on a command line, in a file or in this script's output; only names are printed. Run it AFTER the site's own
 # deploy has finished: a secret change made while a deploy is uploading can be lost when that deploy activates.
@@ -25,8 +26,8 @@ ACCOUNT_ID=12ea67fb7ced068de03f35c22688e436
 DOLPHIN_ACCOUNT_ID=484888470752
 MANAGED_CONTAINER="" # set: workers-stage/SITE/terraform exists too (Terraform writes it)
 case "$SITE" in
-  dolphin-labs | dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
-  dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;
+  dolphin-films) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID ;;
+  dolphin-labs | dolphin-maps) SOURCE_ACCOUNT=$DOLPHIN_ACCOUNT_ID MANAGED_CONTAINER=1 ;;
   lights) SOURCE_ACCOUNT="" MANAGED_CONTAINER=1 ;;
   *) SOURCE_ACCOUNT="" ;;
 esac
@@ -131,6 +132,11 @@ for label in ("OUT_OF_BAND", "MANAGED"):
 if sys.argv[1] == "dolphin-maps":
     required = {"MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_SECRET_ACCESS_KEY",
                 "MODERATION_AWS_REGION", "MODERATION_TEXT_REGION"}
+    missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
+    if missing:
+        sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))
+if sys.argv[1] == "dolphin-labs":
+    required = {"FANTASY_ACCESS_AUD"}
     missing = required.difference(json.loads(os.environ["MANAGED"] or "{}"))
     if missing:
         sys.exit("managed container is missing required names: " + ", ".join(sorted(missing)))

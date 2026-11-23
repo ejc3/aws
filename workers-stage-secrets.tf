@@ -34,9 +34,11 @@
 #
 # Rolling a Dolphin site back here inside the 7-day recovery window needs the deleted container restored first.
 #
-# One exception to "Terraform never holds a value": dolphin-maps-stage also gets a key Terraform makes (its moderation user,
+# Two exceptions to "Terraform never holds a value": dolphin-maps-stage also gets a key Terraform makes (its moderation user,
 # dolphin-maps-moderation.tf), written into a second container of its own, workers-stage/dolphin-maps/terraform in the
-# Dolphin account. The loader merges the two and refuses a name in both; the out-of-band container stays out of state.
+# Dolphin account, and dolphin-labs-stage gets FANTASY_ACCESS_AUD, the Access audience of its hostname
+# (dolphin-labs-stage-fantasy.tf), in workers-stage/dolphin-labs/terraform there. The loader merges each pair and refuses a
+# name in both; the out-of-band containers stay out of state.
 #
 # The staging copies use NON-production values where the site has them (their own OAuth client, the non-production
 # database) and fresh stage-only random secrets where a value only has to be unguessable. Vercel never returns a
