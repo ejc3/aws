@@ -144,9 +144,9 @@ class ServiceTests(unittest.TestCase):
         self.assertNotRegex(TF, r">\s*/(tmp|var|etc)[^\n]*key")
 
     def test_held_back_subscriptions_reach_the_server_safely(self):
-        # The reserve map renders PROFILE=N[ last-resort] lines; the owner's first one holds a subscription out entirely.
+        # The reserve map renders PROFILE=N[ last-resort] lines; the owner's first one keeps a subscription for when every other one is out (last resort, owner, 2026-11-23).
         body = re.search(r"claw_master_profile_reserve = \{(.*?)\n  \}", TF, re.S).group(1)
-        self.assertIn('"claude-colton-renewed-20261112" = { reserve = 100, last_resort = false }', body)
+        self.assertIn('"claude-colton-renewed-20261112" = { reserve = 100, last_resort = true }', body)
         self.assertIn('" last-resort"', TF)
         # The file is replaced by one rename (never read half-written) and readable by the server's group only.
         boot = TF[TF.index("# Held-back subscriptions (local.claw_master_profile_reserve)"):]

@@ -91,7 +91,7 @@ locals {
   # API-key backup. Below the point the normal draining rules apply. An apply rewrites /etc/claude-master/profile-reserve
   # and the running server picks it up within about two minutes, with no restart.
   claw_master_profile_reserve = {
-    "claude-colton-renewed-20261112" = { reserve = 100, last_resort = false }
+    "claude-colton-renewed-20261112" = { reserve = 100, last_resort = true }
   }
   claw_master_profile_reserve_file = join("", concat(
     ["# PROFILE=N[ last-resort], written by Terraform from local.claw_master_profile_reserve (claw-master-server.tf)\n"],
