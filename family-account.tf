@@ -23,10 +23,12 @@ module "family_account" {
     aws     = aws
     aws.app = aws.family
   }
-  app                  = "family"
-  ou_name              = "Family"
-  email                = local.family_account_email
-  organization_root_id = data.aws_organizations_organization.current.roots[0].id
+  app     = "family"
+  ou_name = "Family"
+  email   = local.family_account_email
+  # From the organization resource, not the data source: the guardrail SCP is then ordered after
+  # the organization's policy types are enabled (security-organization.tf), as Astryx's depends_on does.
+  organization_root_id = aws_organizations_organization.security.roots[0].id
   region               = var.aws_region
   global_actions       = local.dolphin_region_scp_global_actions
   appliers = {

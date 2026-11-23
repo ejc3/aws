@@ -64,4 +64,10 @@ variable "stage" {
     login_policy_ids = list(string)
   })
   default = null
+  validation {
+    # The connector's Access-required rule is this path as a regex: plain path characters only, so
+    # no metacharacter can make it miss while the API's bypass rule still matches.
+    condition     = var.stage == null || can(regex("^/[A-Za-z0-9/_-]+$", var.stage.login_path))
+    error_message = "stage.login_path is a plain path: /, letters, digits, _ and -."
+  }
 }
