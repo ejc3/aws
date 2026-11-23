@@ -16,7 +16,7 @@
 # and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
 # On the mini (ssh <mini>), as its login user, with Tart at ~/.local/bin/tart (README "The Mac mini"):
-#   * clones the VM from the base image pinned below, by digest, and sizes it (ci 9 cores / 36 GB / 200 GB disk, skevh
+#   * clones the VM from the base image pinned below, by digest, and sizes it (ci 9 cores / 28 GB / 200 GB disk, skevh
 #     4 / 16 / 100: a Mac runs at most two macOS VMs at once, and these two leave the host 2 cores and 12 GB). An
 #     existing VM is kept as it is: this never deletes or re-clones one.
 #   * the LaunchAgent com.ejcampbell.tart.<vm>: `tart run --no-graphics <vm>` at login, restarted by launchd. ci also
@@ -60,7 +60,9 @@ done
 [ -z "$RUNNERS$SLOTS_ONLY" ] || [ "$VM" = ci ] || usage
 [ -z "$RUNNERS" ] || [ -z "$SLOTS_ONLY" ] || usage
 case "$VM" in
-  ci) CPU=9 MEMORY_MB=36864 DISK_GB=200 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro' ;;
+  # The two guests' RAM stays resident on the host (a guest fills it with its own cache), so together they must
+  # leave macOS room beside its ~7 GB wired: at 36 + 16 of 64 GB the host ran out and hung (2026-11-22, #999).
+  ci) CPU=9 MEMORY_MB=28672 DISK_GB=200 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro' ;;
   skevh) CPU=4 MEMORY_MB=16384 DISK_GB=100 DIRS='' ;;
   *) usage ;;
 esac

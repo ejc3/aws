@@ -22,6 +22,13 @@ COMMAND_SECONDS = 300
 USER_PATH = "/usr/local/bin:/usr/bin:/bin"
 MAX_HOST_PIDS = 8192
 MAX_HOST_LINKS = 65536
+# The build-output pass (--host-only) starts no worker call after this many
+# seconds of the run; one call takes at most COMMAND_SECONDS + 10, which keeps
+# the whole run inside the unit's 45-minute TimeoutStartSec.
+BUILD_DEADLINE = 35 * 60
+BUILD_KEYS = {"status", "worktrees", "dirs", "bytes", "failed", "next"}
+BUILD_COUNTS = ("worktrees", "dirs", "bytes", "failed")
+CURSOR = re.compile(r"[0-9]{1,19}:[0-9a-f]{64}\Z")
 
 
 @dataclass(frozen=True, order=True)
@@ -39,7 +46,13 @@ def pressured():
             or fs.f_files > 0 and fs.f_favail * 10 <= fs.f_files)
 
 
-def managed_accounts():
+def managed_accounts(host_only=False):
+    if host_only:
+        # A host without nextjs-ct (fcvm-metal-arm) has one account and no
+        # machines. Refuse a Next.js host so its containers are never skipped.
+        if CONFIG.exists() or CONFIG.is_symlink():
+            raise ValueError("host-only mode on a managed container host")
+        return ["ubuntu"]
     with CONFIG.open("rb") as f:
         data = f.read(1024 * 1024 + 1)
     if len(data) > 1024 * 1024:
@@ -232,18 +245,70 @@ def clean(accounts, query, pressure, apply, busy_accounts):
     return removed
 
 
+def clean_builds(query, pressure, apply, deadline, clock=time.monotonic):
+    """fcvm-metal-arm only: idle worktrees' ignored build output, oldest first.
+
+    Each worker call is one bounded pass that rechecks pressure between
+    worktrees; a cursor carries the next call on. Without apply it only counts.
+    """
+    mode = "--clean-builds" if apply else "--builds"
+    totals = dict.fromkeys(BUILD_COUNTS, 0)
+    cursor, outcome = None, "done"
+    while True:
+        if apply and not pressure():
+            outcome = "healthy"
+            break
+        if clock() >= deadline:
+            outcome = "out of time"
+            break
+        answer = query("ubuntu", mode, *(("--after", cursor) if cursor else ()))
+        if (not isinstance(answer, dict) or answer.keys() != BUILD_KEYS
+                or answer["status"] not in ("healthy", "done", "more")
+                or not all(type(answer[key]) is int and 0 <= answer[key] < 2**63 for key in BUILD_COUNTS)
+                or not (answer["next"] is None
+                        or isinstance(answer["next"], str) and CURSOR.fullmatch(answer["next"]))):
+            raise ValueError("invalid build cleanup result from ubuntu")
+        for key in BUILD_COUNTS:
+            totals[key] += answer[key]
+        outcome = answer["status"]
+        if outcome != "more":
+            break
+        if answer["next"] is None or answer["next"] == cursor:
+            raise ValueError("build cleanup made no progress")
+        cursor = answer["next"]
+    verb = "removed" if apply else "removable"
+    print(f"nextjs-worktree-prune: build output {outcome}: {totals['worktrees']} worktrees, "
+          f"{totals['dirs']} directories, {totals['bytes']} bytes ({totals['bytes'] / 1024**3:.1f} GiB) "
+          f"{verb}, {totals['failed']} directories not removed")
+    return totals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="remove eligible worktrees while disk is pressured")
+    parser.add_argument("--host-only", action="store_true",
+                        help="clean only the host's ubuntu account, then idle worktrees' build output;"
+                             " for hosts without nextjs-ct")
     args = parser.parse_args()
     if os.geteuid():
         parser.exit(2, "nextjs-worktree-prune: run the host driver as root\n")
+    start = time.monotonic()
     try:
         # The installed entry point acquires the lock before loading this file.
         if not pressured():
             print("nextjs-worktree-prune: disk has enough space; skipped")
             return
-        clean(managed_accounts(), query_worker, pressured, args.apply, host_busy_accounts)
+        incomplete = False
+        try:
+            clean(managed_accounts(args.host_only), query_worker, pressured, args.apply, host_busy_accounts)
+        except IncompleteAccounts:
+            incomplete = True
+        # Build output only on a host-only run (fcvm-metal-arm), after the merged
+        # pass. managed_accounts has already refused host-only on a Next.js host.
+        if args.host_only:
+            clean_builds(query_worker, pressured, args.apply, start + BUILD_DEADLINE)
+        if incomplete:
+            raise IncompleteAccounts
     except IncompleteAccounts:
         parser.exit(1, "nextjs-worktree-prune: cleanup incomplete; see account results above\n")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as e:

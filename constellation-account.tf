@@ -256,6 +256,19 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
       Resource  = aws_ssm_parameter.astryx.arn
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
       }, {
+      # Apply ejc3/constellation's infra/apps/family in the Family account (family-account.tf), and read /infra/family. Same pin.
+      Sid       = "AssumeTheFamilyApplyRoleOnly"
+      Effect    = "Allow"
+      Action    = "sts:AssumeRole"
+      Resource  = module.family_account.terraform_role_arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
+      Sid       = "ReadTheFamilyPointerOnly"
+      Effect    = "Allow"
+      Action    = "ssm:GetParameter"
+      Resource  = module.family_account.pointer_arn
+      Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }
+      }, {
       # opencode's abliteration.ai key (dev-ai-services.tf), on both metal boxes: no instance pin.
       Sid      = "ReadTheAbliterationApiKey"
       Effect   = "Allow"

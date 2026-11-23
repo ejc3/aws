@@ -23,7 +23,8 @@ locals {
 
   # One lane repository per stack (owner, 2026-11-23): staging's, adopted from the spike, and prod's while prod is enabled.
   # Each repository admits only its own stack's roles and its own stack's Lambda pull. Staging never reads or writes prod's;
-  # a promotion copies the image staging tested into prod's by digest, on prod's own credentials (fcvm-fleet-prod-ci.tf).
+  # a promotion will copy the image staging tested into prod's by digest, on prod's own credentials. That grant is not
+  # here yet (#1002): until it lands, prod's repository has no writer and prod CI still denies ecr:*.
   fcvm_lambda_repo_name      = "fcvm-fleet/lambda-tile"
   fcvm_lambda_prod_repo_name = "fcvm-fleet/lambda-tile-prod"
   # Each repository's mutable, never-expired tags: the keep- tags ejc3/fcvm fleet/lambda/release.py moves there. Staging's
@@ -223,8 +224,8 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile_prod" {
   })
 }
 
-# Only prod's tile functions pull from prod's repository. Prod CI's copy and retag are admitted where they are granted
-# (fcvm-fleet-prod-ci.tf).
+# Only prod's tile functions pull from prod's repository. Prod CI's copy and retag will be admitted with their grant
+# (#1002); until then nothing writes to it.
 resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile_prod" {
   count      = local.fcvm_fleet_prod
   provider   = aws.fcvm_fleet_east1

@@ -108,7 +108,9 @@ locals {
   runner_budget_groups = {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
     dolphin = {
-      daily_usd = 50
+      # $80 (was $50, 2026-11-22): a busy day of dolphin-maps merges throttled the group, and throttled at $50 the
+      # four repos fit only two `l` jobs at once (68 vCPUs), so pull requests queued behind main's CI and deploy.
+      daily_usd = 80
       repos     = concat(local.dolphin_runner_pool_repos, ["dolphin-labs-hq/dolphin-family"])
     }
 
@@ -117,8 +119,8 @@ locals {
   }
   # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
   # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
-  # host_hour_usd), at vcpu_hour_usd, rounded down: at $50 a day, imagine 72 vCPUs (8 hosts), dolphin 68 (14 hosts) and
-  # constellation 74 (4 hosts).
+  # host_hour_usd), at vcpu_hour_usd, rounded down: imagine 72 vCPUs (8 hosts, $50 a day), dolphin 115 (14 hosts,
+  # $80 a day) and constellation 74 (4 hosts, $50 a day).
   # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
   # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
   # still under the refill ($2.08/h).
@@ -511,6 +513,8 @@ resource "aws_iam_role_policy" "runner_app_lambda" {
       },
       {
         # The budget buckets (app_runner.py update_bucket): a consistent read, then a write conditional on the version.
+        # The same table keeps the group wait, where each repo's queue scan stopped (scan/<repo>) and the pools that
+        # recently refused capacity (pools/refused).
         Sid      = "BudgetBuckets"
         Effect   = "Allow"
         Action   = ["dynamodb:GetItem", "dynamodb:PutItem"]
@@ -730,7 +734,9 @@ resource "aws_dynamodb_table" "runner_app_reruns" {
 }
 
 # One item per budget group (app_runner.py, "budget buckets"): {level_usd, updated_at, rate_usd_h, throttled, spend,
-# version}. Nothing here is precious: a missing item starts full, so no point-in-time recovery.
+# version}. Also the controller's other small state: waiting/<group>, scan/<repo> (where the queue scan resumes) and
+# pools/refused. Nothing here is precious: a missing item starts full, a missing cursor starts at the oldest run and a
+# missing pool list tries every pool in order, so no point-in-time recovery.
 resource "aws_dynamodb_table" "runner_app_budget" {
   count        = var.enable_github_runner ? 1 : 0
   name         = "github-app-runner-budget"
@@ -827,6 +833,30 @@ resource "aws_cloudwatch_metric_alarm" "too_many_app_runner_vcpus_per_repo" {
   namespace           = "GitHubAppRunner"
   metric_name         = "LiveVcpus"
   dimensions          = { Repo = each.key }
+  statistic           = "Maximum"
+  period              = 300
+  treat_missing_data  = "notBreaching"
+}
+
+# Per runner label: a queued job of ours has waited more than 30 minutes with no host (issue #991: a dolphin `l` job
+# waited from 16:04 to 19:59 and nothing said so). The controller publishes OldestQueuedSeconds per label on every
+# reconcile, from its own queue scan, so this needs nothing in GitHub Actions to run. The repos sharing a label (the
+# dolphin repos) share one series. A scan can take a few rounds to come back to a job deep in a long queue
+# (app_runner.py queued_jobs), so one breaching 5-minute period in the last 30 minutes raises it, and it clears only
+# after 30 minutes without one. Missing data is the reconcile-silent alarm's to report.
+resource "aws_cloudwatch_metric_alarm" "app_runner_queued_too_long" {
+  for_each            = var.enable_github_runner ? toset([for c in values(local.runner_app_config) : c.label]) : toset([])
+  alarm_name          = "github-app-runner-queued-too-long-${each.key}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = 6
+  datapoints_to_alarm = 1
+  threshold           = 30 * 60
+  alarm_description   = "A queued [self-hosted, ${each.key}, ...] job has waited more than 30 minutes with no app runner host. Read the github-app-runner log for that job: a cap, the budget bucket, capacity refusals or a scan stopping short."
+  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
+  ok_actions          = [aws_sns_topic.cost_alerts.arn]
+  namespace           = "GitHubAppRunner"
+  metric_name         = "OldestQueuedSeconds"
+  dimensions          = { Label = each.key }
   statistic           = "Maximum"
   period              = 300
   treat_missing_data  = "notBreaching"

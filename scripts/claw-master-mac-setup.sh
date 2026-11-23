@@ -37,8 +37,8 @@ KEY=${FCVM_KEY:-$HOME/.ssh/fcvm-ec2}
 
 # Pins. Keep CM_TAG equal to claw_master_tag in claw-master-server.tf (a test enforces it) and
 # bump the sha256 values together with it.
-CM_TAG=claw-master-dee7046
-CM_SHA256_DARWIN_ARM64=450e3995dd2c49539c09a969c5476571649511923b7ba3a38cb6af3c41c6af45
+CM_TAG=claw-master-47cd10c
+CM_SHA256_DARWIN_ARM64=02f84c7432fef61ff50393e2cabf9ef2aba565365cd73ec267f268bbf1373e38
 CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 # The executable inside that tarball: an installed cloudflared is judged by this, not by its version string.
