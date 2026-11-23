@@ -1722,8 +1722,12 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 - `com.ccgames.mini-ssh.cloudflared`: the host's connector.
 - `com.ejcampbell.tart.skevh` and `com.ejcampbell.tart.ci`: `tart run --no-graphics <vm>` (Tart 2.38.0 in
   `~/Applications/tart.app`, linked at `~/.local/bin/tart`). `ci` also mounts the mini's `~/Applications/Xcode.app`
-  read-only. A Mac runs at most two macOS VMs at once, so the mini is full: ci has 9 cores / 36 GB / 200 GB, skevh 4 /
+  read-only. A Mac runs at most two macOS VMs at once, so the mini is full: ci has 9 cores / 28 GB / 200 GB, skevh 4 /
   16 / 100.
+  Keep the two guests' memory well under the host's 64 GB. A guest fills all of its RAM (with its own file cache too), and
+  every page stays resident on the host, which also needs about 7 GB wired for itself. At 36 + 16 GB the host had 0.2 GB
+  free and macOS's memory killer, jetsam, killed its daemons in a loop until it hung (2026-11-22, #999). The
+  `JetsamEvent-*.ips` reports in `/Library/Logs/DiagnosticReports` list each process's resident size.
 - Inside each VM, its own connector as the guest's `admin` (`com.ccgames.mac-vm-<vm>.cloudflared`), keys-only sshd.
 
 **FileVault is on**, so the mini cannot log itself in: after a power cut or a reboot nothing above runs until someone
