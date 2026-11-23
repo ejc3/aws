@@ -19,7 +19,8 @@ MIB = 1024**2
 HOUR = 3600
 
 # xcrun simctl: the device list comes from a JSON file; erase empties data/ and rewrites device.plist, as
-# CoreSimulator does, and refuses a booted device.
+# CoreSimulator does, and refuses a booted device. Every call is recorded first, so an attempted erase shows.
+# A device with boots_after_listings = N reports Booted from listing N + 1 on.
 XCRUN = r'''#!/usr/bin/env python3
 import json, os, shutil, sys
 state_file, calls = os.environ["FAKE_SIMS"], os.environ["FAKE_CALLS"]
@@ -27,6 +28,11 @@ sims = json.load(open(state_file))
 args = sys.argv[1:]
 assert args[0] == "simctl"
 print(*args[1:], file=open(calls, "a"))
+listings = sum(line.startswith("list") for line in open(calls))
+for d in sims.values():
+    if listings > d.get("boots_after_listings", float("inf")):
+        d["state"] = "Booted"
+json.dump(sims, open(state_file, "w"))
 if args[1:] == ["list", "devices", "--json"]:
     print(json.dumps({"devices": {"com.apple.CoreSimulator.SimRuntime.iOS-26-0": [
         {"udid": u, "state": d["state"], "name": d["name"], "isAvailable": True} for u, d in sims.items()]}}))
@@ -44,6 +50,9 @@ else:
 '''
 LSOF = r'''#!/usr/bin/env python3
 import os
+if os.environ.get("FAKE_TOUCH"):
+    stamp = float(os.environ["FAKE_TOUCH_TIME"])
+    os.utime(os.environ["FAKE_TOUCH"], (stamp, stamp))
 print("p1")
 for path in filter(None, os.environ.get("FAKE_OPEN", "").split(":")):
     print("n" + path)
@@ -85,7 +94,7 @@ class Cleaner(unittest.TestCase):
             (self.root / name).chmod(0o755)
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
-        for key in ("CI_SIM_STATE_DIR", "MAC_STATE_DIR", "FAKE_OPEN"):
+        for key in ("CI_SIM_STATE_DIR", "MAC_STATE_DIR", "FAKE_OPEN", "FAKE_TOUCH", "FAKE_TOUCH_TIME"):
             os.environ.pop(key, None)
         os.environ.update(HOME=str(self.home), TMPDIR=str(self.tmp), FAKE_SIMS=str(self.sims),
                           FAKE_CALLS=str(self.calls))
@@ -108,7 +117,7 @@ class Cleaner(unittest.TestCase):
             os.utime(path, (mtime, mtime))
         return path
 
-    def sim(self, n, state, mib, plist_age_hours):
+    def sim(self, n, state, mib, plist_age_hours, **extra):
         device = self.devices / udid(n)
         self.blob(device / "data/Containers/app", mib)
         plist = device / "device.plist"
@@ -116,7 +125,7 @@ class Cleaner(unittest.TestCase):
         stamp = self.now - plist_age_hours * HOUR
         os.utime(plist, (stamp, stamp))
         sims = json.loads(self.sims.read_text())
-        sims[udid(n)] = {"state": state, "name": f"Dolphin Maps CI mini-{n}: iPhone 17"}
+        sims[udid(n)] = {"state": state, "name": f"Dolphin Maps CI mini-{n}: iPhone 17", **extra}
         self.sims.write_text(json.dumps(sims))
 
     def run_clean(self, min_free_mib, dry_run=False):
@@ -186,6 +195,44 @@ class Cleaner(unittest.TestCase):
         self.assertTrue((self.work / "checkout/big").exists())
         self.assertIn("1 DerivedData entries removed", out)
         self.assertIn("2 temp entries removed", out)
+
+    def test_never_erases_a_simulator_that_is_not_shut_down(self):
+        # No slot lock is held: only the state check stands between these devices and an erase. Each in-use
+        # device is larger than the one stale shut-down device, so it would be chosen first.
+        for n, state in ((1, "Booted"), (2, "Booting"), (3, "Creating"), (4, "Shutting Down")):
+            self.sim(n, state, 6, 48)
+        self.sim(5, "Shutdown", 8, 48, boots_after_listings=1)  # a job boots it after the cleaner's scan
+        self.sim(6, "Shutdown", 1, 48)
+        # A dry run takes no second look: the scan alone must leave the in-use devices out.
+        result, erased, out = self.run_clean(min_free_mib=10_000, dry_run=True)
+        self.assertEqual(erased, [])
+        self.assertIn("2 simulators erased", out)  # 5 (still shut down at its first listing) and 6
+        self.calls.write_text("")  # restart the listing count: 5 is shut down again at the real run's scan
+        # The real run: 5 is Shutdown in the scan and Booted when it is checked again under the locks.
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [udid(6)])
+        for n in range(1, 6):
+            self.assertTrue((self.devices / udid(n) / "data/Containers/app").exists())
+
+    def test_caches_touched_minutes_ago_survive_while_older_ones_go(self):
+        minutes = self.now - 10 * 60
+        self.sim(1, "Shutdown", 1, 1)
+        self.blob(self.derived / "Old-abc/Build/a", 1)
+        self.blob(self.derived / "Recent-def/Build/a", 1, mtime=minutes)
+        self.blob(self.derived / "Written-ghi/Build/a", 1)  # old at the scan, written before its removal
+        self.blob(self.tmp / "old-file", 1)
+        self.blob(self.tmp / "recent-file", 1, mtime=minutes)
+        # A dry run takes no second look: the scan alone must leave the recent entries out.
+        result, erased, out = self.run_clean(min_free_mib=10_000, dry_run=True)
+        self.assertIn("2 DerivedData entries removed", out)
+        self.assertIn("1 temp entries removed", out)
+        # The real run: a job writes into Written-ghi after the scan; the check under the locks must see it.
+        os.environ.update(FAKE_TOUCH=str(self.derived / "Written-ghi/Build/a"), FAKE_TOUCH_TIME=str(minutes))
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(sorted(p.name for p in self.derived.iterdir()), ["Recent-def", "Written-ghi"])
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["recent-file"])
+        self.assertIn("1 DerivedData entries removed", out)
+        self.assertIn("1 temp entries removed", out)
 
     def test_any_held_mac_build_lock_stops_every_action(self):
         self.sim(1, "Shutdown", 2, 12)

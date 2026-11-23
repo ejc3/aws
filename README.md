@@ -1794,7 +1794,8 @@ failed with "No space left on device": 44 runner simulators held 64 GB, DerivedD
 7.7 GB, and nothing in the VM cleaned any of it. The same install as the test slots (`--runners` or
 `--simulator-slots`, idempotent) puts `ci-disk-clean` in `/usr/local/libexec/mini-simulator` and the LaunchAgent
 `com.ejcampbell.ci-disk-clean` in `/Library/LaunchAgents`, loaded in `admin`'s session (where the simulators live),
-hourly and at load, at the lowest CPU and I/O priority. It acts only while `/System/Volumes/Data` has under 30 GB free
+hourly and at load, at the lowest CPU and I/O priority. Like the runners, it relies on `admin`'s auto-login session:
+without one it does not run. It acts only while `/System/Volumes/Data` has under 30 GB free
 or is at least 85% used, and stops as soon as neither holds. First it erases, largest first, simulators that are
 `Shutdown` and whose `device.plist` is 6 hours old (`xcrun simctl erase` keeps each device and its UDID, so the
 runners' named devices stay where jobs look; erasing the 32 stale ones freed about 27 GB). Then it removes entries
