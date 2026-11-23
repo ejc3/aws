@@ -87,10 +87,10 @@ resource "github_actions_environment_variable" "fcvm_prod" {
   value         = each.value
 }
 
-# The role ARN carries the account id: a secret, as staging's (fcvm-fleet-ci.tf).
+# The role ARN and the lane repository URL carry the account id: secrets, as staging's (fcvm-fleet-ci.tf).
 resource "github_actions_environment_secret" "fcvm_prod" {
   provider    = github.agents_md
-  for_each    = var.fcvm_fleet_prod_enabled ? toset(["AWS_ROLE_ARN", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "CLOUDFLARE_API_TOKEN"]) : toset([])
+  for_each    = var.fcvm_fleet_prod_enabled ? toset(["AWS_ROLE_ARN", "CF_ACCESS_CLIENT_ID", "CF_ACCESS_CLIENT_SECRET", "CLOUDFLARE_API_TOKEN", "LAMBDA_TILE_REPO"]) : toset([])
   repository  = "fcvm"
   environment = github_repository_environment.fcvm_prod[0].environment
   secret_name = each.key
@@ -99,6 +99,7 @@ resource "github_actions_environment_secret" "fcvm_prod" {
     CF_ACCESS_CLIENT_ID     = cloudflare_zero_trust_access_service_token.fcvm_prod_ci[0].client_id
     CF_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.fcvm_prod_ci[0].client_secret
     CLOUDFLARE_API_TOKEN    = cloudflare_account_token.fcvm_prod_workers_deploy[0].value
+    LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
   }[each.key]
 }
 
@@ -147,10 +148,32 @@ resource "aws_iam_role_policy" "fcvm_prod_ci" {
         Action      = "lambda:*"
         NotResource = concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])
       },
+      # The prod lane (ejc3/fcvm publish.py --stack prod --lambda-digest) moves keep-prod-* in the lane repository:
+      # read an image and put a tag on it. No layer upload, so only manifests whose layers the repository holds.
+      {
+        Sid      = "RetagTheLaneImage"
+        Effect   = "Allow"
+        Action   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"]
+        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+      },
+      {
+        Sid    = "NeverUploadToTheLaneRepository"
+        Effect = "Deny"
+        Action = ["ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:BatchDeleteImage",
+          "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy", "ecr:PutLifecyclePolicy",
+        "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability"]
+        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+      },
+      {
+        Sid         = "NoOtherRepository"
+        Effect      = "Deny"
+        Action      = "ecr:*"
+        NotResource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+      },
       {
         Sid    = "NeverPublishAdministerOrReadCredentials"
         Effect = "Deny"
-        Action = ["ecr:*", "iam:*", "sts:AssumeRole*", "s3:*", "secretsmanager:*", "ssm:*", "ecs:*", "ec2:*",
+        Action = ["iam:*", "sts:AssumeRole*", "s3:*", "secretsmanager:*", "ssm:*", "ecs:*", "ec2:*",
         "dynamodb:*", "cloudwatch:*", "logs:*"]
         Resource = "*"
       },

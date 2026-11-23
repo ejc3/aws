@@ -225,8 +225,12 @@ def load_record(ssm):
 def checked_release(value):
     """The shape of one release record entry (without its own `previous`)."""
     coordinator = value.get("coordinator") if isinstance(value, dict) else None
+    base = {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run"}
     ok = (isinstance(value, dict)
-          and set(value) == {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run"}
+          and set(value) in (base, base | {"lambda_digest"})
+          # The set's lane image, when ejc3/fcvm's prod lane is on (FLEET_LAMBDA_LANE_PROD): a rollback returns to it.
+          and ("lambda_digest" not in value or (isinstance(value["lambda_digest"], str)
+                                                and DIGEST.fullmatch(value["lambda_digest"])))
           and isinstance(coordinator, dict) and set(coordinator) == {"commit", "digest"}
           and isinstance(coordinator["commit"], str) and COMMIT.fullmatch(coordinator["commit"])
           and isinstance(coordinator["digest"], str) and DIGEST.fullmatch(coordinator["digest"])
@@ -238,15 +242,16 @@ def checked_release(value):
           and (value["smoke_run"] is None or (type(value["smoke_run"]) is int and value["smoke_run"] > 0)))
     if not ok:
         raise ValueError("a release record names a coordinator commit and digest, a web commit, a Worker version, "
-                         "a generation, a build id and a smoke run")
+                         "a generation, a build id and a smoke run, and may name a lane image digest")
     return value
 
 
 def record(event, ssm):
     """Write the release record: the release now running, and the one it replaced."""
     release = event.get("release")
-    if set(event) != {"action", "release"} or not isinstance(release, dict) or set(release) != {
-            "coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run", "previous"}:
+    fields = {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run", "previous"}
+    if set(event) != {"action", "release"} or not isinstance(release, dict) or set(release) not in (
+            fields, fields | {"lambda_digest"}):
         raise ValueError("record takes one release and its previous")
     current = checked_release({k: v for k, v in release.items() if k != "previous"})
     previous = release["previous"]

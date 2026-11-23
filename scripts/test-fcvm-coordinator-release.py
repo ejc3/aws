@@ -572,6 +572,24 @@ class ProdReleaseTests(unittest.TestCase):
         self.assertEqual(json.loads(self.aws.record), first)
 
 
+class ProdLaneRecordTests(ProdReleaseTests):
+    """ejc3/fcvm's prod promotion records the set's lane image (lambda_digest) so a rollback returns to it."""
+
+    def test_a_record_may_name_the_sets_lane_image(self):
+        lane, earlier = "sha256:" + "4" * 64, "sha256:" + "5" * 64
+        first = {**self.entry(), "lambda_digest": lane, "previous": {**self.entry(generation=6), "lambda_digest": earlier}}
+        self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "recorded"})
+        self.assertEqual(json.loads(self.aws.record), first)
+        # The next record's previous is that entry, lane image included.
+        second = {**self.entry(), "lambda_digest": earlier, "previous": {k: v for k, v in first.items() if k != "previous"}}
+        self.assertEqual(self.run_release({"action": "record", "release": second}), {"status": "recorded"})
+
+    def test_a_malformed_lane_image_is_refused(self):
+        for value in ("latest", None, 7, "sha256:" + "A" * 64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.run_release({"action": "record", "release": {**self.entry(), "lambda_digest": value, "previous": None}})
+
+
 class ProdCiTerraformTests(unittest.TestCase):
     """fcvm-fleet-prod-ci.tf: what the prod CI role and the prod functions may do, and that all of it is gated."""
 
@@ -608,12 +626,26 @@ class ProdCiTerraformTests(unittest.TestCase):
         policy = self.block('resource "aws_iam_role_policy"', "fcvm_prod_ci")
         allows = re.findall(r'Effect = "Allow", Action = "([^"]+)", Resource = ([^ }]+)', policy)
         self.assertEqual(allows, [("lambda:InvokeFunction", "local.fcvm_prod_release_functions")])
+        # Besides invoking, only retagging the lane repository's images (ejc3/fcvm publish.py --lambda-digest moves
+        # keep-prod-*): read an image and put a tag on it. It cannot upload a layer, so it can only tag manifests
+        # whose layers the repository already holds, and every other ECR repository stays denied.
+        lane = self.statement(policy, "RetagTheLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', lane), ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", lane)
+        uploads = self.statement(policy, "NeverUploadToTheLaneRepository")
+        self.assertRegex(uploads, r'Effect\s+= "Deny"')
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', uploads),
+                              ["ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:BatchDeleteImage",
+                               "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy",
+                               "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability"])
+        never = self.statement(policy, "NeverPublishAdministerOrReadCredentials")
+        self.assertIn("NotResource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", self.statement(policy, "NoOtherRepository"))
+        self.assertNotIn('"ecr:*"', never)
         # Lambda tests the resolved $LATEST even for CI's unqualified Invoke. Versions, aliases and other functions
         # must still match the explicit deny, and only the unqualified production ARNs appear in the Allow above.
         deny = re.search(r'Sid\s+= "NoOtherFunction"\s+Effect\s+= "Deny"\s+Action\s+= "lambda:\*"\s+NotResource\s+= ([^\n]+)', policy)
         self.assertIsNotNone(deny)
         self.assertEqual(deny[1], 'concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])')
-        self.assertIn('"ecr:*"', policy)
         functions = self.text.split("fcvm_prod_release_functions = concat(", 1)[1].split("\n  )", 1)[0]
         self.assertEqual(re.findall(r"aws_lambda_function\.([a-z_]+)", functions),
                          ["fcvm_coordinator_release_prod", "fcvm_ami_prod_release"])
@@ -621,6 +653,19 @@ class ProdCiTerraformTests(unittest.TestCase):
         ci = (ROOT / "fcvm-fleet-ci.tf").read_text()
         repo_policy = ci.split('resource "aws_ecr_repository_policy" "fcvm_coordinator_ci"', 1)[1].split("\n}\n", 1)[0]
         self.assertNotIn("fcvm_prod_ci", repo_policy)
+
+    def statement(self, policy, sid):
+        return re.split(r'Sid\s+= "' + sid + '"', policy, maxsplit=1)[1].split("},", 1)[0]
+
+    def test_the_prod_ci_role_reads_the_lane_repository_and_its_url(self):
+        secrets = self.block('resource "github_actions_environment_secret"', "fcvm_prod")
+        self.assertIn('"LAMBDA_TILE_REPO"', secrets)
+        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url", secrets)
+        lane = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+        policy = lane.split('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('Sid       = "ProdCiRetagsTheLaneImage"', policy)
+        self.assertIn("aws_iam_role.fcvm_prod_ci[0].arn", policy)
+        self.assertIn("var.fcvm_fleet_prod_enabled ?", policy)
 
     def test_the_prod_functions_reach_prod_only(self):
         fleet = self.block('resource "aws_iam_role_policy"', "fcvm_coordinator_release_prod_fleet")

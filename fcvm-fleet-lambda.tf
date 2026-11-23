@@ -147,7 +147,7 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
   repository = aws_ecr_repository.fcvm_fleet_lambda_tile.name
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [
+    Statement = concat([
       {
         Sid       = "LambdaPullsTheTileImage"
         Effect    = "Allow"
@@ -162,7 +162,15 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
         Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
         "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage"]
       },
-    ]
+      ], var.fcvm_fleet_prod_enabled ? [
+      # Prod CI retags only (fcvm-fleet-prod-ci.tf denies it every upload).
+      {
+        Sid       = "ProdCiRetagsTheLaneImage"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }
+        Action    = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"]
+      },
+    ] : [])
   })
 }
 
