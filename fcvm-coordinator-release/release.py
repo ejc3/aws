@@ -299,9 +299,10 @@ def candidate(ssm, ecr, ecs):
         value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         digest = pointer_digest(value)
         out[name] = {"digest": digest, "commits": commits_of(ecr, digest)}
-        # Per stack, so the record (which the manual rollback reads with the prod lane off) never depends on it:
-        # ejc3/fcvm's decide refuses on a lane_error. A timeout or endpoint error (BotoCoreError) and a task
-        # definition without a coordinator container (StopIteration) or a field (KeyError) are "unreadable".
+        # Per stack: a failed lane read never fails the answer, so the record is always returned. ejc3/fcvm's
+        # decide refuses on a lane_error, and its manual rollback does only when a recorded entry names a lane
+        # image. A timeout or endpoint error (BotoCoreError) and a task definition without a coordinator container
+        # (StopIteration) or a field (KeyError) are "unreadable".
         try:
             out[name]["lambda_digest"] = running_lane(ecs, *services[name], value)
         except (Refused, ClientError, BotoCoreError, StopIteration, KeyError) as error:
