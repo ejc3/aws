@@ -337,13 +337,56 @@ class WorktreePruneTests(unittest.TestCase):
             self.assertEqual(start.call_args.kwargs["group"], os.getegid())
             self.assertEqual(start.call_args.kwargs["extra_groups"], [])
 
-    def test_incomplete_ranking_never_returns_a_partial_list(self):
-        self.worktree("older")
-        self.worktree("newer")
-        with mock.patch.object(WORKER, "LIST_LIMIT", 1):
-            with self.assertRaises(WORKER.Incomplete):
-                self.list()
+    def merged_worktrees(self, count, checkout=True):
+        """Worktrees at the default tip (merged), aged 1..count seconds."""
+        paths = []
+        for index in range(count):
+            path = self.home / f"wt{index:04d}"
+            self.git(self.repo, "worktree", "add", "-q", *([] if checkout else ["--no-checkout"]),
+                     "-b", path.name, str(path))
+            self.set_age(path, (index + 1) * 1_000_000_000)
+            paths.append(path)
+        return paths
 
+    def test_more_eligible_than_the_list_limit_returns_the_oldest_limit(self):
+        # 513 real linked worktrees; skip only the per-tree Git status reads.
+        paths = self.merged_worktrees(WORKER.LIST_LIMIT + 1, checkout=False)
+        with mock.patch.object(WORKER, "clean", return_value=True):
+            candidates = self.list()
+        self.assertEqual([c["age_ns"] for c in candidates],
+                         [(i + 1) * 1_000_000_000 for i in range(WORKER.LIST_LIMIT)])
+        self.assertTrue(all(p.exists() for p in paths), "listing must be read-only")
+
+    def test_ranking_budget_returns_only_the_verified_oldest_prefix(self):
+        paths = self.merged_worktrees(4)
+        now = [0.0]
+        real_clean = WORKER.clean
+        checked = []
+
+        def clean(home, path, head, directory):
+            checked.append(path)
+            if len(checked) == 2:
+                now[0] = WORKER.RANK_SECONDS + 1  # the budget runs out during the second check
+            return real_clean(home, path, head, directory)
+
+        with mock.patch.object(WORKER, "clock", lambda: now[0]), mock.patch.object(WORKER, "clean", clean):
+            candidates = self.list()
+        self.assertEqual(checked, paths[:2], "no candidate is checked after the budget")
+        self.assertEqual([c["age_ns"] for c in candidates], [1_000_000_000, 2_000_000_000])
+        for candidate in candidates:
+            self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertEqual([p.exists() for p in paths], [False, False, True, True])
+
+    def test_removal_still_refuses_after_its_budget(self):
+        path, = self.merged_worktrees(1)
+        token, = (c["token"] for c in self.list())
+        times = iter([0.0, 0.0, 0.0, WORKER.RANK_SECONDS + 1])
+        with mock.patch.object(WORKER, "clock", lambda: next(times, WORKER.RANK_SECONDS + 1)), \
+             self.assertRaises(WORKER.Incomplete):
+            self.remove(token)
+        self.assertTrue(path.exists())
+
+    def test_incomplete_ranking_is_reported_without_a_partial_list(self):
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(WORKER.sys, "argv", ["worker", "--list"]), \
              mock.patch.object(WORKER.pwd, "getpwuid", return_value=mock.Mock(pw_dir="/home/fixture")), \

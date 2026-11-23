@@ -130,6 +130,26 @@ class HostCleanup(unittest.TestCase):
             ), self.assertRaisesRegex(ValueError, "host-only"):
                 host.managed_accounts(host_only=True)
 
+    def test_without_host_only_a_missing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            host, "CONFIG", Path(temp) / "absent.json"
+        ), patch.object(sys, "argv", ["driver", "--apply"]), patch.object(
+            host.os, "geteuid", return_value=0
+        ), patch.object(host, "pressured", return_value=True), patch.object(
+            host, "clean", side_effect=AssertionError("cleaned without an account list")
+        ), patch.object(host.subprocess, "run", side_effect=AssertionError("machinectl called")), \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as stop:
+            host.main()
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("stopped (FileNotFoundError)", err.getvalue())
+
+    def test_host_only_refuses_a_dangling_config_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.symlink_to(Path(temp) / "missing.json")
+            with patch.object(host, "CONFIG", config), self.assertRaisesRegex(ValueError, "host-only"):
+                host.managed_accounts(host_only=True)
+
     def test_oldest_across_accounts_and_stop_on_relief(self):
         calls = []
         listings = {
