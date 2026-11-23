@@ -1730,6 +1730,29 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
 unlock once.
 
+**Phones on the mini, for device builds.** Two iPhones are plugged into the mini by USB, paired with `ejcampbell`,
+with Developer Mode on, and registered with the Apple developer team. Development builds signed on the mini install on
+either. The two run different iOS releases, so a build can be checked on both.
+
+| phone | iOS | name in the Apple team's device list |
+|---|---|---|
+| iPhone 14 Pro Max | 26 | `iPhone 14 Pro Max (Mac mini desk)` |
+| iPhone 12 (added 2026-11-23) | 27 | `iPhone` |
+
+`ssh mini 'xcrun devicectl list devices'` shows them (`physical`, `connected`). Each should read `paired`, Developer
+Mode `enabled` and developer services available.
+
+**Adding a phone** takes a person at it for two steps:
+1. Plug it in, unlock it, tap **Trust This Computer** and enter its passcode. Until then `devicectl` reads
+   `pairing in progress`.
+2. Turn on Settings > Privacy & Security > **Developer Mode**. The phone restarts and asks to confirm.
+
+Then, over `ssh mini`, `xcrun devicectl device info ddiServices --device <UDID>` mounts the developer disk image for the
+phone's iOS. Check that its UDID is in the team's device list: App Store Connect API `GET /v1/devices?filter[udid]=`
+with the `games-worth-watching/app-store-connect` key, and `POST /v1/devices` if it is missing. Xcode's automatic
+signing (`-allowProvisioningUpdates`) adds a registered phone to the development profile on the next build. Keep
+UDIDs out of this repository.
+
 **The CI VM's runners** are `mini-1` through `mini-4`. To rebuild them, run
 `scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
 the build tools and a signing keychain in the guest, then registers each missing runner with the
