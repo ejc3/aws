@@ -111,7 +111,9 @@ resource "aws_ssm_association" "nextjs_worktree_prune" {
 }
 
 # fcvm-metal-arm's ~/src fills its one root disk with agents' linked worktrees.
-# Same installer and safety rules; only the ubuntu account, no machinectl.
+# Same installer and safety rules; only the ubuntu account, no machinectl. Its
+# --host-only run then also clears idle worktrees' ignored node_modules, .next
+# and target (the worker's build pass); the Next.js job never runs that pass.
 resource "aws_ssm_association" "fcvm_arm_worktree_prune" {
   count = var.enable_firecracker_instance ? 1 : 0
 

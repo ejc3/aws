@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Remove clean, proven merged linked worktrees when this account's disk is full."""
+"""Remove clean, proven merged linked worktrees when this account's disk is full.
+
+On fcvm-metal-arm only, the host driver then asks for a second pass: the
+ignored build output (node_modules, .next, target) of idle linked worktrees.
+"""
 import argparse
 import hashlib
 import itertools
@@ -34,6 +38,21 @@ RANK_SECONDS = 240
 # The ranking budget's clock; Git and gh timeouts use time.monotonic directly.
 clock = time.monotonic
 COMMAND_OWNER = None
+OPERATIONS = ("rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+              "BISECT_START")
+# The build-output pass (--builds, --clean-builds). Only these directory names,
+# at most this many levels below a linked worktree's root, are ever removed.
+BUILD_NAMES = frozenset({"node_modules", ".next", "target"})
+BUILD_DEPTH = 3
+IDLE_SECONDS = 7 * 86400
+BUILD_SECONDS = 150
+DELETE_SECONDS = 60
+WALK_LIMIT = 1_000_000
+CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{64})")
+# The time of a reflog line: "<old> <new> <name> <email> <seconds> <zone>\t<message>".
+REFLOG_TIME = re.compile(rb"> ([0-9]{1,12}) [+-][0-9]{4}\t")
+# File times are wall-clock times, so the idle cutoff is too.
+wall = time.time
 
 
 class Incomplete(Exception):
@@ -219,8 +238,13 @@ def merged(home, repo, head, ref, tip, origin):
     return False
 
 
-def protected_paths(home, uid, inspect_all=False):
-    """Protect kernel paths and ndev registrations; production inspects every UID."""
+def protected_paths(home, uid, inspect_all=False, mapped=False):
+    """Protect kernel paths and ndev registrations; production inspects every UID.
+
+    With mapped (the build pass), each process's executable and the files it
+    has mapped (/proc/<pid>/maps) count too, so a binary running from target/
+    or a library loaded from node_modules keeps its worktree.
+    """
     reserved = set()
     active = set()
     # Mounts can share st_dev (bind mounts); protect the mountpoint itself as
@@ -243,13 +267,25 @@ def protected_paths(home, uid, inspect_all=False):
                     if str(uid) not in owner:
                         continue
                 with os.scandir(proc / "fd") as descriptors:
-                    for link in itertools.chain((proc / "cwd",), (Path(e.path) for e in descriptors)):
-                        try:
-                            target = Path(os.readlink(link).removesuffix(" (deleted)"))
-                        except FileNotFoundError:
-                            continue
-                        if target.is_absolute() and under(target, home):
-                            active.add(target)
+                    links = (proc / "cwd", *((proc / "exe",) if mapped else ()), *(Path(e.path) for e in descriptors))
+                for link in links:
+                    try:
+                        target = Path(os.readlink(link).removesuffix(" (deleted)"))
+                    except FileNotFoundError:
+                        continue
+                    if target.is_absolute() and under(target, home):
+                        active.add(target)
+                if mapped:
+                    try:
+                        with (proc / "maps").open("rb") as maps:
+                            for line in maps:
+                                fields = line.rstrip(b"\n").split(None, 5)
+                                if len(fields) == 6 and fields[5].startswith(b"/"):
+                                    target = Path(os.fsdecode(fields[5]).removesuffix(" (deleted)"))
+                                    if under(target, home):
+                                        active.add(target)
+                    except FileNotFoundError:
+                        pass  # a kernel thread, a fixture, or the process exited
             except (FileNotFoundError, ProcessLookupError):
                 continue  # The process or descriptor exited during inspection.
 
@@ -333,8 +369,7 @@ def clean(home, path, head, directory):
         return False
     if not (directory / "index").is_file() or any(directory.glob("*.lock")):
         return False
-    if any((directory / name).exists() for name in
-           ("rebase-merge", "rebase-apply", "sequencer", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_START")):
+    if any((directory / name).exists() for name in OPERATIONS):
         return False
     marker = directory / "claude-interactive"
     if marker.exists() and time.time() - marker.stat().st_mtime < MARKER_AGE:
@@ -475,6 +510,242 @@ def prune(home, uid, token=None, *, inspect_all=False):
     return skipped if token else {"candidates": eligible}
 
 
+class NotIdle(Exception):
+    """A worktree whose idleness could not be proven; keep it."""
+
+
+def git_idle(home, path, admin, uid, device, cutoff):
+    """When the worktree was last used by Git, if that predates the cutoff.
+
+    The newer of HEAD's commit time and the newest HEAD reflog entry (a
+    commit, checkout, reset or rebase), in nanoseconds. Not file times of
+    HEAD or index: any `git status` rewrites the index, so they record reads.
+    None for anything else: a missing or unusual file, a lock, an operation in
+    progress, a lock on the worktree or an interactive marker of any age.
+    """
+    try:
+        if (any(os.path.lexists(admin / name) for name in ("claude-interactive", "locked", *OPERATIONS))
+                or any(admin.glob("*.lock"))):
+            return None
+        for name in ("HEAD", "logs/HEAD"):
+            info = (admin / name).lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_dev != device:
+                return None
+        fd = os.open(admin / "logs/HEAD", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as log:
+            log.seek(max(0, os.fstat(log.fileno()).st_size - 4096))
+            last = log.read(4096).rstrip(b"\n").rpartition(b"\n")[2]
+    except OSError:
+        return None
+    reflog = REFLOG_TIME.search(last)
+    commit = git(home, path, "show", "-s", "--format=%ct", "HEAD")
+    if not reflog or commit is None or not commit.strip().isdigit():
+        return None
+    newest = max(int(reflog[1]), int(commit)) * 10**9
+    return newest if newest < cutoff else None
+
+
+def build_ignored(home, path, relative):
+    """Git ignores this directory in the worktree and tracks nothing inside it."""
+    # check-ignore takes paths, not pathspecs (it refuses literal magic); a
+    # pattern-like parent name at worst reads as not ignored, which keeps it.
+    # check-ignore skips tracked paths, not tracked files below an ignored
+    # directory, so ls-files (literal) must also find nothing there.
+    name = os.fspath(relative)
+    return (git(home, path, "check-ignore", "-q", "--", name) == b""
+            and git(home, path, "--literal-pathspecs", "ls-files", "-z", "--", name) == b"")
+
+
+def survey(home, path, uid, device, cutoff, end, verified=(), ask=None):
+    """List a worktree's removable build directories, proving every other file idle.
+
+    Returns [(relative path, (st_dev, st_ino))]. Raises NotIdle when a file
+    outside those directories was modified since the cutoff, a directory below
+    the root holds a .git entry (a nested clone answers ignore questions for
+    itself, not the outer worktree), the tree crosses a filesystem or cannot be
+    read, and Incomplete when the time budget runs out. Reads metadata only
+    and follows no symlink. A recheck passes the first survey's result as
+    verified: those directories, at the same inode, are not asked about again,
+    except ask, the one about to be removed.
+    """
+    found = []
+    entries = 0
+
+    def fail(error):
+        raise NotIdle from error
+
+    for top, directories, files, fd in os.fwalk(os.fspath(path), follow_symlinks=False, onerror=fail):
+        depth = len(Path(top).relative_to(path).parts)
+        descend = []
+        for name, listed_dir in itertools.chain(((d, True) for d in directories), ((f, False) for f in files)):
+            entries += 1
+            if entries > WALK_LIMIT:
+                raise NotIdle
+            if clock() >= end:
+                raise Incomplete("build survey timed out")
+            if name == ".git" and depth:
+                raise NotIdle
+            try:
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except OSError as error:
+                raise NotIdle from error
+            if info.st_dev != device:
+                raise NotIdle
+            if stat.S_ISDIR(info.st_mode):
+                if not listed_dir:
+                    raise NotIdle  # replaced while listing
+                relative = Path(top, name).relative_to(path)
+                key = (relative, (info.st_dev, info.st_ino))
+                if (name in BUILD_NAMES and depth < BUILD_DEPTH and info.st_uid == uid
+                        and (key in verified and relative != ask or build_ignored(home, path, relative))):
+                    found.append(key)
+                else:
+                    descend.append(name)
+            # Any other entry, a symlink included, is a file that must be idle.
+            # Not ctime: removing or adding any hard link to a file changes it.
+            elif info.st_mtime_ns >= cutoff:
+                raise NotIdle
+        directories[:] = descend
+    return found
+
+
+def reraise(error):
+    raise error
+
+
+def measure(directory, device, end):
+    """Bytes removing a directory frees: entries with no other hard link.
+
+    None if unsure, including a .git entry anywhere inside (a repository).
+    """
+    try:
+        info = directory.lstat()
+        total = info.st_blocks * 512
+        for _, directories, files, fd in os.fwalk(os.fspath(directory), follow_symlinks=False, onerror=reraise):
+            for name in itertools.chain(directories, files):
+                if clock() >= end:
+                    raise Incomplete("build measurement timed out")
+                if name == ".git":
+                    return None
+                entry = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                if entry.st_dev != device:
+                    return None
+                # A pnpm store file is hard-linked into node_modules; removing the link frees nothing.
+                if stat.S_ISDIR(entry.st_mode) or entry.st_nlink == 1:
+                    total += entry.st_blocks * 512
+    except OSError:
+        return None
+    return total
+
+
+def inode(path):
+    info = path.lstat()
+    return info.st_dev, info.st_ino
+
+
+def builds(home, uid, apply, after=None, *, inspect_all=False):
+    """One time-boxed pass over idle linked worktrees, oldest first.
+
+    Ranks worktrees by Git use (git_idle), then reports (or, with apply,
+    removes) their ignored node_modules, .next and target directories.
+    Returns counts and a cursor only, never a path.
+    """
+    result = {"status": "healthy", "worktrees": 0, "dirs": 0, "bytes": 0, "failed": 0, "next": None}
+    if not pressure(home):
+        return result
+    end = clock() + BUILD_SECONDS
+    device = home.stat().st_dev
+    if not owned(home, uid, device):
+        raise OSError("unsafe home")
+    cutoff = int((wall() - IDLE_SECONDS) * 1e9)
+    directories = list(dict.fromkeys(roots(home, uid, device)))
+    registered = set(directories)
+    candidates = []
+    for repo in directories:
+        if clock() >= end:
+            raise Incomplete("repository discovery timed out")
+        # The first record, the main checkout, is never a candidate.
+        for record in worktrees(home, repo):
+            path = Path(record["worktree"])
+            if path == home or not under(path, home):
+                continue
+            registered.add(path.resolve())
+            if len(registered) > 4096:
+                raise Incomplete("worktree discovery exceeded limit")
+            if {"bare", "locked", "prunable"} & record.keys():
+                continue
+            # identity() proves a linked worktree: a .git file naming this repository's admin directory.
+            info = identity(repo, path, record.get("HEAD", ""), uid, device)
+            age = git_idle(home, path, info[0], uid, device, cutoff) if info else None
+            if age is not None:
+                key = (age, hashlib.sha256(os.fsencode(path)).hexdigest())
+                if after is None or key > after:
+                    candidates.append((key, path, info[0]))
+    candidates.sort()
+    paths = protected_paths(home, uid, inspect_all, mapped=True)
+    result["status"] = "done"
+    for key, path, admin in candidates:
+        # Always take one candidate, so every pass advances the cursor.
+        if result["next"] is not None and clock() >= end:
+            result["status"] = "more"
+            break
+        if apply and not pressure(home):
+            result["status"] = "healthy"
+            break
+        result["next"] = "%d:%s" % key
+        if protected(path, paths) or any(p != path and under(p, path) for p in registered):
+            continue
+        try:
+            found = survey(home, path, uid, device, cutoff, end)
+        except (NotIdle, Incomplete):
+            continue
+        counted = freed = 0
+        stop = False
+        for relative, expected in found:
+            directory = path / relative
+            if clock() >= end + DELETE_SECONDS:
+                stop = True
+                break
+            try:
+                size = measure(directory, device, end + DELETE_SECONDS)
+                if size is None:
+                    continue
+                # The recheck is the last step before removal: survey again (the
+                # same real, ignored, untracked directory by inode; every other
+                # file still idle; no nested clone), the worktree's Git use
+                # unchanged, and no process, mapping, mount or published site in it.
+                try:
+                    current = survey(home, path, uid, device, cutoff, end + DELETE_SECONDS, found, relative)
+                    same = owned(directory, uid, device) and inode(directory) == expected
+                except (NotIdle, OSError):
+                    break
+                if not ((relative, expected) in current and same
+                        and git_idle(home, path, admin, uid, device, cutoff) == key[0]
+                        and not protected(path, protected_paths(home, uid, inspect_all, mapped=True))):
+                    break
+                if apply and run(home, ["/usr/bin/rm", "-rf", "--one-file-system", "--", os.fspath(directory)],
+                                 timeout=DELETE_SECONDS) is None:
+                    # rm removed what the account may remove; the rest (a
+                    # root-owned subdirectory, say) stays. Count it once, go on.
+                    result["failed"] += 1
+                    continue
+            except Incomplete:
+                # Out of time mid-directory; a partly removed build directory is still regenerable.
+                result["failed"] += int(apply)
+                stop = True
+                break
+            counted += 1
+            freed += size
+        if counted:
+            result["worktrees"] += 1
+            result["dirs"] += counted
+            result["bytes"] += freed
+        if stop:
+            result["status"] = "more"
+            break
+    return result
+
+
 def main():
     global COMMAND_OWNER
     parser = argparse.ArgumentParser(description=__doc__)
@@ -482,9 +753,20 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--list", action="store_true", help="list eligible candidates without removing anything")
     mode.add_argument("--remove", metavar="TOKEN", help="revalidate and remove one listed candidate")
+    mode.add_argument("--builds", action="store_true",
+                      help="count idle worktrees' ignored build output without removing anything")
+    mode.add_argument("--clean-builds", action="store_true",
+                      help="remove idle worktrees' ignored build output while the disk is pressured")
+    parser.add_argument("--after", metavar="CURSOR", help="continue a build pass after this cursor")
     args = parser.parse_args()
     if args.remove and not TOKEN.fullmatch(args.remove):
         parser.error("invalid worktree token")
+    after = None
+    if args.after is not None:
+        match = CURSOR.fullmatch(args.after)
+        if not match or not (args.builds or args.clean_builds):
+            parser.error("--after takes a cursor from a build pass")
+        after = (int(match[1]), match[2])
     root = os.geteuid() == 0
     if root != bool(args.owner) or (root and not ACCOUNT.fullmatch(args.owner)):
         parser.error("a valid --owner is required as root and permitted only as root")
@@ -498,7 +780,10 @@ def main():
                     or entry.pw_dir != "/home/" + args.owner):
                 raise OSError("invalid owner")
             COMMAND_OWNER = (uid, entry.pw_gid)
-        result = prune(home, uid, args.remove, inspect_all=root)
+        if args.builds or args.clean_builds:
+            result = builds(home, uid, args.clean_builds, after, inspect_all=root)
+        else:
+            result = prune(home, uid, args.remove, inspect_all=root)
     except (OSError, RuntimeError, ValueError, KeyError, IndexError, Incomplete) as error:
         if not args.remove:
             # The host discards container stderr. Keep diagnostics in this account's journal;
