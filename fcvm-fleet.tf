@@ -237,6 +237,11 @@ locals {
     ["--dns-subzone", local.fcvm_fleet_names_zone, "--dns-subzone-ns", join(",", local.fcvm_fleet_names_ns), "--dns-listen", "0.0.0.0:${local.fcvm_fleet_dns_port}"],
     # The EC2 half's aggregator beside the coordinator: its layout on loopback, browsers on 443 of the task's own addresses.
     local.fcvm_fleet_aggregated ? ["--ec2-aggregate-listen", "127.0.0.1:${local.fcvm_fleet_aggregate_port}", "--ec2-aggregate-tls", "--ec2-aggregate-tls-dir", "/run/fcvm-fleet/tls"] : [],
+    # The staging Lambda lane (fcvm-fleet-lambda.tf, local.fcvm_fleet_lambda_lane): its tiles, execution role and capacity
+    # provider. The lane image is FLEET_LAMBDA_IMAGE in the task's environment, which the release function moves.
+    local.fcvm_fleet_lambda_lane ? ["--lambda", "aws", "--lambda-tiles", tostring(local.fcvm_lambda_max_tiles),
+      "--lambda-role", aws_iam_role.fcvm_lambda_tile["stage"].arn,
+    "--lambda-capacity-provider", aws_cloudformation_stack.fcvm_lambda["stage"].outputs["CapacityProviderArn"]] : [],
     # The broadcast (fcvm-fleet-broadcast.tf): its aggregator's private listener, the secret it pushes with and signs
     # playback tokens from, and the seats for direct streams.
     local.fcvm_fleet_broadcast ? ["--broadcast-listen", "127.0.0.1:${local.fcvm_fleet_broadcast_port}", "--broadcast-secret", aws_secretsmanager_secret.fcvm_fleet_broadcast[0].name, "--direct-capacity", tostring(local.fcvm_fleet_direct_capacity)] : [],
@@ -1366,7 +1371,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       readonlyRootFilesystem = true
       # The subzone's DNS server (fcvm-fleet-dns.tf). One protocol per port mapping; TCP reaches the same port.
       portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]
-      environment = [
+      environment = concat([
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
@@ -1380,7 +1385,10 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${m.security_group_id}"]) },
         # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
         { name = "RUST_LOG", value = "info" },
-      ]
+        ],
+        # The lane image staging selected, by digest in staging's repository; the release function moves it afterwards.
+        local.fcvm_fleet_lambda_lane ? [{ name = "FLEET_LAMBDA_IMAGE", value = "${aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url}@${data.aws_ecr_image.fcvm_fleet_lambda_stage_current[0].image_digest}" }] : []
+      )
       logConfiguration = {
         logDriver = "awslogs"
         options   = { awslogs-group = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name, awslogs-region = local.fcvm_fleet_home_region, awslogs-stream-prefix = "coordinator" }

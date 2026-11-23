@@ -2120,5 +2120,49 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("ExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service", cond)
 
 
+
+class LambdaLaneEnableTests(unittest.TestCase):
+    """The staging Lambda lane switch (ejc3/aws#974): off, nothing changes; on, the coordinator runs Lambda tiles from
+    the lane image staging selected in its own repository, and ejc3/fcvm's FLEET_LAMBDA_LANE is on."""
+    lane = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+
+    def test_the_switch_is_off(self):
+        self.assertRegex(self.lane, r"\n  fcvm_fleet_lambda_lane = false\n")
+
+    def test_the_coordinator_takes_the_lane_flags_only_with_the_switch_on(self):
+        command = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
+        flags = re.search(r"local\.fcvm_fleet_lambda_lane \? \[(.*?)\] : \[\],", command, re.S)
+        self.assertIsNotNone(flags, "the lane flags are not behind the switch")
+        self.assertEqual(re.findall(r'"(--[a-z-]+)"', flags[1]),
+                         ["--lambda", "--lambda-tiles", "--lambda-role", "--lambda-capacity-provider"])
+        self.assertIn('"aws"', flags[1])
+        self.assertIn("tostring(local.fcvm_lambda_max_tiles)", flags[1])
+        self.assertIn('aws_iam_role.fcvm_lambda_tile["stage"].arn', flags[1])
+        self.assertIn('aws_cloudformation_stack.fcvm_lambda["stage"].outputs["CapacityProviderArn"]', flags[1])
+        self.assertNotIn("--lambda", command.replace(flags[0], ""))
+
+    def test_the_lane_image_is_stagings_selection_in_stagings_repository(self):
+        current = block('data "aws_ecr_image" "fcvm_fleet_lambda_stage_current"', self.lane)
+        self.assertIn("count           = local.fcvm_fleet_lambda_lane ? 1 : 0", current)
+        self.assertIn("repository_name = aws_ecr_repository.fcvm_fleet_lambda_tile.name", current)
+        self.assertIn('image_tag       = "keep-stage-current"', current)
+        self.assertNotIn("lambda_tile_prod", current)
+        task = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn('local.fcvm_fleet_lambda_lane ? [{ name = "FLEET_LAMBDA_IMAGE", value = '
+                      '"${aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url}@${data.aws_ecr_image.fcvm_fleet_lambda_stage_current[0].image_digest}" }] : []', task)
+
+    def test_the_switch_needs_aggregated_streaming_and_sets_fcvms_variable(self):
+        guard = block('resource "terraform_data" "fcvm_fleet_lambda_lane_needs"', self.lane)
+        self.assertIn("count = local.fcvm_fleet_lambda_lane ? 1 : 0", guard)
+        self.assertIn("condition     = local.fcvm_fleet_aggregated", guard)
+        variable = block('resource "github_actions_variable" "fcvm_fleet_lambda_lane"', self.lane)
+        self.assertIn("count         = local.fcvm_fleet_lambda_lane ? 1 : 0", variable)
+        self.assertIn('variable_name = "FLEET_LAMBDA_LANE"', variable)
+        self.assertIn('value         = "on"', variable)
+        self.assertIn('repository    = "fcvm"', variable)
+        # Prod's switch is not this one.
+        self.assertNotIn("FLEET_LAMBDA_LANE_PROD", self.lane)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
