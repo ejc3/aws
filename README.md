@@ -1789,6 +1789,21 @@ shows the test slot holders. To update the shim on a running CI VM without touch
 registrations or restarting listeners, run `scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots`
 from the Mac on its LAN. The runners already search `/usr/local/bin` ahead of `/usr/bin`.
 
+**The CI VM cleans its own disk** (#1021). On 2026-11-23 its 200 GB data volume had 1.6 GB free and iOS builds
+failed with "No space left on device": 44 runner simulators held 64 GB, DerivedData 7.3 GB and the temp folders
+7.7 GB, and nothing in the VM cleaned any of it. The same install as the test slots (`--runners` or
+`--simulator-slots`, idempotent) puts `ci-disk-clean` in `/usr/local/libexec/mini-simulator` and the LaunchAgent
+`com.ejcampbell.ci-disk-clean` in `/Library/LaunchAgents`, loaded in `admin`'s session (where the simulators live),
+hourly and at load, at the lowest CPU and I/O priority. It acts only while `/System/Volumes/Data` has under 30 GB free
+or is at least 85% used, and stops as soon as neither holds. First it erases, largest first, simulators that are
+`Shutdown` and whose `device.plist` is 6 hours old (`xcrun simctl erase` keeps each device and its UDID, so the
+runners' named devices stay where jobs look; erasing the 32 stale ones freed about 27 GB). Then it removes entries
+of `~/Library/Developer/Xcode/DerivedData` and of `admin`'s TMPDIR that nothing has modified for 24 hours and no
+process has open, oldest first. Before every action it takes the mac-build cleanup admission lock and every slot
+lock exclusively without waiting, so it does nothing while a test command runs; it never visits `~/runners`. It
+logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
+`/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to

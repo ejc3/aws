@@ -5,6 +5,8 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import plistlib
+import pwd
 import select
 import subprocess
 import tempfile
@@ -21,7 +23,8 @@ if Path(sys.argv[0]).name == "ssh":
     cmd = args[-1].replace("\\", "")
     if "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
-            assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "install-ci-sim-slots.sh"}
+            assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
+                                                         "install-ci-sim-slots.sh"}
         print("test: installed CI test slots")
     elif "Print :CFBundleShortVersionString" in cmd:
         print("27.0\n27A123")
@@ -50,6 +53,18 @@ else:
         print("add", endpoint, file=open(os.environ["CALLS"], "a"))
     else:
         raise RuntimeError("Unexpected GitHub call")
+'''
+
+# Session gui/<uid> exists; the agent counts as loaded once it has been bootstrapped.
+LAUNCHCTL = r'''#!/usr/bin/env python3
+import os, sys
+calls = os.environ["FAKE_LAUNCHCTL_CALLS"]
+args = sys.argv[1:]
+with open(calls, "a") as f:
+    print(*args, file=f)
+seen = open(calls).read().splitlines()
+if args[0] == "print" and args[1].count("/") == 2:
+    sys.exit(0 if any(c.startswith("bootstrap") for c in seen) else 1)
 '''
 
 
@@ -128,9 +143,50 @@ class SimulatorSlots(unittest.TestCase):
                         MAC_BUILD=str(self.mac_build), CI_SIM_SLOTS="1")
         for key in ("MAC_BUILD_SLOT", "MAC_SIMULATOR_SLOT", "MAC_STATE_DIR", "CI_SIM_STATE_DIR"):
             self.env.pop(key, None)
+        # The disk cleaner's LaunchAgent goes to a stand-in directory and a launchctl that records its calls.
+        self.agents = self.root / "LaunchAgents"
+        self.launchctl_calls = self.root / "launchctl-calls"
+        launchctl = self.root / "launchctl"
+        launchctl.write_text(LAUNCHCTL)
+        launchctl.chmod(0o755)
+        self.install_env = dict(os.environ, CI_LAUNCH_AGENTS=str(self.agents), LAUNCHCTL=str(launchctl),
+                                CI_CLEAN_USER=pwd.getpwuid(os.getuid()).pw_name,
+                                FAKE_LAUNCHCTL_CALLS=str(self.launchctl_calls))
 
     def install(self):
-        return subprocess.run(["sh", self.installer, self.prefix], capture_output=True, text=True)
+        return subprocess.run(["sh", self.installer, self.prefix], capture_output=True, text=True,
+                              env=self.install_env)
+
+    def launchctl(self):
+        return self.launchctl_calls.read_text().splitlines() if self.launchctl_calls.exists() else []
+
+    def test_disk_cleaner_agent_is_installed_once_and_reloaded_only_on_change(self):
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Disk cleaner loaded", result.stdout)
+        cleaner = self.mac_build.with_name("ci-disk-clean")
+        self.assertTrue(os.access(cleaner, os.X_OK))
+        plist = self.agents / "com.ejcampbell.ci-disk-clean.plist"
+        with plist.open("rb") as f:
+            agent = plistlib.load(f)
+        self.assertEqual(agent["ProgramArguments"], [str(cleaner)])
+        self.assertEqual(agent["StartInterval"], 3600)
+        self.assertEqual((agent["Nice"], agent["ProcessType"], agent["LowPriorityIO"]), (20, "Background", True))
+        self.assertEqual(agent["LimitLoadToSessionType"], "Aqua")
+        uid = os.getuid()
+        self.assertEqual([c for c in self.launchctl() if not c.startswith("print")],
+                         [f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
+        # Unchanged and loaded: nothing is reloaded.
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unchanged and loaded", result.stdout)
+        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 1)
+        # A changed plist is replaced and reloaded once more.
+        plist.write_text(plist.read_text().replace("3600", "60"))
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
+        with plist.open("rb") as f:
+            self.assertEqual(plistlib.load(f)["StartInterval"], 3600)
 
     def test_install_is_idempotent_and_preserves_an_unmanaged_xcodebuild(self):
         self.shim.parent.mkdir(parents=True)
