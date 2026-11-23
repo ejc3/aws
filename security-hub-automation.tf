@@ -16,6 +16,9 @@
 #     and vulnerabilities, never "by design", and no rule can match them;
 #   - an ACTIVE record.
 # A rule scoped to resources names them in resource_ids (EQUALS: exact ARNs; PREFIX only for IAM.1's session policies).
+# A rule for resources with no stable ARN (instances a service launches fresh each run) names them by tag instead, in
+# resource_tags: each { key, value } is matched EQUALS (Security Hub's tag filter has no PREFIX; several values on one
+# key are joined by OR). Every other rule has resource_tags = [], which renders no criterion.
 # Security Hub limits: at most 20 values per criteria field, rule_order 1..1000 and unique in a region.
 # scripts/test-security-hub-automation.py pins all of this.
 
@@ -34,6 +37,7 @@ locals {
       controls            = ["EC2.9"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       # GuardDuty.5-11: EKS audit logs, Lambda, EKS runtime, EC2 malware scanning, RDS, S3 and runtime monitoring. The
@@ -46,6 +50,7 @@ locals {
       controls            = ["GuardDuty.5", "GuardDuty.6", "GuardDuty.7", "GuardDuty.8", "GuardDuty.9", "GuardDuty.10", "GuardDuty.11"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       # Inspector.2 (ECR scanning) and Inspector.3 (Lambda code scanning): the enabler scans EC2 and Lambda dependencies
@@ -57,6 +62,7 @@ locals {
       controls            = ["Inspector.2", "Inspector.3"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       # Config.1 fails with CONFIG_RECORDER_CUSTOM_ROLE: the recorder writes with our own role (security-config-<region>,
@@ -70,6 +76,7 @@ locals {
       controls            = ["Config.1"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       # EC2.25 (launch template assigns a public IP) and ECS.2 (ECS service assigns a public IP): the EC2.9 reason, no
@@ -82,6 +89,7 @@ locals {
       controls            = ["EC2.25", "ECS.2"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       # IAM.1 (a policy allows *:*) on nextjs-ct-member-<person> only: STS session policies nextjs-ct-imds passes as
@@ -94,6 +102,7 @@ locals {
       controls            = ["IAM.1"]
       resource_comparison = "PREFIX"
       resource_ids        = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:policy/nextjs-ct-member-"]
+      resource_tags       = []
     },
   ]
 
@@ -107,6 +116,7 @@ locals {
     note                = "Key-only SSH/ET open by design until the Cloudflare VPN replaces public SSH; then remove this rule. security-hub-automation.tf"
     controls            = ["EC2.18", "EC2.19"]
     resource_comparison = "EQUALS"
+    resource_tags       = []
   }
   security_hub_open_ssh_groups = {
     "us-west-1" = concat(
@@ -133,7 +143,11 @@ locals {
   # account has no NAT; dolphin-aws redis.tf), and Config.1, which fails by design on the recorder's own role. A rule cannot
   # match the finding's status reason, so that one would also hide a stopped or deleted recorder: Dolphin has no
   # security-forward-audit path, so the alarm in its own account (dolphin_config_recorder, dolphin-security.tf) raises
-  # that instead. Orders follow this region's main rules.
+  # that instead. EC2.9 on the podcast speech-to-text workers (dolphin-aws podcasts.tf): AWS Batch GPU instances that,
+  # like Redis, take a public IP only to egress (no NAT) behind a group with no inbound rule (dolphin-labs-podcast-whisper).
+  # Batch launches new instances every run, so no ARN can name them: the rule matches the Name tag that the two compute
+  # environments put on what they launch, exactly the spot and on-demand values, and no other EC2.9 finding there.
+  # Orders follow this region's main rules.
   security_hub_dolphin_rules = [
     {
       name                = "dolphin-inspector-ecr-lambda-code-off-by-design"
@@ -143,6 +157,7 @@ locals {
       controls            = ["Inspector.2", "Inspector.3"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
     },
     {
       name                = "dolphin-redis-public-ip-by-design"
@@ -152,6 +167,7 @@ locals {
       controls            = ["ECS.2"]
       resource_comparison = "EQUALS"
       resource_ids        = ["arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/redis"]
+      resource_tags       = []
     },
     {
       name                = "dolphin-config-custom-recorder-role-by-design"
@@ -161,6 +177,20 @@ locals {
       controls            = ["Config.1"]
       resource_comparison = ""
       resource_ids        = []
+      resource_tags       = []
+    },
+    {
+      name                = "dolphin-podcast-whisper-public-ip-by-design"
+      order               = 11
+      description         = "EC2.9 on the Dolphin podcast speech-to-text workers only (AWS Batch instances named dolphin-labs-podcast-whisper-spot or -on-demand): they take a public IP to egress (no NAT in the account) and their security group allows no inbound (dolphin-aws podcasts.tf). Any other instance still alerts."
+      note                = "Dolphin podcast whisper workers: public IP for egress only, no inbound rule (dolphin-aws podcasts.tf). security-hub-automation.tf"
+      controls            = ["EC2.9"]
+      resource_comparison = ""
+      resource_ids        = []
+      resource_tags = [
+        { key = "Name", value = "dolphin-labs-podcast-whisper-spot" },
+        { key = "Name", value = "dolphin-labs-podcast-whisper-on-demand" },
+      ]
     },
   ]
 
@@ -200,6 +230,14 @@ resource "aws_securityhub_automation_rule" "by_design" {
       content {
         comparison = each.value.resource_comparison
         value      = resource_id.value
+      }
+    }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
       }
     }
     record_state {
@@ -262,6 +300,14 @@ resource "aws_securityhub_automation_rule" "by_design_west2" {
         value      = resource_id.value
       }
     }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
+      }
+    }
     record_state {
       comparison = "EQUALS"
       value      = "ACTIVE"
@@ -320,6 +366,14 @@ resource "aws_securityhub_automation_rule" "by_design_dr" {
       content {
         comparison = each.value.resource_comparison
         value      = resource_id.value
+      }
+    }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
       }
     }
     record_state {
@@ -385,6 +439,14 @@ resource "aws_securityhub_automation_rule" "by_design_staging" {
         value      = resource_id.value
       }
     }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
+      }
+    }
     record_state {
       comparison = "EQUALS"
       value      = "ACTIVE"
@@ -443,6 +505,14 @@ resource "aws_securityhub_automation_rule" "by_design_staging_dr" {
       content {
         comparison = each.value.resource_comparison
         value      = resource_id.value
+      }
+    }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
       }
     }
     record_state {
@@ -507,6 +577,14 @@ resource "aws_securityhub_automation_rule" "by_design_dolphin" {
       content {
         comparison = each.value.resource_comparison
         value      = resource_id.value
+      }
+    }
+    dynamic "resource_tags" {
+      for_each = each.value.resource_tags
+      content {
+        comparison = "EQUALS"
+        key        = resource_tags.value.key
+        value      = resource_tags.value.value
       }
     }
     record_state {
