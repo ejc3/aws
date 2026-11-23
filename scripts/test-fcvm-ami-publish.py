@@ -67,6 +67,11 @@ class SSM:
         return {"Version": self.versions[Name]}
 
 
+class ConditionalCheckFailed(RuntimeError):
+    """What DynamoDB raises for a conditional put on an item that exists (a botocore ClientError's response)."""
+    response = {"Error": {"Code": "ConditionalCheckFailedException", "Message": "The conditional request failed"}}
+
+
 class DDB:
     def __init__(self):
         self.item = None
@@ -76,7 +81,7 @@ class DDB:
         self.puts += 1
         assert TableName == "locks" and ConditionExpression == "attribute_not_exists(LockID)"
         if self.item is not None:
-            raise RuntimeError("locked")
+            raise ConditionalCheckFailed("locked")
         self.item = copy.deepcopy(Item)
 
     def delete_item(self, TableName, Key, ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues):
@@ -3395,7 +3400,7 @@ class PublisherTests(unittest.TestCase):
         try:
             other = self.publisher()
             with mock.patch.object(other, "load") as read:
-                with self.assertRaisesRegex(RuntimeError, "locked"):
+                with self.assertRaisesRegex(RuntimeError, "backend lock is held"):
                     other.run({"action": "replicate-active-release"})
                 read.assert_not_called()
         finally:
@@ -3680,6 +3685,28 @@ class ProdPublisherTests(unittest.TestCase):
         self.assertIsNone(self.ddb.item)
         self.assertEqual(self.promote(), {"status": "unchanged", **self.receipt})
         self.assertEqual(len(self.ec2.created), 4)
+
+    def test_a_held_terraform_lock_answers_busy_and_changes_nothing(self):
+        # 2026-11-23 09:46:47 UTC: promote-prod failed in 219 ms while the backend lock was held, and the promotion
+        # rolled back. A held lock is busy (ejc3/fcvm prod_release.py asks again), not a failed release.
+        self.ddb.item = {"LockID": {"S": "exact-backend/key"}, "Info": {"S": "terraform-owner"}}
+        for action in ("promote-prod", "rollback-prod"):
+            with self.subTest(action=action):
+                with self.assertRaises(MODULE.Busy):
+                    self.publisher().prod_event({"action": action, "receipt": self.receipt})
+                self.assertEqual(self.ddb.item["Info"]["S"], "terraform-owner")
+                self.assertEqual((self.ec2.created, self.fleet_ssm.values["/prod/release"]), ([], self.prod_before))
+        class Held:
+            def prod_event(self, event):
+                raise MODULE.Busy("held")
+        with mock.patch.object(MODULE, "ProdPublisher", Held):
+            self.assertEqual(MODULE.prod_handler({"action": "promote-prod", "receipt": self.receipt}, None), {"status": "busy"})
+        # Any other failure is still a failed release.
+        class Broken:
+            def prod_event(self, event):
+                raise KeyError("x")
+        with mock.patch.object(MODULE, "ProdPublisher", Broken), self.assertRaisesRegex(RuntimeError, "prod image release failed"):
+            MODULE.prod_handler({"action": "promote-prod", "receipt": self.receipt}, None)
 
     def test_only_the_gate_verified_receipt_that_staging_runs_is_promoted(self):
         cases = {"unverified": lambda: self.main_ssm.values.__setitem__("/factory/gate", {"generation": 11, "build_id": "factory:old"}),

@@ -45,6 +45,10 @@ class Refused(Exception):
     pass
 
 
+class Busy(RuntimeError):
+    """Terraform's backend lock is held by someone else (an apply, a plan, another release): nothing ran."""
+
+
 def need(value, message):
     if not value:
         raise Refused(message)
@@ -602,9 +606,15 @@ class Publisher:
             "Who": "fcvm-image-publisher", "Version": "1.10.3",
             "Created": datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc).isoformat(),
             "Path": self.env["LOCK_ID"], "Info": self.build_id})
-        self.client("dynamodb").put_item(TableName=self.env["LOCK_TABLE"],
-            Item={"LockID": {"S": self.env["LOCK_ID"]}, "Info": {"S": self.lock_info}},
-            ConditionExpression="attribute_not_exists(LockID)")
+        try:
+            self.client("dynamodb").put_item(TableName=self.env["LOCK_TABLE"],
+                Item={"LockID": {"S": self.env["LOCK_ID"]}, "Info": {"S": self.lock_info}},
+                ConditionExpression="attribute_not_exists(LockID)")
+        except Exception as error:
+            self.lock_info = None
+            if getattr(error, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                raise Busy("Terraform's backend lock is held") from None
+            raise
 
     def release(self):
         if self.lock_info is not None:
@@ -2238,6 +2248,9 @@ def prod_handler(event, context):
         return ProdPublisher().prod_event(event)
     except Refused as refusal:
         return {"status": "refused", "reason": str(refusal)}
+    except Busy:
+        # Nothing ran: ejc3/fcvm prod_release.py asks again, as it does the coordinator release.
+        return {"status": "busy"}
     except Exception:
         raise RuntimeError("prod image release failed; inspect the bounded publication journal") from None
 
