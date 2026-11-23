@@ -400,6 +400,22 @@ class LaneReleaseTests(unittest.TestCase):
         with self.assertRaises(release.Refused):
             self.run_release({"action": "lane"})
 
+    def test_each_stack_reads_its_own_lane_repository(self):
+        prod = LaneECR(current=LANE)
+        with patch.dict(os.environ, {**PROD_ENV, "LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile-prod"}):
+            release.lane_selected(prod, "prod", LANE)
+        self.assertEqual(prod.calls, [{"repositoryName": "fcvm-fleet/lambda-tile-prod",
+                                       "imageIds": [{"imageTag": "keep-prod-current"}]}])
+
+    def test_a_lane_repository_of_the_other_stack_is_refused(self):
+        # Prod's function configured with staging's repository (or the reverse) reads and names nothing.
+        for env, url in ((PROD_ENV, LANE_URL), (ENV, "registry.example/fcvm-fleet/lambda-tile-prod")):
+            with self.subTest(stack=env["STACK"]), patch.dict(os.environ, {**env, "LANE_REPOSITORY_URL": url}):
+                lane = LaneECR()
+                with self.assertRaises(ValueError):
+                    release.lane_selected(lane, env["STACK"], LANE)
+                self.assertEqual(lane.calls, [])
+
     def test_the_lane_action_never_waits_for_the_lock(self):
         # Read only: it answers while a release or a Terraform run holds the backend lock (never "busy").
         self.aws.lock = "another operator"
@@ -420,11 +436,12 @@ class LaneReleaseTests(unittest.TestCase):
                 tf = (ROOT / path).read_text()
                 policy = block(tf, role)
                 # One new statement: read the lane repository's images. Nothing writes to it.
+                # Each function's own stack's repository (ejc3/aws#986: one lane repository per stack), never the other's.
+                own = "aws_ecr_repository.fcvm_fleet_lambda_tile" + ("_prod[0]" if stack == "prod" else "")
                 lane = [line.strip() for line in policy.splitlines() if "fcvm_fleet_lambda_tile" in line]
                 self.assertEqual(lane, ['{ Effect = "Allow", Action = "ecr:DescribeImages", '
-                                        'Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn },'])
-                self.assertRegex(block(tf, function),
-                                 r"LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile\.repository_url")
+                                        f'Resource = {own}.arn }},'])
+                self.assertRegex(block(tf, function), r"LANE_REPOSITORY_URL\s+= " + re.escape(own) + r"\.repository_url")
 
 
 class ProdAWS(AWS):
