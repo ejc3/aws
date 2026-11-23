@@ -55,16 +55,28 @@ else:
         raise RuntimeError("Unexpected GitHub call")
 '''
 
-# Session gui/<uid> exists; the agent counts as loaded once it has been bootstrapped.
+# Session gui/<uid> exists. The agent is loaded once bootstrapped; after a bootout of a loaded agent it is still
+# listed for two more prints (an instance still exiting), and bootstrap fails while it is listed, as launchctl's does.
 LAUNCHCTL = r'''#!/usr/bin/env python3
 import os, sys
 calls = os.environ["FAKE_LAUNCHCTL_CALLS"]
 args = sys.argv[1:]
+history = open(calls).read().splitlines() if os.path.exists(calls) else []
 with open(calls, "a") as f:
     print(*args, file=f)
-seen = open(calls).read().splitlines()
+loaded, lingering = False, 0
+for call in history:
+    if call.startswith("bootstrap"):
+        loaded, lingering = True, 0
+    elif call.startswith("bootout"):
+        lingering, loaded = (2 if loaded else 0), False
+    elif call.startswith("print") and call.count("/") == 2 and lingering:
+        lingering -= 1
 if args[0] == "print" and args[1].count("/") == 2:
-    sys.exit(0 if any(c.startswith("bootstrap") for c in seen) else 1)
+    sys.exit(0 if loaded or lingering else 1)
+if args[0] == "bootstrap" and (loaded or lingering):
+    print("Bootstrap failed: 5: Input/output error", file=sys.stderr)
+    sys.exit(5)
 '''
 
 
@@ -181,9 +193,10 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("unchanged and loaded", result.stdout)
         self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 1)
-        # A changed plist is replaced and reloaded once more.
+        # A changed plist is replaced and reloaded once more, after the old instance has finished exiting.
         plist.write_text(plist.read_text().replace("3600", "60"))
-        self.assertEqual(self.install().returncode, 0)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
         with plist.open("rb") as f:
             self.assertEqual(plistlib.load(f)["StartInterval"], 3600)

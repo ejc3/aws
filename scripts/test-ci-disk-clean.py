@@ -9,6 +9,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -43,7 +44,8 @@ elif args[1] == "erase":
         sys.exit(149)
     device = os.path.join(os.environ["HOME"], "Library/Developer/CoreSimulator/Devices", udid)
     shutil.rmtree(os.path.join(device, "data"))
-    os.mkdir(os.path.join(device, "data"))
+    if not sims[udid].get("erase_leaves_no_data"):
+        os.mkdir(os.path.join(device, "data"))
     open(os.path.join(device, "device.plist"), "w").write("erased")
 else:
     sys.exit(2)
@@ -233,6 +235,34 @@ class Cleaner(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), ["recent-file"])
         self.assertIn("1 DerivedData entries removed", out)
         self.assertIn("1 temp entries removed", out)
+
+    def test_a_missing_data_folder_after_an_erase_does_not_stop_the_other_erases(self):
+        self.sim(1, "Shutdown", 3, 12, erase_leaves_no_data=True)  # largest, so erased first
+        self.sim(2, "Shutdown", 2, 12)
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [udid(1), udid(2)])
+        self.assertIn("2 simulators erased", out)
+        self.assertEqual(result["status"], "nothing more to clean")
+
+    def test_entries_vanishing_during_the_scan_are_skipped(self):
+        # Whichever vanish-* entry is walked first removes every one of them: it vanishes during its own walk,
+        # and the others vanish between the listing and their stat.
+        for name in ("vanish-a", "vanish-b", "vanish-c"):
+            self.blob(self.tmp / name / "x", 1)
+        self.blob(self.tmp / "old-file", 1)
+        real_tree = self.m.tree
+
+        def tree(path, device):
+            if Path(path).parent == self.tmp and Path(path).name.startswith("vanish-"):
+                for doomed in self.tmp.glob("vanish-*"):
+                    shutil.rmtree(doomed)
+            return real_tree(path, device)
+
+        self.m.tree = tree
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(sorted(p.name for p in self.tmp.iterdir()), [])
+        self.assertIn("1 temp entries removed", out)
+        self.assertEqual(result["status"], "nothing more to clean")
 
     def test_any_held_mac_build_lock_stops_every_action(self):
         self.sim(1, "Shutdown", 2, 12)

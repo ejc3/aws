@@ -63,6 +63,13 @@ install -m 644 "$stage/plist" "$stage/plist.new"
 mv -f "$stage/plist.new" "$plist"
 if "$launchctl" print "gui/$uid" >/dev/null 2>&1; then
   "$launchctl" bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+  # bootout returns before a running instance has exited, and bootstrap fails while it is still listed.
+  tries=0
+  while "$launchctl" print "gui/$uid/$label" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -le 60 ] || { echo "The old disk cleaner did not unload within 30 seconds" >&2; exit 1; }
+    sleep 0.5
+  done
   "$launchctl" bootstrap "gui/$uid" "$plist"
   echo "Disk cleaner loaded for $user"
 else

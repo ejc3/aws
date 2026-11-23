@@ -145,7 +145,10 @@ def erase_simulators(home, device, now, apply, stats, short):
         if isinstance(udid, str) and UDID.match(udid) and state == "Shutdown" and stale(devices, udid, cutoff):
             data = devices / udid / "data"
             if os.path.isdir(data) and not os.path.islink(data):
-                found.append((tree(data, device)[0], udid))
+                try:
+                    found.append((tree(data, device)[0], udid))
+                except FileNotFoundError:
+                    continue
     for before, udid in sorted(found, reverse=True):
         if not short():
             return True
@@ -159,7 +162,11 @@ def erase_simulators(home, device, now, apply, stats, short):
             if simctl("erase", udid, check=False).returncode != 0:
                 stats.failed += 1
                 continue
-        stats.add("simulators", before - tree(devices / udid / "data", device)[0])
+        try:
+            left = tree(devices / udid / "data", device)[0]
+        except FileNotFoundError:
+            left = 0  # CoreSimulator recreates data/ when the device next boots
+        stats.add("simulators", before - left)
     return False
 
 
@@ -212,12 +219,18 @@ def age_out_caches(home, now, apply, stats, short):
             for entry in entries:
                 if kind == "temp" and entry.name.startswith("com.apple."):
                     continue  # system services keep sockets and state here for as long as they run
-                s = entry.stat(follow_symlinks=False)
+                try:
+                    s = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # removed since the listing
                 if s.st_dev != device or s.st_uid != os.getuid():
                     continue
                 if not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode)):
                     continue  # links, sockets and pipes stay
-                size, newest = tree(entry.path, device)
+                try:
+                    size, newest = tree(entry.path, device)
+                except FileNotFoundError:
+                    continue
                 if newest <= cutoff:
                     found.append((newest, kind, entry.path, device, size))
     opened, listed = set(), None
