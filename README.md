@@ -2305,9 +2305,10 @@ deletes regenerable build output from idle linked worktrees, oldest first, and
 stops once space recovers: only `node_modules`, `.next` and `target` directories
 at most three levels below the worktree root, each a real directory on the same
 disk, owned by `ubuntu`, ignored by Git and holding no tracked file. A worktree
-qualifies only when it is not locked, not marked interactive, not in use, its Git
-`HEAD`, `index` and `logs/HEAD` are all over 7 days old, and no other file in it
-changed in 7 days. Each directory is checked again just before `rm -rf
+qualifies only when it is not locked, not marked interactive, not in use, its
+`HEAD` commit and newest `HEAD` reflog entry are over 7 days old, and no other
+file in it was modified in 7 days (file mtime; not the index's time, which any
+`git status` rewrites, nor ctime, which any new hard link changes). Each directory is checked again just before `rm -rf
 --one-file-system` removes it as `ubuntu`. The run logs counts and sizes only,
 starts no new pass after 35 minutes, and the preview reports what it would free.
 

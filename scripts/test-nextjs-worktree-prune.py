@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import time
@@ -457,10 +458,10 @@ class BuildOutputTests(Fixture):
     def kept(self, path):
         return all((path / name).exists() for name in ("node_modules", ".next", "target"))
 
-    def set_git_age(self, path, ns):
-        admin = self.admin(path)
-        for name in ("HEAD", "index", "logs/HEAD"):
-            os.utime(admin / name, ns=(ns, ns))
+    def set_reflog_time(self, path, seconds):
+        """Rewrite every HEAD reflog entry's time, as if the worktree was last used then."""
+        log = self.admin(path) / "logs/HEAD"
+        log.write_bytes(re.sub(rb"> [0-9]+ ([+-][0-9]{4})\t", rb"> %d \1\t" % seconds, log.read_bytes()))
 
     def test_only_ignored_build_directories_are_removed(self):
         path = self.build_worktree("build")
@@ -513,14 +514,20 @@ class BuildOutputTests(Fixture):
 
     def test_interactive_locked_recent_and_busy_worktrees_are_untouched(self):
         paths = {name: self.build_worktree(name) for name in
-                 ("interactive", "locked", "recent-file", "recent-head", "cwd", "fd", "mount")}
+                 ("interactive", "locked", "recent-file", "recent-reflog", "recent-commit", "cwd", "fd", "mount")}
         marker = self.admin(paths["interactive"]) / "claude-interactive"
         marker.touch()
         os.utime(marker, ns=(1, 1))  # a marker of any age keeps the build output
         self.git(self.repo, "worktree", "lock", str(paths["locked"]))
         future = int((self.later - 86400) * 1e9)
         os.utime(paths["recent-file"] / "src/code", ns=(future, future))
-        os.utime(self.admin(paths["recent-head"]) / "HEAD", ns=(future, future))
+        self.set_reflog_time(paths["recent-reflog"], future // 10**9)
+        (paths["recent-commit"] / "src/code").write_text("committed later\n")
+        os.utime(paths["recent-commit"] / "src/code", ns=(1, 1))
+        when = f"@{future // 10**9} +0000"
+        subprocess.run([GIT, "-C", str(paths["recent-commit"]), "commit", "-qam", "later"], check=True, timeout=5,
+                       env={**self.environment, "GIT_COMMITTER_DATE": when, "GIT_AUTHOR_DATE": when})
+        self.set_reflog_time(paths["recent-commit"], int(time.time()))  # only the commit time is recent
         pid = self.proc / "2147483647"
         (pid / "fd").mkdir(parents=True)
         (pid / "status").write_text(f"Uid:\t{self.uid}\t{self.uid}\t{self.uid}\t{self.uid}\n")
@@ -533,6 +540,31 @@ class BuildOutputTests(Fixture):
         for name, path in paths.items():
             self.assertTrue(self.kept(path), name)
 
+    def test_git_status_rewriting_index_and_head_does_not_count_as_use(self):
+        path = self.build_worktree("read-only-use")
+        future = int((self.later - 86400) * 1e9)
+        admin = self.admin(path)
+        for name in ("index", "HEAD"):
+            os.utime(admin / name, ns=(future, future))
+        self.assertEqual(self.builds()["worktrees"], 1)
+        self.assertFalse((path / "node_modules").exists())
+
+    def test_a_recent_ctime_alone_does_not_count_as_use(self):
+        # A hard link made or removed anywhere (a pnpm install) changes a file's
+        # ctime. Every file here has a ctime of now and an old mtime.
+        path = self.build_worktree("old-mtimes")
+        for top, _, files in os.walk(path):
+            for name in files:
+                os.utime(os.path.join(top, name), ns=(1, 1), follow_symlinks=False)
+        os.link(path / "src/code", self.base / "hard-link")
+        cutoff = int((time.time() - 60) * 1e9)
+        device = self.home.stat().st_dev
+        found = WORKER.survey(self.home, path, self.uid, device, cutoff, WORKER.clock() + 60)
+        self.assertEqual(len(found), 4)
+        os.utime(path / "src/code", ns=(cutoff, cutoff))
+        with self.assertRaises(WORKER.NotIdle):
+            WORKER.survey(self.home, path, self.uid, device, cutoff, WORKER.clock() + 60)
+
     def test_main_checkout_is_untouched(self):
         self.output(self.repo, "node_modules/pkg", "target/debug")
         linked = self.build_worktree("linked")
@@ -543,8 +575,9 @@ class BuildOutputTests(Fixture):
 
     def test_oldest_first_and_stops_when_pressure_clears(self):
         older, newer = self.build_worktree("older"), self.build_worktree("newer")
-        self.set_git_age(older, 1_000_000_000)
-        self.set_git_age(newer, 2_000_000_000)
+        base = int(time.time())
+        self.set_reflog_time(older, base + 10)
+        self.set_reflog_time(newer, base + 20)
         with mock.patch.object(WORKER, "pressure", lambda home: (older / "node_modules").exists()):
             result = self.builds()
         self.assertEqual((result["status"], result["worktrees"]), ("healthy", 1))
@@ -556,8 +589,9 @@ class BuildOutputTests(Fixture):
 
     def test_time_budget_returns_a_cursor_that_the_next_pass_continues(self):
         older, newer = self.build_worktree("older"), self.build_worktree("newer")
-        self.set_git_age(older, 1_000_000_000)
-        self.set_git_age(newer, 2_000_000_000)
+        base = int(time.time())
+        self.set_reflog_time(older, base + 10)
+        self.set_reflog_time(newer, base + 20)
         now = [0.0]
         survey = WORKER.survey
 

@@ -49,6 +49,8 @@ BUILD_SECONDS = 150
 DELETE_SECONDS = 60
 WALK_LIMIT = 1_000_000
 CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{64})")
+# The time of a reflog line: "<old> <new> <name> <email> <seconds> <zone>\t<message>".
+REFLOG_TIME = re.compile(rb"> ([0-9]{1,12}) [+-][0-9]{4}\t")
 # File times are wall-clock times, so the idle cutoff is too.
 wall = time.time
 
@@ -495,9 +497,12 @@ class NotIdle(Exception):
     """A worktree whose idleness could not be proven; keep it."""
 
 
-def git_idle(admin, uid, device, cutoff):
-    """The newest of a worktree's HEAD, index and HEAD reflog, if all predate the cutoff.
+def git_idle(home, path, admin, uid, device, cutoff):
+    """When the worktree was last used by Git, if that predates the cutoff.
 
+    The newer of HEAD's commit time and the newest HEAD reflog entry (a
+    commit, checkout, reset or rebase), in nanoseconds. Not file times of
+    HEAD or index: any `git status` rewrites the index, so they record reads.
     None for anything else: a missing or unusual file, a lock, an operation in
     progress, a lock on the worktree or an interactive marker of any age.
     """
@@ -505,14 +510,21 @@ def git_idle(admin, uid, device, cutoff):
         if (any(os.path.lexists(admin / name) for name in ("claude-interactive", "locked", *OPERATIONS))
                 or any(admin.glob("*.lock"))):
             return None
-        newest = 0
-        for name in ("HEAD", "index", "logs/HEAD"):
+        for name in ("HEAD", "logs/HEAD"):
             info = (admin / name).lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_dev != device:
                 return None
-            newest = max(newest, info.st_mtime_ns)
+        fd = os.open(admin / "logs/HEAD", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(fd, "rb") as log:
+            log.seek(max(0, os.fstat(log.fileno()).st_size - 4096))
+            last = log.read(4096).rstrip(b"\n").rpartition(b"\n")[2]
     except OSError:
         return None
+    reflog = REFLOG_TIME.search(last)
+    commit = git(home, path, "show", "-s", "--format=%ct", "HEAD")
+    if not reflog or commit is None or not commit.strip().isdigit():
+        return None
+    newest = max(int(reflog[1]), int(commit)) * 10**9
     return newest if newest < cutoff else None
 
 
@@ -531,7 +543,7 @@ def survey(home, path, uid, device, cutoff, end):
     """List a worktree's removable build directories, proving every other file idle.
 
     Returns [(relative path, (st_dev, st_ino))]. Raises NotIdle when a file
-    outside those directories changed since the cutoff, the tree crosses a
+    outside those directories was modified since the cutoff, the tree crosses a
     filesystem or cannot be read, and Incomplete when the time budget runs
     out. Reads metadata only and follows no symlink.
     """
@@ -566,7 +578,8 @@ def survey(home, path, uid, device, cutoff, end):
                 else:
                     descend.append(name)
             # Any other entry, a symlink included, is a file that must be idle.
-            elif max(info.st_mtime_ns, info.st_ctime_ns) >= cutoff:
+            # Not ctime: removing or adding any hard link to a file changes it.
+            elif info.st_mtime_ns >= cutoff:
                 raise NotIdle
         directories[:] = descend
     return found
@@ -604,8 +617,9 @@ def inode(path):
 def builds(home, uid, apply, after=None, *, inspect_all=False):
     """One time-boxed pass over idle linked worktrees, oldest first.
 
-    Reports (or, with apply, removes) their ignored node_modules, .next and
-    target directories. Returns counts and a cursor only, never a path.
+    Ranks worktrees by Git use (git_idle), then reports (or, with apply,
+    removes) their ignored node_modules, .next and target directories.
+    Returns counts and a cursor only, never a path.
     """
     result = {"status": "healthy", "worktrees": 0, "dirs": 0, "bytes": 0, "failed": 0, "next": None}
     if not pressure(home):
@@ -633,7 +647,7 @@ def builds(home, uid, apply, after=None, *, inspect_all=False):
                 continue
             # identity() proves a linked worktree: a .git file naming this repository's admin directory.
             info = identity(repo, path, record.get("HEAD", ""), uid, device)
-            age = git_idle(info[0], uid, device, cutoff) if info else None
+            age = git_idle(home, path, info[0], uid, device, cutoff) if info else None
             if age is not None:
                 key = (age, hashlib.sha256(os.fsencode(path)).hexdigest())
                 if after is None or key > after:
@@ -670,7 +684,7 @@ def builds(home, uid, apply, after=None, *, inspect_all=False):
                 same = owned(directory, uid, device) and inode(directory) == expected
             except OSError:
                 same = False
-            if not (same and git_idle(admin, uid, device, cutoff) == key[0]
+            if not (same and git_idle(home, path, admin, uid, device, cutoff) == key[0]
                     and build_ignored(home, path, relative)
                     and not protected(path, protected_paths(home, uid, inspect_all))):
                 break
