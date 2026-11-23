@@ -2,8 +2,8 @@
 
 A release may also carry `lambda_digest`, the Lambda tiles' lane image the stack's CI selected (ejc3/fcvm
 fleet/coord/publish.py, fleet/lambda/release.py). The function sets the coordinator's FLEET_LAMBDA_IMAGE to
-LANE_REPOSITORY_URL@lambda_digest only when the lane repository's keep-<stack>-current tag holds that digest, so CI
-cannot make a coordinator run an image nothing protects; when the repository cannot be read or the tag holds another
+LANE_REPOSITORY_URL@lambda_digest only when keep-<stack>-current in the stack's own lane repository holds that
+digest, so CI cannot make a coordinator run an image nothing protects; when the repository cannot be read or the tag holds another
 digest, it refuses and changes nothing. A release without `lambda_digest` is the release without a lane. Read-only
 `lane` returns the lane digest the coordinator runs and the commit tags of its coordinator image, which CI uses to
 skip a release of an ancestor of what runs.
@@ -74,7 +74,16 @@ def stack():
 
 
 LANE_VARIABLE = "FLEET_LAMBDA_IMAGE"
-LANE_REPOSITORY = "fcvm-fleet/lambda-tile"
+# One lane repository per stack (ejc3/aws#986): a stack's function reads and names only its own.
+LANE_REPOSITORIES = {"stage": "fcvm-fleet/lambda-tile", "prod": "fcvm-fleet/lambda-tile-prod"}
+
+
+def lane_repository(name):
+    """The stack's lane repository name, refusing a LANE_REPOSITORY_URL that names another repository."""
+    repository = LANE_REPOSITORIES[name]
+    if os.environ["LANE_REPOSITORY_URL"].split("/", 1)[-1] != repository:
+        raise ValueError(f"LANE_REPOSITORY_URL is not the {name} lane repository")
+    return repository
 
 
 def lane_of(response):
@@ -90,8 +99,8 @@ def lane_of(response):
 
 
 def lane_selected(lane_ecr, name, digest):
-    """Refuse unless the lane repository's keep-<stack>-current holds `digest`."""
-    rows = lane_ecr.describe_images(repositoryName=LANE_REPOSITORY,
+    """Refuse unless the stack's lane repository's keep-<stack>-current holds `digest`."""
+    rows = lane_ecr.describe_images(repositoryName=lane_repository(name),
                                     imageIds=[{"imageTag": f"keep-{name}-current"}])["imageDetails"]
     if len(rows) != 1 or rows[0].get("imageDigest") != digest:
         raise Refused("lane-not-selected", f"keep-{name}-current does not hold the lane digest")
