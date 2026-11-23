@@ -473,8 +473,18 @@ class ProdAWS(AWS):
         # Staging's service, which the candidate reads for the lane image staging runs.
         if kwargs.get("services") == [PROD_ENV["STAGE_SERVICE"]]:
             assert kwargs["cluster"] == PROD_ENV["STAGE_CLUSTER"]
-            return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3"}]}
+            return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3",
+                                  "deployments": [{"rolloutState": "COMPLETED"}]}]}
         return super().describe_services(**kwargs)
+
+    def describe_task_definition(self, **kwargs):
+        # Staging's running task: its image is the one staging's pointer names.
+        if kwargs["taskDefinition"].endswith("fcvm-fleet-coordinator:3"):
+            stage = copy.deepcopy(self.old)
+            stage["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
+            stage["taskDefinition"]["containerDefinitions"][0]["image"] = self.stage_image
+            return stage
+        return super().describe_task_definition(**kwargs)
 
     def describe_images(self, **kwargs):
         ids = kwargs["imageIds"][0]
@@ -560,12 +570,43 @@ class ProdReleaseTests(unittest.TestCase):
             "status": "ok", "stage": {"digest": DIGEST, "commits": ["b" * 40], "lambda_digest": None},
             "prod": {"digest": "sha256:" + "c" * 64, "commits": ["e" * 40], "lambda_digest": None}, "release": None})
 
+    def test_a_lane_image_candidate_cannot_read_is_a_per_stack_error(self):
+        # The manual rollback reads the record through candidate also with the prod lane off: staging's service
+        # missing, or a running task that disagrees with its pointer or is still rolling out, is reported per
+        # stack (ejc3/fcvm's decide refuses on it) and never fails the whole answer.
+        real = self.aws.describe_services
+        def broken(**kwargs):
+            if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
+                return {"services": [], "failures": [{"reason": "MISSING"}]}
+            return real(**kwargs)
+        self.aws.describe_services = broken
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual((result["stage"]["lambda_digest"], result["stage"]["lane_error"]), (None, "service-unavailable"))
+        self.assertNotIn("lane_error", result["prod"])
+        self.assertIsNone(result["release"])
+
+    def test_candidate_refuses_a_lane_image_from_a_task_its_pointer_does_not_name(self):
+        # Prod's pointer names one image, its service runs another (a release in progress or rolled back).
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = REPO + "@sha256:" + "9" * 64
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["prod"]["lane_error"], "pointer-mismatch")
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        real = self.aws.describe_services
+        def rolling(**kwargs):
+            answer = real(**kwargs)
+            answer["services"][0]["deployments"] = [{"rolloutState": "IN_PROGRESS"}, {"rolloutState": "COMPLETED"}]
+            return answer
+        self.aws.describe_services = rolling
+        self.assertEqual(self.run_release({"action": "candidate"})["prod"]["lane_error"], "not-idle")
+
     def test_candidate_names_the_lane_image_each_coordinator_runs(self):
         # What a stack runs comes from its running task, never from the lane repository's tags.
         lane_url = PROD_ENV["LANE_REPOSITORY_URL"]
         stage_lane, prod_lane = "sha256:" + "4" * 64, "sha256:" + "5" * 64
         stage_def = copy.deepcopy(self.aws.old)
         stage_def["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
+        stage_def["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.stage_image
         stage_def["taskDefinition"]["containerDefinitions"][0]["environment"].append(
             {"name": "FLEET_LAMBDA_IMAGE", "value": lane_url + "@" + stage_lane})
         self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
@@ -576,7 +617,8 @@ class ProdReleaseTests(unittest.TestCase):
             asked.append(kwargs)
             if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
                 assert kwargs["cluster"] == PROD_ENV["STAGE_CLUSTER"]
-                return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3"}]}
+                return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3",
+                                      "deployments": [{"rolloutState": "COMPLETED"}]}]}
             return real_services(**kwargs)
         def describe_task_definition(**kwargs):
             if kwargs["taskDefinition"].endswith("fcvm-fleet-coordinator:3"):

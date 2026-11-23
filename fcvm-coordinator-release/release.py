@@ -273,12 +273,19 @@ def record(event, ssm):
     return {"status": "recorded"}
 
 
-def running_lane(ecs, cluster, name):
-    """The lane digest a stack's running coordinator task names (FLEET_LAMBDA_IMAGE), or None."""
+def running_lane(ecs, cluster, name, image):
+    """The lane digest a stack's running coordinator task names (FLEET_LAMBDA_IMAGE), or None. The service must
+    run one settled deployment whose coordinator image is the one the stack's pointer names (`image`)."""
     result = ecs.describe_services(cluster=cluster, services=[name])
     if result.get("failures") or len(result.get("services", [])) != 1:
         raise Refused("service-unavailable", "service unavailable")
-    return lane_of(ecs.describe_task_definition(taskDefinition=result["services"][0]["taskDefinition"]))
+    current = result["services"][0]
+    if len(current.get("deployments", [])) != 1:
+        raise Refused("not-idle", "the service is rolling out")
+    definition = ecs.describe_task_definition(taskDefinition=current["taskDefinition"])
+    if image_of(definition) != image:
+        raise Refused("pointer-mismatch", "release pointer and running task disagree")
+    return lane_of(definition)
 
 
 def candidate(ssm, ecr, ecs):
@@ -290,7 +297,13 @@ def candidate(ssm, ecr, ecs):
     for name, parameter in (("stage", os.environ["STAGE_IMAGE_PARAMETER"]), ("prod", os.environ["IMAGE_PARAMETER"])):
         value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         digest = pointer_digest(value)
-        out[name] = {"digest": digest, "commits": commits_of(ecr, digest), "lambda_digest": running_lane(ecs, *services[name])}
+        out[name] = {"digest": digest, "commits": commits_of(ecr, digest)}
+        # Per stack, so the record (which the manual rollback reads with the prod lane off) never depends on it:
+        # ejc3/fcvm's decide refuses on a lane_error.
+        try:
+            out[name]["lambda_digest"] = running_lane(ecs, *services[name], value)
+        except (Refused, ClientError) as error:
+            out[name].update({"lambda_digest": None, "lane_error": error_code(error) or "unreadable"})
     out["release"] = load_record(ssm)
     return out
 
