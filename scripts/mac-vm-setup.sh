@@ -11,7 +11,8 @@
 # in from the mini's ~/Applications/Xcode.app, Homebrew tools, the builds' signing keychain), then registers a
 # pool of GitHub Actions runners named mini-<n> in dolphin-labs-hq's Default group. An eligible private
 # repository can select any runner in the shared iOS pool or require the mini using its host label.
-# To install only the test slots on a running CI VM: scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots.
+# To install only the test slots and the hourly disk cleaner (ci-disk-clean) on a running CI VM:
+#   scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
 # and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
@@ -69,8 +70,9 @@ esac
 on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "$@"; }
 
 # Existing listeners already search /usr/local/bin. Updating the tools there also works during a job.
+# The same install loads (or reloads, when it changed) the admin's hourly disk cleaner LaunchAgent.
 install_sim_slots() {
-  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim install-ci-sim-slots.sh |
+  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim ci/ci-disk-clean install-ci-sim-slots.sh |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' '
       set -e
       d=$(mktemp -d)
