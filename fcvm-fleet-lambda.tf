@@ -5,8 +5,8 @@
 # per tile, fcvm-lam-<fleet>-<n> (ejc3/fcvm src/fleet/coord/lambda.rs), publishes a new version for every launch, and
 # deletes them when the fleet sleeps; no function exists while it sleeps, and an empty capacity provider runs no instance.
 #
-# This file grants and creates; it does not turn the lane on. The coordinator runs Lambda tiles only with --lambda aws and
-# --lambda-tiles, which fcvm-fleet.tf and fcvm-fleet-prod.tf do not pass yet (the next PR, staging first).
+# This file grants and creates. The staging lane runs only with local.fcvm_fleet_lambda_lane on (below), which passes
+# --lambda aws and --lambda-tiles to staging's coordinator; prod's coordinator passes neither yet.
 #
 # Cost while a tile is assigned: Lambda keeps the tile's previous instance running beside its current one (measured
 # 2026-11-22, ejc3/fcvm lambda lane step 0), so two g4dn.xlarge per tile at the on-demand price plus Lambda's management fee.
@@ -89,6 +89,48 @@ locals {
       }
     }
   }
+}
+
+# ------------------------------------------------------------------------------------------------ the staging lane switch
+# On: staging's coordinator runs --lambda-tiles of its 8 AWS places as Lambda tiles, from the lane image staging selected
+# (keep-stage-current in staging's repository), and ejc3/fcvm's FLEET_LAMBDA_LANE is on, so each staging release selects
+# the lane build paired with its commit and the release function moves FLEET_LAMBDA_IMAGE with it.
+#
+# Before turning it on:
+# - Aggregated streaming is on (local.fcvm_fleet_aggregated): --lambda aws serves its tiles on the task's port 443 through
+#   --ec2-aggregate-tls, and the coordinator refuses to start without it.
+# - keep-stage-current exists: the coordinator refuses --lambda aws without --lambda-image, and the first staging release
+#   with the lane on comes after this apply. Select the newest build once from fcvm-arm (ejc3/fcvm
+#   fleet/lambda/release.py select --stack stage --built --running none).
+locals {
+  fcvm_fleet_lambda_lane = false
+}
+
+data "aws_ecr_image" "fcvm_fleet_lambda_stage_current" {
+  count           = local.fcvm_fleet_lambda_lane ? 1 : 0
+  provider        = aws.fcvm_fleet_east1
+  repository_name = aws_ecr_repository.fcvm_fleet_lambda_tile.name
+  image_tag       = "keep-stage-current"
+}
+
+resource "terraform_data" "fcvm_fleet_lambda_lane_needs" {
+  count = local.fcvm_fleet_lambda_lane ? 1 : 0
+  lifecycle {
+    precondition {
+      condition     = local.fcvm_fleet_aggregated
+      error_message = "The staging Lambda lane needs aggregated streaming (local.fcvm_fleet_aggregated): --lambda aws needs --ec2-aggregate-tls."
+    }
+  }
+}
+
+# The repository variable ejc3/fcvm's staging release reads (fleet/coord/publish.py lane_setting); an environment variable
+# of the same name would not reach the deploy workflow's job-level if.
+resource "github_actions_variable" "fcvm_fleet_lambda_lane" {
+  count         = local.fcvm_fleet_lambda_lane ? 1 : 0
+  provider      = github.agents_md
+  repository    = "fcvm"
+  variable_name = "FLEET_LAMBDA_LANE"
+  value         = "on"
 }
 
 # ------------------------------------------------------------------------------------------------ the lane image
