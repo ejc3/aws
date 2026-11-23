@@ -1806,10 +1806,10 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   photo of a house. Its key is written to `workers-stage/lights/terraform` and loaded with
   `scripts/workers-stage-secrets.sh lights`. The loader also reads `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID`
   from this account's `browserbase/credentials` for the inventory check. Run it after `deploy-lights-web` finishes. The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
-- **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
-  script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
-  of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
-  covers it.
+- **Open Fantasy's old view on staging** (`workers-stage.tf`), being retired: the Worker `fantasy-stage`, whose source
+  ejc3/constellation removed when Open Fantasy moved into dolphin-labs. Its URLs are off (`urls = false`); once the Worker
+  is deleted, its entry leaves `local.workers_stage`, the reverse of the order for adding a site. Its books bucket and
+  upload credential (`fantasy-books.tf`) are removed.
 - **Lights on staging** (`workers-stage.tf`): the Worker `lights-stage`, the buying wizard as Worker assets plus a small
   script for `/api/*` (live Shopify prices and the photo reader), deployed by ejc3/constellation (`deploy-lights-web.yml`)
   from the same `cloudflare-deploy` environment. It is one of the staging Workers behind the shared "Site staging
