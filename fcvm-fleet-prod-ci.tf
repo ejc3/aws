@@ -8,8 +8,10 @@
 #
 # - GitHub environment fleet-prod-deploy on ejc3/fcvm, main only. The repository variable FLEET_PROD_ENABLED tells
 #   the workflows the stack exists; without it they skip with a message.
-# - fcvm-prod-ci: the OIDC role of that environment only. It may invoke the two prod release functions below and
-#   nothing else: no ECR push (prod releases images staging already published), no staging function, no state.
+# - fcvm-prod-ci: the OIDC role of that environment only. It may invoke the two prod release functions below, and for
+#   the Lambda lane copy the image staging tested from staging's lane repository (read only) into prod's by digest and
+#   move keep-prod-* there. No coordinator image push (prod releases images staging already published), no staging
+#   function, no state.
 # - fcvm-coordinator-release-prod: release.py with STACK=prod. It changes only the prod service's image, takes
 #   Terraform's backend lock as staging's does, and goes ahead only while ActiveViewers{Fleet=prod} (namespace
 #   FCVM/Fleet, ejc3/fcvm src/fleet/coord/metrics.rs) has been 0 for 5 minutes; otherwise it returns `held`. `force`
@@ -99,7 +101,7 @@ resource "github_actions_environment_secret" "fcvm_prod" {
     CF_ACCESS_CLIENT_ID     = cloudflare_zero_trust_access_service_token.fcvm_prod_ci[0].client_id
     CF_ACCESS_CLIENT_SECRET = cloudflare_zero_trust_access_service_token.fcvm_prod_ci[0].client_secret
     CLOUDFLARE_API_TOKEN    = cloudflare_account_token.fcvm_prod_workers_deploy[0].value
-    LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
+    LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
   }[each.key]
 }
 
@@ -148,27 +150,54 @@ resource "aws_iam_role_policy" "fcvm_prod_ci" {
         Action      = "lambda:*"
         NotResource = concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])
       },
-      # The prod lane (ejc3/fcvm publish.py --stack prod --lambda-digest) moves keep-prod-* in the lane repository:
-      # read an image and put a tag on it. No layer upload, so only manifests whose layers the repository holds.
+      # The prod lane (ejc3/fcvm fleet/lambda/release.py copy, publish.py --stack prod --lambda-digest): copy the image
+      # staging tested from staging's lane repository into prod's by digest, then move keep-prod-* in prod's. Staging's
+      # is read only, so nothing here can change what staging runs or keeps; nothing in staging can reach prod's.
       {
-        Sid      = "RetagTheLaneImage"
+        Sid      = "ReadTheTestedLaneImage"
         Effect   = "Allow"
-        Action   = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"]
+        Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
         Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
       },
       {
-        Sid    = "NeverUploadToTheLaneRepository"
+        Sid    = "CopyAndRetagTheLaneImage"
+        Effect = "Allow"
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage"]
+        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn
+      },
+      # The copy goes through the registry API, which takes a token; the token itself grants nothing beyond the above.
+      {
+        Sid       = "SignInToTheLaneRegistry"
+        Effect    = "Allow"
+        Action    = "ecr:GetAuthorizationToken"
+        Resource  = "*"
+        Condition = { StringEquals = { "aws:RequestedRegion" = "us-east-1" } }
+      },
+      {
+        Sid       = "OnlyReadStagingsLaneRepository"
+        Effect    = "Deny"
+        NotAction = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+        Resource  = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+      },
+      {
+        Sid    = "NeverAdministerProdsLaneRepository"
         Effect = "Deny"
-        Action = ["ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:BatchDeleteImage",
-          "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy", "ecr:PutLifecyclePolicy",
-        "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability"]
-        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+        Action = ["ecr:BatchDeleteImage", "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy",
+          "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability", "ecr:PutImageScanningConfiguration",
+        "ecr:PutReplicationConfiguration"]
+        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn
       },
+      # Every ECR action but GetAuthorizationToken, outside the two lane repositories. Not ecr:*: GetAuthorizationToken's
+      # resource is "*", which a NotResource deny of ecr:* would also deny.
       {
-        Sid         = "NoOtherRepository"
-        Effect      = "Deny"
-        Action      = "ecr:*"
-        NotResource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+        Sid    = "NoOtherRepository"
+        Effect = "Deny"
+        Action = ["ecr:Batch*", "ecr:Complete*", "ecr:Create*", "ecr:Delete*", "ecr:Describe*", "ecr:GetAccountSetting",
+          "ecr:GetDownloadUrlForLayer", "ecr:GetLifecyclePolicy*", "ecr:GetRegistry*", "ecr:GetRepositoryPolicy", "ecr:Initiate*",
+          "ecr:List*", "ecr:Put*", "ecr:Replicate*", "ecr:Set*", "ecr:Start*", "ecr:Tag*", "ecr:Untag*", "ecr:Update*",
+        "ecr:Upload*", "ecr:Validate*"]
+        NotResource = [aws_ecr_repository.fcvm_fleet_lambda_tile.arn, aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn]
       },
       {
         Sid    = "NeverPublishAdministerOrReadCredentials"
@@ -325,22 +354,24 @@ resource "aws_lambda_function" "fcvm_coordinator_release_prod" {
   source_code_hash               = data.archive_file.fcvm_coordinator_release.output_base64sha256
   environment {
     variables = {
-      STACK                 = "prod"
-      CLUSTER               = aws_ecs_cluster.fcvm_fleet_prod[0].name
-      SERVICE               = aws_ecs_service.fcvm_fleet_prod_coordinator[0].name
-      FAMILY                = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family
-      RELEASE_ROLE          = aws_iam_role.fcvm_coordinator_release_prod_fleet[0].arn
-      REPOSITORY_URL        = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
-      LANE_REPOSITORY_URL   = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
-      IMAGE_PARAMETER       = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
-      STAGE_IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
-      STAGE_CLUSTER         = aws_ecs_cluster.fcvm_fleet.name
-      STAGE_SERVICE         = aws_ecs_service.fcvm_fleet_coordinator.name
-      RELEASE_RECORD        = aws_ssm_parameter.fcvm_prod_release_record[0].name
-      METRICS_NAMESPACE     = "FCVM/Fleet"
-      METRIC_FLEET          = local.fcvm_fleet_prod_stack.fleet
-      LOCK_TABLE            = "ejc3-terraform-locks"
-      LOCK_ID               = local.fcvm_stage_lock_id
+      STACK               = "prod"
+      CLUSTER             = aws_ecs_cluster.fcvm_fleet_prod[0].name
+      SERVICE             = aws_ecs_service.fcvm_fleet_prod_coordinator[0].name
+      FAMILY              = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family
+      RELEASE_ROLE        = aws_iam_role.fcvm_coordinator_release_prod_fleet[0].arn
+      REPOSITORY_URL      = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
+      LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
+      # Only to read which lane image staging's running task names (candidate); never read from or written to.
+      STAGE_LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
+      IMAGE_PARAMETER           = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
+      STAGE_IMAGE_PARAMETER     = aws_ssm_parameter.fcvm_coordinator_release.name
+      STAGE_CLUSTER             = aws_ecs_cluster.fcvm_fleet.name
+      STAGE_SERVICE             = aws_ecs_service.fcvm_fleet_coordinator.name
+      RELEASE_RECORD            = aws_ssm_parameter.fcvm_prod_release_record[0].name
+      METRICS_NAMESPACE         = "FCVM/Fleet"
+      METRIC_FLEET              = local.fcvm_fleet_prod_stack.fleet
+      LOCK_TABLE                = "ejc3-terraform-locks"
+      LOCK_ID                   = local.fcvm_stage_lock_id
     }
   }
   depends_on = [aws_iam_role_policy.fcvm_coordinator_release_prod, aws_iam_role_policy.fcvm_coordinator_release_prod_fleet]

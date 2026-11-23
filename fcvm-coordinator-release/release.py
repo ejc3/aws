@@ -86,13 +86,14 @@ def lane_repository(name):
     return repository
 
 
-def lane_of(response):
-    """The lane digest the coordinator's FLEET_LAMBDA_IMAGE names, None without one, or a refusal."""
+def lane_of(response, url=None):
+    """The lane digest the coordinator's FLEET_LAMBDA_IMAGE names, None without one, or a refusal. `url` is the lane
+    repository the task's stack uses: this function's own (LANE_REPOSITORY_URL) unless given."""
     container = next(c for c in response["taskDefinition"]["containerDefinitions"] if c["name"] == "coordinator")
     values = [e["value"] for e in container.get("environment", []) if e.get("name") == LANE_VARIABLE]
     if not values:
         return None
-    prefix = os.environ["LANE_REPOSITORY_URL"] + "@"
+    prefix = (url or os.environ["LANE_REPOSITORY_URL"]) + "@"
     if len(values) != 1 or not values[0].startswith(prefix) or not DIGEST.fullmatch(values[0][len(prefix):]):
         raise Refused("lane-invalid", "the coordinator's lane image is not a digest in the lane repository")
     return values[0][len(prefix):]
@@ -282,7 +283,7 @@ def record(event, ssm):
     return {"status": "recorded"}
 
 
-def running_lane(ecs, cluster, name, image):
+def running_lane(ecs, cluster, name, image, url):
     """The lane digest a stack's running coordinator task names (FLEET_LAMBDA_IMAGE), or None. The service must
     run one settled deployment whose coordinator image is the one the stack's pointer names (`image`)."""
     result = ecs.describe_services(cluster=cluster, services=[name])
@@ -295,15 +296,17 @@ def running_lane(ecs, cluster, name, image):
     definition = ecs.describe_task_definition(taskDefinition=current["taskDefinition"])
     if image_of(definition) != image:
         raise Refused("pointer-mismatch", "release pointer and running task disagree")
-    return lane_of(definition)
+    return lane_of(definition, url)
 
 
 def candidate(ssm, ecr, ecs):
     """Staging's and prod's coordinator images, the lane image each running task names, and the release record,
     for the promotion. What a stack runs comes from its task; the lane repository's tags only protect images."""
     out = {"status": "ok"}
+    # Each stack's task names its own stack's lane repository (ejc3/aws#986): staging's URL for staging's task.
     services = {"stage": (os.environ["STAGE_CLUSTER"], os.environ["STAGE_SERVICE"]),
                 "prod": (os.environ["CLUSTER"], os.environ["SERVICE"])}
+    urls = {"stage": os.environ["STAGE_LANE_REPOSITORY_URL"], "prod": os.environ["LANE_REPOSITORY_URL"]}
     for name, parameter in (("stage", os.environ["STAGE_IMAGE_PARAMETER"]), ("prod", os.environ["IMAGE_PARAMETER"])):
         value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         digest = pointer_digest(value)
@@ -313,7 +316,7 @@ def candidate(ssm, ecr, ecs):
         # image. A timeout or endpoint error (BotoCoreError) and a task definition without a coordinator container
         # (StopIteration) or a field (KeyError) are "unreadable".
         try:
-            out[name]["lambda_digest"] = running_lane(ecs, *services[name], value)
+            out[name]["lambda_digest"] = running_lane(ecs, *services[name], value, urls[name])
         except (Refused, ClientError, BotoCoreError, StopIteration, KeyError) as error:
             out[name].update({"lambda_digest": None, "lane_error": error_code(error) or "unreadable"})
     out["release"] = load_record(ssm)

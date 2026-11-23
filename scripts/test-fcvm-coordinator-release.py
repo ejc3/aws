@@ -269,7 +269,9 @@ PROD_ENV = {**ENV, "STACK": "prod", "CLUSTER": "fcvm-fleet-prod", "SERVICE": "fc
             "FAMILY": "fcvm-fleet-prod-coordinator", "IMAGE_PARAMETER": "/fleet/prod/image",
             "STAGE_IMAGE_PARAMETER": "/fleet/stage/image", "RELEASE_RECORD": "/fleet/prod/release",
             "METRICS_NAMESPACE": "FCVM/Fleet", "METRIC_FLEET": "prod", "STAGE_CLUSTER": "fcvm-fleet",
-            "STAGE_SERVICE": "fcvm-fleet-coordinator", "LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile"}
+            "STAGE_SERVICE": "fcvm-fleet-coordinator",
+            "LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile-prod",
+            "STAGE_LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile"}
 PROD_OLD = PROD_ENV["FAMILY"]
 
 
@@ -659,15 +661,16 @@ class ProdReleaseTests(unittest.TestCase):
 
     def test_candidate_names_the_lane_image_each_coordinator_runs(self):
         # What a stack runs comes from its running task, never from the lane repository's tags.
-        lane_url = PROD_ENV["LANE_REPOSITORY_URL"]
+        # Each stack's task names its own stack's lane repository (ejc3/aws#986).
+        stage_url, prod_url = PROD_ENV["STAGE_LANE_REPOSITORY_URL"], PROD_ENV["LANE_REPOSITORY_URL"]
         stage_lane, prod_lane = "sha256:" + "4" * 64, "sha256:" + "5" * 64
         stage_def = copy.deepcopy(self.aws.old)
         stage_def["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
         stage_def["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.stage_image
         stage_def["taskDefinition"]["containerDefinitions"][0]["environment"].append(
-            {"name": "FLEET_LAMBDA_IMAGE", "value": lane_url + "@" + stage_lane})
+            {"name": "FLEET_LAMBDA_IMAGE", "value": stage_url + "@" + stage_lane})
         self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
-            {"name": "FLEET_LAMBDA_IMAGE", "value": lane_url + "@" + prod_lane})
+            {"name": "FLEET_LAMBDA_IMAGE", "value": prod_url + "@" + prod_lane})
         asked = []
         real_services, real_definition = self.aws.describe_services, self.aws.describe_task_definition
         def describe_services(**kwargs):
@@ -685,6 +688,10 @@ class ProdReleaseTests(unittest.TestCase):
         result = self.run_release({"action": "candidate"})
         self.assertEqual((result["stage"]["lambda_digest"], result["prod"]["lambda_digest"]), (stage_lane, prod_lane))
         self.assertEqual(self.aws.calls, [])
+        # A task that names the other stack's repository is refused for that stack.
+        stage_def["taskDefinition"]["containerDefinitions"][0]["environment"][-1]["value"] = prod_url + "@" + stage_lane
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual((result["stage"]["lane_error"], result["prod"]["lambda_digest"]), ("lane-invalid", prod_lane))
 
     def entry(self, digest="sha256:" + "c" * 64, commit="e" * 40, generation=7):
         return {"coordinator": {"commit": commit, "digest": digest}, "web_commit": "f" * 40, "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12,
@@ -753,6 +760,8 @@ class ProdLaneTerraformTests(unittest.TestCase):
         function = tf.split('resource "aws_lambda_function" "fcvm_coordinator_release_prod"', 1)[1].split("\n}\n", 1)[0]
         self.assertRegex(function, r"STAGE_CLUSTER\s+= aws_ecs_cluster\.fcvm_fleet\.name")
         self.assertRegex(function, r"STAGE_SERVICE\s+= aws_ecs_service\.fcvm_fleet_coordinator\.name")
+        self.assertRegex(function, r"STAGE_LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile\.repository_url")
+        self.assertRegex(function, r"LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile_prod\[0\]\.repository_url")
 
 
 class ProdCiTerraformTests(unittest.TestCase):
@@ -791,20 +800,54 @@ class ProdCiTerraformTests(unittest.TestCase):
         policy = self.block('resource "aws_iam_role_policy"', "fcvm_prod_ci")
         allows = re.findall(r'Effect = "Allow", Action = "([^"]+)", Resource = ([^ }]+)', policy)
         self.assertEqual(allows, [("lambda:InvokeFunction", "local.fcvm_prod_release_functions")])
-        # Besides invoking, only retagging the lane repository's images (ejc3/fcvm publish.py --lambda-digest moves
-        # keep-prod-*): read an image and put a tag on it. It cannot upload a layer, so it can only tag manifests
-        # whose layers the repository already holds, and every other ECR repository stays denied.
-        lane = self.statement(policy, "RetagTheLaneImage")
-        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', lane), ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"])
-        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", lane)
-        uploads = self.statement(policy, "NeverUploadToTheLaneRepository")
-        self.assertRegex(uploads, r'Effect\s+= "Deny"')
-        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', uploads),
-                              ["ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload", "ecr:BatchDeleteImage",
-                               "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy",
-                               "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability"])
+        # Besides invoking, only the prod lane's copy (ejc3/fcvm fleet/lambda/release.py copy): read the image staging
+        # tested from staging's lane repository, write it into prod's by digest and move keep-prod-* there.
+        read = self.statement(policy, "ReadTheTestedLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', read), ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", read)
+        write = self.statement(policy, "CopyAndRetagTheLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', write), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:BatchGetImage"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn", write)
+        token = self.statement(policy, "SignInToTheLaneRegistry")
+        self.assertIn('Action    = "ecr:GetAuthorizationToken"', token)
+        self.assertIn('"aws:RequestedRegion" = "us-east-1"', token)
+        # Staging's repository: those two reads and nothing else.
+        stage_only = self.statement(policy, "OnlyReadStagingsLaneRepository")
+        self.assertRegex(stage_only, r'Effect\s+= "Deny"')
+        self.assertIn('NotAction = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', stage_only)
+        self.assertIn("Resource  = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", stage_only)
+        admin = self.statement(policy, "NeverAdministerProdsLaneRepository")
+        self.assertRegex(admin, r'Effect\s+= "Deny"')
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', admin),
+                              ["ecr:BatchDeleteImage", "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy",
+                               "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability",
+                               "ecr:PutImageScanningConfiguration", "ecr:PutReplicationConfiguration"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn", admin)
+        # Every other repository stays denied. The deny names actions, not ecr:*, because GetAuthorizationToken's
+        # resource is "*": a NotResource deny of ecr:* would deny the sign-in too.
+        other = self.statement(policy, "NoOtherRepository")
+        self.assertIn("NotResource = [aws_ecr_repository.fcvm_fleet_lambda_tile.arn, aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn]", other)
+        patterns = re.findall(r'"ecr:([^"]+)"', other)
+        known = ["BatchCheckLayerAvailability", "BatchDeleteImage", "BatchGetImage", "BatchGetRepositoryScanningConfiguration",
+                 "CompleteLayerUpload", "CreatePullThroughCacheRule", "CreateRepository", "CreateRepositoryCreationTemplate",
+                 "DeleteLifecyclePolicy", "DeletePullThroughCacheRule", "DeleteRegistryPolicy", "DeleteRepository",
+                 "DeleteRepositoryCreationTemplate", "DeleteRepositoryPolicy", "DescribeImageReplicationStatus",
+                 "DescribeImageScanFindings", "DescribeImages", "DescribePullThroughCacheRules", "DescribeRegistry",
+                 "DescribeRepositories", "DescribeRepositoryCreationTemplates", "GetAccountSetting", "GetDownloadUrlForLayer",
+                 "GetLifecyclePolicy", "GetLifecyclePolicyPreview", "GetRegistryPolicy", "GetRegistryScanningConfiguration",
+                 "GetRepositoryPolicy", "InitiateLayerUpload", "ListImages", "ListTagsForResource", "PutAccountSetting",
+                 "PutImage", "PutImageScanningConfiguration", "PutImageTagMutability", "PutLifecyclePolicy",
+                 "PutRegistryPolicy", "PutRegistryScanningConfiguration", "PutReplicationConfiguration", "ReplicateImage",
+                 "SetRepositoryPolicy", "StartImageScan", "StartLifecyclePolicyPreview", "TagResource", "UntagResource",
+                 "UpdatePullThroughCacheRule", "UpdateRepositoryCreationTemplate", "UploadLayerPart",
+                 "ValidatePullThroughCacheRule"]
+        def denied(action):
+            return any(re.fullmatch(p.replace("*", ".*"), action) for p in patterns)
+        self.assertEqual([a for a in known if not denied(a)], [])
+        self.assertFalse(denied("GetAuthorizationToken"))
         never = self.statement(policy, "NeverPublishAdministerOrReadCredentials")
-        self.assertIn("NotResource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", self.statement(policy, "NoOtherRepository"))
         self.assertNotIn('"ecr:*"', never)
         # Lambda tests the resolved $LATEST even for CI's unqualified Invoke. Versions, aliases and other functions
         # must still match the explicit deny, and only the unqualified production ARNs appear in the Allow above.
@@ -822,15 +865,26 @@ class ProdCiTerraformTests(unittest.TestCase):
     def statement(self, policy, sid):
         return re.split(r'Sid\s+= "' + sid + '"', policy, maxsplit=1)[1].split("},", 1)[0]
 
-    def test_the_prod_ci_role_reads_the_lane_repository_and_its_url(self):
+    def test_the_prod_ci_role_reads_staging_and_writes_prods_lane_repository(self):
         secrets = self.block('resource "github_actions_environment_secret"', "fcvm_prod")
         self.assertIn('"LAMBDA_TILE_REPO"', secrets)
-        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url", secrets)
+        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url", secrets)
         lane = (ROOT / "fcvm-fleet-lambda.tf").read_text()
-        policy = lane.split('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', 1)[1].split("\n}\n", 1)[0]
-        self.assertIn('Sid       = "ProdCiRetagsTheLaneImage"', policy)
-        self.assertIn("aws_iam_role.fcvm_prod_ci[0].arn", policy)
-        self.assertIn("var.fcvm_fleet_prod_enabled ?", policy)
+        def policy(name):
+            return lane.split(f'resource "aws_ecr_repository_policy" "{name}"', 1)[1].split("\n}\n", 1)[0]
+        stage, prod = policy("fcvm_fleet_lambda_tile"), policy("fcvm_fleet_lambda_tile_prod")
+        # Staging's repository admits prod CI to read only, and only while prod exists.
+        read = self.statement(stage, "ProdCiReadsTheTestedLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }", read)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', read), ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"])
+        self.assertIn("var.fcvm_fleet_prod_enabled ?", stage)
+        self.assertNotIn("ProdCiRetagsTheLaneImage", lane)
+        # Prod's admits prod CI's copy and retag, the same actions its role holds there.
+        write = self.statement(prod, "ProdCiCopiesAndRetagsTheLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }", write)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', write), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:BatchGetImage"])
 
     def test_the_prod_functions_reach_prod_only(self):
         fleet = self.block('resource "aws_iam_role_policy"', "fcvm_coordinator_release_prod_fleet")
@@ -860,10 +914,10 @@ class ProdCiTerraformTests(unittest.TestCase):
         staging = (ROOT / "fcvm-fleet-ci.tf").read_text()
         self.assertRegex(staging, r'STACK   = "stage"\n\s*CLUSTER = aws_ecs_cluster\.fcvm_fleet\.name')
         prod = self.block('resource "aws_lambda_function"', "fcvm_coordinator_release_prod")
-        for line in ('STACK                 = "prod"', "CLUSTER               = aws_ecs_cluster.fcvm_fleet_prod[0].name",
-                     "FAMILY                = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family",
-                     'METRICS_NAMESPACE     = "FCVM/Fleet"'):
-            self.assertIn(line, prod)
+        for key, value in (("STACK", '"prod"'), ("CLUSTER", "aws_ecs_cluster.fcvm_fleet_prod[0].name"),
+                           ("FAMILY", "aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family"),
+                           ("METRICS_NAMESPACE", '"FCVM/Fleet"')):
+            self.assertRegex(prod, r"\n\s+" + key + r"\s+= " + re.escape(value) + "\n")
 
 
 class Session:

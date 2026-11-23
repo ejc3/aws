@@ -172,12 +172,13 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
         "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage"]
       },
       ], var.fcvm_fleet_prod_enabled ? [
-      # Prod CI retags only (fcvm-fleet-prod-ci.tf denies it every upload).
+      # A promotion's copy reads the image staging tested, by digest, on prod CI's credentials (fcvm-fleet-prod-ci.tf).
+      # Read only: prod CI's own policy denies it every other action here.
       {
-        Sid       = "ProdCiRetagsTheLaneImage"
+        Sid       = "ProdCiReadsTheTestedLaneImage"
         Effect    = "Allow"
         Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }
-        Action    = ["ecr:BatchGetImage", "ecr:DescribeImages", "ecr:PutImage"]
+        Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
       },
     ] : [])
   })
@@ -231,8 +232,7 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile_prod" {
   })
 }
 
-# Only prod's tile functions pull from prod's repository. Prod CI's copy and retag are admitted where they are granted
-# (fcvm-fleet-prod-ci.tf).
+# Only prod's tile functions pull from prod's repository, and only prod CI writes to it.
 resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile_prod" {
   count      = local.fcvm_fleet_prod
   provider   = aws.fcvm_fleet_east1
@@ -246,6 +246,14 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile_prod" {
         Principal = { Service = "lambda.amazonaws.com" }
         Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
         Condition = { StringLike = { "aws:sourceArn" = local.fcvm_lambda_function_arns.prod } }
+      },
+      # Prod CI (another account) copies the tested image in by digest and moves keep-prod-* (fcvm-fleet-prod-ci.tf).
+      {
+        Sid       = "ProdCiCopiesAndRetagsTheLaneImage"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }
+        Action = ["ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload", "ecr:PutImage", "ecr:BatchGetImage"]
       },
     ]
   })
