@@ -30,6 +30,9 @@ MARKER_AGE = 30 * 86400
 TIMEOUT = 10
 OUTPUT_LIMIT = 2 * 1024**2
 LIST_LIMIT = 512
+RANK_SECONDS = 240
+# The ranking budget's clock; Git and gh timeouts use time.monotonic directly.
+clock = time.monotonic
 COMMAND_OWNER = None
 
 
@@ -376,7 +379,7 @@ def prune(home, uid, token=None, *, inspect_all=False):
     healthy = {"status": "healthy"} if token else {"candidates": []}
     if not pressure(home):
         return healthy
-    end = time.monotonic() + 240
+    end = clock() + RANK_SECONDS
     device = home.stat().st_dev
     if not owned(home, uid, device):
         raise OSError("unsafe home")
@@ -384,7 +387,7 @@ def prune(home, uid, token=None, *, inspect_all=False):
     candidates = []
     registered = set(directories)
     for repo in directories:
-        if time.monotonic() >= end:
+        if clock() >= end:
             raise Incomplete("repository discovery timed out")
         for record in worktrees(home, repo):
             path = Path(record.get("worktree", ""))
@@ -398,7 +401,7 @@ def prune(home, uid, token=None, *, inspect_all=False):
                 info = identity(repo, path, head, uid, device)
                 if info and (not token or token == info[2]):
                     candidates.append((info[1], repo, path, record, info))
-    if time.monotonic() >= end:
+    if clock() >= end:
         raise Incomplete("worktree discovery timed out")
     if not candidates or (token and len(candidates) != 1):
         return skipped
@@ -409,8 +412,13 @@ def prune(home, uid, token=None, *, inspect_all=False):
     merge_proofs = set()
     valid_repos = {}
     for age, repo, path, record, info in sorted(candidates, key=lambda item: (item[0], item[2])):
-        if time.monotonic() >= end:
-            raise Incomplete("worktree ranking timed out")
+        if clock() >= end:
+            if token:
+                raise Incomplete("worktree ranking timed out")
+            # Candidates are ranked oldest first and each listed one passed
+            # every check, so the list so far is a verified oldest-first prefix.
+            # Removal rechecks each one; the next run ranks the rest.
+            break
         if not pressure(home):
             return healthy
         if protected(path, paths) or any(p != path and under(p, path) for p in registered):
@@ -447,8 +455,8 @@ def prune(home, uid, token=None, *, inspect_all=False):
             merge_proofs.add(proof)
         if not token:
             eligible.append({"token": info[2], "age_ns": age})
-            if len(eligible) > LIST_LIMIT:
-                raise Incomplete("eligible worktrees exceeded list limit")
+            if len(eligible) == LIST_LIMIT:
+                break  # The oldest LIST_LIMIT; later runs reach the rest.
             continue
         # Recheck all non-Git protections, registration and worktree content just
         # before removal. Use Git's ordinary removal and keep every branch ref.
@@ -462,7 +470,7 @@ def prune(home, uid, token=None, *, inspect_all=False):
             return healthy
         removed = git(home, repo, "worktree", "remove", "--", str(path), timeout=50) is not None
         return {"status": "removed" if removed else "declined"}
-    if time.monotonic() >= end:
+    if token and clock() >= end:
         raise Incomplete("worktree ranking timed out")
     return skipped if token else {"candidates": eligible}
 

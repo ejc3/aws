@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 """Offline acceptance tests for the host's account ordering and output boundary."""
+import base64
 import contextlib
+import gzip
+import hashlib
 import importlib.util
 import io
 import os
 from pathlib import Path
+import re
 import subprocess
+import textwrap
 import sys
 import tempfile
 import unittest
@@ -17,6 +22,34 @@ SPEC = importlib.util.spec_from_file_location(
 host = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = host
 SPEC.loader.exec_module(host)
+ROOT = Path(__file__).resolve().parents[1]
+TF = (ROOT / "nextjs-worktree-prune.tf").read_text()
+
+
+def tf_block(kind, name):
+    """One top-level block of the .tf file, through its closing brace at column 0."""
+    match = re.search(rf'^{kind} "aws_ssm_association" "{name}" {{\n(.*?)^}}\n', TF, re.S | re.M)
+    assert match, name
+    return match[1]
+
+
+def render_installer(job):
+    """Render the installer heredoc as Terraform would for one job (gzip bytes aside)."""
+    jobs = dict(re.findall(r'^    (\w+) += (\{.*\})$', TF, re.M))
+    fields = dict(re.findall(r'(\w+) = "([^"]*)"', jobs[job]))
+    text = TF.split("key => <<-SH\n", 1)[1].split("\n    SH\n", 1)[0] + "\n"
+    text = textwrap.dedent(text)
+
+    def script(name):
+        return ROOT / "scripts" / name
+
+    text = re.sub(r'\$\{base64gzip\(file\("\$\{path\.module\}/scripts/([^"]+)"\)\)\}',
+                  lambda m: base64.b64encode(gzip.compress(script(m[1]).read_bytes())).decode(), text)
+    text = re.sub(r'\$\{filesha256\("\$\{path\.module\}/scripts/([^"]+)"\)\}',
+                  lambda m: hashlib.sha256(script(m[1]).read_bytes()).hexdigest(), text)
+    text = re.sub(r"\$\{job\.(\w+)\}", lambda m: fields[m[1]], text)
+    assert "${" not in text and "%{" not in text, "unrendered Terraform interpolation"
+    return text
 
 
 class HostCleanup(unittest.TestCase):
@@ -30,6 +63,92 @@ class HostCleanup(unittest.TestCase):
         )
         for when in ("2026-11-22 23:30:00", "2026-11-23 00:30:00", "2026-11-23 01:30:00"):
             self.assertIn(when, schedule)
+
+    def test_each_installer_is_valid_shell_and_pins_the_script_pair(self):
+        for job in ("nextjs", "fcvm"):
+            text = render_installer(job)
+            subprocess.run(["sh", "-n"], input=text, text=True, check=True)
+            for name in ("nextjs-worktree-prune-host.py", "nextjs-worktree-prune.py"):
+                digest = hashlib.sha256((ROOT / "scripts" / name).read_bytes()).hexdigest()
+                # Once for the install check, once in the entry wrapper's check.
+                self.assertEqual(text.count(digest), 2, (job, name))
+            # The installer touches only its own files and timer: no package
+            # manager, and no restart of any other unit.
+            self.assertIsNone(re.search(r"\b(apt|apt-get|dpkg|snap)\b", text), job)
+            self.assertEqual(re.findall(r"systemctl (\S+)", text),
+                             ["daemon-reload", "enable", "is-enabled", "is-active", "show"])
+
+    def test_nextjs_job_is_unchanged_and_fcvm_job_is_host_only(self):
+        nextjs, fcvm = render_installer("nextjs"), render_installer("fcvm")
+        self.assertIn("ExecStart=/usr/local/sbin/nextjs-worktree-prune --apply\n", nextjs)
+        self.assertIn("/run/nextjs-worktree-prune.lock", nextjs)
+        self.assertNotIn("fcvm", nextjs)
+        self.assertIn("ExecStart=/usr/local/sbin/fcvm-worktree-prune --apply --host-only\n", fcvm)
+        for unit in ("/etc/systemd/system/fcvm-worktree-prune.service",
+                     "/etc/systemd/system/fcvm-worktree-prune.timer", "/run/fcvm-worktree-prune.lock",
+                     "Nice=15", "IOSchedulingClass=idle", "NoNewPrivileges=yes", "TimeoutStartSec=45min",
+                     "systemctl enable --now fcvm-worktree-prune.timer"):
+            self.assertIn(unit, fcvm)
+        self.assertNotIn("/etc/systemd/system/nextjs-worktree-prune", fcvm)
+        # The driver loads its worker from this one path on both hosts.
+        self.assertIn(str(host.WORKER), fcvm)
+
+    def test_fcvm_association_targets_only_fcvm_arm(self):
+        block = tf_block("resource", "fcvm_arm_worktree_prune")
+        self.assertIn("count = var.enable_firecracker_instance ? 1 : 0", block)
+        self.assertEqual(re.findall(r"values += (.*)", block), ["[aws_instance.firecracker_dev[0].id]"])
+        self.assertIn('commands         = local.worktree_prune_install["fcvm"]', block)
+        nextjs = tf_block("resource", "nextjs_worktree_prune")
+        self.assertEqual(re.findall(r"values += (.*)", nextjs), ["[local.nextjs_live_instance.id]"])
+        self.assertIn('commands         = local.worktree_prune_install["nextjs"]', nextjs)
+
+    def test_host_only_cleans_ubuntu_without_machinectl(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            host, "CONFIG", Path(temp) / "absent.json"
+        ), patch.object(host.subprocess, "run", side_effect=AssertionError("machinectl called")), patch.object(
+            host.subprocess, "Popen", side_effect=AssertionError("command run")
+        ):
+            self.assertEqual(host.managed_accounts(host_only=True), ["ubuntu"])
+            # Only ubuntu is cleaned, so no host process scan is needed either.
+            with patch.object(host, "PROC", Path(temp) / "no-proc"):
+                self.assertEqual(host.host_busy_accounts(["ubuntu"]), set())
+            seen = []
+            with patch.object(sys, "argv", ["driver", "--apply", "--host-only"]), patch.object(
+                host.os, "geteuid", return_value=0
+            ), patch.object(host, "pressured", return_value=True), patch.object(
+                host, "clean", side_effect=lambda accounts, *rest: seen.append((accounts, rest[2]))
+            ):
+                host.main()
+            self.assertEqual(seen, [(["ubuntu"], True)])
+
+    def test_host_only_refuses_a_container_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.write_text('{"users":{"ejc3":{}}}', encoding="utf-8")
+            with patch.object(host, "CONFIG", config), patch.object(
+                host.subprocess, "run", side_effect=AssertionError("machinectl called")
+            ), self.assertRaisesRegex(ValueError, "host-only"):
+                host.managed_accounts(host_only=True)
+
+    def test_without_host_only_a_missing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp, patch.object(
+            host, "CONFIG", Path(temp) / "absent.json"
+        ), patch.object(sys, "argv", ["driver", "--apply"]), patch.object(
+            host.os, "geteuid", return_value=0
+        ), patch.object(host, "pressured", return_value=True), patch.object(
+            host, "clean", side_effect=AssertionError("cleaned without an account list")
+        ), patch.object(host.subprocess, "run", side_effect=AssertionError("machinectl called")), \
+                contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as stop:
+            host.main()
+        self.assertEqual(stop.exception.code, 1)
+        self.assertIn("stopped (FileNotFoundError)", err.getvalue())
+
+    def test_host_only_refuses_a_dangling_config_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.symlink_to(Path(temp) / "missing.json")
+            with patch.object(host, "CONFIG", config), self.assertRaisesRegex(ValueError, "host-only"):
+                host.managed_accounts(host_only=True)
 
     def test_oldest_across_accounts_and_stop_on_relief(self):
         calls = []
