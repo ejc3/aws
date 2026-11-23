@@ -21,11 +21,15 @@ locals {
   # Log groups exist for the first 8 tile numbers (the AWS half's size); the execution role cannot create others.
   fcvm_lambda_log_tiles = range(1, 9)
 
-  fcvm_lambda_repo_name = "fcvm-fleet/lambda-tile"
-  fcvm_lambda_repo_arn  = "arn:aws:ecr:${local.fcvm_lambda_region}:${local.fcvm_fleet_account_id}:repository/${local.fcvm_lambda_repo_name}"
-  # The lane image's mutable, never-expired tags: the keep- tags ejc3/fcvm fleet/lambda/release.py moves (each stack's
-  # current, previous and next image, and the newest build).
-  fcvm_lambda_protected_tags = "keep-*"
+  # One lane repository per stack (owner, 2026-11-23): staging's, adopted from the spike, and prod's while prod is enabled.
+  # Each repository admits only its own stack's roles and its own stack's Lambda pull. Staging never reads or writes prod's;
+  # a promotion copies the image staging tested into prod's by digest, on prod's own credentials (fcvm-fleet-prod-ci.tf).
+  fcvm_lambda_repo_name      = "fcvm-fleet/lambda-tile"
+  fcvm_lambda_prod_repo_name = "fcvm-fleet/lambda-tile-prod"
+  # Each repository's mutable, never-expired tags: the keep- tags ejc3/fcvm fleet/lambda/release.py moves there. Staging's
+  # holds keep-stage-current, -previous and -next and keep-built (the newest build); prod's holds keep-prod-*.
+  fcvm_lambda_protected_tags      = "keep-*"
+  fcvm_lambda_prod_protected_tags = "keep-prod-*"
 
   # Each stack's VPC in us-east-1, its coordinator task role and its certificate secret (fcvm-fleet.tf, fcvm-fleet-prod.tf).
   fcvm_lambda_stacks = merge(
@@ -48,6 +52,10 @@ locals {
       }
     },
   )
+  fcvm_lambda_repositories = merge(
+    { stage = aws_ecr_repository.fcvm_fleet_lambda_tile },
+    { for r in aws_ecr_repository.fcvm_fleet_lambda_tile_prod : "prod" => r },
+  )
   # Both AWS Budgets filters use these cost-allocation tags on the billed resources.
   fcvm_lambda_billing_tags = {
     for k, s in local.fcvm_lambda_stacks : k => [
@@ -67,8 +75,8 @@ locals {
       if contains(data.aws_availability_zones.fcvm_lambda.names, az) && contains(data.aws_ec2_instance_type_offerings.fcvm_lambda_gpu.locations, az)
     ]
   }
-  # What the coordinator's --lambda-role, --lambda-capacity-provider and --lambda-image take (the next PR), and where
-  # fcvm-arm pushes the lane image (/infra/fcvm-fleet, gpu_lambda).
+  # What the coordinator's --lambda-role, --lambda-capacity-provider and --lambda-image take (the next PR), each stack's
+  # lane repository, and where fcvm-arm pushes the lane image: staging's (/infra/fcvm-fleet, gpu_lambda).
   fcvm_fleet_gpu_lambda = {
     region          = local.fcvm_lambda_region
     repository_name = local.fcvm_lambda_repo_name
@@ -77,16 +85,17 @@ locals {
       for k, s in local.fcvm_lambda_stacks : k => {
         execution_role_arn    = aws_iam_role.fcvm_lambda_tile[k].arn
         capacity_provider_arn = aws_cloudformation_stack.fcvm_lambda[k].outputs["CapacityProviderArn"]
+        repository_url        = local.fcvm_lambda_repositories[k].repository_url
       }
     }
   }
 }
 
 # ------------------------------------------------------------------------------------------------ the lane image
-# Created by fcvm-arm for the spike (2026-11-21) and adopted here, scanned on push. Both stacks pull from it, so what each
-# stack runs or can roll back to must outlive the other stack's pushes. ejc3/fcvm fleet/lambda/release.py marks those
-# images with keep- tags, among them keep-<stack>-current and keep-<stack>-previous for stage and prod (ejc3/fcvm
-# fleet/PROTOCOL.md, "Which lane image a stack runs"). They are the only tags that move; every other tag is immutable.
+# Staging's lane repository: created by fcvm-arm for the spike (2026-11-21) and adopted here, scanned on push. What staging
+# runs or can roll back to must outlive later pushes, so ejc3/fcvm fleet/lambda/release.py marks those images with keep-
+# tags (keep-stage-current, -previous and -next, and keep-built; ejc3/fcvm fleet/PROTOCOL.md, "Which lane image a stack
+# runs"). They are the only tags that move; every other tag is immutable. Prod's repository is below.
 import {
   to = aws_ecr_repository.fcvm_fleet_lambda_tile
   id = "fcvm-fleet/lambda-tile"
@@ -139,9 +148,9 @@ resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile" {
   })
 }
 
-# CreateFunction refuses an image unless the repository policy lets the Lambda service pull it for that function. Only the
-# stacks' tile functions (fcvm-lam-<fleet>-*, any version) qualify. Staging CI (fcvm-fleet-ci.tf) is in another account, so
-# the repository admits its push here too.
+# CreateFunction refuses an image unless the repository policy lets the Lambda service pull it for that function. Only
+# staging's tile functions (fcvm-lam-<fleet>-*, any version) qualify here. Staging CI (fcvm-fleet-ci.tf) is in another
+# account, so the repository admits its push here too.
 resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
   provider   = aws.fcvm_fleet_east1
   repository = aws_ecr_repository.fcvm_fleet_lambda_tile.name
@@ -153,7 +162,7 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
         Effect    = "Allow"
         Principal = { Service = "lambda.amazonaws.com" }
         Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
-        Condition = { StringLike = { "aws:sourceArn" = values(local.fcvm_lambda_function_arns) } }
+        Condition = { StringLike = { "aws:sourceArn" = local.fcvm_lambda_function_arns.stage } }
       },
       {
         Sid       = "StagingCiPushesTheLaneImage"
@@ -166,12 +175,80 @@ resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile" {
   })
 }
 
-# fcvm-arm builds the lane image (ejc3/fcvm fleet/lambda) and pushes it here through fcvm-fleet-terraform, as it does the
-# coordinator's. Push and list only: the repository, its policies and the functions are not its to change.
+# Prod's lane repository: only images a promotion copied from staging's by digest (ejc3/fcvm fleet/PROTOCOL.md, "Which
+# lane image a stack runs"), with the same lifecycle as staging's over prod's own keep- tags.
+resource "aws_ecr_repository" "fcvm_fleet_lambda_tile_prod" {
+  count                = local.fcvm_fleet_prod
+  provider             = aws.fcvm_fleet_east1
+  name                 = local.fcvm_lambda_prod_repo_name
+  image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"
+
+  image_tag_mutability_exclusion_filter {
+    filter      = local.fcvm_lambda_prod_protected_tags
+    filter_type = "WILDCARD"
+  }
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+
+  tags = { Name = "fcvm-lambda-tile-prod", Project = "fcvm-fleet", Fleet = local.fcvm_fleet_prod_stack.fleet }
+}
+
+resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile_prod" {
+  count      = local.fcvm_fleet_prod
+  provider   = aws.fcvm_fleet_east1
+  repository = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].name
+  # As staging's: rule 1 keeps every image a keep-prod- tag holds, rule 2 the newest five of the rest.
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "never an image prod runs or can roll back to"
+        selection = {
+          tagStatus      = "tagged"
+          tagPatternList = [local.fcvm_lambda_prod_protected_tags]
+          countType      = "imageCountMoreThan"
+          countNumber    = 100
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 2
+        description  = "keep the newest 5 images"
+        selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 5 }
+        action       = { type = "expire" }
+      },
+    ]
+  })
+}
+
+# Only prod's tile functions pull from prod's repository. Prod CI's copy and retag are admitted where they are granted
+# (fcvm-fleet-prod-ci.tf).
+resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile_prod" {
+  count      = local.fcvm_fleet_prod
+  provider   = aws.fcvm_fleet_east1
+  repository = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "LambdaPullsTheTileImage"
+        Effect    = "Allow"
+        Principal = { Service = "lambda.amazonaws.com" }
+        Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
+        Condition = { StringLike = { "aws:sourceArn" = local.fcvm_lambda_function_arns.prod } }
+      },
+    ]
+  })
+}
+
+# fcvm-arm builds the lane image (ejc3/fcvm fleet/lambda) and pushes it to staging's repository through fcvm-fleet-terraform,
+# as it does the coordinator's. Push and list only: the repository, its policies and the functions are not its to change.
 resource "aws_iam_policy" "fcvm_fleet_terraform_lambda" {
   provider    = aws.fcvm_fleet
   name        = "fcvm-lambda-tile-push"
-  description = "Push the fleet's Lambda tile image to its one repository"
+  description = "Push the fleet's Lambda tile image to staging's lane repository"
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -198,8 +275,8 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_terraform_lambda" {
 }
 
 # ------------------------------------------------------------------------------------------------ the functions' role
-# A tile's environment writes its log streams, pulls the lane image, and reads its stack's certificate secret (cert, key and
-# scene token: TLS ends in the renderer, ejc3/fcvm fleet/PROTOCOL.md "Lambda tile"). The secret's own policy also names this
+# A tile's environment writes its log streams, pulls the lane image from its stack's repository, and reads its stack's
+# certificate secret (cert, key and scene token: TLS ends in the renderer, ejc3/fcvm fleet/PROTOCOL.md "Lambda tile"). The secret's own policy also names this
 # role (fcvm-fleet-stage-cert.tf, fcvm-fleet-prod.tf).
 resource "aws_iam_role" "fcvm_lambda_tile" {
   for_each = local.fcvm_lambda_stacks
@@ -228,7 +305,7 @@ resource "aws_iam_role_policy" "fcvm_lambda_tile" {
       {
         Effect   = "Allow"
         Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
-        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+        Resource = local.fcvm_lambda_repositories[each.key].arn
       },
       {
         Effect   = "Allow"
@@ -391,7 +468,7 @@ resource "aws_iam_policy" "fcvm_lambda_coordinator" {
         Sid      = "PullTheTileImage"
         Effect   = "Allow"
         Action   = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]
-        Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn
+        Resource = local.fcvm_lambda_repositories[each.key].arn
       },
     ]
   })
