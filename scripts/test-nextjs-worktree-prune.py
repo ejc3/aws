@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -19,7 +20,7 @@ SPEC.loader.exec_module(WORKER)
 GIT = "/usr/bin/git"
 
 
-class WorktreePruneTests(unittest.TestCase):
+class Fixture(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
@@ -114,6 +115,8 @@ class WorktreePruneTests(unittest.TestCase):
     def remove(self, token):
         return WORKER.prune(self.home, self.uid, token)
 
+
+class WorktreePruneTests(Fixture):
     def test_oldest_clean_merged_candidate_removed_without_deleting_ref(self):
         newer = self.worktree("newer")
         older = self.worktree("older")
@@ -421,6 +424,170 @@ class WorktreePruneTests(unittest.TestCase):
         with mock.patch.object(WORKER, "OUTPUT_LIMIT", 1024):
             with self.assertRaises(WORKER.Incomplete):
                 WORKER.run(self.home, ["/usr/bin/python3", "-I", "-c", "print('x' * 1024)"])
+
+
+class BuildOutputTests(Fixture):
+    """The fcvm-only pass over idle worktrees' ignored node_modules, .next and target."""
+
+    def setUp(self):
+        super().setUp()
+        # Root-anchored .next, so a deeper .next is not ignored; node_modules and target anywhere.
+        (self.repo / ".gitignore").write_text("*.local\nnode_modules/\n/.next\ntarget\n")
+        self.git(self.repo, "commit", "-qam", "ignore build output")
+        self.push()
+        # Everything the fixture writes is "now"; judge idleness eight days later.
+        self.later = time.time() + 8 * 86400
+        patch = mock.patch.object(WORKER, "wall", lambda: self.later)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def output(self, path, *relative):
+        for name in relative:
+            (path / name).mkdir(parents=True, exist_ok=True)
+            (path / name / "artifact.bin").write_bytes(b"x" * 65536)
+
+    def build_worktree(self, name):
+        path = self.worktree(name)
+        self.output(path, "node_modules/pkg", ".next/cache", "target/debug", "packages/web/node_modules")
+        return path
+
+    def builds(self, apply=True, after=None):
+        return WORKER.builds(self.home, self.uid, apply, after)
+
+    def kept(self, path):
+        return all((path / name).exists() for name in ("node_modules", ".next", "target"))
+
+    def set_git_age(self, path, ns):
+        admin = self.admin(path)
+        for name in ("HEAD", "index", "logs/HEAD"):
+            os.utime(admin / name, ns=(ns, ns))
+
+    def test_only_ignored_build_directories_are_removed(self):
+        path = self.build_worktree("build")
+        # Too deep, a .next the anchored rule does not ignore, and other ignored files.
+        self.output(path, "a/b/c/node_modules", "packages/web/.next", "dist")
+        (path / "notes.local").write_text("ignored, but not build output")
+        preview = self.builds(apply=False)
+        self.assertEqual((preview["status"], preview["worktrees"], preview["dirs"], preview["failed"]),
+                         ("done", 1, 4, 0))
+        self.assertGreaterEqual(preview["bytes"], 4 * 65536)
+        self.assertTrue(self.kept(path), "a preview removes nothing")
+        result = self.builds()
+        self.assertEqual({k: result[k] for k in ("status", "worktrees", "dirs", "bytes", "failed")},
+                         {k: preview[k] for k in ("status", "worktrees", "dirs", "bytes", "failed")})
+        for gone in ("node_modules", ".next", "target", "packages/web/node_modules"):
+            self.assertFalse((path / gone).exists(), gone)
+        for kept in ("a/b/c/node_modules/artifact.bin", "packages/web/.next/artifact.bin",
+                     "dist/artifact.bin", "notes.local", "src/code", ".gitignore", ".git"):
+            self.assertTrue((path / kept).exists(), kept)
+        self.assertEqual(self.git(path, "status", "--porcelain", "--untracked-files=no"), b"",
+                         "no tracked file changed")
+        self.assertNotIn(str(self.home), json.dumps(result), "results carry counts, never paths")
+
+    def test_tracked_target_is_kept(self):
+        path = self.build_worktree("tracked")
+        (path / "target/keep.txt").write_text("tracked despite the ignore rule")
+        self.git(path, "add", "-f", "target/keep.txt")
+        self.git(path, "-c", "user.name=F", "-c", "user.email=f@example.com", "commit", "-qm", "track target")
+        result = self.builds()
+        self.assertEqual(result["dirs"], 3)
+        self.assertEqual((path / "target/keep.txt").read_text(), "tracked despite the ignore rule")
+        self.assertTrue((path / "target/debug/artifact.bin").exists())
+        self.assertFalse((path / "node_modules").exists())
+
+    def test_symlinked_build_directory_and_symlink_targets_are_kept(self):
+        path = self.worktree("links")
+        store, shared = self.home / "store", self.home / "shared"
+        self.output(self.home, "store", "shared")
+        (path / "node_modules").symlink_to(store)
+        (path / ".next").symlink_to(path / "src")
+        self.output(path, "target/debug")
+        (path / "target/linked").symlink_to(shared)
+        result = self.builds()
+        self.assertEqual(result["dirs"], 1)
+        self.assertFalse((path / "target").exists())
+        self.assertTrue((path / "node_modules").is_symlink())
+        self.assertTrue((path / ".next").is_symlink())
+        for target in (store / "artifact.bin", shared / "artifact.bin", path / "src/code"):
+            self.assertTrue(target.exists(), target)
+
+    def test_interactive_locked_recent_and_busy_worktrees_are_untouched(self):
+        paths = {name: self.build_worktree(name) for name in
+                 ("interactive", "locked", "recent-file", "recent-head", "cwd", "fd", "mount")}
+        marker = self.admin(paths["interactive"]) / "claude-interactive"
+        marker.touch()
+        os.utime(marker, ns=(1, 1))  # a marker of any age keeps the build output
+        self.git(self.repo, "worktree", "lock", str(paths["locked"]))
+        future = int((self.later - 86400) * 1e9)
+        os.utime(paths["recent-file"] / "src/code", ns=(future, future))
+        os.utime(self.admin(paths["recent-head"]) / "HEAD", ns=(future, future))
+        pid = self.proc / "2147483647"
+        (pid / "fd").mkdir(parents=True)
+        (pid / "status").write_text(f"Uid:\t{self.uid}\t{self.uid}\t{self.uid}\t{self.uid}\n")
+        (pid / "cwd").symlink_to(paths["cwd"] / "src")
+        (pid / "fd/3").symlink_to(paths["fd"] / "node_modules/pkg/artifact.bin")
+        with self.mountinfo.open("a") as stream:
+            stream.write(f"2 1 8:1 / {paths['mount']}/target rw - ext4 /dev/test rw\n")
+        result = self.builds()
+        self.assertEqual((result["worktrees"], result["dirs"]), (0, 0))
+        for name, path in paths.items():
+            self.assertTrue(self.kept(path), name)
+
+    def test_main_checkout_is_untouched(self):
+        self.output(self.repo, "node_modules/pkg", "target/debug")
+        linked = self.build_worktree("linked")
+        self.assertEqual(self.builds()["worktrees"], 1)
+        self.assertTrue((self.repo / "node_modules/pkg/artifact.bin").exists())
+        self.assertTrue((self.repo / "target/debug/artifact.bin").exists())
+        self.assertFalse((linked / "node_modules").exists())
+
+    def test_oldest_first_and_stops_when_pressure_clears(self):
+        older, newer = self.build_worktree("older"), self.build_worktree("newer")
+        self.set_git_age(older, 1_000_000_000)
+        self.set_git_age(newer, 2_000_000_000)
+        with mock.patch.object(WORKER, "pressure", lambda home: (older / "node_modules").exists()):
+            result = self.builds()
+        self.assertEqual((result["status"], result["worktrees"]), ("healthy", 1))
+        self.assertFalse((older / "node_modules").exists())
+        self.assertTrue(self.kept(newer))
+        with mock.patch.object(WORKER, "pressure", return_value=False):
+            self.assertEqual(self.builds()["status"], "healthy")
+        self.assertTrue(self.kept(newer))
+
+    def test_time_budget_returns_a_cursor_that_the_next_pass_continues(self):
+        older, newer = self.build_worktree("older"), self.build_worktree("newer")
+        self.set_git_age(older, 1_000_000_000)
+        self.set_git_age(newer, 2_000_000_000)
+        now = [0.0]
+        survey = WORKER.survey
+
+        def slow(*args):
+            found = survey(*args)
+            now[0] = WORKER.BUILD_SECONDS + 1  # the budget runs out during the first worktree
+            return found
+
+        with mock.patch.object(WORKER, "clock", lambda: now[0]), mock.patch.object(WORKER, "survey", slow):
+            first = self.builds()
+        self.assertEqual((first["status"], first["worktrees"]), ("more", 1))
+        self.assertTrue(self.kept(newer))
+        match = WORKER.CURSOR.fullmatch(first["next"])
+        second = self.builds(after=(int(match[1]), match[2]))
+        self.assertEqual((second["status"], second["worktrees"]), ("done", 1))
+        self.assertFalse((newer / "node_modules").exists())
+
+    def test_build_modes_run_from_the_command_line_and_after_needs_one(self):
+        for argv, apply in ((["worker", "--builds"], False), (["worker", "--clean-builds"], True)):
+            with mock.patch.object(WORKER.sys, "argv", argv), \
+                 mock.patch.object(WORKER.pwd, "getpwuid", return_value=mock.Mock(pw_dir="/home/fixture", pw_uid=1)), \
+                 mock.patch.object(WORKER, "builds", return_value={"status": "done"}) as run, \
+                 mock.patch.object(WORKER, "prune", side_effect=AssertionError("merged pass ran")), \
+                 contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(WORKER.main(), 0)
+            self.assertEqual(run.call_args.args[2], apply)
+            self.assertEqual(json.loads(out.getvalue()), {"status": "done"})
+        with mock.patch.object(WORKER.sys, "argv", ["worker", "--list", "--after", "1:" + "a" * 64]), \
+             contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            WORKER.main()
 
 
 if __name__ == "__main__":

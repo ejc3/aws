@@ -2300,6 +2300,16 @@ or starting cleanup during installation.
 fcvm-metal-arm runs the same job for its `ubuntu` account only, as
 `fcvm-worktree-prune.timer` (`--host-only`: no containers, no `machinectl`), from
 its own association; `sudo fcvm-worktree-prune --host-only` previews it there.
+There, after the merged-worktree pass and under the same pressure test, it also
+deletes regenerable build output from idle linked worktrees, oldest first, and
+stops once space recovers: only `node_modules`, `.next` and `target` directories
+at most three levels below the worktree root, each a real directory on the same
+disk, owned by `ubuntu`, ignored by Git and holding no tracked file. A worktree
+qualifies only when it is not locked, not marked interactive, not in use, its Git
+`HEAD`, `index` and `logs/HEAD` are all over 7 days old, and no other file in it
+changed in 7 days. Each directory is checked again just before `rm -rf
+--one-file-system` removes it as `ubuntu`. The run logs counts and sizes only,
+starts no new pass after 35 minutes, and the preview reports what it would free.
 
 **Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
 every 30 seconds. The recorder keeps bounded, root-only files in

@@ -117,9 +117,12 @@ class HostCleanup(unittest.TestCase):
                 host.os, "geteuid", return_value=0
             ), patch.object(host, "pressured", return_value=True), patch.object(
                 host, "clean", side_effect=lambda accounts, *rest: seen.append((accounts, rest[2]))
+            ), patch.object(
+                host, "clean_builds", side_effect=lambda query, pressure, apply, deadline: seen.append(("builds", apply))
             ):
                 host.main()
-            self.assertEqual(seen, [(["ubuntu"], True)])
+            # The build-output pass follows the merged-worktree pass.
+            self.assertEqual(seen, [(["ubuntu"], True), ("builds", True)])
 
     def test_host_only_refuses_a_container_host(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -249,6 +252,84 @@ class HostCleanup(unittest.TestCase):
                 ("ubuntu", "--list"), ("ejc3", "--list"), ("connor", "--list"),
                 ("connor", "--remove", "c" * 64), ("ubuntu", "--remove", "a" * 64),
             ])
+
+    def test_nextjs_mode_never_runs_the_build_pass(self):
+        for argv in (["driver", "--apply"], ["driver"]):
+            seen = []
+            with patch.object(sys, "argv", argv), patch.object(host.os, "geteuid", return_value=0), patch.object(
+                host, "pressured", return_value=True
+            ), patch.object(host, "managed_accounts", return_value=["ubuntu", "ejc3"]), patch.object(
+                host, "clean", side_effect=lambda accounts, *rest: seen.append(accounts)
+            ), patch.object(host, "clean_builds", side_effect=AssertionError("build pass on Next.js")):
+                host.main()
+            self.assertEqual(seen, [["ubuntu", "ejc3"]])
+
+    def test_host_only_on_a_nextjs_host_stops_before_the_build_pass(self):
+        with tempfile.TemporaryDirectory() as temp:
+            config = Path(temp) / "config.json"
+            config.write_text('{"users":{"ejc3":{}}}', encoding="utf-8")
+            with patch.object(sys, "argv", ["driver", "--apply", "--host-only"]), patch.object(
+                host.os, "geteuid", return_value=0
+            ), patch.object(host, "CONFIG", config), patch.object(host, "pressured", return_value=True), \
+                    patch.object(host, "clean_builds", side_effect=AssertionError("build pass on Next.js")), \
+                    contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as stop:
+                host.main()
+            self.assertEqual(stop.exception.code, 1)
+
+    @staticmethod
+    def build_answer(status, next_=None, **counts):
+        return {"status": status, "next": next_, **{k: counts.get(k, 0) for k in host.BUILD_COUNTS}}
+
+    def test_build_pass_follows_the_cursor_and_stops_when_pressure_clears(self):
+        calls = []
+        pressure = [True, True, False]
+        answers = [self.build_answer("more", "1:" + "a" * 64, worktrees=2, dirs=3, bytes=10),
+                   self.build_answer("more", "2:" + "b" * 64, worktrees=1, dirs=1, bytes=5, failed=1)]
+
+        def query(account, *argv):
+            calls.append((account, *argv))
+            return answers.pop(0)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            totals = host.clean_builds(query, lambda: pressure.pop(0), True, float("inf"))
+        self.assertEqual(calls, [("ubuntu", "--clean-builds"), ("ubuntu", "--clean-builds", "--after", "1:" + "a" * 64)])
+        self.assertEqual(totals, {"worktrees": 3, "dirs": 4, "bytes": 15, "failed": 1})
+        self.assertIn("build output healthy: 3 worktrees, 4 directories, 15 bytes", out.getvalue())
+
+    def test_build_preview_only_counts_and_ignores_pressure(self):
+        calls = []
+
+        def query(account, *argv):
+            calls.append(argv)
+            return self.build_answer("done", worktrees=4, dirs=9, bytes=2 * 1024**3)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            host.clean_builds(query, lambda: self.fail("preview checked pressure"), False, float("inf"))
+        self.assertEqual(calls, [("--builds",)])
+        self.assertIn("4 worktrees, 9 directories, 2147483648 bytes (2.0 GiB) removable", out.getvalue())
+
+    def test_build_pass_stops_at_its_deadline(self):
+        now = [0]
+
+        def query(account, *argv):
+            now[0] = host.BUILD_DEADLINE
+            return self.build_answer("more", "1:" + "a" * 64)
+
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            host.clean_builds(query, lambda: True, True, host.BUILD_DEADLINE, clock=lambda: now[0])
+        self.assertIn("build output out of time", out.getvalue())
+
+    def test_build_pass_refuses_bad_or_stalled_answers(self):
+        cursor = "1:" + "a" * 64
+        for answers in ([{"status": "done"}], [self.build_answer("removed")],
+                        [self.build_answer("done", worktrees=-1)], [self.build_answer("done", bytes=True)],
+                        [self.build_answer("done", "/home/ubuntu/src/x")], [self.build_answer("more")],
+                        [self.build_answer("more", cursor), self.build_answer("more", cursor)]):
+            with self.subTest(answers=answers), contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaises(ValueError):
+                host.clean_builds(lambda *_: answers.pop(0), lambda: True, True, float("inf"))
 
     def test_untrusted_stdout_is_bounded_before_json_parsing(self):
         with tempfile.TemporaryDirectory() as temp:
