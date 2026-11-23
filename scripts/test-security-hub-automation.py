@@ -3,7 +3,8 @@
 
 A Security Hub automation rule silences an alert, so it must stay as narrow as its evidence: this account only, Security
 Hub control findings only (never a GuardDuty or Inspector finding), exact security-group ARNs for the open-SSH rule and
-exactly the nextjs-ct session policies for IAM.1. Adding a new suppression means changing EXPECTED_RULES here on purpose.
+exactly the nextjs-ct session policies for IAM.1, and exactly the podcast workers' Name tags for Dolphin's EC2.9. Adding a new
+suppression means changing EXPECTED_RULES (or the Dolphin set) here on purpose.
 The default security groups must declare no rule at all: the provider then removes every rule from them."""
 import re
 import unittest
@@ -40,6 +41,9 @@ EXPECTED_RULES = {
     "public-ip-assignment-by-design": (["EC2.25", "ECS.2"], "", []),
     "nextjs-ct-session-policies-by-design": (["IAM.1"], "PREFIX", [IAM_PREFIX]),
 }
+# The one tag-scoped rule: Dolphin's podcast speech-to-text workers, whose instance ids change every Batch run.
+WHISPER_RULE = "dolphin-podcast-whisper-public-ip-by-design"
+WHISPER_TAGS = [("Name", "dolphin-labs-podcast-whisper-spot"), ("Name", "dolphin-labs-podcast-whisper-on-demand")]
 SSH_RULE = "public-ssh-by-design"
 SSH_GROUPS = {
     "us-west-1": [
@@ -166,6 +170,17 @@ def items(listtext):
     return out
 
 
+def tag_fields(listtext):
+    """[(key, value)] of a resource_tags list; each element must be exactly { key = "...", value = "..." }."""
+    out = []
+    for element in items(listtext):
+        m = re.fullmatch(r'\{\s*key\s*=\s*"([^"]+)"\s*,\s*value\s*=\s*"([^"]+)"\s*\}', element)
+        if not m:
+            raise AssertionError("resource_tags element is not { key, value }: %s" % element)
+        out.append((m.group(1), m.group(2)))
+    return out
+
+
 def rule_fields(objtext):
     body = objtext[1:-1]
     return {
@@ -174,6 +189,7 @@ def rule_fields(objtext):
         "controls": [c.strip('"') for c in items(attr(body, "controls"))],
         "resource_comparison": attr(body, "resource_comparison").strip('"'),
         "resource_ids": items(attr(body, "resource_ids")) if attr(body, "resource_ids") else None,
+        "resource_tags": tag_fields(attr(body, "resource_tags")) if attr(body, "resource_tags") else None,
         "note": attr(body, "note"),
         "description": attr(body, "description"),
     }
@@ -205,12 +221,30 @@ class SecurityHubAutomation(unittest.TestCase):
             self.assertEqual(fields.get("product_name", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", '"Security', 'Hub"'], name)
             self.assertEqual(fields.get("record_state", "").split(), ["comparison", "=", '"EQUALS"', "value", "=", '"ACTIVE"'], name)
             # Only these fields: nothing that could widen a rule or reach another product's findings.
-            self.assertEqual(set(fields), {"aws_account_id", "product_name", "record_state", "compliance_security_control_id", "resource_id"}, name)
+            self.assertEqual(set(fields), {"aws_account_id", "product_name", "record_state", "compliance_security_control_id",
+                                           "resource_id", "resource_tags"}, name)
             self.assertNotIn("NOT_EQUALS", crit, name)
             self.assertNotIn("CONTAINS", crit, name)
             self.assertIn("comparison = \"EQUALS\"\n        value      = compliance_security_control_id.value", re.sub(r"[ ]+\n", "\n", crit), name)
             self.assertIn("comparison = each.value.resource_comparison", crit, name)
+            # tags: exact values only (no CONTAINS, no NOT_*), from the rule's own list, empty for every untagged rule
+            self.assertEqual(fields["resource_tags"].split(),
+                             ["for_each", "=", "each.value.resource_tags", "content", "{", "comparison", "=", '"EQUALS"',
+                              "key", "=", "resource_tags.value.key", "value", "=", "resource_tags.value.value", "}"], name)
             self.assertIn('status = "SUPPRESSED"', body, name)
+
+    def test_no_rule_can_match_guardduty_or_inspector_findings(self):
+        """Control findings only: every rule's one product criterion is EQUALS "Security Hub", and nothing names another
+        product (product_arn, company_name, generator, finding type) that could reach a GuardDuty or Inspector finding."""
+        for name, body in self.resources().items():
+            (_, crit), = blocks(body, r"(?m)^  criteria")
+            products = blocks(crit, r"(?m)^    product_name")
+            self.assertEqual(len(products), 1, name)
+            self.assertEqual(attr(products[0][1], "value"), '"Security Hub"', name)
+            self.assertEqual(attr(products[0][1], "comparison"), '"EQUALS"', name)
+            for other in ("product_arn", "company_name", "generator_id", "type", "product_fields"):
+                self.assertNotRegex(crit, r"(?m)^\s*(dynamic \")?%s\b" % other, name)
+            self.assertNotRegex(crit, r"(?i)\"(amazon )?(guardduty|inspector)\"", name)
 
     def test_regions_providers_and_preconditions(self):
         for name, body in self.resources().items():
@@ -224,6 +258,9 @@ class SecurityHubAutomation(unittest.TestCase):
     def test_rules_are_exactly_the_reviewed_set(self):
         got = {r["name"]: (r["controls"], r["resource_comparison"], r["resource_ids"]) for r in self.rules}
         self.assertEqual(got, EXPECTED_RULES)
+        # the main and open-SSH rules render as before: no tag criterion
+        for r in self.rules + [self.ssh]:
+            self.assertEqual(r["resource_tags"], [], r["name"])
         self.assertEqual((self.ssh["name"], self.ssh["controls"], self.ssh["resource_comparison"]), (SSH_RULE, ["EC2.18", "EC2.19"], "EQUALS"))
         self.assertIsNone(self.ssh["resource_ids"])  # filled per region from security_hub_open_ssh_groups
 
@@ -238,12 +275,14 @@ class SecurityHubAutomation(unittest.TestCase):
 
     def test_dolphin_rules_are_the_reviewed_set(self):
         rules = [rule_fields(o) for o in items(local_value(self.text, "security_hub_dolphin_rules"))]
-        got = {r["name"]: (r["controls"], r["resource_comparison"], r["resource_ids"], r["order"]) for r in rules}
+        got = {r["name"]: (r["controls"], r["resource_comparison"], r["resource_ids"], r["resource_tags"], r["order"])
+               for r in rules}
         self.assertEqual(got, {
-            "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], 8),
+            "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], [], 8),
             "dolphin-redis-public-ip-by-design": (["ECS.2"], "EQUALS",
-                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], 9),
-            "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], 10),
+                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], [], 9),
+            "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], [], 10),
+            WHISPER_RULE: (["EC2.9"], "", [], WHISPER_TAGS, 11),
         })
         # they share us-west-1 with the main rules: orders and names must not collide
         main = {r["order"] for r in self.rules} | {self.ssh["order"]}
@@ -253,6 +292,23 @@ class SecurityHubAutomation(unittest.TestCase):
         for r in rules:
             self.assertLessEqual(len(r["note"]), 512, r["name"])
             self.assertLessEqual(len(r["description"]), 1024, r["name"])
+
+    def test_whisper_rule_is_dolphin_ec2_9_by_exact_name_tags(self):
+        """The one tag-scoped rule: only in the Dolphin rules (matched to the Dolphin account by by_design_dolphin), only
+        EC2.9, and only instances whose Name is exactly one of the two compute environments' values."""
+        dolphin = [rule_fields(o) for o in items(local_value(self.text, "security_hub_dolphin_rules"))]
+        tagged = [r for r in dolphin + self.rules + [self.ssh] if r["resource_tags"]]
+        self.assertEqual([r["name"] for r in tagged], [WHISPER_RULE])
+        rule, = tagged
+        self.assertEqual(rule["controls"], ["EC2.9"])
+        self.assertEqual(rule["resource_tags"], WHISPER_TAGS)
+        self.assertEqual({k for k, _ in rule["resource_tags"]}, {"Name"})
+        self.assertTrue(all(v.startswith("dolphin-labs-podcast-whisper-") for _, v in rule["resource_tags"]))
+        self.assertLessEqual(len(rule["resource_tags"]), 20)
+        self.assertNotIn(WHISPER_RULE, local_value(self.text, "security_hub_rules_by_region"))
+        self.assertNotIn(WHISPER_RULE, local_value(self.text, "security_hub_staging_rules"))
+        (_, res), = blocks(self.text, r'resource "aws_securityhub_automation_rule" "by_design_dolphin"')
+        self.assertIn(" in local.security_hub_dolphin_rules :", attr(res, "for_each"))
 
     def test_dolphin_config_1_rule_stands_on_the_recorder_alarm(self):
         """Dolphin has no security-forward-audit path, and a Config.1 rule also hides a stopped recorder: the rule is
