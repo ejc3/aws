@@ -852,14 +852,21 @@ The coordinator tags each function with `Purpose=fcvm-fleet-tile` and its
 `Fleet` (ejc3/fcvm `src/fleet/coord/lambda.rs`). The daily budgets filter
 charges by these tags.
 
-fcvm-arm pushes the lane image to `fcvm-fleet/lambda-tile` through the fleet
-role. Both stacks pull from that one repository. Its lifecycle policy expires
-every image outside the newest five unless the image carries a `keep-` tag,
-among them `keep-<stack>-current` and `keep-<stack>-previous` for `stage` and
-`prod`: the image a stack runs and the one it can roll back to. `keep-` tags are
-the only mutable ones. ejc3/fcvm `fleet/lambda/release.py` moves them (`select`, `promote`,
-`rollback`), and a stack's coordinator takes the lane image by digest. The
-repository, each stack's role and provider are in the pointer:
+Each stack has its own lane repository (owner, 2026-11-23): staging's
+`fcvm-fleet/lambda-tile`, and prod's `fcvm-fleet/lambda-tile-prod` while prod is
+enabled. Each admits only its own stack's roles and its own stack's Lambda
+pull; no staging grant names prod's (staging's ECS execution role keeps AWS's
+managed pull-anywhere-in-the-account policy, read-only). Staging CI and fcvm-arm
+push to staging's. A promotion will copy the image staging tested into prod's by
+digest, on prod's own credentials; until that grant lands (#1002) prod's has no
+writer. Each lifecycle policy expires every image outside the
+newest five unless the image carries one of its stack's `keep-` tags:
+`keep-stage-current`, `-previous`, `-next` and `keep-built` in staging's,
+`keep-prod-current`, `-previous` and `-next` in prod's, the image a stack runs
+and the one it can roll back to. Those are the only mutable tags. ejc3/fcvm
+`fleet/lambda/release.py` moves them, and a stack's coordinator takes the lane
+image by digest from its own repository. Each stack's repository, role and
+provider are in the pointer:
 
 ```bash
 aws ssm get-parameter --region us-west-1 --name /infra/fcvm-fleet \

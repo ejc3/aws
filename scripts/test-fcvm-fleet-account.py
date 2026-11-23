@@ -462,7 +462,7 @@ class LambdaGrantTests(unittest.TestCase):
     def test_a_tile_reads_its_own_stacks_certificate_and_writes_its_own_logs(self):
         runtime = block('resource "aws_iam_role_policy" "fcvm_lambda_tile"', self.source)
         self.assertIn('["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', runtime)
-        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", runtime)
+        self.assertIn("Resource = local.fcvm_lambda_repositories[each.key].arn", runtime)
         self.assertIn("log-group:/aws/lambda/fcvm-lam-${each.value.fleet}-*:log-stream:*", runtime)
         self.assertIn('Action   = "secretsmanager:GetSecretValue"', runtime)
         self.assertIn("Resource = each.value.tls_secret_arn", runtime)
@@ -487,15 +487,35 @@ class LambdaGrantTests(unittest.TestCase):
         self.assertIn('aws.fcvm_fleet_east1', repo_policy)
         self.assertIn('Principal = { Service = "lambda.amazonaws.com" }', repo_policy)
         self.assertIn('Action    = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', repo_policy)
-        self.assertIn('"aws:sourceArn" = values(local.fcvm_lambda_function_arns)', repo_policy)
-        self.assertEqual(repo_policy.count('Effect'), 1)
+        self.assertIn('"aws:sourceArn" = local.fcvm_lambda_function_arns.stage', repo_policy)
+        self.assertIn('Sid       = "LambdaPullsTheTileImage"', repo_policy)
         # The spike's repository is adopted, not recreated.
         self.assertIn('import {\n  to = aws_ecr_repository.fcvm_fleet_lambda_tile\n  id = "fcvm-fleet/lambda-tile"\n}', self.source)
+
+    def test_staging_ci_pushes_and_records_the_lane_image_and_deletes_nothing(self):
+        # ejc3/fcvm .github/workflows/fleet-lambda-image.yml: the fleet-stage-deploy job pushes rev-<commit> and moves
+        # keep-built (fleet/lambda/release.py publish): push, read the image back, put a tag. Never delete an image.
+        ci = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        role = block('resource "aws_iam_role_policy" "fcvm_stage_ci"', ci)
+        lane = self.statement(role, "PushAndRecordTheLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', lane), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:DescribeImages", "ecr:BatchGetImage",
+        ])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", lane)
+        repo_policy = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', self.source)
+        ci_pull = self.statement(repo_policy, "StagingCiPushesTheLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }", ci_pull)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', ci_pull), re.findall(r'"(ecr:[^"]+)"', lane))
+        self.assertNotRegex(role + repo_policy, r"ecr:(?:BatchDeleteImage|Delete|Set|Create|\*)")
+        secrets = block('resource "github_actions_environment_secret" "fcvm_stage"', ci)
+        self.assertIn('"LAMBDA_TILE_REPO"', secrets)
+        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url", secrets)
 
     def test_an_image_a_stack_runs_or_rolls_back_to_is_never_expired(self):
         # ejc3/fcvm fleet/lambda/release.py moves the keep- tags (each stack's current, previous, next); they are the only
         # mutable tags, and its LIFECYCLE (whose tests model this policy) is the policy below.
-        self.assertIn('fcvm_lambda_protected_tags = "keep-*"', self.source)
+        self.assertRegex(self.source, r'fcvm_lambda_protected_tags\s+= "keep-\*"')
         repo = block('resource "aws_ecr_repository" "fcvm_fleet_lambda_tile"', self.source)
         self.assertIn('image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"', repo)
         self.assertRegex(repo, r'image_tag_mutability_exclusion_filter \{\s+filter\s+= local.fcvm_lambda_protected_tags\s+'
@@ -509,6 +529,73 @@ class LambdaGrantTests(unittest.TestCase):
                          r'countType\s+= "imageCountMoreThan"\s+countNumber\s+= 100\s+\}')
         # Rule 2 keeps cleaning up: every image outside the newest five that no protected tag holds.
         self.assertIn('selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 5 }', rules[1][1])
+
+
+class LaneRepositoryPerStackTests(unittest.TestCase):
+    """One lane repository per stack (owner, 2026-11-23): staging's fcvm-fleet/lambda-tile and prod's
+    fcvm-fleet/lambda-tile-prod. Each admits only its own stack's roles and its own stack's Lambda pull, and nothing in
+    staging names the production repository."""
+    source = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+    STAGE_REPO = "aws_ecr_repository.fcvm_fleet_lambda_tile."
+    PROD_REPO = "aws_ecr_repository.fcvm_fleet_lambda_tile_prod"
+
+    def test_production_has_its_own_repository_only_while_it_is_enabled(self):
+        self.assertRegex(self.source, r'fcvm_lambda_prod_repo_name\s+= "fcvm-fleet/lambda-tile-prod"')
+        repo = block('resource "aws_ecr_repository" "fcvm_fleet_lambda_tile_prod"', self.source)
+        self.assertIn("count                = local.fcvm_fleet_prod", repo)
+        self.assertIn("name                 = local.fcvm_lambda_prod_repo_name", repo)
+        self.assertIn('image_tag_mutability = "IMMUTABLE_WITH_EXCLUSION"', repo)
+        self.assertRegex(repo, r'image_tag_mutability_exclusion_filter \{\s+filter\s+= local.fcvm_lambda_prod_protected_tags\s+'
+                         r'filter_type = "WILDCARD"\s+\}')
+        self.assertIn("scan_on_push = true", repo)
+        self.assertRegex(self.source, r'fcvm_lambda_prod_protected_tags\s+= "keep-prod-\*"')
+        policy = block('resource "aws_ecr_lifecycle_policy" "fcvm_fleet_lambda_tile_prod"', self.source)
+        self.assertIn("repository = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].name", policy)
+        self.assertRegex(policy, r'tagStatus\s+= "tagged"\s+tagPatternList = \[local.fcvm_lambda_prod_protected_tags\]\s+'
+                         r'countType\s+= "imageCountMoreThan"\s+countNumber\s+= 100\s+\}')
+        self.assertIn('selection    = { tagStatus = "any", countType = "imageCountMoreThan", countNumber = 5 }', policy)
+
+    def test_each_repository_admits_only_its_own_stacks_lambda_pull(self):
+        stage = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile"', self.source)
+        prod = block('resource "aws_ecr_repository_policy" "fcvm_fleet_lambda_tile_prod"', self.source)
+        self.assertIn('"aws:sourceArn" = local.fcvm_lambda_function_arns.stage', stage)
+        self.assertIn('"aws:sourceArn" = local.fcvm_lambda_function_arns.prod', prod)
+        self.assertIn("count      = local.fcvm_fleet_prod", prod)
+        self.assertIn("repository = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].name", prod)
+        self.assertNotIn("fcvm_lambda_function_arns.prod", stage)
+        self.assertNotIn("values(local.fcvm_lambda_function_arns)", self.source)
+        # Staging's repository admits staging's CI; prod's admits nothing of staging's.
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }", stage)
+        self.assertNotRegex(prod, r"fcvm_stage_ci|fcvm_fleet_coordinator_task\b|fcvm_fleet_terraform")
+        # Exactly one statement, for the Lambda service only: no AWS principal, no wildcard.
+        self.assertEqual(prod.count("Effect"), 1)
+        self.assertNotIn("AWS =", prod)
+        self.assertNotRegex(prod, r'Principal\s*=\s*"\*"')
+
+    def test_a_stack_pulls_only_from_its_own_repository(self):
+        self.assertRegex(self.source, r'fcvm_lambda_repositories = merge\(\s+\{ stage = aws_ecr_repository.fcvm_fleet_lambda_tile \},\s+'
+                         r'\{ for r in aws_ecr_repository.fcvm_fleet_lambda_tile_prod : "prod" => r \},\s+\)')
+        runtime = block('resource "aws_iam_role_policy" "fcvm_lambda_tile"', self.source)
+        self.assertIn("Resource = local.fcvm_lambda_repositories[each.key].arn", runtime)
+        coordinator = block('resource "aws_iam_policy" "fcvm_lambda_coordinator"', self.source)
+        pull = coordinator.split('Sid      = "PullTheTileImage"', 1)[1].split("},", 1)[0]
+        self.assertIn("Resource = local.fcvm_lambda_repositories[each.key].arn", pull)
+        self.assertNotIn(self.STAGE_REPO + "arn", runtime + coordinator)
+
+    def test_staging_has_no_statement_on_the_production_repository(self):
+        ci = (ROOT / "fcvm-fleet-ci.tf").read_text()
+        stage_ci = block('resource "aws_iam_role_policy" "fcvm_stage_ci"', ci)
+        self.assertNotIn(self.PROD_REPO, stage_ci)
+        self.assertNotIn("lambda-tile-prod", stage_ci)
+        secrets = block('resource "github_actions_environment_secret" "fcvm_stage"', ci)
+        self.assertNotIn(self.PROD_REPO, secrets)
+        # fcvm-arm's hand push names staging's repository only.
+        push = block('resource "aws_iam_policy" "fcvm_fleet_terraform_lambda"', self.source)
+        self.assertNotIn(self.PROD_REPO, push)
+
+    def test_the_fleet_parameter_names_each_stacks_repository(self):
+        lane = self.source.split("fcvm_fleet_gpu_lambda = {", 1)[1].split("\n  }\n", 1)[0]
+        self.assertIn("repository_url        = local.fcvm_lambda_repositories[k].repository_url", lane)
 
 
 class QuotaTests(unittest.TestCase):
