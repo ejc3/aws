@@ -25,8 +25,8 @@ CA_FILE=${CLAW_MASTER_CA:-$HOME/.config/claude-master/ca.pem}
 
 # Pins. Keep CM_TAG equal to claw_master_tag in claw-master-server.tf and CFD_VERSION to
 # cloudflared_version in claw-master-tunnel.tf (tests enforce both); bump the sha256 values with them.
-CM_TAG=claw-master-678d001
-CM_SHA256_WINDOWS_AMD64=1118f88874830295d1e431d935f62448277bfa82086fe879e160dfe95be975c4
+CM_TAG=claw-master-dad690c
+CM_SHA256_WINDOWS_AMD64=b52dd39fe5916929c0928cd69dbfadf2bcbf28ffd7dc731800f4cebaf0e7e075
 CFD_VERSION=2026.9.3
 CFD_SHA256_WINDOWS_AMD64=f096265ec2fcbe9bb6e2d64268db167ced3fcbb83d894bdb9e2fcdb26f2ea7e2
 AGENT_LISTEN=127.0.0.1:8445
