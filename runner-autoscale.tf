@@ -19,6 +19,10 @@ locals {
   # these can take in the primary runner region is (8 + 2) x 64 for arm64 (c7gd, m7gd and
   # r7gd.metal are all 64 vCPU) plus (4 + 2) x 96 for x86 (128 when m6id.metal is the type
   # that launched). That shares the Standard spot quota with the parallel boxes (ohio-pbox.tf).
+  # Launches fall back to us-west-1 when Ohio refuses (runner_regions), where the same pools
+  # can take 640 + 576 to 768 = 1,216 to 1,408 vCPU: more than that region's 1,148 vCPU
+  # Standard spot quota (2026-11-24), which the app runners (runner-app.tf) share. A full
+  # fallback is refused by the quota first, and leaves the app runners less while it lasts.
   runner_max_by_arch = {
     arm64  = 8
     x86_64 = 4
@@ -102,9 +106,9 @@ data "archive_file" "runner_webhook" {
 
       # ------------------------------------------------------------------ runner regions
       # The control plane (SSM, DynamoDB, these Lambdas) never moves. The RUNNERS can: RUNNER_REGIONS is the ordered list
-      # of regions they may run in, the PRIMARY first (where new ones launch). During a move it lists both, so hosts in
-      # the old region are still counted, reused and reaped until they drain. One region (the default) behaves exactly
-      # as before: every call passes straight through to that region's client.
+      # of regions they may run in, the PRIMARY first: a launch tries every pool there before the next region's (the
+      # webhook's launch_runner). Hosts in every listed region are counted, reused and reaped. One region (the
+      # default) behaves exactly as before: every call passes straight through to that region's client.
       CONTROL_REGION = 'us-west-1'
       RUNNER_REGIONS = json.loads(os.environ.get('RUNNER_REGIONS') or '["us-west-1"]')
       PRIMARY_REGION = RUNNER_REGIONS[0]
@@ -203,17 +207,39 @@ data "archive_file" "runner_webhook" {
               return getattr(self.clients[self.primary], name)
 
       ec2 = RegionalEC2(RUNNER_REGIONS)
-      # RunInstances only, with botocore's own retries off. A spot pool with no
-      # capacity answers InsufficientInstanceCapacity, and the default client
-      # retried that same pool four times with backoff ("reached max retries: 4"):
-      # on 2026-09-13 one exhausted pool cost 7 to 15 seconds, and two or three of
-      # them ran invocations into the 30-second timeout while this function's one
-      # execution was held and the deliveries arriving meanwhile were throttled.
-      # The launcher moves on to the next pool itself.
-      launch_ec2 = boto3.client('ec2', region_name=PRIMARY_REGION,
-                                config=Config(retries={'total_max_attempts': 1}))
+      # The launch's own calls (the AMI lookup and RunInstances), one client per runner
+      # region, with botocore's own retries off. A spot pool with no capacity answers
+      # InsufficientInstanceCapacity, and the default client retried that same pool
+      # four times with backoff ("reached max retries: 4"): on 2026-09-13 one exhausted
+      # pool cost 7 to 15 seconds, and two or three of them ran invocations into the
+      # 30-second timeout while this function's one execution was held and the
+      # deliveries arriving meanwhile were throttled. The launcher moves on to the next
+      # pool itself.
+      #
+      # Bounded as well, so one call fits LAUNCH_CALL_SECONDS: the launcher starts a call
+      # only while that much of the invocation, and LAUNCH_FINISH_SECONDS after it, is
+      # left. In the webhook's log on 2026-11-12 an Ohio refusal took about 1.0 second and
+      # a launch with its credential about 2.7, so 6 seconds is more than twice a whole
+      # launch. An answer that has not come by then is an unknown outcome:
+      # spot moves on to the next pool, as for any refusal, and on-demand stops. After
+      # the last call: the credential, and at most one REFUSAL_MEMORY_CLIENT write.
+      LAUNCH_CLIENT = Config(connect_timeout=2, read_timeout=6, retries={'total_max_attempts': 1})
+      LAUNCH_CALL_SECONDS = 8
+      LAUNCH_FINISH_SECONDS = 3
+      launch_ec2 = {region: boto3.client('ec2', region_name=region, config=LAUNCH_CLIENT)
+                    for region in RUNNER_REGIONS}
       ssm = boto3.client('ssm', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      # The refusal memory's own client (remembered_refusals): one attempt, 1 second to
+      # connect and 1 to answer, so no call to it takes more than about 2 seconds. The
+      # first call that fails turns it off for the rest of the invocation
+      # (refusal_memory_state), so an unreachable table costs one such call per
+      # invocation, not one per refusal; it never blocks a launch.
+      REFUSAL_MEMORY_CLIENT = Config(connect_timeout=1, read_timeout=1, retries={'total_max_attempts': 1})
+      refusal_memory = boto3.client('dynamodb', region_name='us-west-1', config=REFUSAL_MEMORY_CLIENT)
+      # Set when a refusal-memory call fails; handler() clears it at the start of every
+      # invocation, since a warm container keeps module state between invocations.
+      refusal_memory_state = {'failed': False}
       lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
@@ -311,9 +337,13 @@ data "archive_file" "runner_webhook" {
           stream = broker and 'ExecStart=/usr/local/sbin/fcvm-runner-job next' in script.splitlines()
           return broker, claims, stream
 
-      def get_latest_runner_ami(arch='arm64'):
-          """Get the latest available AMI for the specified architecture"""
-          response = ec2.describe_images(
+      def get_latest_runner_ami(arch='arm64', region=None):
+          """The newest available runner AMI for arch in region (the primary by default), or None.
+
+          Looked up in the region that will launch it: an AMI id is regional, and
+          ami-replicator copies the images fcvm publishes in us-west-1 to Ohio.
+          """
+          response = launch_ec2[region or PRIMARY_REGION].describe_images(
               Owners=['self'],
               Filters=[
                   {'Name': 'tag:Purpose', 'Values': ['github-runner']},
@@ -822,31 +852,157 @@ data "archive_file" "runner_webhook" {
               raise RuntimeError('LAUNCH_SUBNETS names no usable subnet; refusing to launch')
           return subnets
 
-      def launch_candidates(arch, subnets, failed=()):
+      def get_launch_networks():
+          """Where a launch may go, in the order to try: [(region, security_group_id, subnets)].
+
+          LAUNCH_NETWORKS is the JSON list Terraform renders from
+          local.runner_fcvm_launch_networks, one entry per region of
+          local.runner_regions in its order, each with that region's security group and
+          its subnets as (subnet_id, availability_zone), most preferred first. Without it,
+          the environment of a controller from before region fallback, a launch goes to
+          the primary region alone through LAUNCH_SUBNETS and SECURITY_GROUP_ID. A
+          malformed list, a subnet named twice, or a region outside RUNNER_REGIONS (whose
+          hosts this controller would neither count nor reap) raises before anything is
+          fetched, minted or launched.
+          """
+          raw = os.environ.get('LAUNCH_NETWORKS')
+          if not raw:
+              return [(PRIMARY_REGION, os.environ['SECURITY_GROUP_ID'], get_launch_subnets())]
+          try:
+              networks = [(entry['region'], entry['security_group_id'],
+                           [(subnet['subnet_id'], subnet['availability_zone']) for subnet in entry['subnets']])
+                          for entry in json.loads(raw)]
+          except (ValueError, TypeError, KeyError):
+              raise RuntimeError('LAUNCH_NETWORKS is not a list of region networks; refusing to launch') from None
+          usable = networks and all(
+              isinstance(region, str) and region in RUNNER_REGIONS and isinstance(group, str) and group and subnets
+              and all(isinstance(value, str) and value for pair in subnets for value in pair)
+              for region, group, subnets in networks)
+          regions = [region for region, _, _ in networks]
+          subnet_ids = [subnet_id for _, _, subnets in networks for subnet_id, _ in subnets]
+          if not usable or len(set(regions)) != len(regions) or len(set(subnet_ids)) != len(subnet_ids):
+              raise RuntimeError('LAUNCH_NETWORKS names no usable network; refusing to launch')
+          return networks
+
+      def in_region_order(subnets, networks):
+          """subnets with every region's before the next region's, in the order of networks.
+
+          Stable, so whatever order the subnets of one region are in is kept: a
+          reordering of one region's zones never moves another region's pools ahead.
+          With no networks (the order of one region) the subnets come back as given.
+          """
+          rank = {subnet_id: index for index, (_, _, region_subnets) in enumerate(networks)
+                  for subnet_id, _ in region_subnets}
+          return sorted(subnets, key=lambda subnet: rank.get(subnet[0], len(networks)))
+
+      def time_left_for_a_launch_call(deadline):
+          """Whether one launch call, and the work after it, still fits before deadline.
+
+          deadline is time.monotonic() when this invocation times out, or None when that
+          is not known. A Lambda timeout cannot be caught: it would end the invocation in
+          the middle of a launch, before its credential is brokered or its decision logged.
+          """
+          return deadline is None or time.monotonic() + LAUNCH_CALL_SECONDS + LAUNCH_FINISH_SECONDS <= deadline
+
+      # RunInstances refusals a later invocation should know about: capacity (the pool) and
+      # quota (the region, refused pool by pool). Any other error is not a verdict on the pool.
+      REMEMBERED_REFUSALS = ON_DEMAND_CAPACITY_REFUSALS | {
+          'MaxSpotInstanceCountExceeded', 'Unsupported', 'SpotMaxPriceTooLow',
+          'InsufficientCapacityOnHost', 'UnfulfillableCapacity'}
+      # How long a refused pool stays at the back. The app runners use the same 10 minutes
+      # (runner-app/app_runner.py, issue #991): two cleanup polls, after which the first
+      # launch asks the pool again.
+      REFUSED_POOL_SECONDS = 10 * 60
+
+      def refusal_memory_key(arch, market):
+          return {'InstanceArn': {'S': f'refused-pools#{arch}#{market}'}}
+
+      def remembered_refusals(arch, market):
+          """(AZ, type) pools that refused arch's `market` launches in the last REFUSED_POOL_SECONDS.
+
+          failed_here remembers a refusal for one invocation, and capacity_failures() reads
+          only the records of instances EC2 accepted. Without this, every delivery and poll
+          walked Ohio's refusing pools first, 12 for x86 at about a second each, which left
+          time for one or two us-west-1 pools (2026-11-12). One row per architecture and
+          market in the registration table (key refused-pools#ARCH#MARKET, beside the
+          poll's queue-scan# rows; a runner's own grant reaches only its instance's row),
+          one attribute per pool, "AZ|type", holding when its refusal expires. Only this
+          function and remember_refusal() use it, and the webhook runs one execution at a
+          time. A row that cannot be read is an empty set: today's order, never a refused
+          launch. After a failed call the memory is not used again in this invocation.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table or refusal_memory_state['failed']:
+              return set()
+          try:
+              item = refusal_memory.get_item(TableName=table, Key=refusal_memory_key(arch, market),
+                                             ConsistentRead=True).get('Item') or {}
+          except Exception as error:
+              refusal_memory_state['failed'] = True
+              print(f'Refusal memory unread ({type(error).__name__}); every pool in its usual order, '
+                    f'and the memory left alone for the rest of this invocation')
+              return set()
+          now = datetime.now(timezone.utc).timestamp()
+          pools = set()
+          for name, value in item.items():
+              az, _, instance_type = name.partition('|')
+              try:
+                  until = float(value['N'])
+              except (KeyError, TypeError, ValueError):
+                  continue
+              if az and instance_type and until > now:
+                  pools.add((az, instance_type))
+          return pools
+
+      def remember_refusal(arch, market, az, instance_type, error):
+          """Keep a capacity or quota refusal of one pool for REFUSED_POOL_SECONDS. Best effort.
+
+          Not for a pool with no known AZ (the SUBNET_ID environment), whose refusal would
+          match every AZ, and not after a refusal-memory call failed in this invocation.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if (not table or not az or refusal_memory_state['failed']
+                  or error_code(error) not in REMEMBERED_REFUSALS):
+              return
+          until = int(datetime.now(timezone.utc).timestamp()) + REFUSED_POOL_SECONDS
+          try:
+              refusal_memory.update_item(TableName=table, Key=refusal_memory_key(arch, market),
+                                         UpdateExpression='SET #pool = :until',
+                                         ExpressionAttributeNames={'#pool': f'{az}|{instance_type}'},
+                                         ExpressionAttributeValues={':until': {'N': str(until)}})
+          except Exception as write_error:
+              refusal_memory_state['failed'] = True
+              print(f'Refusal of {instance_type} in {az} not remembered ({type(write_error).__name__}); '
+                    f'the memory left alone for the rest of this invocation')
+
+      def launch_candidates(arch, subnets, failed=(), networks=()):
           """(subnet_id, availability_zone, instance_type) in the order to try them.
 
           Every type in the first subnet before any in the next, keeping the type
-          order within each. Terraform lists us-west-1c first for both
-          architectures: its ARM metal spot was cheaper with a better placement
-          score, x86 cost the same in both, and a second AZ is what the type
-          fallback alone could never provide.
+          order within each. launch_runner passes the subnets of every runner region
+          and their networks, and every region's subnets come before the next
+          region's whatever order they arrive in (in_region_order), so the primary
+          region's pools are tried first and the next region's after them: a second
+          AZ, and a second region, are what the type fallback alone could never
+          provide.
 
           Reordering, never filtering: a (type, AZ) pair that just failed goes to
-          the back but stays in the list, so a launch is still attempted when every
-          pair has failed, and a failure in one AZ never holds back that type in
-          another. An AZ unknown on either side matches, which is the old per-type
-          backoff. The loop in launch_runner cannot discover a capacity failure on
-          its own - run_instances returns an instance ID for a spot request AWS
-          cannot fulfil and kills the instance afterwards, so no exception is ever
-          raised to advance it. The previous attempt's outcome is what advances the
-          list, which is why this takes the failures as an argument.
+          the back, behind the other regions' pools too, but stays in the list, so
+          a launch is still attempted when every pair has failed, and a failure in
+          one AZ never holds back that type in another. An AZ unknown on either side
+          matches, which is the old per-type backoff. The loop in launch_runner
+          cannot discover a capacity failure on its own - run_instances returns an
+          instance ID for a spot request AWS cannot fulfil and kills the instance
+          afterwards, so no exception is ever raised to advance it. The previous
+          attempt's outcome is what advances the list, which is why this takes the
+          failures as an argument.
           """
           def recently_failed(az, instance_type):
               return any(failed_type == instance_type
                          and (failed_az is None or az is None or failed_az == az)
                          for failed_az, failed_type in failed)
           ordered = [(subnet_id, az, instance_type)
-                     for subnet_id, az in subnets
+                     for subnet_id, az in in_region_order(subnets, networks)
                      for instance_type in get_instance_types(arch)]
           return ([c for c in ordered if not recently_failed(c[1], c[2])]
                   + [c for c in ordered if recently_failed(c[1], c[2])])
@@ -917,11 +1073,18 @@ data "archive_file" "runner_webhook" {
           """'on-demand' for a job that asks for the on-demand label, else 'spot'."""
           return 'on-demand' if ON_DEMAND_LABEL in [str(l).lower() for l in labels] else 'spot'
 
-      def launch_runner(arch='arm64', failed_here=None, rate_refused=None, market='spot'):
-          """Launch a new runner instance, trying each subnet and instance type.
+      def launch_runner(arch='arm64', failed_here=None, rate_refused=None, market='spot', deadline=None):
+          """Launch a new runner instance, trying each region, subnet and instance type.
 
           `market` 'spot' launches spot capacity, the default; 'on-demand' buys the
           launch on-demand, for a job that asked for the on-demand label.
+
+          Regions in the order of LAUNCH_NETWORKS (local.runner_regions): every pool of
+          the primary region before any of the next region's, each region with its own
+          AMI, subnets and security group. A region with no AMI is skipped. The walk
+          leaves a pool, and so a region, on the refusals it always moved on from: any
+          refusal for spot, and only a capacity or quota refusal
+          (ON_DEMAND_CAPACITY_REFUSALS) for on-demand.
 
           failed_here holds the (AZ, type) pairs whose run_instances raised in this
           invocation, and the handler passes one set to every launch in a batch. A
@@ -929,12 +1092,19 @@ data "archive_file" "runner_webhook" {
           launch to read, so without it each launch in a batch would retry every
           pair that had just refused, inside the 30-second function timeout.
           rate_refused, shared the same way, holds the architectures whose root
-          volume initialization rate run_instances refused in this invocation.
+          volume initialization rate run_instances refused in this invocation. A
+          capacity or quota refusal is also kept for REFUSED_POOL_SECONDS across
+          invocations (remembered_refusals), and those pools go to the back too.
+
+          deadline is time.monotonic() when the invocation times out, or None. No call
+          starts without time for it and the work after it
+          (time_left_for_a_launch_call), so a slow second region ends this launch's
+          walk, never the invocation.
           """
-          ami_id = get_latest_runner_ami(arch)
-          if not ami_id:
-              raise Exception(f"No runner AMI found for architecture: {arch}")
-          subnets = get_launch_subnets()
+          networks = get_launch_networks()
+          where = {subnet_id: (region, group) for region, group, region_subnets in networks
+                   for subnet_id, _ in region_subnets}
+          subnets = [subnet for _, _, region_subnets in networks for subnet in region_subnets]
           if failed_here is None:
               failed_here = set()
           if rate_refused is None:
@@ -952,8 +1122,45 @@ data "archive_file" "runner_webhook" {
           if recent:
               pools = sorted(f'{instance_type} in {az or "an unknown AZ"}' for az, instance_type in recent)
               print(f'Recent capacity failures on {pools}, trying other pools first')
-          candidates = launch_candidates(arch, subnets, recent | failed_here)
+          # And the refusals earlier invocations met: in a region that refuses, the next
+          # launch starts in the next region instead of asking every pool again.
+          remembered = remembered_refusals(arch, market)
+          if remembered:
+              pools = sorted(f'{instance_type} in {az}' for az, instance_type in remembered)
+              print(f'Refusals remembered on {pools}, trying other pools first')
+          candidates = launch_candidates(arch, subnets, recent | failed_here | remembered, networks)
           last_error = None
+          out_of_time = False
+
+          # Each region's AMI, looked up when the walk first reaches the region, so a
+          # launch the primary takes makes no AMI lookup or RunInstances call in another
+          # region (the fleet reads above go to every listed region). A region with none
+          # (fcvm has not published one there, or ami-replicator has not copied it yet),
+          # or whose lookup fails, is skipped, never the launch.
+          images = {}
+
+          def image_in(region):
+              nonlocal out_of_time
+              if region not in images:
+                  if not time_left_for_a_launch_call(deadline):
+                      out_of_time = True
+                      return None
+                  try:
+                      images[region] = get_latest_runner_ami(arch, region)
+                  except Exception as error:
+                      print(f'Runner AMI lookup failed in {region}: {type(error).__name__}: {error}')
+                      images[region] = None
+                  if images[region] is None:
+                      print(f'No {arch} runner AMI usable in {region}; skipping {region}')
+              return images[region]
+
+          # A region the walk reaches has an AMI before anything is fetched or minted:
+          # normally one lookup, the first region's.
+          walk_regions = dict.fromkeys(where[subnet_id][0] for subnet_id, _, _ in candidates)
+          if not any(image_in(region) for region in walk_regions):
+              if out_of_time:
+                  raise Exception(f'No {arch} launch tried: too little of the invocation left')
+              raise Exception(f"No runner AMI found for architecture: {arch}")
 
           # x86 AMI is from 300GB dev instance, ARM is smaller
           volume_size = 300 if arch == 'x86_64' else 100
@@ -971,7 +1178,22 @@ data "archive_file" "runner_webhook" {
           broker, claims_registration, stream = user_data_protocol(user_data)
           registration_token = get_registration_token() if broker else None
 
+          walking = None
           for subnet_id, az, instance_type in candidates:
+              region, group = where[subnet_id]
+              ami_id = image_in(region)  # a lookup only when the walk first reaches the region
+              if ami_id and not time_left_for_a_launch_call(deadline):
+                  out_of_time = True
+              if out_of_time:
+                  print(f'Stopped the {arch} launch walk before {instance_type} in {az or subnet_id}: '
+                        f'too little of the invocation left')
+                  break
+              if not ami_id:
+                  continue
+              if region != walking:
+                  if walking is not None:
+                      print(f'No {arch} pool in {walking} launched; trying {region}')
+                  walking = region
               try:
                   request = dict(
                       MinCount=1,
@@ -982,7 +1204,7 @@ data "archive_file" "runner_webhook" {
                       NetworkInterfaces=[{
                           'DeviceIndex': 0,
                           'SubnetId': subnet_id,
-                          'Groups': [os.environ['SECURITY_GROUP_ID']],
+                          'Groups': [group],
                           'AssociatePublicIpAddress': True,
                           'Ipv6PrefixCount': 1,
                       }],
@@ -1029,7 +1251,7 @@ data "archive_file" "runner_webhook" {
                           'SpotOptions': {'SpotInstanceType': 'one-time'}
                       }
                   try:
-                      response = launch_ec2.run_instances(**request)
+                      response = launch_ec2[region].run_instances(**request)
                   except Exception as e:
                       if not initialization_refused(e, root_volume):
                           raise
@@ -1038,19 +1260,22 @@ data "archive_file" "runner_webhook" {
                       print(f'Root volume initialization rate refused for {instance_type} in {az or subnet_id}: {e}; launching without it')
                       del root_volume['VolumeInitializationRate']
                       rate_refused.add(arch)
-                      response = launch_ec2.run_instances(**request)
+                      if not time_left_for_a_launch_call(deadline):
+                          raise
+                      response = launch_ec2[region].run_instances(**request)
               except Exception as e:
                   if market == 'on-demand' and error_code(e) not in ON_DEMAND_CAPACITY_REFUSALS:
                       raise  # Common failure or uncertain delivery: do not try another pool or market.
                   last_error = e
                   failed_here.add((az, instance_type))
+                  remember_refusal(arch, market, az, instance_type, e)
                   print(f"Failed to launch {instance_type} in {az or subnet_id}: {e}, trying next...")
                   continue
 
               # Do not put this in the capacity-fallback try. Once EC2 accepted
               # a launch, a broker error must never launch another instance type.
               instance_id = response['Instances'][0]['InstanceId']
-              ec2.owner[instance_id] = PRIMARY_REGION
+              ec2.owner[instance_id] = region
               if market == 'spot':
                   JUST_LAUNCHED[instance_id] = (arch, az, datetime.now(timezone.utc))
               print(f'Launched {instance_id} ({instance_type}) in {subnet_id} ({az or "unknown AZ"})')
@@ -1076,6 +1301,8 @@ data "archive_file" "runner_webhook" {
 
           if market == 'on-demand' and last_error is not None:
               raise OnDemandCapacityUnavailable(f'On-demand {arch} capacity unavailable: {last_error}') from None
+          if out_of_time and last_error is None:
+              raise Exception(f'No {arch} launch tried: too little of the invocation left')
           raise last_error or Exception(f"All subnets and instance types failed for {arch}")
 
       # Warm hosts. A runner registers --ephemeral, so its registration ends with
@@ -1381,6 +1608,12 @@ data "archive_file" "runner_webhook" {
                                               f'{arch} host a queued job')}
 
       def handler(event, context):
+          # When this invocation times out, which bounds the launch walk (launch_runner).
+          # Unknown (None) on a direct call without a Lambda context.
+          remaining_ms = getattr(context, 'get_remaining_time_in_millis', None)
+          deadline = time.monotonic() + remaining_ms() / 1000 if callable(remaining_ms) else None
+          # A refusal-memory failure in an earlier invocation does not carry over.
+          refusal_memory_state['failed'] = False
           # Parse webhook
           body = event.get('body', '{}')
           # Case-insensitive header lookup. This line IS the webhook fix: the API
@@ -1559,7 +1792,7 @@ data "archive_file" "runner_webhook" {
                       if len(launched_here) >= launch_room:
                           break
                       try:
-                          instance_id, instance_type = launch_runner(arch, failed_here, rate_refused, launch_market)
+                          instance_id, instance_type = launch_runner(arch, failed_here, rate_refused, launch_market, deadline)
                       except OnDemandCapacityUnavailable as e:
                           on_demand_failure = str(e)
                           break  # Ordinary jobs may still use Spot without consuming an extra slot.
@@ -1620,10 +1853,13 @@ resource "aws_lambda_function" "runner_webhook" {
 
   environment {
     variables = {
-      # Ordered [{subnet_id, availability_zone}] from local.runner_fcvm_launch_subnets (the PRIMARY region's).
-      # The launcher needs each subnet's AZ because it keys capacity backoff by AZ.
-      LAUNCH_SUBNETS = jsonencode([for subnet in local.runner_fcvm_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
-      # The provider updates configuration before code, so the old code still reads SUBNET_ID during the apply.
+      # Every runner region's launch network, in local.runner_regions order: [{region, security_group_id,
+      # subnets = [{subnet_id, availability_zone}]}]. The launcher walks them in that order and needs each subnet's AZ
+      # because it keys capacity backoff by AZ.
+      LAUNCH_NETWORKS = jsonencode(local.runner_fcvm_launch_networks)
+      # The PRIMARY region's alone, as the controller before region fallback reads them: the provider updates
+      # configuration before code, so the old code still reads these (and SUBNET_ID) during the apply.
+      LAUNCH_SUBNETS    = jsonencode([for subnet in local.runner_fcvm_launch_subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }])
       SUBNET_ID         = local.runner_fcvm_launch_subnets[0].id
       SECURITY_GROUP_ID = local.runner_fcvm_security_group.id
       RUNNER_REGIONS    = jsonencode(local.runner_regions)
@@ -2597,9 +2833,9 @@ data "archive_file" "runner_cleanup" {
 
       # ------------------------------------------------------------------ runner regions
       # The control plane (SSM, DynamoDB, these Lambdas) never moves. The RUNNERS can: RUNNER_REGIONS is the ordered list
-      # of regions they may run in, the PRIMARY first (where new ones launch). During a move it lists both, so hosts in
-      # the old region are still counted, reused and reaped until they drain. One region (the default) behaves exactly
-      # as before: every call passes straight through to that region's client.
+      # of regions they may run in, the PRIMARY first: a launch tries every pool there before the next region's (the
+      # webhook's launch_runner). Hosts in every listed region are counted, reused and reaped. One region (the
+      # default) behaves exactly as before: every call passes straight through to that region's client.
       CONTROL_REGION = 'us-west-1'
       RUNNER_REGIONS = json.loads(os.environ.get('RUNNER_REGIONS') or '["us-west-1"]')
       PRIMARY_REGION = RUNNER_REGIONS[0]

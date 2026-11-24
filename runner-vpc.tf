@@ -94,19 +94,33 @@ resource "aws_route_table_association" "runner_us_west_1c" {
 }
 
 locals {
-  # Where the fcvm metal runners may run, PRIMARY FIRST. New runners launch in the primary; every region listed is
-  # counted, reused, reaped and allowed by IAM. One entry is today. A move to Ohio (ohio.tf, prepared and idle) is two
-  # applies: ["us-east-2", "us-west-1"] (new runners in Ohio while the us-west-1 ones drain and are still reaped), then
-  # ["us-east-2"] once the old region is empty. The control plane (SSM, DynamoDB, the Lambdas) stays in us-west-1.
-  runner_regions        = ["us-east-2"]
+  # Where the fcvm metal runners may run, in launch order, PRIMARY FIRST. A launch walks every subnet and instance type
+  # of the primary, then, once every pool there has refused (any refusal for spot; capacity or quota for on-demand),
+  # those of the next region, with that region's own AMI (a region with none is skipped), subnets and security group
+  # (local.runner_fcvm_launch_networks, the webhook's LAUNCH_NETWORKS), as far as the invocation's time allows. A
+  # capacity or quota refusal is remembered for 10 minutes, so later launches start with the pools that have not just
+  # refused, in either region. Every listed region is read on every launch decision, and a read that fails there fails
+  # the launch. Every region listed is also counted, reused, reaped and allowed by IAM: exactly the listed regions'
+  # subnets, security groups and AMIs. Ohio (ohio.tf) is primary: its metal spot is 15-65% cheaper than us-west-1's,
+  # where the runners ran until the 2026-10 move and which is the fallback now (owner, 2026-11-24: "Make sure CI spreads
+  # out across regions"). The control plane (SSM, DynamoDB, the Lambdas) stays in us-west-1.
+  runner_regions        = ["us-east-2", "us-west-1"]
   runner_primary_region = local.runner_regions[0]
   runner_networks = var.enable_github_runner ? {
     "us-west-1" = { subnets = concat(aws_subnet.runner_us_west_1c, aws_subnet.runner), security_group = aws_security_group.runner[0] }
     "us-east-2" = { subnets = aws_subnet.ohio_runner, security_group = aws_security_group.ohio_runner[0] }
   } : {}
+  # Every listed region's launch network, in launch order: the webhook's LAUNCH_NETWORKS.
+  runner_fcvm_launch_networks = var.enable_github_runner ? [for r in local.runner_regions : {
+    region            = r
+    security_group_id = local.runner_networks[r].security_group.id
+    subnets           = [for subnet in local.runner_networks[r].subnets : { subnet_id = subnet.id, availability_zone = subnet.availability_zone }]
+  }] : []
+  # The primary's alone, for the controller code from before region fallback during the apply (LAUNCH_SUBNETS).
   runner_fcvm_launch_subnets = var.enable_github_runner ? local.runner_networks[local.runner_primary_region].subnets : []
   runner_fcvm_security_group = var.enable_github_runner ? local.runner_networks[local.runner_primary_region].security_group : null
-  # Every subnet and security group in any listed region, for IAM (a host in the old region must stay manageable).
+  # Every subnet and security group in any listed region, for IAM: a launch may fall back to any of them, and a host
+  # there must stay manageable. Built from the same runner_networks entries as runner_fcvm_launch_networks.
   runner_fcvm_subnet_arns = var.enable_github_runner ? flatten([for r in local.runner_regions : local.runner_networks[r].subnets[*].arn]) : []
   runner_fcvm_sg_arns     = var.enable_github_runner ? [for r in local.runner_regions : local.runner_networks[r].security_group.arn] : []
   # Where the control plane lives: SSM bootstrap credentials, the registration table, the Lambdas.
@@ -114,10 +128,12 @@ locals {
 }
 
 locals {
-  # Every subnet a runner may launch into, most preferred first. The webhook Lambda
-  # tries every instance type in one subnet before the next (LAUNCH_SUBNETS), and the
-  # launch and IPv6 IAM grants are pinned to exactly this list, so a subnet the
-  # launcher tries is always one its runner is allowed to boot in.
+  # The us-west-1 runner subnets, most preferred first: where the app runners
+  # (runner-app.tf) and their image builder (runner-app-image.tf) launch. Their
+  # controllers try every instance type in one subnet before the next (LAUNCH_SUBNETS),
+  # and their launch IAM grants are pinned to exactly this list, so a subnet a launcher
+  # tries is always one its runner is allowed to boot in. The fcvm runners' subnets per
+  # region are runner_networks above.
   runner_launch_subnets     = concat(aws_subnet.runner_us_west_1c, aws_subnet.runner)
   runner_launch_subnet_arns = local.runner_launch_subnets[*].arn
 }
