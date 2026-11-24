@@ -789,12 +789,13 @@ def case_a_spot_launch_starts_in_the_zone_with_the_fewest_live_spot_runners():
              instance("i-c2", head, "pending", 2, az="us-west-1c"),
              instance("i-a1", head, "running", 30, az="us-west-1a"),
              instance("i-a-gone", head, "terminated", 30, az="us-west-1a"),
-             instance("i-a-od", head, "running", 30, az="us-west-1a", tags={"Market": "on-demand"}),
+             instance("i-c-od", head, "running", 30, az="us-west-1c", tags={"Market": "on-demand"}),
              instance("i-a-arm", type_order("arm64")[0], "running", 30, arch="arm64", az="us-west-1a")]
     ec2 = FakeEC2(fleet)
     webhook(ec2)["launch_runner"]("x86_64")
     assert launched_pools(ec2) == [(SUBNET_A, head)], launched_pools(ec2)
-    # An on-demand launch is not spread: it keeps Terraform's order.
+    # An on-demand launch is not spread: it keeps Terraform's order. The on-demand host sits in
+    # us-west-1c, so a spread that counted it would start in us-west-1a instead.
     ec2 = FakeEC2(fleet)
     webhook(ec2)["launch_runner"]("x86_64", market="on-demand")
     assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
@@ -1426,12 +1427,13 @@ def case_a_refused_pool_is_not_retried_within_one_batch():
     head, second = type_order("arm64")[:2]
     ec2 = FakeEC2(run_instances_errors={(SUBNET_C, head): "InsufficientInstanceCapacity"})
     event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
-                                 "launch_count": 2})}
+                                 "launch_count": 3})}
     result = webhook(ec2)["handler"](event, None)
-    assert "Launched 2 arm64 runner(s)" in result["body"], result
-    # The second launch starts in the other AZ (the first one holds a runner now), and the
-    # pool that refused is still not asked again.
-    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_A, head)], \
+    assert "Launched 3 arm64 runner(s)" in result["body"], result
+    # The second launch starts in the other AZ (the first one holds a runner now). The third
+    # finds the AZs level and starts in us-west-1c again, where it must skip the pool that
+    # refused instead of asking it a second time.
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_A, head), (SUBNET_C, second)], \
         launched_pools(ec2)
 
 
