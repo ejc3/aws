@@ -108,9 +108,10 @@ locals {
   runner_budget_groups = {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
     dolphin = {
-      # $80 (was $50, 2026-11-22): a busy day of dolphin-maps merges throttled the group, and throttled at $50 the
-      # four repos fit only two `l` jobs at once (68 vCPUs), so pull requests queued behind main's CI and deploy.
-      daily_usd = 80
+      # $120 (was $80, 2026-11-24; $50 before 2026-11-22): the group was throttled from 2026-11-22 23:54 UTC for most of
+      # a busy day, and throttled at $80 (115 vCPUs) production deploys waited hours behind queued CI. The owner:
+      # "Raise ... use judgment" (dolphin-labs#2080).
+      daily_usd = 120
       repos     = concat(local.dolphin_runner_pool_repos, ["dolphin-labs-hq/dolphin-family"])
     }
 
@@ -119,8 +120,8 @@ locals {
   }
   # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
   # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
-  # host_hour_usd), at vcpu_hour_usd, rounded down: imagine 72 vCPUs (8 hosts, $50 a day), dolphin 115 (14 hosts,
-  # $80 a day) and constellation 74 (4 hosts, $50 a day).
+  # host_hour_usd), at vcpu_hour_usd, rounded down: imagine 72 vCPUs (8 hosts, $50 a day), dolphin 176 (14 hosts,
+  # $120 a day) and constellation 74 (4 hosts, $50 a day).
   # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
   # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
   # still under the refill ($2.08/h).
