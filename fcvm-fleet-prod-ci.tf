@@ -262,9 +262,16 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet" {
         Condition = { StringEquals = { "ecs:CreateAction" = "RegisterTaskDefinition" } }
       },
       { Effect = "Allow", Action = "ecr:DescribeImages", Resource = aws_ecr_repository.fcvm_fleet_coordinator.arn },
+      # A release's lambda_digest must be what keep-prod-current holds in prod's own lane repository
+      # (fcvm-coordinator-release/release.py). Read only: the function never writes to it, and never reads staging's.
+      { Effect = "Allow", Action = "ecr:DescribeImages", Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:GetParameterHistory"]
         Resource = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].arn
+      },
+      {
+        Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].arn
       },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
@@ -303,6 +310,8 @@ resource "aws_lambda_function" "fcvm_coordinator_release_prod" {
       FAMILY                = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family
       RELEASE_ROLE          = aws_iam_role.fcvm_coordinator_release_prod_fleet[0].arn
       REPOSITORY_URL        = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
+      LANE_REPOSITORY_URL   = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
+      LANE_PARAMETER        = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].name
       IMAGE_PARAMETER       = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
       STAGE_IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
       RELEASE_RECORD        = aws_ssm_parameter.fcvm_prod_release_record[0].name
