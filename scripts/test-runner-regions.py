@@ -212,11 +212,17 @@ class WiringTests(unittest.TestCase):
     def test_every_ec2_arn_in_the_launch_iam_follows_the_region_list(self):
         iam = re.search(r'resource "aws_iam_role_policy" "runner_lambda" \{.*?\n\}\n', TF, re.S).group()
         ec2_arns = re.findall(r'arn:aws:ec2:([^:"]*):', iam)
-        # every one is the loop variable, except the temporary AMI-builder reaper, which only ever runs in us-west-1a
+        # every one is the loop variable, except the temporary AMI-builder reaper, which only ever runs in us-west-1a, and
+        # the pruning of unpublished runner images and their snapshots, which are built there only (#1034)
         self.assertEqual(sorted(set(ec2_arns)), ["${r}", "us-west-1"])
-        self.assertEqual(ec2_arns.count("us-west-1"), 1)
+        self.assertEqual(ec2_arns.count("us-west-1"), 3)
         builder = iam[iam.index("ReapExistingTemporaryAMIBuilder"):]
         self.assertIn('"arn:aws:ec2:us-west-1:', builder.split("Condition")[0])
+        for sid, resource in (("PruneUnpublishedRunnerImage", '"arn:aws:ec2:us-west-1::image/*"'),
+                              ("DeletePrunedRunnerImageSnapshot", '"arn:aws:ec2:us-west-1::snapshot/*"')):
+            statement = iam[iam.index(f'Sid      = "{sid}"'):].split("\n      },", 1)[0]
+            self.assertIn(f"Resource = {resource}", statement)
+            self.assertIn("Condition = {", statement)
 
     def test_the_instance_may_assign_ipv6_only_on_its_own_runner_subnets_in_every_listed_region(self):
         pol = re.search(r'resource "aws_iam_role_policy" "runner" \{.*?\n\}\n', VPC, re.S).group()
@@ -251,9 +257,14 @@ class WiringTests(unittest.TestCase):
         for name in ("runner-bootstrap.tf", "runner-vpc.tf", "runner-autoscale.tf"):
             text = (ROOT / name).read_text()
             lines = [l for l in text.splitlines() if "arn:aws:ec2:us-west-1" in l and not l.lstrip().startswith("#")]
-            allowed = [l for l in lines if "builders only ever run in us-west-1a" in l]
+            allowed = [l for l in lines if "builders only ever run in us-west-1a" in l
+                       or "# images are built in us-west-1 only" in l]
             self.assertEqual(sorted(set(lines) - set(allowed)), [], "%s pins an EC2 ARN to us-west-1" % name)
         self.assertEqual(sum("builders only ever run in us-west-1a" in l for l in TF.splitlines()), 1)
+        # Only the image and snapshot ARNs of the two pruning statements carry the builder-region marker (#1034).
+        marked = [l.strip() for l in TF.splitlines() if "# images are built in us-west-1 only" in l]
+        self.assertEqual(marked, ['Resource = "arn:aws:ec2:us-west-1::image/*" # images are built in us-west-1 only',
+                                  'Resource = "arn:aws:ec2:us-west-1::snapshot/*" # images are built in us-west-1 only'])
 
     def test_ohio_has_the_key_pair_the_launcher_names_on_every_launch(self):
         self.assertIn("KeyName='fcvm-ec2'", TF)

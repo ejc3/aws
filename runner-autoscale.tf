@@ -1791,7 +1791,7 @@ resource "aws_iam_role_policy" "runner_lambda" {
         Sid      = "DeletePrunedRunnerImageSnapshot"
         Effect   = "Allow"
         Action   = "ec2:DeleteSnapshot"
-        Resource = "arn:aws:ec2:us-west-1::snapshot/*"
+        Resource = "arn:aws:ec2:us-west-1::snapshot/*" # images are built in us-west-1 only
         Condition = {
           StringEquals = { "aws:ResourceTag/Purpose" = "github-runner" }
         }
