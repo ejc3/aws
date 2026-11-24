@@ -401,6 +401,12 @@ class BoxAgentNotesTests(unittest.TestCase):
                        "nothing you run inside can change them", "Name a cause only after you have seen it"):
             self.assertIn(phrase, notes)
 
+    def test_the_notes_say_how_to_use_run_cloud_without_leaking_or_overspending(self):
+        notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
+        for phrase in ("`run-cloud/api-key`", "--inactivity-timeout", "--hard-timeout", "runcloud ios delete",
+                       "never touch a session you did not", "never onto a command line"):
+            self.assertIn(phrase, notes)
+
 
 class EternalTerminalTests(unittest.TestCase):
     """The phone connects with Eternal Terminal: nextjs-dev ran etserver on 2022, the containers did not, and the phone's
