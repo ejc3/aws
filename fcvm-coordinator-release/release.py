@@ -34,7 +34,7 @@ import uuid
 
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import BotoCoreError, ClientError
 
 CONDITION_FAILED = "ConditionalCheckFailedException"
 COMMIT = re.compile(r"[0-9a-f]{40}")
@@ -92,13 +92,14 @@ def lane_repository(name):
     return repository
 
 
-def lane_of(response):
-    """The lane digest the coordinator's FLEET_LAMBDA_IMAGE names, None without one, or a refusal."""
+def lane_of(response, url=None):
+    """The lane digest the coordinator's FLEET_LAMBDA_IMAGE names, None without one, or a refusal. `url` is the lane
+    repository the task's stack uses: this function's own (LANE_REPOSITORY_URL) unless given."""
     container = next(c for c in response["taskDefinition"]["containerDefinitions"] if c["name"] == "coordinator")
     values = [e["value"] for e in container.get("environment", []) if e.get("name") == LANE_VARIABLE]
     if not values:
         return None
-    prefix = os.environ["LANE_REPOSITORY_URL"] + "@"
+    prefix = (url or os.environ["LANE_REPOSITORY_URL"]) + "@"
     if len(values) != 1 or not values[0].startswith(prefix) or not DIGEST.fullmatch(values[0][len(prefix):]):
         raise Refused("lane-invalid", "the coordinator's lane image is not a digest in the lane repository")
     return values[0][len(prefix):]
@@ -117,7 +118,7 @@ def lane_selected(lane_ecr, name, digest):
         raise Refused("lane-not-selected", f"keep-{name}-current does not hold the lane digest")
 
 
-def task_input(response, image, lane=None):
+def task_input(response, image, lane=None, clear=False):
     """Preserve the service's task configuration; replace exactly one container image, and with `lane`, the
     coordinator's FLEET_LAMBDA_IMAGE."""
     old = response["taskDefinition"]
@@ -131,9 +132,10 @@ def task_input(response, image, lane=None):
     for container in containers:
         if container["name"] == "coordinator":
             container["image"] = image
-            if lane is not None:
+            if lane is not None or clear:
                 env = [e for e in container.get("environment", []) if e.get("name") != LANE_VARIABLE]
-                container["environment"] = env + [{"name": LANE_VARIABLE, "value": os.environ["LANE_REPOSITORY_URL"] + "@" + lane}]
+                container["environment"] = env + ([] if clear else [
+                    {"name": LANE_VARIABLE, "value": os.environ["LANE_REPOSITORY_URL"] + "@" + lane}])
     fields = ("family", "taskRoleArn", "executionRoleArn", "networkMode", "volumes",
               "placementConstraints", "requiresCompatibilities", "cpu", "memory",
               "pidMode", "ipcMode", "proxyConfiguration", "ephemeralStorage",
@@ -245,8 +247,12 @@ def load_record(ssm):
 def checked_release(value):
     """The shape of one release record entry (without its own `previous`)."""
     coordinator = value.get("coordinator") if isinstance(value, dict) else None
+    base = {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run"}
     ok = (isinstance(value, dict)
-          and set(value) == {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run"}
+          and set(value) in (base, base | {"lambda_digest"})
+          # The set's lane image, when ejc3/fcvm's prod lane is on (FLEET_LAMBDA_LANE_PROD): a rollback returns to it.
+          and ("lambda_digest" not in value or (isinstance(value["lambda_digest"], str)
+                                                and DIGEST.fullmatch(value["lambda_digest"])))
           and isinstance(coordinator, dict) and set(coordinator) == {"commit", "digest"}
           and isinstance(coordinator["commit"], str) and COMMIT.fullmatch(coordinator["commit"])
           and isinstance(coordinator["digest"], str) and DIGEST.fullmatch(coordinator["digest"])
@@ -258,15 +264,16 @@ def checked_release(value):
           and (value["smoke_run"] is None or (type(value["smoke_run"]) is int and value["smoke_run"] > 0)))
     if not ok:
         raise ValueError("a release record names a coordinator commit and digest, a web commit, a Worker version, "
-                         "a generation, a build id and a smoke run")
+                         "a generation, a build id and a smoke run, and may name a lane image digest")
     return value
 
 
 def record(event, ssm):
     """Write the release record: the release now running, and the one it replaced."""
     release = event.get("release")
-    if set(event) != {"action", "release"} or not isinstance(release, dict) or set(release) != {
-            "coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run", "previous"}:
+    fields = {"coordinator", "web_commit", "worker_version", "generation", "build_id", "smoke_run", "previous"}
+    if set(event) != {"action", "release"} or not isinstance(release, dict) or set(release) not in (
+            fields, fields | {"lambda_digest"}):
         raise ValueError("record takes one release and its previous")
     current = checked_release({k: v for k, v in release.items() if k != "previous"})
     previous = release["previous"]
@@ -275,6 +282,11 @@ def record(event, ssm):
     running = pointer_digest(ssm.get_parameter(Name=os.environ["IMAGE_PARAMETER"])["Parameter"]["Value"])
     if current["coordinator"]["digest"] != running:
         raise Refused("not-running", "the recorded coordinator is not the one prod runs")
+    # The set's lane image too, or none: a forced rollback returns to what the record names (ran_before), so a record
+    # naming a lane prod does not run would refuse that rollback mid-incident, or drop the lane silently.
+    lane_running = ssm.get_parameter(Name=os.environ["LANE_PARAMETER"])["Parameter"]["Value"]
+    if lane_running != lane_value(current.get("lambda_digest")):
+        raise Refused("not-running", "the recorded lane image is not the one prod runs")
     stored = load_record(ssm)
     if stored is not None and {k: v for k, v in stored.items() if k != "previous"} == current:
         return {"status": "unchanged"}
@@ -287,13 +299,42 @@ def record(event, ssm):
     return {"status": "recorded"}
 
 
-def candidate(ssm, ecr):
-    """Staging's and prod's coordinator images and the release record, for the promotion."""
+def running_lane(ecs, cluster, name, image, url):
+    """The lane digest a stack's running coordinator task names (FLEET_LAMBDA_IMAGE), or None. The service must
+    run one settled deployment whose coordinator image is the one the stack's pointer names (`image`)."""
+    result = ecs.describe_services(cluster=cluster, services=[name])
+    if result.get("failures") or len(result.get("services", [])) != 1:
+        raise Refused("service-unavailable", "service unavailable")
+    current = result["services"][0]
+    deployments = current.get("deployments", [])
+    if len(deployments) != 1 or deployments[0].get("rolloutState") != "COMPLETED":
+        raise Refused("not-idle", "the service is rolling out")
+    definition = ecs.describe_task_definition(taskDefinition=current["taskDefinition"])
+    if image_of(definition) != image:
+        raise Refused("pointer-mismatch", "release pointer and running task disagree")
+    return lane_of(definition, url)
+
+
+def candidate(ssm, ecr, ecs):
+    """Staging's and prod's coordinator images, the lane image each running task names, and the release record,
+    for the promotion. What a stack runs comes from its task; the lane repository's tags only protect images."""
     out = {"status": "ok"}
+    # Each stack's task names its own stack's lane repository (ejc3/aws#986): staging's URL for staging's task.
+    services = {"stage": (os.environ["STAGE_CLUSTER"], os.environ["STAGE_SERVICE"]),
+                "prod": (os.environ["CLUSTER"], os.environ["SERVICE"])}
+    urls = {"stage": os.environ["STAGE_LANE_REPOSITORY_URL"], "prod": os.environ["LANE_REPOSITORY_URL"]}
     for name, parameter in (("stage", os.environ["STAGE_IMAGE_PARAMETER"]), ("prod", os.environ["IMAGE_PARAMETER"])):
         value = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         digest = pointer_digest(value)
         out[name] = {"digest": digest, "commits": commits_of(ecr, digest)}
+        # Per stack: a failed lane read never fails the answer, so the record is always returned. ejc3/fcvm's
+        # decide refuses on a lane_error, and its manual rollback does only when a recorded entry names a lane
+        # image. A timeout or endpoint error (BotoCoreError) and a task definition without a coordinator container
+        # (StopIteration) or a field (KeyError) are "unreadable".
+        try:
+            out[name]["lambda_digest"] = running_lane(ecs, *services[name], value, urls[name])
+        except (Refused, ClientError, BotoCoreError, StopIteration, KeyError) as error:
+            out[name].update({"lambda_digest": None, "lane_error": error_code(error) or "unreadable"})
     out["release"] = load_record(ssm)
     return out
 
@@ -311,7 +352,7 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
     if name == "prod" and action == "candidate":
         if set(event) != {"action"}:
             raise ValueError("candidate takes no arguments")
-        return candidate(ssm, ecr)
+        return candidate(ssm, ecr, ecs)
     if name == "prod" and action == "record":
         return record(event, ssm)
     if action == "lane":
@@ -325,8 +366,10 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
     if not set(event) <= allowed or "force" in event and event["force"] is not True:
         raise ValueError("a release takes a commit and a digest (and, in prod, force for a rollback)")
     lane = event.get("lambda_digest")
-    if "lambda_digest" in event and not (isinstance(lane, str) and DIGEST.fullmatch(lane)):
-        raise ValueError("lambda_digest is an image digest")
+    # lambda_digest null: return to running no lane image (ejc3/fcvm's rollback to a set that ran none).
+    clear = "lambda_digest" in event and lane is None
+    if "lambda_digest" in event and not clear and not (isinstance(lane, str) and DIGEST.fullmatch(lane)):
+        raise ValueError("lambda_digest is an image digest, or null to remove the lane image")
     force = event.get("force") is True
     commit, digest = event.get("commit", ""), event.get("digest", "")
     if not isinstance(commit, str) or not isinstance(digest, str) \
@@ -385,21 +428,23 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
             progress["step"] = "lane"
             lane_selected(lane_ecr, name, lane)
             progress["step"] = "inspect"
-            if force and lane != lane_of(old):
-                # force skips the viewer hold to return to an image prod ran before; a lane prod does not run is
-                # not a rollback. Change it in a release that waits for the hold.
-                raise Refused("not-a-rollback", "force cannot change the lane image")
-        if previous == image and (lane is None or lane_of(old) == lane):
+        if force and (lane is not None or clear) and lane != lane_of(old) \
+                and not ran_before(ssm, os.environ["LANE_PARAMETER"], lane_value(lane)):
+            # force skips the viewer hold to return to a set prod ran before (ejc3/fcvm's rollback): its lane must be
+            # one the lane pointer has held. No lane always qualifies (the pointer starts at none), so a forced
+            # rollback may always drop the lane, the conservative direction. A lane prod never ran waits for the hold.
+            raise Refused("not-a-rollback", "force returns only to a lane image prod ran before")
+        if previous == image and (lane is None and not clear or lane_of(old) == lane):
             progress["step"] = "rollout"
             wait_for(ecs, old_arn, time.monotonic() + 60)
-            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest, **lane_result(lane)}
+            return {"status": "unchanged", "taskDefinition": old_arn, "digest": digest, **lane_result(lane, clear)}
         if name == "prod" and not force:
             # Again under the lock, just before the change: the window to UpdateService is seconds.
             progress["step"] = "hold"
             waiting = held(cloudwatch)
             if waiting:
                 return waiting
-        definition = task_input(old, image, lane)
+        definition = task_input(old, image, lane, clear)
         # Bump the parameter version BEFORE the first ECS change. The ephemeral
         # Terraform guard then rejects older saved plans, even after rollback or
         # a failed registration that leaves the image value unchanged.
@@ -412,11 +457,11 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         progress["step"] = "rollout"
         wait_for(ecs, new_arn, time.monotonic() + min(480, max(5, remaining_ms() / 1000 - 240)))
         progress["step"] = "pointer"
-        if lane is not None and lane_value(lane) != lane_previous:
+        if (lane is not None or clear) and lane_value(lane) != lane_previous:
             lane_written = True
             ssm.put_parameter(Name=os.environ["LANE_PARAMETER"], Value=lane_value(lane), Type="String", Overwrite=True)
         ssm.put_parameter(Name=parameter, Value=image, Type="String", Overwrite=True)
-        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane)}
+        return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane, clear)}
     except Exception:
         if new_arn:
             failed_step, progress["step"] = progress["step"], "rollback"
@@ -436,8 +481,8 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         unlock(ddb, table, lock_id, info, progress)
 
 
-def lane_result(lane):
-    return {} if lane is None else {"lambda_digest": lane}
+def lane_result(lane, clear=False):
+    return {"lambda_digest": None} if clear else {} if lane is None else {"lambda_digest": lane}
 
 
 def unlock(ddb, table, lock_id, info, progress):

@@ -18,9 +18,13 @@ class ClientError(Exception):
         self.response = response
 
 
+class BotoCoreError(Exception):
+    pass
+
+
 stubs = {"boto3": types.ModuleType("boto3"), "botocore": types.ModuleType("botocore"),
          "botocore.config": types.SimpleNamespace(Config=object),
-         "botocore.exceptions": types.SimpleNamespace(ClientError=ClientError)}
+         "botocore.exceptions": types.SimpleNamespace(ClientError=ClientError, BotoCoreError=BotoCoreError)}
 ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location("release", ROOT / "fcvm-coordinator-release/release.py")
 release = importlib.util.module_from_spec(spec)
@@ -273,7 +277,10 @@ class ReleaseTests(unittest.TestCase):
 PROD_ENV = {**ENV, "STACK": "prod", "CLUSTER": "fcvm-fleet-prod", "SERVICE": "fcvm-fleet-prod-coordinator",
             "FAMILY": "fcvm-fleet-prod-coordinator", "IMAGE_PARAMETER": "/fleet/prod/image",
             "STAGE_IMAGE_PARAMETER": "/fleet/stage/image", "RELEASE_RECORD": "/fleet/prod/release",
-            "METRICS_NAMESPACE": "FCVM/Fleet", "METRIC_FLEET": "prod"}
+            "METRICS_NAMESPACE": "FCVM/Fleet", "METRIC_FLEET": "prod", "STAGE_CLUSTER": "fcvm-fleet",
+            "STAGE_SERVICE": "fcvm-fleet-coordinator",
+            "LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile-prod",
+            "STAGE_LANE_REPOSITORY_URL": "registry.example/fcvm-fleet/lambda-tile"}
 PROD_OLD = PROD_ENV["FAMILY"]
 
 
@@ -361,7 +368,8 @@ class LaneReleaseTests(unittest.TestCase):
             self.run_release({**EVENT, "lambda_digest": LANE})
 
     def test_a_malformed_lane_digest_is_refused_before_anything(self):
-        for value in ("latest", "sha256:" + "E" * 64, None, 7):
+        # null is valid: it removes the lane image (LaneClearTests).
+        for value in ("latest", "sha256:" + "E" * 64, "", 7):
             with self.assertRaises(ValueError):
                 self.run_release({**EVENT, "lambda_digest": value})
         self.assertEqual(self.aws.calls, [])
@@ -517,7 +525,9 @@ class LaneReleaseTests(unittest.TestCase):
                 self.assertIn(f'"^(none|${{replace(aws_ecr_repository.{repository}.repository_url', definition)
                 # The release role reads and writes the pointer; the function names it.
                 rules = block(ci[stack], policy)
-                self.assertRegex(rules, r'Action = \["ssm:GetParameter", "ssm:PutParameter"\]\s+Resource = [^\n]*'
+                history = ', "ssm:GetParameterHistory"' if stack == "prod" else ""  # only prod has force
+                self.assertRegex(rules, r'Action = \["ssm:GetParameter", "ssm:PutParameter"' + re.escape(history) + r'\]'
+                                 r'\s+Resource = [^\n]*'
                                  + re.escape(f"{ref}.arn"))
                 self.assertRegex(block(ci[stack], function), r"LANE_PARAMETER\s+= " + re.escape(f"{ref}.name"))
 
@@ -555,6 +565,7 @@ class ProdAWS(AWS):
         self.stage_image = REPO + "@" + DIGEST
         self.record = "{}"
         self.tags = {DIGEST: ["b" * 40], "sha256:" + "c" * 64: ["e" * 40, "bdaa0003"]}
+        self.lane_history = ["none"]
 
     def get_metric_data(self, **kwargs):
         query = kwargs["MetricDataQueries"][0]["MetricStat"]
@@ -579,6 +590,7 @@ class ProdAWS(AWS):
 
     def put_parameter(self, **kwargs):
         if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            self.lane_history.append(kwargs["Value"])
             return super().put_parameter(**kwargs)
         if kwargs["Name"] == PROD_ENV["RELEASE_RECORD"]:
             self.record = kwargs["Value"]
@@ -588,9 +600,31 @@ class ProdAWS(AWS):
         super().put_parameter(**kwargs)
         self.history.append(kwargs["Value"])
 
+    lane_history = None
+
     def get_parameter_history(self, **kwargs):
-        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"] and kwargs["WithDecryption"] is False
+        assert kwargs["WithDecryption"] is False
+        if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            return {"Parameters": [{"Value": value} for value in (self.lane_history or ["none"])]}
+        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"]
         return {"Parameters": [{"Value": value} for value in self.history]}
+
+    def describe_services(self, **kwargs):
+        # Staging's service, which the candidate reads for the lane image staging runs.
+        if kwargs.get("services") == [PROD_ENV["STAGE_SERVICE"]]:
+            assert kwargs["cluster"] == PROD_ENV["STAGE_CLUSTER"]
+            return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3",
+                                  "deployments": [{"rolloutState": "COMPLETED"}]}]}
+        return super().describe_services(**kwargs)
+
+    def describe_task_definition(self, **kwargs):
+        # Staging's running task: its image is the one staging's pointer names.
+        if kwargs["taskDefinition"].endswith("fcvm-fleet-coordinator:3"):
+            stage = copy.deepcopy(self.old)
+            stage["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
+            stage["taskDefinition"]["containerDefinitions"][0]["image"] = self.stage_image
+            return stage
+        return super().describe_task_definition(**kwargs)
 
     def describe_images(self, **kwargs):
         ids = kwargs["imageIds"][0]
@@ -694,8 +728,108 @@ class ProdReleaseTests(unittest.TestCase):
 
     def test_candidate_names_both_images_by_digest_and_commit(self):
         self.assertEqual(self.run_release({"action": "candidate"}), {
-            "status": "ok", "stage": {"digest": DIGEST, "commits": ["b" * 40]},
-            "prod": {"digest": "sha256:" + "c" * 64, "commits": ["e" * 40]}, "release": None})
+            "status": "ok", "stage": {"digest": DIGEST, "commits": ["b" * 40], "lambda_digest": None},
+            "prod": {"digest": "sha256:" + "c" * 64, "commits": ["e" * 40], "lambda_digest": None}, "release": None})
+
+    def test_a_lane_image_candidate_cannot_read_is_a_per_stack_error(self):
+        # The manual rollback reads the record through candidate also with the prod lane off: staging's service
+        # missing, or a running task that disagrees with its pointer or is still rolling out, is reported per
+        # stack (ejc3/fcvm's decide refuses on it) and never fails the whole answer.
+        real = self.aws.describe_services
+        def broken(**kwargs):
+            if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
+                return {"services": [], "failures": [{"reason": "MISSING"}]}
+            return real(**kwargs)
+        self.aws.describe_services = broken
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual((result["stage"]["lambda_digest"], result["stage"]["lane_error"]), (None, "service-unavailable"))
+        self.assertNotIn("lane_error", result["prod"])
+        self.assertIsNone(result["release"])
+
+    def test_a_lane_read_that_fails_outside_aws_is_a_per_stack_error(self):
+        # A timeout or endpoint error (not a ClientError), or a task definition without a coordinator container,
+        # leaves the answer ok with the record in it: the manual rollback reads the record this way.
+        real_services, real_definition = self.aws.describe_services, self.aws.describe_task_definition
+        def timeout(**kwargs):
+            if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
+                raise BotoCoreError("read timeout")
+            return real_services(**kwargs)
+        self.aws.describe_services = timeout
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("release", result)
+        self.assertEqual((result["stage"]["lambda_digest"], result["stage"]["lane_error"]), (None, "unreadable"))
+        self.assertNotIn("lane_error", result["prod"])
+        self.aws.describe_services = real_services
+        def no_coordinator(**kwargs):
+            answer = copy.deepcopy(real_definition(**kwargs))
+            for container in answer["taskDefinition"]["containerDefinitions"]:
+                container["name"] = "other"
+            return answer
+        self.aws.describe_task_definition = no_coordinator
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["status"], "ok")
+        self.assertIn("release", result)
+        self.assertEqual((result["prod"]["lane_error"], result["stage"]["lane_error"]), ("unreadable", "unreadable"))
+
+    def test_a_single_deployment_still_rolling_out_is_not_idle(self):
+        real = self.aws.describe_services
+        def rolling(**kwargs):
+            answer = real(**kwargs)
+            answer["services"][0]["deployments"] = [{"rolloutState": "IN_PROGRESS"}]
+            return answer
+        self.aws.describe_services = rolling
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual((result["stage"]["lane_error"], result["prod"]["lane_error"]), ("not-idle", "not-idle"))
+
+    def test_candidate_refuses_a_lane_image_from_a_task_its_pointer_does_not_name(self):
+        # Prod's pointer names one image, its service runs another (a release in progress or rolled back).
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = REPO + "@sha256:" + "9" * 64
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual(result["prod"]["lane_error"], "pointer-mismatch")
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        real = self.aws.describe_services
+        def rolling(**kwargs):
+            answer = real(**kwargs)
+            answer["services"][0]["deployments"] = [{"rolloutState": "IN_PROGRESS"}, {"rolloutState": "COMPLETED"}]
+            return answer
+        self.aws.describe_services = rolling
+        self.assertEqual(self.run_release({"action": "candidate"})["prod"]["lane_error"], "not-idle")
+
+    def test_candidate_names_the_lane_image_each_coordinator_runs(self):
+        # What a stack runs comes from its running task, never from the lane repository's tags.
+        # Each stack's task names its own stack's lane repository (ejc3/aws#986).
+        stage_url, prod_url = PROD_ENV["STAGE_LANE_REPOSITORY_URL"], PROD_ENV["LANE_REPOSITORY_URL"]
+        stage_lane, prod_lane = "sha256:" + "4" * 64, "sha256:" + "5" * 64
+        stage_def = copy.deepcopy(self.aws.old)
+        stage_def["taskDefinition"]["family"] = "fcvm-fleet-coordinator"
+        stage_def["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.stage_image
+        stage_def["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": stage_url + "@" + stage_lane})
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": prod_url + "@" + prod_lane})
+        asked = []
+        real_services, real_definition = self.aws.describe_services, self.aws.describe_task_definition
+        def describe_services(**kwargs):
+            asked.append(kwargs)
+            if kwargs["services"] == [PROD_ENV["STAGE_SERVICE"]]:
+                assert kwargs["cluster"] == PROD_ENV["STAGE_CLUSTER"]
+                return {"services": [{"taskDefinition": "arn:example:task-definition/fcvm-fleet-coordinator:3",
+                                      "deployments": [{"rolloutState": "COMPLETED"}]}]}
+            return real_services(**kwargs)
+        def describe_task_definition(**kwargs):
+            if kwargs["taskDefinition"].endswith("fcvm-fleet-coordinator:3"):
+                return copy.deepcopy(stage_def)
+            return real_definition(**kwargs)
+        self.aws.describe_services, self.aws.describe_task_definition = describe_services, describe_task_definition
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual((result["stage"]["lambda_digest"], result["prod"]["lambda_digest"]), (stage_lane, prod_lane))
+        self.assertEqual(self.aws.calls, [])
+        # A task that names the other stack's repository is refused for that stack.
+        stage_def["taskDefinition"]["containerDefinitions"][0]["environment"][-1]["value"] = prod_url + "@" + stage_lane
+        result = self.run_release({"action": "candidate"})
+        self.assertEqual((result["stage"]["lane_error"], result["prod"]["lambda_digest"]), ("lane-invalid", prod_lane))
 
     def entry(self, digest="sha256:" + "c" * 64, commit="e" * 40, generation=7):
         return {"coordinator": {"commit": commit, "digest": digest}, "web_commit": "f" * 40, "worker_version": "0" * 8 + "-0000-0000-0000-" + "0" * 12,
@@ -716,6 +850,131 @@ class ProdReleaseTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.run_release({"action": "record", "release": {**self.entry(), field: value, "previous": None}})
         self.assertEqual(json.loads(self.aws.record), first)
+
+
+class ProdLaneRecordTests(ProdReleaseTests):
+    """ejc3/fcvm's prod promotion records the set's lane image (lambda_digest) so a rollback returns to it."""
+
+    PROD_LANE = "registry.example/fcvm-fleet/lambda-tile-prod"
+
+    def test_a_record_may_name_the_sets_lane_image(self):
+        lane, earlier = "sha256:" + "4" * 64, "sha256:" + "5" * 64
+        with patch.dict(os.environ, {"LANE_REPOSITORY_URL": self.PROD_LANE}):
+            self.aws.lane_pointer = self.PROD_LANE + "@" + lane  # prod runs the set's lane image
+            first = {**self.entry(), "lambda_digest": lane, "previous": {**self.entry(generation=6), "lambda_digest": earlier}}
+            self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "recorded"})
+            self.assertEqual(json.loads(self.aws.record), first)
+            # The next record's previous is that entry, lane image included.
+            self.aws.lane_pointer = self.PROD_LANE + "@" + earlier
+            second = {**self.entry(), "lambda_digest": earlier, "previous": {k: v for k, v in first.items() if k != "previous"}}
+            self.assertEqual(self.run_release({"action": "record", "release": second}), {"status": "recorded"})
+
+    def test_a_record_must_name_the_lane_prod_runs(self):
+        # A forced rollback returns to what the record names: a lane prod does not run would refuse it mid-incident,
+        # and a record without the lane prod runs would drop it.
+        lane = "sha256:" + "4" * 64
+        with patch.dict(os.environ, {"LANE_REPOSITORY_URL": self.PROD_LANE}):
+            for pointer, entry in (("none", {**self.entry(), "lambda_digest": lane}),
+                                   (self.PROD_LANE + "@sha256:" + "5" * 64, {**self.entry(), "lambda_digest": lane}),
+                                   (self.PROD_LANE + "@" + lane, self.entry())):
+                with self.subTest(pointer=pointer, lane=entry.get("lambda_digest")):
+                    self.aws.lane_pointer, before = pointer, self.aws.record
+                    with self.assertRaises(release.Refused) as refused:
+                        self.run_release({"action": "record", "release": {**entry, "previous": None}})
+                    self.assertEqual(refused.exception.code, "not-running")
+                    self.assertEqual(self.aws.record, before)
+
+    def test_a_malformed_lane_image_is_refused(self):
+        for value in ("latest", None, 7, "sha256:" + "A" * 64):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                self.run_release({"action": "record", "release": {**self.entry(), "lambda_digest": value, "previous": None}})
+
+
+class ProdForcedLaneTests(unittest.TestCase):
+    """force skips the viewer hold to return to a set prod ran before (ejc3/fcvm's rollback). Its lane image, or no
+    lane, must be one prod's lane pointer has held; a lane prod never ran waits for the hold like any release."""
+    PROD_LANE = "registry.example/fcvm-fleet/lambda-tile-prod"
+
+    def setUp(self):
+        self.aws, self.lane = ProdAWS(), LaneECR(current=LANE)
+        self.aws.history.insert(0, REPO + "@" + DIGEST)  # the coordinator image prod ran before
+        self.aws.viewers = [3.0]  # a viewer: only force can go ahead
+        p = patch.dict(os.environ, {**PROD_ENV, "LANE_REPOSITORY_URL": self.PROD_LANE,
+                                    "LANE_PARAMETER": "/fleet/prod/lambda-image"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def running(self, lane):
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": self.PROD_LANE + "@" + lane})
+        self.aws.lane_pointer = self.PROD_LANE + "@" + lane
+
+    def release(self, lane):
+        return release.deploy({**EVENT, "force": True, "lambda_digest": lane}, self.aws, self.aws, self.aws, self.aws,
+                              self.aws, lane_ecr=self.lane)
+
+    def test_force_returns_to_a_lane_prod_ran_before(self):
+        self.running("sha256:" + "9" * 64)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@" + LANE, self.PROD_LANE + "@sha256:" + "9" * 64]
+        self.assertEqual(self.release(LANE)["status"], "deployed")
+        self.assertEqual((self.aws.lane_pointer, self.aws.metric_reads), (self.PROD_LANE + "@" + LANE, 0))
+
+    def test_force_returns_to_no_lane_when_prod_ran_none(self):
+        self.running(LANE)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@" + LANE]
+        self.assertEqual(self.release(None)["status"], "deployed")
+        self.assertEqual(self.aws.lane_pointer, "none")
+
+    def test_force_refuses_a_lane_prod_never_ran(self):
+        self.running("sha256:" + "9" * 64)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@sha256:" + "9" * 64]
+        with self.assertRaises(release.Refused) as refused:
+            self.release(LANE)
+        self.assertEqual(refused.exception.code, "not-a-rollback")
+        self.assertEqual((self.aws.calls, self.aws.arn), (["lock", "unlock"], OLD))
+
+    def test_force_refuses_no_lane_when_the_pointer_never_held_none(self):
+        self.running(LANE)
+        self.aws.lane_history = [self.PROD_LANE + "@" + LANE]
+        with self.assertRaises(release.Refused) as refused:
+            self.release(None)
+        self.assertEqual(refused.exception.code, "not-a-rollback")
+        self.assertEqual(self.aws.arn, OLD)
+
+
+class LaneClearTests(LaneReleaseTests):
+    """A rollback to a set that ran no lane image (ejc3/fcvm --lambda-digest none) sends lambda_digest null: the
+    function removes FLEET_LAMBDA_IMAGE and reads no tag."""
+
+    def test_a_null_lane_digest_removes_the_lane_image(self):
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
+        self.aws.lane_pointer = LANE_URL + "@" + LANE
+        result = self.run_release({**EVENT, "lambda_digest": None})
+        self.assertEqual(result, {"status": "deployed", "taskDefinition": NEW, "digest": DIGEST, "lambda_digest": None})
+        self.assertEqual(self.lane.calls, [])
+        self.assertEqual(self.coordinator_env(self.aws.registered), {"STATE": "bucket"})
+        # The lane pointer follows, so the next Terraform apply renders no lane either.
+        self.assertEqual(self.aws.lane_pointer, "none")
+
+    def test_a_null_lane_digest_with_no_lane_image_running_is_unchanged(self):
+        self.aws.image = REPO + "@" + DIGEST
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        self.assertEqual(self.run_release({**EVENT, "lambda_digest": None})["status"], "unchanged")
+        self.assertEqual(self.lane.calls, [])
+
+
+class ProdLaneTerraformTests(unittest.TestCase):
+    def test_the_prod_function_reads_stagings_service_only(self):
+        tf = (ROOT / "fcvm-fleet-prod-ci.tf").read_text()
+        policy = tf.split('resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet"', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('{ Effect = "Allow", Action = "ecs:DescribeServices", Resource = aws_ecs_service.fcvm_fleet_coordinator.id }', policy)
+        self.assertNotIn('"ecs:UpdateService", Resource = aws_ecs_service.fcvm_fleet_coordinator.id', policy)
+        function = tf.split('resource "aws_lambda_function" "fcvm_coordinator_release_prod"', 1)[1].split("\n}\n", 1)[0]
+        self.assertRegex(function, r"STAGE_CLUSTER\s+= aws_ecs_cluster\.fcvm_fleet\.name")
+        self.assertRegex(function, r"STAGE_SERVICE\s+= aws_ecs_service\.fcvm_fleet_coordinator\.name")
+        self.assertRegex(function, r"STAGE_LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile\.repository_url")
+        self.assertRegex(function, r"LANE_REPOSITORY_URL\s+= aws_ecr_repository\.fcvm_fleet_lambda_tile_prod\[0\]\.repository_url")
 
 
 class ProdCiTerraformTests(unittest.TestCase):
@@ -754,12 +1013,60 @@ class ProdCiTerraformTests(unittest.TestCase):
         policy = self.block('resource "aws_iam_role_policy"', "fcvm_prod_ci")
         allows = re.findall(r'Effect = "Allow", Action = "([^"]+)", Resource = ([^ }]+)', policy)
         self.assertEqual(allows, [("lambda:InvokeFunction", "local.fcvm_prod_release_functions")])
+        # Besides invoking, only the prod lane's copy (ejc3/fcvm fleet/lambda/release.py copy): read the image staging
+        # tested from staging's lane repository, write it into prod's by digest and move keep-prod-* there.
+        read = self.statement(policy, "ReadTheTestedLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', read), ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", read)
+        write = self.statement(policy, "CopyAndRetagTheLaneImage")
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', write), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:BatchGetImage"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn", write)
+        token = self.statement(policy, "SignInToTheLaneRegistry")
+        self.assertIn('Action    = "ecr:GetAuthorizationToken"', token)
+        self.assertIn('"aws:RequestedRegion" = "us-east-1"', token)
+        # Staging's repository: those two reads and nothing else.
+        stage_only = self.statement(policy, "OnlyReadStagingsLaneRepository")
+        self.assertRegex(stage_only, r'Effect\s+= "Deny"')
+        self.assertIn('NotAction = ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"]', stage_only)
+        self.assertIn("Resource  = aws_ecr_repository.fcvm_fleet_lambda_tile.arn", stage_only)
+        admin = self.statement(policy, "NeverAdministerProdsLaneRepository")
+        self.assertRegex(admin, r'Effect\s+= "Deny"')
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', admin),
+                              ["ecr:BatchDeleteImage", "ecr:DeleteRepository", "ecr:SetRepositoryPolicy", "ecr:DeleteRepositoryPolicy",
+                               "ecr:PutLifecyclePolicy", "ecr:DeleteLifecyclePolicy", "ecr:PutImageTagMutability",
+                               "ecr:PutImageScanningConfiguration", "ecr:PutReplicationConfiguration"])
+        self.assertIn("Resource = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn", admin)
+        # Every other repository stays denied. The deny names actions, not ecr:*, because GetAuthorizationToken's
+        # resource is "*": a NotResource deny of ecr:* would deny the sign-in too.
+        other = self.statement(policy, "NoOtherRepository")
+        self.assertIn("NotResource = [aws_ecr_repository.fcvm_fleet_lambda_tile.arn, aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].arn]", other)
+        patterns = re.findall(r'"ecr:([^"]+)"', other)
+        known = ["BatchCheckLayerAvailability", "BatchDeleteImage", "BatchGetImage", "BatchGetRepositoryScanningConfiguration",
+                 "CompleteLayerUpload", "CreatePullThroughCacheRule", "CreateRepository", "CreateRepositoryCreationTemplate",
+                 "DeleteLifecyclePolicy", "DeletePullThroughCacheRule", "DeleteRegistryPolicy", "DeleteRepository",
+                 "DeleteRepositoryCreationTemplate", "DeleteRepositoryPolicy", "DescribeImageReplicationStatus",
+                 "DescribeImageScanFindings", "DescribeImages", "DescribePullThroughCacheRules", "DescribeRegistry",
+                 "DescribeRepositories", "DescribeRepositoryCreationTemplates", "GetAccountSetting", "GetDownloadUrlForLayer",
+                 "GetLifecyclePolicy", "GetLifecyclePolicyPreview", "GetRegistryPolicy", "GetRegistryScanningConfiguration",
+                 "GetRepositoryPolicy", "InitiateLayerUpload", "ListImages", "ListTagsForResource", "PutAccountSetting",
+                 "PutImage", "PutImageScanningConfiguration", "PutImageTagMutability", "PutLifecyclePolicy",
+                 "PutRegistryPolicy", "PutRegistryScanningConfiguration", "PutReplicationConfiguration", "ReplicateImage",
+                 "SetRepositoryPolicy", "StartImageScan", "StartLifecyclePolicyPreview", "TagResource", "UntagResource",
+                 "UpdatePullThroughCacheRule", "UpdateRepositoryCreationTemplate", "UploadLayerPart",
+                 "ValidatePullThroughCacheRule"]
+        def denied(action):
+            return any(re.fullmatch(p.replace("*", ".*"), action) for p in patterns)
+        self.assertEqual([a for a in known if not denied(a)], [])
+        self.assertFalse(denied("GetAuthorizationToken"))
+        never = self.statement(policy, "NeverPublishAdministerOrReadCredentials")
+        self.assertNotIn('"ecr:*"', never)
         # Lambda tests the resolved $LATEST even for CI's unqualified Invoke. Versions, aliases and other functions
         # must still match the explicit deny, and only the unqualified production ARNs appear in the Allow above.
         deny = re.search(r'Sid\s+= "NoOtherFunction"\s+Effect\s+= "Deny"\s+Action\s+= "lambda:\*"\s+NotResource\s+= ([^\n]+)', policy)
         self.assertIsNotNone(deny)
         self.assertEqual(deny[1], 'concat(local.fcvm_prod_release_functions, [for arn in local.fcvm_prod_release_functions : "${arn}:$LATEST"])')
-        self.assertIn('"ecr:*"', policy)
         functions = self.text.split("fcvm_prod_release_functions = concat(", 1)[1].split("\n  )", 1)[0]
         self.assertEqual(re.findall(r"aws_lambda_function\.([a-z_]+)", functions),
                          ["fcvm_coordinator_release_prod", "fcvm_ami_prod_release"])
@@ -768,9 +1075,35 @@ class ProdCiTerraformTests(unittest.TestCase):
         repo_policy = ci.split('resource "aws_ecr_repository_policy" "fcvm_coordinator_ci"', 1)[1].split("\n}\n", 1)[0]
         self.assertNotIn("fcvm_prod_ci", repo_policy)
 
+    def statement(self, policy, sid):
+        return re.split(r'Sid\s+= "' + sid + '"', policy, maxsplit=1)[1].split("},", 1)[0]
+
+    def test_the_prod_ci_role_reads_staging_and_writes_prods_lane_repository(self):
+        secrets = self.block('resource "github_actions_environment_secret"', "fcvm_prod")
+        self.assertIn('"LAMBDA_TILE_REPO"', secrets)
+        self.assertIn("LAMBDA_TILE_REPO        = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url", secrets)
+        lane = (ROOT / "fcvm-fleet-lambda.tf").read_text()
+        def policy(name):
+            return lane.split(f'resource "aws_ecr_repository_policy" "{name}"', 1)[1].split("\n}\n", 1)[0]
+        stage, prod = policy("fcvm_fleet_lambda_tile"), policy("fcvm_fleet_lambda_tile_prod")
+        # Staging's repository admits prod CI to read only, and only while prod exists.
+        read = self.statement(stage, "ProdCiReadsTheTestedLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }", read)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', read), ["ecr:BatchGetImage", "ecr:GetDownloadUrlForLayer"])
+        self.assertIn("var.fcvm_fleet_prod_enabled ?", stage)
+        self.assertNotIn("ProdCiRetagsTheLaneImage", lane)
+        # Prod's admits prod CI's copy and retag, the same actions its role holds there.
+        write = self.statement(prod, "ProdCiCopiesAndRetagsTheLaneImage")
+        self.assertIn("Principal = { AWS = aws_iam_role.fcvm_prod_ci[0].arn }", write)
+        self.assertCountEqual(re.findall(r'"(ecr:[^"]+)"', write), [
+            "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload", "ecr:UploadLayerPart", "ecr:CompleteLayerUpload",
+            "ecr:PutImage", "ecr:BatchGetImage"])
+
     def test_the_prod_functions_reach_prod_only(self):
         fleet = self.block('resource "aws_iam_role_policy"', "fcvm_coordinator_release_prod_fleet")
-        self.assertNotIn("aws_ecs_service.fcvm_fleet_coordinator.", fleet)
+        # Staging's service only to read which lane image it runs.
+        self.assertEqual([line.strip() for line in fleet.splitlines() if "aws_ecs_service.fcvm_fleet_coordinator." in line],
+                         ['{ Effect = "Allow", Action = "ecs:DescribeServices", Resource = aws_ecs_service.fcvm_fleet_coordinator.id },'])
         self.assertNotIn("aws_ecs_task_definition.fcvm_fleet_coordinator.", fleet)
         # Staging's pointer: read only.
         self.assertRegex(fleet, r'Action = "ssm:GetParameter", Resource = aws_ssm_parameter\.fcvm_coordinator_release\.arn')
@@ -794,10 +1127,10 @@ class ProdCiTerraformTests(unittest.TestCase):
         staging = (ROOT / "fcvm-fleet-ci.tf").read_text()
         self.assertRegex(staging, r'STACK   = "stage"\n\s*CLUSTER = aws_ecs_cluster\.fcvm_fleet\.name')
         prod = self.block('resource "aws_lambda_function"', "fcvm_coordinator_release_prod")
-        for line in ('STACK                 = "prod"', "CLUSTER               = aws_ecs_cluster.fcvm_fleet_prod[0].name",
-                     "FAMILY                = aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family",
-                     'METRICS_NAMESPACE     = "FCVM/Fleet"'):
-            self.assertIn(line, prod)
+        for key, value in (("STACK", '"prod"'), ("CLUSTER", "aws_ecs_cluster.fcvm_fleet_prod[0].name"),
+                           ("FAMILY", "aws_ecs_task_definition.fcvm_fleet_prod_coordinator[0].family"),
+                           ("METRICS_NAMESPACE", '"FCVM/Fleet"')):
+            self.assertRegex(prod, r"\n\s+" + key + r"\s+= " + re.escape(value) + "\n")
 
 
 class Session:
