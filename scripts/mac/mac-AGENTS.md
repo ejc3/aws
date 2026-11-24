@@ -23,6 +23,10 @@ TestFlight. A check that needs a real device (a universal link tapped, a sign-in
 camera) is yours to run: never hand the owner a step this phone can do. The Mac mini has phones
 too; its `~/AGENTS.md` says how to build and sign there.
 
+Limits on that phone: work only in the app under test, TestFlight and the system prompts it raises. No
+purchases, no payment or Apple Account sheets, no settings outside the app's own, and nothing in the
+owner's other apps.
+
 - `xcrun devicectl device info apps` does not list App Store or TestFlight apps, not even with
   `--include-all-apps`. An app missing from it proves nothing.
 - Use the build testers run first: the project's TestFlight build, installed through TestFlight

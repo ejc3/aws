@@ -1835,8 +1835,9 @@ writes the machine's `~/AGENTS.md` (`~/CLAUDE.md` links to it) from `scripts/mac
 on the machine: the toolchain, the attached iPhones and the development-signing keychains made for agents.
 A LaunchAgent rewrites it hourly, so its device list stays current. It says how to sign a device build
 here (the login keychain refuses SSH sessions), and that a real-device check is the agent's to run on the
-attached phones (`devicectl` does not list App Store or TestFlight apps). The PR watch re-runs
-`scripts/mac-setup.sh mini` after a merge that changes `scripts/mac-setup.sh` or `scripts/mac/`.
+attached phones (`devicectl` does not list App Store or TestFlight apps). After a merge that changes
+`scripts/mac-setup.sh` or `scripts/mac/`, the PR watch re-runs `scripts/mac-setup.sh mini` on fcvm-arm (the
+jumpbox has no route to the mini).
 
 Give each task its own checkout and build products. To build an exact committed Swift package from a
 Linux checkout, run the following in Bash. Copy any needed uncommitted inputs explicitly.

@@ -37,6 +37,10 @@ The phones below are on USB with Developer Mode on, signed in to the owner's acc
 TestFlight. A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
 camera) is yours to run: never hand the owner a step these phones can do.
 
+Limits on those phones: work only in the app under test, TestFlight and the system prompts it raises. No
+purchases, no payment or Apple Account sheets, no settings outside the app's own, and nothing in the
+owner's other apps.
+
 - `xcrun devicectl device info apps` does not list App Store or TestFlight apps, not even with
   `--include-all-apps`. An app missing from it proves nothing.
 - Use the build testers run first: the project's TestFlight build, installed through TestFlight
