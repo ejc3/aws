@@ -26,10 +26,13 @@ locals {
   }
 
   # Default Ubuntu build matching var.parallel_box_ami_ohio; a regional security refresh may override it below.
-  pbox_fallback_ami_name = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20260923"
+  # Keep every pbox image at a serial built after 2026-11-09: that is when noble-updates took linux-aws 7.0.0-1017, the
+  # first Ubuntu AWS kernel with Linux 25ae123db10b (no rcu_barrier() per dying bridge under RTNL, ejc3/fcvm#1563). A box
+  # runs the kernel its image ships: the boot-time security update installs newer ones and does not reboot.
+  pbox_fallback_ami_name = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20261120"
   # Its x86_64 build (var.parallel_box_ami_ohio_x86 at home), which `pbox up` passes with --image-id for an x86 flavor
-  # (kvm-gpu-96, pbox-flavors.tf). Present in all four regions (checked 2026-10-22 with describe-images).
-  pbox_fallback_ami_name_x86 = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20260923"
+  # (kvm-gpu-96, pbox-flavors.tf). Present in all four regions (checked 2026-11-24 with describe-images).
+  pbox_fallback_ami_name_x86 = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-20261120"
 
   # Every box launches from the site's one template, named by the caller. The fresh work disk is as big as the largest
   # home volume: it exists only while the box does, so the size costs cents.
@@ -191,7 +194,7 @@ module "pbox_fallback_us_west_2" {
   name                  = "us-west-2"
   cidr_block            = local.pbox_fallback_regions["us-west-2"].cidr
   availability_zones    = local.pbox_fallback_regions["us-west-2"].azs
-  ami_name              = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-20261023"
+  ami_name              = local.pbox_fallback_common.ami_name
   ami_name_x86          = local.pbox_fallback_common.ami_name_x86
   template_name         = local.pbox_fallback_common.template_name
   work_size             = local.pbox_fallback_common.work_size
