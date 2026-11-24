@@ -11,17 +11,25 @@ locals {
   # The caps differ because the demand does. An ejc3/fcvm PR whose files reach the VM matrix
   # runs four arm64 jobs and one x64 job, and every merge to main runs the matrix again. At
   # four arm64 runners the arm64 pool served one PR at a time, and on 2026-10-24 PR runs
-  # waited 3+ hours behind each other and behind main. Eight runs two PRs' arm64 jobs at
+  # waited 3+ hours behind each other and behind main. Eight ran two PRs' arm64 jobs at
   # once. A larger cap runs the same jobs sooner; it does not add jobs, so the cost per job
   # is unchanged and only the peak concurrency rises.
   #
+  # On 2026-11-24, at 8 and 4, 17 CI runs were queued with every runner busy and main's own
+  # runs waited over an hour all day. 16 and 8 run four PRs' matrices at once. At that day's
+  # spot prices a full fleet is about 20 USD an hour (16 x 0.57 to 0.76 for c7gd and
+  # m7gd.metal, 8 x 1.11 to 1.19 for r5d.metal) against about 10 at 8 and 4, for as long as
+  # the queue keeps it full; an idle fleet is still zero.
+  #
   # Each pool can hold LAUNCH_HEADROOM (2) more instances than its cap, so the spot vCPU
-  # these can take in the primary runner region is (8 + 2) x 64 for arm64 (c7gd, m7gd and
-  # r7gd.metal are all 64 vCPU) plus (4 + 2) x 96 for x86 (128 when m6id.metal is the type
-  # that launched). That shares the Standard spot quota with the parallel boxes (ohio-pbox.tf).
+  # these can take in the primary runner region is (16 + 2) x 64 for arm64 (c7gd, m7gd and
+  # r7gd.metal are all 64 vCPU) plus (8 + 2) x 96 for x86 (128 when m6id.metal is the type
+  # that launched): 2112, or 2432 on m6id.metal. That shares the Standard spot quota with the
+  # parallel boxes (ohio-pbox.tf): 3072 vCPU in us-east-2 on 2026-11-24, which leaves the
+  # boxes 960 (640 on m6id.metal).
   runner_max_by_arch = {
-    arm64  = 8
-    x86_64 = 4
+    arm64  = 16
+    x86_64 = 8
   }
 
   # MiB/s at which EBS fills a new runner's root volume from its AMI snapshot (provisioned
