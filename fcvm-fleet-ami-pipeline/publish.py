@@ -632,7 +632,7 @@ class Publisher:
         try:
             info = json.loads(held["Info"]["S"])
         except (KeyError, TypeError, ValueError):
-            return  # released since the put, or a holder written in another format (Terraform's): busy
+            return  # released since the put, or a holder whose Info is not JSON: busy
         if not isinstance(info, dict) or info.get("Who") != "fcvm-image-publisher":
             return
         try:
