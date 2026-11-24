@@ -811,8 +811,9 @@ class Files(unittest.TestCase):
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo"}
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
+            mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
-                (["mini"], build, "--build-only"),
+                (["mini"], build | mini, "--build-only"),
                 ([], build | desktop | cleaner, ""),
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
                 (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
@@ -854,6 +855,94 @@ class Files(unittest.TestCase):
         self.assertIn("umask 077", gui)
         self.assertIn("launchctl asuser", gui)
 
+
+
+@unittest.skipUnless(shutil.which("zsh"), "needs zsh")
+class AgentsMd(Base):
+    """The mini's ~/AGENTS.md: the template, then what is on the machine (devices, signing keychains)."""
+
+    def setUp(self):
+        super().setUp()
+        self.template = self.temp / "mini-AGENTS.md"
+        self.template.write_text("# This Mac mini\n\nRules from the template.\n")
+        self.out = self.temp / "AGENTS.md"
+        fake = self.temp / "devicectl"
+        fake.write_text("#!/bin/sh\n"
+                        "echo 'Name   Identifier   State   Model   Reality'\n"
+                        "echo 'A phone   ID-1 (UDID)   connected   iPhone (iPhone15,3)   physical'\n"
+                        "echo 'A sim   ID-2 (UDID)   shutdown   iPhone 17   simulated'\n")
+        fake.chmod(0o755)
+        self.env.update(MAC_AGENTS_TEMPLATE=str(self.template), MAC_AGENTS_OUT=str(self.out),
+                        MAC_AGENTS_DEVICECTL=str(fake))
+
+    def write(self):
+        return self.run_("zsh", BIN / "mac-agents-md")
+
+    def test_keeps_the_template_and_lists_physical_devices_and_signing_keychains(self):
+        kc = self.temp / "agent-work" / "signing"
+        kc.mkdir(parents=True)
+        (kc / "dev.keychain-db").write_text("")
+        (kc / "dev.keychain.pw").write_text("")
+        (kc / "lone.keychain-db").write_text("")  # no password file: not usable, not listed
+        r = self.write()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = self.out.read_text()
+        self.assertTrue(text.startswith("# This Mac mini\n\nRules from the template.\n"))
+        self.assertIn("A phone", text)
+        self.assertNotIn("A sim", text)
+        self.assertIn("~/agent-work/signing/dev.keychain-db", text)
+        self.assertNotIn("lone.keychain-db", text)
+        self.assertIn("Not installed", text)  # no ~/agent-tools/env.zsh in this home
+        self.assertEqual(os.readlink(self.temp / "CLAUDE.md"), str(self.out))
+
+    def test_says_so_when_nothing_is_attached_or_signable(self):
+        fake = self.temp / "none"
+        fake.write_text("#!/bin/sh\necho 'Name   Identifier   State'\n")
+        fake.chmod(0o755)
+        self.env["MAC_AGENTS_DEVICECTL"] = str(fake)
+        self.assertEqual(self.write().returncode, 0)
+        text = self.out.read_text()
+        self.assertIn("None physical right now.", text)
+        self.assertIn("None: device builds cannot be signed here yet.", text)
+
+    def test_refuses_without_its_template_and_leaves_no_file(self):
+        self.env["MAC_AGENTS_TEMPLATE"] = str(self.temp / "missing.md")
+        r = self.write()
+        self.assertEqual(r.returncode, 1)
+        self.assertFalse(self.out.exists())
+
+    def test_leaves_a_claude_md_that_is_not_its_link(self):
+        own = self.temp / "CLAUDE.md"
+        own.write_text("mine\n")
+        self.assertEqual(self.write().returncode, 0)
+        self.assertEqual(own.read_text(), "mine\n")
+
+
+class IosToolchain(unittest.TestCase):
+    """The mini's host toolchain: every download pinned to a SHA-256, and a mismatch refused."""
+
+    script = (ROOT / "scripts" / "mac" / "ios-toolchain.zsh").read_text()
+
+    def test_pins_each_download(self):
+        for name in ("node", "xcodegen", "micromamba"):
+            m = re.search(r"^%s_sha256=([0-9a-f]+)$" % name, self.script, re.M)
+            self.assertIsNotNone(m, name)
+            self.assertEqual(len(m.group(1)), 64, name)
+        for name in ("node_version", "pnpm_version", "xcodegen_version", "micromamba_version", "cocoapods_version"):
+            self.assertRegex(self.script, r"(?m)^%s=[0-9][0-9.\-]*$" % name)
+        self.assertEqual(self.script.count('fetch "https://'), 3)
+
+    def test_refuses_a_download_whose_hash_is_not_the_pinned_one(self):
+        fetch = re.search(r"(?ms)^fetch\(\) \{.*?^\}", self.script).group(0)
+        self.assertIn('[ "$got" = "$3" ] || {', fetch)
+        self.assertIn("exit 1", fetch)
+
+    def test_the_mini_setup_ships_and_runs_it(self):
+        setup = (ROOT / "scripts" / "mac-setup.sh").read_text()
+        self.assertIn("files+=(ios-toolchain.zsh mini-AGENTS.md bin/mac-agents-md)", setup)
+        install = (ROOT / "scripts" / "mac" / "install.zsh").read_text()
+        self.assertIn('/bin/zsh "$src/ios-toolchain.zsh"', install)
+        self.assertIn('"$bin/mac-agents-md"', install)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

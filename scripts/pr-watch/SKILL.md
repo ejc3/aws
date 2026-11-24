@@ -128,7 +128,10 @@ If filtering fails, stop before posting. Continue to check other private informa
    Stop hook. Exit 0 clears every `targeted` entry, exit 2 is pending, and exit 75 skips an ineligible or busy check;
    neither a skipped nor a failed check clears anything. The private plan log path is printed. A merge that
    changed `scripts/pr-watch-install.sh` or `scripts/pr-watch/` also re-runs `scripts/pr-watch-install.sh --watcher`
-   from that worktree before it is removed, so the running skill, hook and claim script are the merged ones. One Terraform
+   from that worktree before it is removed, so the running skill, hook and claim script are the merged ones. A merge
+   that changed `scripts/mac-setup.sh` or `scripts/mac/` also re-runs `scripts/mac-setup.sh mini` from that worktree
+   (it is idempotent: the mini's toolchain, its `~/AGENTS.md` and its LaunchAgent), and notes the output's last line
+   on the PR; an unreachable mini keeps the PR in `unapplied`. One Terraform
    run at a time on the jumpbox: check `pgrep -af "terraform (plan|apply)"`, `uptime`, and ListAgents for other AWS sessions
    (agree on one run owner and tell them when it ends); `-lock-timeout=10m`, never `-lock=false`. A plan that replaces
    or destroys something unexpected stops the run and goes to the owner. (Two backstops: the Stop hook's drift plan and

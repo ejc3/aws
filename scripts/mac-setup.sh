@@ -14,7 +14,8 @@
 #
 #   scripts/mac-setup.sh [SSH_ALIAS] [--update-peekaboo]      default alias: mac
 #   scripts/mac-setup.sh mac --artifact-cleaner-only     install only the MacBook Scratch cleaner
-#   scripts/mac-setup.sh mini      bare mini: private workspaces and the shared build slots only
+#   scripts/mac-setup.sh mini      the mini: private workspaces, the shared build slots, the iOS app toolchain on the
+#                                  host (scripts/mac/ios-toolchain.zsh) and its ~/AGENTS.md (mac-agents-md, hourly)
 #
 # Idempotent; it replaces files and never restarts, kills or relaunches anything, except that --update-peekaboo quits a
 # running Peekaboo of another version, installs the pinned one and reopens it. The macOS privacy grants Peekaboo needs
@@ -45,6 +46,7 @@ if [[ -n $cleaner_only ]]; then
 elif [[ $alias_ = mini ]]; then
   [[ -z $update ]] || usage
   mode=--build-only
+  files+=(ios-toolchain.zsh mini-AGENTS.md bin/mac-agents-md)
 else
   files+=(peekaboo-install.sh bin/mac-gui bin/mac-lease bin/peekaboo)
 fi
