@@ -1599,8 +1599,9 @@ Available if a task needs them; neither needs a key on disk.
   nextjs-dev-role (the owner's container; members are denied it) and admins. Rotate with `terraform apply -replace=cloudflare_zero_trust_access_service_token.claw_master_dashboard_agents`,
   then set the Worker secret `DASHBOARD_SERVICE_TOKEN_CLIENT_ID` from output `claw_master_dashboard`.
 - **The staging Workers, as an agent**, metal boxes and the owner's nextjs-ct container. `workers-stage-agents/access`
-  (us-west-1) holds a Cloudflare Access service token (`client_id`, `client_secret`) admitted only by the
-  staging-Workers Access application (`workers-stage.tf`), so an agent can open a `<site>-stage` Worker it deployed.
+  (us-west-1) holds a Cloudflare Access service token (`client_id`, `client_secret`) admitted by the staging-Workers
+  Access application (`workers-stage.tf`), the staging check applications that list its policy, and fcvm.dev's staging
+  page and coordinator API (`fcvm-dev.tf`, #1032), so an agent can open a staging deploy it made.
   Send the headers on curl's stdin, never as arguments (an argument is readable in `/proc/<pid>/cmdline`): `printf
   'CF-Access-Client-Id: %s\nCF-Access-Client-Secret: %s\n' "$ID" "$SECRET" | curl -H @-
   https://<site>-stage.<subdomain>.workers.dev/`, the two values from `get-secret-value` in the environment, never in a
@@ -1845,7 +1846,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - **Quotas** (#605, #937): G and VT Spot (L-3819A6DF) reached 480 vCPUs in us-east-1 on 2026-11-21.
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
-  on, SSL Full (strict). Staging only, behind Access for the owner and the main-only CI service token: `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
+  on, SSL Full (strict). Staging only, behind Access for the owner, the main-only CI service token and the metal agents' staging token (#1032): `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
   agents' service token) and `stage.fcvm.dev` (the `fcvm-fleet-stage` Worker, deployed from ejc3/fcvm; it forwards the
   page's `/live` and `/poster.jpg` to the API host with its own service token, `fcvm-fleet-stage-worker`, admitted by the

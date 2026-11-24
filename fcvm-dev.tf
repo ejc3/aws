@@ -13,7 +13,9 @@
 # STAGING ONLY, behind Access, the gate created before either hostname exists (owner-only, as Lattice staging):
 #   fleet-api-stage.fcvm.dev  -> tunnel fcvm-fleet-coordinator -> the coordinator in its task (localhost:8080). The
 #                                connector requires an Access token on every path: the owner's, or at /agent the agents'
-#                                service token (its own application, so it is never a bypass).
+#                                service token (its own application, so it is never a bypass). The metal-box agents'
+#                                staging token (workers-stage-agents) opens this host and the page too, as it opens
+#                                the <site>-stage Workers (#1032); never production's.
 #   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its owner/CI application.
 #                                Its fallback forwards /live and /poster.jpg to fleet-api-stage with its service token.
 #   fleet-api-direct-stage.fcvm.dev -> /live only, gated by the page's Access application and exact audience. Sign-in
@@ -96,6 +98,9 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
     { id = cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id, precedence = 3 },
+    # The metal-box agents' staging token (workers-stage.tf), to check a fleet deploy headless as for the
+    # <site>-stage Workers (ejc3/aws#1032). Staging only: production's applications are fcvm-dev-prod.tf's.
+    { id = cloudflare_zero_trust_access_policy.workers_stage_agents.id, precedence = 4 },
   ]
 }
 
@@ -118,6 +123,8 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
   policies = [
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
+    # The metal-box agents' staging token, as on the API host (ejc3/aws#1032).
+    { id = cloudflare_zero_trust_access_policy.workers_stage_agents.id, precedence = 3 },
   ]
   # Eager sign-in redirects through both destinations. The new hostname must resolve
   # first; it reaches only the tunnel's 404 until this application gates its /live.
@@ -158,7 +165,8 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
 # upgrade got Access's 302 to the login page, which a WebSocket cannot follow: the page said "Cannot reach the fleet
 # yet" until the window had visited the API host once. The Worker now forwards /live and /poster.jpg (and no other
 # path) with this token, which the API application admits and the site and /agent applications do not. Anyone the
-# Worker serves has already passed the site application, whose policies are the API application's own two.
+# Worker serves has already passed the site application, every one of whose policies the API application also admits
+# (the owner, CI, the metal agents' staging token; scripts/test-fcvm-dev.py keeps the page's a subset of the API's).
 # The token reaches the Worker as two secrets of ejc3/fcvm's main-only cloudflare-deploy environment, which the deploy
 # uploads with the version (wrangler deploy --secrets-file).
 # Rotate the secret in place: commit the next client_secret_version (initial default is 1) and an explicit RFC3339
@@ -238,7 +246,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "fcvm_fleet_coordinator" {
 }
 
 # The connector verifies the allowed application audiences itself. The browser-only route takes only /live with the
-# page application's audience, never a Worker or agent credential.
+# page application's audience, never the Worker's or the GPU hosts' agent credential (the page application does admit the
+# metal agents' staging token, #1032).
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator" {
   account_id = var.cloudflare_account_id
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.fcvm_fleet_coordinator.id
