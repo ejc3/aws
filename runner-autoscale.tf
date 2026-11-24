@@ -230,10 +230,16 @@ data "archive_file" "runner_webhook" {
                     for region in RUNNER_REGIONS}
       ssm = boto3.client('ssm', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
-      # The refusal memory's own client (remembered_refusals): one attempt, inside 2
-      # seconds, so a slow table costs a launch at most that and never blocks it.
+      # The refusal memory's own client (remembered_refusals): one attempt, 1 second to
+      # connect and 1 to answer, so no call to it takes more than about 2 seconds. The
+      # first call that fails turns it off for the rest of the invocation
+      # (refusal_memory_state), so an unreachable table costs one such call per
+      # invocation, not one per refusal; it never blocks a launch.
       REFUSAL_MEMORY_CLIENT = Config(connect_timeout=1, read_timeout=1, retries={'total_max_attempts': 1})
       refusal_memory = boto3.client('dynamodb', region_name='us-west-1', config=REFUSAL_MEMORY_CLIENT)
+      # Set when a refusal-memory call fails; handler() clears it at the start of every
+      # invocation, since a warm container keeps module state between invocations.
+      refusal_memory_state = {'failed': False}
       lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
@@ -923,16 +929,18 @@ data "archive_file" "runner_webhook" {
           one attribute per pool, "AZ|type", holding when its refusal expires. Only this
           function and remember_refusal() use it, and the webhook runs one execution at a
           time. A row that cannot be read is an empty set: today's order, never a refused
-          launch.
+          launch. After a failed call the memory is not used again in this invocation.
           """
           table = os.environ.get('REGISTRATION_TABLE', '')
-          if not table:
+          if not table or refusal_memory_state['failed']:
               return set()
           try:
               item = refusal_memory.get_item(TableName=table, Key=refusal_memory_key(arch, market),
                                              ConsistentRead=True).get('Item') or {}
           except Exception as error:
-              print(f'Refusal memory unread ({type(error).__name__}); every pool in its usual order')
+              refusal_memory_state['failed'] = True
+              print(f'Refusal memory unread ({type(error).__name__}); every pool in its usual order, '
+                    f'and the memory left alone for the rest of this invocation')
               return set()
           now = datetime.now(timezone.utc).timestamp()
           pools = set()
@@ -947,9 +955,14 @@ data "archive_file" "runner_webhook" {
           return pools
 
       def remember_refusal(arch, market, az, instance_type, error):
-          """Keep a capacity or quota refusal of one pool for REFUSED_POOL_SECONDS. Best effort."""
+          """Keep a capacity or quota refusal of one pool for REFUSED_POOL_SECONDS. Best effort.
+
+          Not for a pool with no known AZ (the SUBNET_ID environment), whose refusal would
+          match every AZ, and not after a refusal-memory call failed in this invocation.
+          """
           table = os.environ.get('REGISTRATION_TABLE', '')
-          if not table or not az or error_code(error) not in REMEMBERED_REFUSALS:
+          if (not table or not az or refusal_memory_state['failed']
+                  or error_code(error) not in REMEMBERED_REFUSALS):
               return
           until = int(datetime.now(timezone.utc).timestamp()) + REFUSED_POOL_SECONDS
           try:
@@ -958,7 +971,9 @@ data "archive_file" "runner_webhook" {
                                          ExpressionAttributeNames={'#pool': f'{az}|{instance_type}'},
                                          ExpressionAttributeValues={':until': {'N': str(until)}})
           except Exception as write_error:
-              print(f'Refusal of {instance_type} in {az} not remembered ({type(write_error).__name__})')
+              refusal_memory_state['failed'] = True
+              print(f'Refusal of {instance_type} in {az} not remembered ({type(write_error).__name__}); '
+                    f'the memory left alone for the rest of this invocation')
 
       def launch_candidates(arch, subnets, failed=(), networks=()):
           """(subnet_id, availability_zone, instance_type) in the order to try them.
@@ -1597,6 +1612,8 @@ data "archive_file" "runner_webhook" {
           # Unknown (None) on a direct call without a Lambda context.
           remaining_ms = getattr(context, 'get_remaining_time_in_millis', None)
           deadline = time.monotonic() + remaining_ms() / 1000 if callable(remaining_ms) else None
+          # A refusal-memory failure in an earlier invocation does not carry over.
+          refusal_memory_state['failed'] = False
           # Parse webhook
           body = event.get('body', '{}')
           # Case-insensitive header lookup. This line IS the webhook fix: the API

@@ -1713,6 +1713,10 @@ def case_launch_calls_fit_the_time_they_are_given():
     memory = module["REFUSAL_MEMORY_CLIENT"]
     assert memory.retries == {"total_max_attempts": 1}, memory
     assert memory.connect_timeout + memory.read_timeout < module["LAUNCH_FINISH_SECONDS"], memory
+    # ... and the memory has a client of its own with that config, not the default DynamoDB one.
+    memory_clients = [kw for service, kw in module["_test_client_options"]
+                      if service == "dynamodb" and kw.get("config") is memory]
+    assert memory_clients == [{"region_name": "us-west-1", "config": memory}], module["_test_client_options"]
 
 
 OHIO_C = "subnet-use2c"
@@ -1806,10 +1810,11 @@ def case_only_capacity_and_quota_refusals_are_remembered_and_per_market():
     head = type_order("arm64")[0]
     errors = {**refusing([OHIO_A], error=FakeClientError("MaxSpotInstanceCountExceeded")),
               **refusing([OHIO_B], error=FakeClientError("RequestLimitExceeded"))}
-    errors[(SUBNET_C, head)] = "read timeout"  # no code: an unknown outcome
     dynamodb = FakeDynamoDB()
-    regions = two_regions(ohio_errors=errors)
+    # No code at all in us-west-1c: an unknown outcome, which spot moves on from.
+    regions = two_regions(ohio_errors=errors, west_errors={(SUBNET_C, head): "read timeout"})
     region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64")
+    assert launched_pools(regions["us-west-1"])[:1] == [(SUBNET_C, head)], launched_pools(regions["us-west-1"])
     assert set(memory_pools(dynamodb, "arm64")) == {f"us-east-2a|{t}" for t in type_order("arm64")}, \
         memory_pools(dynamodb, "arm64")
     # The on-demand walk still starts with the pool spot just found out of quota.
@@ -1817,6 +1822,58 @@ def case_only_capacity_and_quota_refusals_are_remembered_and_per_market():
     region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64", market="on-demand")
     assert launched_pools(regions["us-east-2"]) == [(OHIO_A, head)], launched_pools(regions["us-east-2"])
     assert memory_pools(dynamodb, "arm64", "on-demand") == {}
+
+
+def memory_calls(dynamodb, op):
+    return [kw for kw in dynamodb.ops(op) if kw["Key"]["InstanceArn"]["S"].startswith("refused-pools#")]
+
+
+def case_a_failed_refusal_memory_call_turns_it_off_for_the_rest_of_the_invocation():
+    """A table that cannot answer costs one bounded call per invocation, not one per refusal,
+    and a later invocation (the same warm container) uses the memory again."""
+    head = type_order("arm64")[0]
+    capacity = FakeClientError("InsufficientInstanceCapacity")
+    error = FakeClientError("ProvisionedThroughputExceededException")
+    batch = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}, "launch_count": 2})}
+
+    # Writes fail: the first refusal's write is the only one tried.
+    dynamodb = FakeDynamoDB(update_error=error)
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=capacity))
+    region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64")
+    assert len(regions["us-east-2"].ops("run_instances")) == 6
+    assert len(memory_calls(dynamodb, "update_item")) == 1, memory_calls(dynamodb, "update_item")
+    assert launched_pools(regions["us-west-1"]) == [(SUBNET_C, head)], launched_pools(regions["us-west-1"])
+
+    # The read fails: a batch of two neither reads again nor writes.
+    dynamodb = FakeDynamoDB(get_error=error)
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=capacity))
+    module = region_webhook(regions, dynamodb=dynamodb)
+    result = module["handler"](batch, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert len(memory_calls(dynamodb, "get_item")) == 1, memory_calls(dynamodb, "get_item")
+    assert memory_calls(dynamodb, "update_item") == []
+    # The next invocation of the same module starts with the memory on again.
+    dynamodb.get_error = None
+    module["handler"](batch, None)
+    assert len(memory_calls(dynamodb, "get_item")) >= 2, memory_calls(dynamodb, "get_item")
+
+
+def case_nothing_is_remembered_for_a_pool_with_no_known_az():
+    """In the SUBNET_ID environment a pool's AZ is unknown, and a refusal recorded there would
+    match every AZ. Neither written nor read: a row's attribute must name an AZ and a type."""
+    head, second = type_order()[:2]
+    dynamodb = FakeDynamoDB()
+    ec2 = FakeEC2(run_instances_errors={head: FakeClientError("InsufficientInstanceCapacity")})
+    webhook(ec2, dynamodb=dynamodb, env={"LAUNCH_SUBNETS": "", "SUBNET_ID": "subnet-legacy"})["launch_runner"]("x86_64")
+    assert launched_pools(ec2) == [("subnet-legacy", head), ("subnet-legacy", second)], launched_pools(ec2)
+    assert memory_calls(dynamodb, "update_item") == [] and memory_pools(dynamodb, "x86_64") == {}
+    future, past = str(int(NOW.timestamp()) + 60), str(int(NOW.timestamp()) - 1)
+    dynamodb = FakeDynamoDB([{"InstanceArn": {"S": "refused-pools#x86_64#spot"},
+                              f"us-east-2a|{head}": {"N": future}, f"us-east-2b|{head}": {"N": past},
+                              f"|{head}": {"N": future}, "us-east-2a|": {"N": future}, "garbage": {"N": future},
+                              f"us-east-2c|{head}": {"S": future}}])
+    module = webhook(FakeEC2(), dynamodb=dynamodb)
+    assert module["remembered_refusals"]("x86_64", "spot") == {("us-east-2a", head)}
 
 
 def case_regions_stay_in_list_order_whatever_order_a_region_s_zones_are_in():

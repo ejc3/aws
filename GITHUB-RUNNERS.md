@@ -151,7 +151,9 @@ the refusals pays once, and the next launches start in us-west-1 until Ohio's re
 Any other error (throttling, an unknown outcome) is not remembered. The webhook writes and reads
 the row with the `GetItem`/`UpdateItem` grant it already has on that table (no new IAM); a
 runner's own grant reaches only its instance's row. A row that cannot be read or written is
-logged and ignored: the launch goes on in the usual order.
+logged and ignored: the launch goes on in the usual order, and the memory is not called again
+for the rest of that invocation. A pool with no known AZ (the old `SUBNET_ID` environment) is
+never remembered: its refusal would match every AZ.
 
 The fallback must not cost the invocation: the webhook runs one execution at a time with a
 30-second timeout it cannot catch. Each launch call goes through its own region's client (one
@@ -159,7 +161,8 @@ attempt, 2 s to connect, 6 s to answer; `LAUNCH_CALL_SECONDS` 8) and starts only
 `LAUNCH_FINISH_SECONDS` (3, for the credential, one refusal-memory write and the decision line)
 are left, so calls start until about 19 seconds in. On 2026-11-12 a refusal took about 1.0 s
 and a launch with its credential about 2.7 s. The refusal memory has its own client (one
-attempt, 1 s to connect, 1 s to answer). A walk that runs out of time ends that launch with the
+attempt, 1 s to connect, 1 s to answer), so a call to it takes at most about 2 s, and an
+unreachable table costs one such call per invocation, not one per refusal. A walk that runs out of time ends that launch with the
 last refusal, and the cleanup poll, which only invokes the webhook and whose queue scan keeps
 its own 120-second budget, is the retry. An answer that has not come in 6 seconds is an unknown
 outcome: spot moves on, on-demand stops.
