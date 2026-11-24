@@ -3757,7 +3757,7 @@ data "archive_file" "runner_cleanup" {
                       continue
                   snapshots = [mapping['Ebs']['SnapshotId'] for mapping in image.get('BlockDeviceMappings', [])
                                if isinstance(mapping.get('Ebs'), dict) and mapping['Ebs'].get('SnapshotId')]
-                  client.deregister_image(ImageId=image_id)
+                  client.deregister_image(ImageId=image_id)  # a refusal is counted against this poll's bound
                   result['deregistered'].append(image_id)
                   for snapshot in snapshots:
                       attempted.add(snapshot)
@@ -3788,17 +3788,26 @@ data "archive_file" "runner_cleanup" {
                   if (now - snapshot['StartTime']).total_seconds() >= UNPUBLISHED_IMAGE_MAX_AGE_HOURS * 3600:
                       old.append(snapshot['SnapshotId'])
               if old:
+                  # A disabled image still uses its snapshot, and DescribeImages leaves it out unless asked.
                   in_use = {mapping['Ebs']['SnapshotId']
-                            for image in client.describe_images(Owners=['self']).get('Images', [])
+                            for image in client.describe_images(Owners=['self'], IncludeDisabled=True).get('Images', [])
                             for mapping in image.get('BlockDeviceMappings', [])
                             if isinstance(mapping.get('Ebs'), dict) and mapping['Ebs'].get('SnapshotId')}
+                  tried = 0
                   for snapshot in sorted(old):
                       if snapshot in in_use:
                           continue
-                      if len(result['orphan_snapshots_deleted']) >= UNPUBLISHED_IMAGE_PRUNES_PER_POLL:
+                      if tried >= UNPUBLISHED_IMAGE_PRUNES_PER_POLL:
                           break
-                      client.delete_snapshot(SnapshotId=snapshot)
-                      result['orphan_snapshots_deleted'].append(snapshot)
+                      tried += 1
+                      try:
+                          client.delete_snapshot(SnapshotId=snapshot)
+                          result['orphan_snapshots_deleted'].append(snapshot)
+                      except Exception as error:
+                          # Counted and passed: one snapshot refused on every poll must not hold back the rest.
+                          result['errors'] += 1
+                          code = getattr(error, 'response', {}).get('Error', {}).get('Code', type(error).__name__)
+                          print(f'ORPHAN SNAPSHOT {snapshot} NOT DELETED: {code}')
           except Exception as error:
               result['errors'] += 1
               print(f'ORPHAN SNAPSHOT PRUNE FAILED: {type(error).__name__}')
@@ -4408,15 +4417,6 @@ data "archive_file" "runner_cleanup" {
                           print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
                           ami_builder_terminated.append(instance_id)
 
-          # Phase 4b: prune the runner images the builder never published. Optional work: it must not
-          # cost the poll the stalled-launch reap or the launcher below.
-          try:
-              image_prune = prune_unpublished_runner_images(now)
-          except Exception as error:
-              print(f'IMAGE PRUNE FAILED: {type(error).__name__}')
-              image_prune = {'deregistered': [], 'snapshots_deleted': [], 'orphan_snapshots_deleted': [], 'errors': 1}
-          print(json.dumps({'event': 'runner_image_prune', **image_prune}))
-
           # Phase 5: Reap launches that never came up
           # A spot metal launch AWS cannot place sits in `pending`, where the lease
           # phase above cannot see it - that phase only walks `running` instances.
@@ -4522,6 +4522,20 @@ data "archive_file" "runner_cleanup" {
                       idle_terminated.append(instance_id)
                   else:
                       terminate_failed.append(instance_id)
+
+          # Last: prune the runner images the builder never published. Optional work in us-west-1, after the
+          # stalled-launch reap, the launcher and the idle sweep, so a slow builder region can never cost a poll
+          # those; with under a minute of the invocation left it waits for the next poll.
+          image_prune = {'deregistered': [], 'snapshots_deleted': [], 'orphan_snapshots_deleted': [], 'errors': 0}
+          if context is not None and context.get_remaining_time_in_millis() < 60000:
+              print('Image prune skipped with under 60s of the invocation left')
+          else:
+              try:
+                  image_prune = prune_unpublished_runner_images(now)
+              except Exception as error:
+                  print(f'IMAGE PRUNE FAILED: {type(error).__name__}')
+                  image_prune['errors'] = 1
+          print(json.dumps({'event': 'runner_image_prune', **image_prune}))
 
           return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'unpublished_images_pruned': image_prune['deregistered'], 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF
