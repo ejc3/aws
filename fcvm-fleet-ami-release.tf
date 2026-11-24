@@ -76,6 +76,15 @@ ephemeral "aws_ssm_parameter" "fcvm_ami_release_guard" {
 }
 
 locals {
+  # The renders host class's images (fcvm-fleet.tf): the same shape as host_amis under a renders_amis key,
+  # { region = { arm64 = "ami-..." } }. The pointer has no such key until the image factory publishes that
+  # flavor, and the publisher owns the value, so the read is a try: a pointer without the key, and a disabled
+  # pipeline (no data source instance to index), both give {}. With {} the class has no launch template, no
+  # policy and no coordinator variables.
+  fcvm_active_renders_amis = try(nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).renders_amis), {})
+}
+
+locals {
   # SSM marks every value sensitive, including this explicitly non-secret image
   # manifest. Only the AMI maps are declassified so resource keys stay usable.
   fcvm_active_host_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).host_amis) : var.fcvm_fleet_host_amis

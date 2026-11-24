@@ -121,9 +121,13 @@ class RetiredSiteTests(unittest.TestCase):
         self.assertIn('VOLTAG="$NAME-work"', SCRIPT)
 
     def test_the_spot_quota_fits_every_slot_at_full_size(self):
-        # one resource owns L-34B43A08 in Ohio, next to the slot list, and it grows with the slots
+        # one resource owns L-34B43A08 in Ohio, next to the slot list, and it grows with the slots. The fcvm-fleet
+        # account's own Standard spot quota in us-east-1 (fcvm-fleet-account.tf) is another account's and another region's.
         tf = "".join(p.read_text() for p in ROOT.glob("*.tf"))
-        self.assertEqual(tf.count('quota_code   = "L-34B43A08"'), 1)
+        owners = re.findall(r'resource "aws_servicequotas_service_quota" "(\w+)" \{\n([^}]*)\}', tf)
+        standard_spot = {name: re.search(r"provider\s+= (\S+)", body).group(1) for name, body in owners
+                         if 'quota_code   = "L-34B43A08"' in body}
+        self.assertEqual(standard_spot, {"ohio_spot_standard": "aws.ohio", "fcvm_fleet_spot_standard_east1": "aws.fcvm_fleet_east1"})
         q = block(OHIO, 'resource "aws_servicequotas_service_quota" "ohio_spot_standard"')
         self.assertIn("provider     = aws.ohio", q)
         self.assertIn('service_code = "ec2"', q)

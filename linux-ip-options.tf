@@ -103,7 +103,7 @@ resource "aws_ssm_association" "linux_ip_options_fleet_east2" {
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Purpose"
-    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox"]
+    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox", "fcvm-fleet-renders"]
   }
   parameters = local.linux_ip_options_parameters
 }
@@ -115,7 +115,7 @@ resource "aws_ssm_association" "linux_ip_options_fleet_west2" {
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Purpose"
-    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox"]
+    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox", "fcvm-fleet-renders"]
   }
   parameters = local.linux_ip_options_parameters
 }
@@ -127,7 +127,7 @@ resource "aws_ssm_association" "linux_ip_options_fleet_east1" {
   schedule_expression = "rate(30 minutes)"
   targets {
     key    = "tag:Purpose"
-    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox"]
+    values = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-gpubox", "fcvm-fleet-renders"]
   }
   parameters = local.linux_ip_options_parameters
 }

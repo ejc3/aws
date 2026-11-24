@@ -1845,6 +1845,9 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   role can publish the coordinator image and invoke the scoped release function.
 - **Quotas** (#605, #937): G and VT Spot (L-3819A6DF) reached 480 vCPUs in us-east-1 on 2026-11-21.
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
+  The renders host class draws on the Standard quotas instead: Terraform asks for 384 vCPUs of Standard Spot
+  (L-34B43A08) and of Standard on demand (L-1216C47A) in us-east-1 (`local.fcvm_fleet_standard_vcpus`). Their current
+  values are not recorded here; read them on the jumpbox before applying.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, behind Access for the owner, the main-only CI service token and the metal agents' staging token (#1032): `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the
@@ -1911,6 +1914,12 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
   `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
   notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
+- **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `c8g.metal-24xl`
+  per stack while the fleet is awake, launched by the coordinator as a GPU host is (`FLEET_RENDERS_TEMPLATES`,
+  `FLEET_RENDERS_SUBNETS`). Its template (`fcvm-fleet-renders-arm64`, instances tagged `Purpose=fcvm-fleet-renders`),
+  its policy (`fcvm-fleet-coordinator-renders`) and those variables exist only once the release pointer has a
+  `renders_amis` entry for us-east-1, which no publisher writes yet: the image factory builds host and tile images
+  only. The publisher is not given the template; Terraform sets its image from the pointer on an apply.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile

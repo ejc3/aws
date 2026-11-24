@@ -629,6 +629,29 @@ class QuotaTests(unittest.TestCase):
             self.assertIn(f"from = aws_servicequotas_service_quota.fcvm_fleet_spot_g_{gone}", TF)
         self.assertEqual(TF.count("destroy = false"), 2)
 
+    def test_standard_quotas_hold_the_renders_hosts_in_us_east_1_and_are_never_lowered(self):
+        # The renders host class (fcvm-fleet.tf) is a c8g.metal-24xl, 96 vCPUs of the Standard families, not G: one host
+        # per stack awake (2 x 96) and per stack the replacement that overlaps it during a spot interruption (2 x 96).
+        self.assertRegex(TF, r"\n  fcvm_fleet_standard_vcpus = 384\n")
+        comment = TF.split("  fcvm_fleet_standard_vcpus = 384\n", 1)[0].rsplit("fcvm_fleet_on_demand_g_vcpus", 1)[1]
+        for part in ("c8g.metal-24xl", "2 x 96 = 192", "spot first", "us-west-2"):
+            self.assertIn(part, " ".join(comment.replace("#", " ").split()), part)
+        # Spot first, on demand when spot is refused: the same number in both markets' quotas.
+        for name, code in (("spot_standard", "L-34B43A08"), ("on_demand_standard", "L-1216C47A")):
+            source = block(f'data "aws_servicequotas_service_quota" "fcvm_fleet_{name}_east1"')
+            quota = block(f'resource "aws_servicequotas_service_quota" "fcvm_fleet_{name}_east1"')
+            for section in (source, quota):
+                self.assertIn("provider     = aws.fcvm_fleet_east1", section)
+                self.assertIn('service_code = "ec2"', section)
+                self.assertIn(f'quota_code   = "{code}"', section)
+            # A quota AWS granted above the target is kept: a request can only raise one.
+            self.assertIn(f"value        = max(local.fcvm_fleet_standard_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_{name}_east1.value)", quota)
+        # us-east-1 only, where the class runs, and once each.
+        for code in ("L-34B43A08", "L-1216C47A"):
+            self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"%s"' % code, TF)), 1, code)
+        # The current values are not in the repository: the file says to read them before applying.
+        self.assertIn("aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-east-1", TF)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
