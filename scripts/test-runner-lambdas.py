@@ -760,9 +760,45 @@ def case_aws_capacity_verdict_advances_the_type():
 def case_stalled_pending_launch_advances_the_type():
     """A launch still pending past the startup window is a capacity failure."""
     head = type_order()[0]
-    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c")])
+    # A runner in us-west-1a keeps the two AZs level, so the launch starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, az="us-west-1a")])
     webhook(ec2)["launch_runner"]("x86_64")
     assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
+
+
+def case_a_batch_of_spot_launches_is_spread_across_the_zones():
+    """AWS reclaims a spot pool's instances together, so a pool that sits in one AZ is lost
+    together: on 2026-11-24 five x86 runners in one AZ went in the same minute. A batch, which
+    is how a pool is refilled after a reclaim, alternates between the AZs."""
+    head = type_order()[0]
+    ec2 = FakeEC2()
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["X64"]},
+                                 "launch_count": 4})}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched 4 x86_64 runner(s)" in result["body"], result
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_A, head), (SUBNET_C, head), (SUBNET_A, head)], \
+        launched_pools(ec2)
+
+
+def case_a_spot_launch_starts_in_the_zone_with_the_fewest_live_spot_runners():
+    """Live means pending or running. A terminated runner, the other architecture's runners and
+    on-demand hosts (which are not reclaimed) do not count."""
+    head = type_order()[0]
+    fleet = [instance("i-c1", head, "running", 30, az="us-west-1c"),
+             instance("i-c2", head, "pending", 2, az="us-west-1c"),
+             instance("i-a1", head, "running", 30, az="us-west-1a"),
+             instance("i-a-gone", head, "terminated", 30, az="us-west-1a"),
+             instance("i-c-od", head, "running", 30, az="us-west-1c", tags={"Market": "on-demand"}),
+             instance("i-a-arm", type_order("arm64")[0], "running", 30, arch="arm64", az="us-west-1a")]
+    ec2 = FakeEC2(fleet)
+    webhook(ec2)["launch_runner"]("x86_64")
+    assert launched_pools(ec2) == [(SUBNET_A, head)], launched_pools(ec2)
+    # An on-demand launch is not spread: it keeps Terraform's order. The on-demand host sits in
+    # us-west-1c, so a spread that counted it would start in us-west-1a instead.
+    ec2 = FakeEC2(fleet)
+    webhook(ec2)["launch_runner"]("x86_64", market="on-demand")
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
 
 def case_capacity_failed_tag_advances_the_type():
@@ -777,7 +813,9 @@ def case_capacity_failed_tag_advances_the_type():
 def case_pending_inside_the_startup_window_is_not_a_failure():
     """A metal instance that is merely still booting must not rotate the list."""
     head = type_order()[0]
-    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c")])
+    # A runner in us-west-1a keeps the two AZs level, so the launch starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, az="us-west-1a")])
     webhook(ec2)["launch_runner"]("x86_64")
     assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
@@ -1376,8 +1414,10 @@ def case_capacity_backoff_is_per_type_and_az():
     assert order[0] == (SUBNET_C, "us-west-1c", head), order
     assert order[-1] == (SUBNET_A, "us-west-1a", head), order
 
-    # The same failure in us-west-1c moves that AZ on to the next type instead.
-    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c")])
+    # The same failure in us-west-1c moves that AZ on to the next type instead. A runner in
+    # us-west-1a keeps the two AZs level, so the launch still starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, arch="arm64", az="us-west-1a")])
     webhook(ec2)["launch_runner"]("arm64")
     assert launched_pools(ec2) == [(SUBNET_C, second)], launched_pools(ec2)
 
@@ -1387,10 +1427,13 @@ def case_a_refused_pool_is_not_retried_within_one_batch():
     head, second = type_order("arm64")[:2]
     ec2 = FakeEC2(run_instances_errors={(SUBNET_C, head): "InsufficientInstanceCapacity"})
     event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
-                                 "launch_count": 2})}
+                                 "launch_count": 3})}
     result = webhook(ec2)["handler"](event, None)
-    assert "Launched 2 arm64 runner(s)" in result["body"], result
-    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_C, second)], \
+    assert "Launched 3 arm64 runner(s)" in result["body"], result
+    # The second launch starts in the other AZ (the first one holds a runner now). The third
+    # finds the AZs level and starts in us-west-1c again, where it must skip the pool that
+    # refused instead of asking it a second time.
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_A, head), (SUBNET_C, second)], \
         launched_pools(ec2)
 
 
