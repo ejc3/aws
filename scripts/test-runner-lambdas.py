@@ -140,7 +140,12 @@ class FakeEC2:
             raise self.prune_listing_error
         if "github-runner-candidate" in purposes or not kw.get("Filters"):
             return {"Images": list(self.images)}
-        return {"Images": [{"ImageId": "ami-test", "CreationDate": "2026-08-01T00:00:00Z"}]}
+        # The launch's runner image. A case sets runner_ami (None: this region has none)
+        # or runner_ami_error on one region's fake.
+        if getattr(self, "runner_ami_error", None):
+            raise self.runner_ami_error
+        ami = getattr(self, "runner_ami", "ami-test")
+        return {"Images": [{"ImageId": ami, "CreationDate": "2026-08-01T00:00:00Z"}] if ami else []}
 
     def describe_snapshots(self, **kw):
         self.calls.append(("describe_snapshots", kw))
@@ -170,7 +175,8 @@ class FakeEC2:
         error = (self.run_instances_errors.get((subnet, kw["InstanceType"]))
                  or self.run_instances_errors.get(kw["InstanceType"]))
         if error:
-            raise Exception(error)
+            # A string is an error message; an exception (a FakeClientError) is raised as it is.
+            raise error if isinstance(error, BaseException) else Exception(error)
         return {"Instances": [{"InstanceId": f"i-new-{kw['InstanceType']}"}]}
 
     def create_tags(self, **kw):
@@ -584,22 +590,30 @@ def capture_emf(emit, **kwargs):
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
-                dynamodb=None, launch_ec2=None):
+                dynamodb=None, launch_ec2=None, regions=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
     imports, so the env vars below land in the REAL environment and would
     otherwise leak between cases (a WEBHOOK_SECRET set by one case must not
     still be set for the next).
+
+    regions, {region: FakeEC2} in RUNNER_REGIONS order, gives each runner region
+    its own EC2 (every EC2 client of that region, the launch client included).
+    The Lambda reads RUNNER_REGIONS as it loads, so that is set before the exec.
     """
     os.environ.clear()
     os.environ.update(_BASE_ENV)
+    if regions:
+        os.environ["RUNNER_REGIONS"] = json.dumps(list(regions))
     clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client,
                "dynamodb": dynamodb or FakeDynamoDB()}
     fake_boto3 = types.ModuleType("boto3")
     client_options = []
     def client(service, **kw):
         client_options.append((service, kw))
+        if service == "ec2" and regions:
+            return regions[kw["region_name"]]
         # The webhook's RunInstances client is its one EC2 client built with a
         # config; a case can hand it a separate fake to see which calls use it.
         if service == "ec2" and "config" in kw and launch_ec2 is not None:
@@ -1339,9 +1353,9 @@ def case_terraform_hands_the_launcher_us_west_1c_first():
     assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_fcvm_launch_subnets : "
                      r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
                      source), "LAUNCH_SUBNETS is not rendered from the PRIMARY region's subnets"
-    # The move to Ohio is two applies; the list must be one of its three states, never an arbitrary region.
-    assert re.search(r'\n  runner_regions\s*=\s*(\["us-west-1"\]|\["us-east-2", "us-west-1"\]|\["us-east-2"\])\n', vpc), \
-        "runner_regions is not one of the permitted states of the Ohio move"
+    # Ohio first, us-west-1 its fallback: never an arbitrary region, never the expensive one first.
+    assert re.search(r'\n  runner_regions\s*=\s*\["us-east-2", "us-west-1"\]\n', vpc), \
+        "runner_regions is not Ohio first with us-west-1 as its fallback"
     assert re.search(r"\n  runner_fcvm_launch_subnets\s*=\s*var\.enable_github_runner \? local\.runner_networks\[local\.runner_primary_region\]\.subnets", vpc)
     # Kept for the previous controller code during the apply; the first launch subnet, 1c today.
     assert re.search(r"\n      SUBNET_ID\s*=\s*local\.runner_fcvm_launch_subnets\[0\]\.id\n", source), \
@@ -1420,6 +1434,264 @@ def case_unusable_launch_subnets_refuse_before_allocating_metal():
             raise AssertionError(f"LAUNCH_SUBNETS={value!r} was accepted")
         assert not ec2.ops("run_instances"), (value, ec2.calls)
         assert not any("registration-token" in url for url in github.requests), value
+
+
+# --------------------------------------------------------------------------
+# Cases: every pool of the primary region, then the next listed region
+# --------------------------------------------------------------------------
+
+OHIO_A, OHIO_B = "subnet-use2a", "subnet-use2b"
+# LAUNCH_NETWORKS as Terraform renders it from runner_regions = ["us-east-2", "us-west-1"].
+LAUNCH_NETWORKS = [
+    {"region": "us-east-2", "security_group_id": "sg-ohio",
+     "subnets": [{"subnet_id": OHIO_A, "availability_zone": "us-east-2a"},
+                 {"subnet_id": OHIO_B, "availability_zone": "us-east-2b"}]},
+    {"region": "us-west-1", "security_group_id": "sg-west", "subnets": LAUNCH_SUBNETS},
+]
+
+
+def two_regions(ohio_errors=None, west_errors=None):
+    """One fake EC2 per runner region, primary first, each with its own runner AMI."""
+    regions = {"us-east-2": FakeEC2(run_instances_errors=ohio_errors),
+               "us-west-1": FakeEC2(run_instances_errors=west_errors)}
+    regions["us-east-2"].runner_ami, regions["us-west-1"].runner_ami = "ami-ohio", "ami-west"
+    return regions
+
+
+def region_webhook(regions, **kw):
+    env = {"LAUNCH_NETWORKS": json.dumps(LAUNCH_NETWORKS), **kw.pop("env", {})}
+    kw.setdefault("github", FakeGitHub())
+    return load_lambda(WEBHOOK_SRC, regions["us-east-2"], kw.pop("ssm", FakeSSM()), regions=regions, env=env, **kw)
+
+
+def refusing(subnets, arch="arm64", error="InsufficientInstanceCapacity"):
+    """run_instances_errors refusing every type of arch in every one of subnets."""
+    return {(subnet, instance_type): error for subnet in subnets for instance_type in type_order(arch)}
+
+
+def case_every_pool_of_the_primary_region_is_tried_before_the_next_region():
+    """Ohio out of ARM metal spot is not CI waiting: the launch goes on to us-west-1,
+    with us-west-1's own AMI and security group, and the host belongs to us-west-1."""
+    types = type_order("arm64")
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B]))
+    ssm = FakeSSM()
+    module = region_webhook(regions, ssm=ssm)
+    instance_id, instance_type = module["launch_runner"]("arm64")
+    ohio, west = regions["us-east-2"], regions["us-west-1"]
+    assert launched_pools(ohio) == [(OHIO_A, t) for t in types] + [(OHIO_B, t) for t in types], launched_pools(ohio)
+    assert launched_pools(west) == [(SUBNET_C, types[0])], launched_pools(west)
+    assert instance_type == types[0], instance_type
+    for fake, ami, group in ((ohio, "ami-ohio", "sg-ohio"), (west, "ami-west", "sg-west")):
+        for call in fake.ops("run_instances"):
+            assert call["ImageId"] == ami and call["NetworkInterfaces"][0]["Groups"] == [group], call
+    # Its credential names the instance ARN of its own region, and the facade writes to it there.
+    assert module["ec2"].region_of(instance_id) == "us-west-1"
+    (put,) = ssm.puts
+    tags = {t["Key"]: t["Value"] for t in put["Tags"]}
+    assert tags["InstanceArn"] == f"arn:aws:ec2:us-west-1:{ACCOUNT_ID}:instance/{instance_id}", tags
+
+
+def case_a_launch_the_primary_region_takes_makes_no_call_in_the_next_region():
+    """The next region's AMI is looked up only when the walk reaches it: a slow or broken
+    second region costs nothing while the primary has capacity."""
+    regions = two_regions()
+    module = region_webhook(regions)
+    instance_id, _ = module["launch_runner"]("x86_64")
+    assert launched_pools(regions["us-east-2"]) == [(OHIO_A, type_order()[0])], launched_pools(regions["us-east-2"])
+    assert regions["us-east-2"].ops("run_instances")[0]["ImageId"] == "ami-ohio"
+    # Only the fleet read fans out to every listed region, as it always has.
+    assert {op for op, _ in regions["us-west-1"].calls} == {"describe_instances"}, regions["us-west-1"].calls
+    assert module["ec2"].region_of(instance_id) == "us-east-2"
+
+
+def case_a_region_without_a_runner_ami_is_skipped_not_the_launch():
+    head = type_order("arm64")[0]
+    for broken in ("no image", "lookup error"):
+        regions = two_regions()
+        if broken == "no image":
+            regions["us-east-2"].runner_ami = None
+        else:
+            regions["us-east-2"].runner_ami_error = FakeClientError("RequestLimitExceeded")
+        region_webhook(regions)["launch_runner"]("arm64")
+        assert regions["us-east-2"].ops("run_instances") == [], broken
+        assert launched_pools(regions["us-west-1"]) == [(SUBNET_C, head)], (broken, launched_pools(regions["us-west-1"]))
+        assert regions["us-west-1"].ops("run_instances")[0]["ImageId"] == "ami-west", broken
+    # With an AMI in no region, nothing is read, minted or launched.
+    regions = two_regions()
+    regions["us-east-2"].runner_ami = regions["us-west-1"].runner_ami = None
+    github, ssm = FakeGitHub(), FakeSSM()
+    try:
+        region_webhook(regions, github=github, ssm=ssm)["launch_runner"]("arm64")
+    except Exception as e:
+        assert "No runner AMI found for architecture: arm64" in str(e), e
+    else:
+        raise AssertionError("launched with no runner AMI in any region")
+    assert not any("registration-token" in url for url in github.requests), github.requests
+    assert not any("user-data" in entry for entry in ssm.journal), ssm.journal
+    assert not any(fake.ops("run_instances") for fake in regions.values())
+
+
+def case_on_demand_leaves_a_region_only_on_a_capacity_or_quota_refusal():
+    """The refusals on-demand always moved on from move it on to the next region too.
+    Anything else may have been accepted, and must not buy a second host elsewhere."""
+    head = type_order("arm64")[0]
+    for code, falls_back in (("InsufficientInstanceCapacity", True), ("VcpuLimitExceeded", True),
+                             ("InstanceLimitExceeded", True), ("UnauthorizedOperation", False)):
+        regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=FakeClientError(code)))
+        try:
+            region_webhook(regions)["launch_runner"]("arm64", market="on-demand")
+            launched = True
+        except Exception:
+            launched = False
+        ohio, west = len(regions["us-east-2"].ops("run_instances")), launched_pools(regions["us-west-1"])
+        if falls_back:
+            assert launched and ohio == 6 and west == [(SUBNET_C, head)], (code, ohio, west)
+        else:
+            assert not launched and ohio == 1 and west == [], (code, ohio, west)
+    # Refused everywhere: every pool of both regions asked once, then the on-demand verdict.
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=FakeClientError("VcpuLimitExceeded")),
+                          west_errors=refusing([SUBNET_C, SUBNET_A], error=FakeClientError("VcpuLimitExceeded")))
+    module = region_webhook(regions)
+    try:
+        module["launch_runner"]("arm64", market="on-demand")
+    except module["OnDemandCapacityUnavailable"]:
+        pass
+    else:
+        raise AssertionError("an on-demand launch refused in every region reported success")
+    assert [len(fake.ops("run_instances")) for fake in regions.values()] == [6, 6]
+
+
+def case_a_batch_does_not_ask_a_refusing_region_again():
+    """failed_here carries across regions: the batch's second launch goes straight to the
+    next region instead of asking the six Ohio pools that just refused."""
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B]))
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+                                 "launch_count": 2})}
+    result = region_webhook(regions)["handler"](event, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert len(regions["us-east-2"].ops("run_instances")) == 6, launched_pools(regions["us-east-2"])
+    assert len(regions["us-west-1"].ops("run_instances")) == 2, launched_pools(regions["us-west-1"])
+
+
+class ClockedEC2(FakeEC2):
+    """Each RunInstances call takes `seconds` on a shared fake clock."""
+
+    def __init__(self, clock, seconds, **kw):
+        super().__init__(**kw)
+        self.clock, self.seconds = clock, seconds
+
+    def run_instances(self, **kw):
+        self.clock[0] += self.seconds
+        return super().run_instances(**kw)
+
+
+def case_the_next_region_is_tried_only_with_time_left_in_the_invocation():
+    """A Lambda timeout cannot be caught. A call starts only with LAUNCH_CALL_SECONDS and
+    LAUNCH_FINISH_SECONDS before the deadline, so a slow walk ends the launch, not the invocation."""
+    # Each Ohio call takes 3 s. At 25 s the fifth would start at 12 s, too late for 14 s more. At
+    # 30 s every Ohio pool fits (the sixth starts at 15 s) and the walk stops at 18 s, before even
+    # the us-west-1 AMI lookup. At 60 s it reaches us-west-1 and launches there.
+    for deadline, ohio_calls, reaches_west in ((25.0, 4, False), (30.0, 6, False), (60.0, 6, True)):
+        clock = [0.0]
+        regions = {"us-east-2": ClockedEC2(clock, 3, run_instances_errors=refusing([OHIO_A, OHIO_B])),
+                   "us-west-1": ClockedEC2(clock, 3)}
+        module = region_webhook(regions)
+        module["time"] = types.SimpleNamespace(monotonic=lambda: clock[0])
+        try:
+            module["launch_runner"]("arm64", deadline=deadline)
+            launched = True
+        except Exception as e:
+            launched = False
+            assert "InsufficientInstanceCapacity" in str(e), e
+        west = regions["us-west-1"]
+        assert launched is reaches_west, (deadline, launched)
+        assert len(regions["us-east-2"].ops("run_instances")) == ohio_calls, deadline
+        assert bool(west.ops("describe_images")) is reaches_west, (deadline, west.calls)
+        assert bool(west.ops("run_instances")) is reaches_west, (deadline, west.calls)
+    # No time at all: nothing is looked up or launched, and the reason says so.
+    regions = two_regions()
+    module = region_webhook(regions)
+    context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: 5000,
+                                    invoked_function_arn="arn:aws:lambda:us-west-1:1:function:github-runner-webhook")
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}})}
+    try:
+        module["handler"](event, context)
+    except Exception as e:
+        assert "too little of the invocation left" in str(e), e
+    else:
+        raise AssertionError("a launch walk started with 5 s of the invocation left")
+    assert not any(fake.ops("run_instances") or fake.ops("describe_images") for fake in regions.values())
+
+
+def case_launch_calls_fit_the_time_they_are_given():
+    """One bounded call per attempt, inside LAUNCH_CALL_SECONDS, and a call plus the work
+    after it inside the function's own timeout."""
+    module = region_webhook(two_regions())
+    config = module["LAUNCH_CLIENT"]
+    assert config.retries == {"total_max_attempts": 1}, config
+    assert config.connect_timeout + config.read_timeout <= module["LAUNCH_CALL_SECONDS"], config
+    function = re.search(r'^resource "aws_lambda_function" "runner_webhook" \{\n.*?^\}', TF_FILE.read_text(),
+                         re.M | re.S).group()
+    timeout = int(re.search(r"\n  timeout\s*=\s*(\d+)\n", function).group(1))
+    assert module["LAUNCH_CALL_SECONDS"] + module["LAUNCH_FINISH_SECONDS"] < timeout, timeout
+    # A launch client in every runner region, and only those.
+    assert set(module["launch_ec2"]) == {"us-east-2", "us-west-1"}, module["launch_ec2"]
+
+
+def case_regions_stay_in_list_order_whatever_order_a_region_s_zones_are_in():
+    """Anything that reorders the subnets before launch_candidates (a spread across zones)
+    cannot move the next region's pools ahead of the primary's: in_region_order is stable
+    within a region."""
+    module = region_webhook(two_regions())
+    networks = module["get_launch_networks"]()
+    ohio_a, ohio_b, west_c, west_a = [subnet for _, _, subnets in networks for subnet in subnets]
+    assert (ohio_a, west_c) == ((OHIO_A, "us-east-2a"), (SUBNET_C, "us-west-1c"))
+    assert module["in_region_order"]([west_a, ohio_b, west_c, ohio_a], networks) == [ohio_b, ohio_a, west_a, west_c]
+    # In a launch: the subnets reach launch_candidates reversed, us-west-1's first.
+    regions = two_regions()
+    module = region_webhook(regions)
+    candidates = module["launch_candidates"]
+    module["launch_candidates"] = (lambda arch, subnets, failed=(), networks=():
+                                   candidates(arch, subnets[::-1], failed, networks))
+    module["launch_runner"]("arm64")
+    assert launched_pools(regions["us-east-2"]) == [(OHIO_B, type_order("arm64")[0])], launched_pools(regions["us-east-2"])
+    assert regions["us-west-1"].ops("run_instances") == [], launched_pools(regions["us-west-1"])
+
+
+def case_unusable_launch_networks_refuse_before_allocating_metal():
+    good = LAUNCH_NETWORKS
+    for value in ("not json", "null", "[]", "{}", '"us-east-2"', json.dumps([{"region": "us-east-2"}]),
+                  json.dumps([dict(good[0], region="eu-west-1")]),             # a region this controller does not reap
+                  json.dumps([dict(good[0], region={})]),
+                  json.dumps([good[0], good[0]]),                              # a region twice
+                  json.dumps([good[0], dict(good[1], subnets=good[0]["subnets"])]),  # a subnet twice
+                  json.dumps([dict(good[0], subnets=[])]),
+                  json.dumps([dict(good[0], security_group_id="")]),
+                  json.dumps([dict(good[0], subnets=[{"subnet_id": OHIO_A}])]),
+                  json.dumps([dict(good[0], subnets=[{"subnet_id": 7, "availability_zone": "us-east-2a"}])])):
+        regions, github = two_regions(), FakeGitHub()
+        module = region_webhook(regions, github=github, env={"LAUNCH_NETWORKS": value})
+        try:
+            module["launch_runner"]("arm64")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"LAUNCH_NETWORKS={value!r} was accepted")
+        assert not any(fake.ops("run_instances") for fake in regions.values()), value
+        assert not any("registration-token" in url for url in github.requests), value
+
+
+def case_terraform_hands_the_launcher_every_listed_region_in_order():
+    vpc = (TF_FILE.parent / "runner-vpc.tf").read_text()
+    source = TF_FILE.read_text()
+    assert re.search(r"\n      LAUNCH_NETWORKS = jsonencode\(local\.runner_fcvm_launch_networks\)\n", source)
+    networks = re.search(r"\n  runner_fcvm_launch_networks = (.*?\n  \}\] : \[\])\n", vpc, re.S).group(1)
+    assert networks.startswith("var.enable_github_runner ? [for r in local.runner_regions : {"), networks
+    for line in ("region            = r",
+                 "security_group_id = local.runner_networks[r].security_group.id",
+                 "subnets           = [for subnet in local.runner_networks[r].subnets : "
+                 "{ subnet_id = subnet.id, availability_zone = subnet.availability_zone }]"):
+        assert line in networks, (line, networks)
 
 
 # --------------------------------------------------------------------------

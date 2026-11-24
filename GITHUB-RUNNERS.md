@@ -110,6 +110,35 @@ generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, 
 price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.
 
+**Regions: Ohio first, then us-west-1.** `local.runner_regions` (`runner-vpc.tf`) is
+`["us-east-2", "us-west-1"]`, in launch order, and reaches the webhook as `LAUNCH_NETWORKS`:
+each region's security group and subnets (Ohio's three AZs, then us-west-1c and us-west-1a,
+the subnets named above). A launch tries every type in every Ohio subnet before any pool in
+us-west-1, so a job waits only when both regions refuse (owner, 2026-11-24: "Make sure CI
+spreads out across regions"). It leaves a pool, and so a region, on the refusals it always
+moved on from: any refusal for spot, and only `InsufficientInstanceCapacity`,
+`VcpuLimitExceeded` and `InstanceLimitExceeded` for on-demand (anything else may have been
+accepted, and must not buy a second host elsewhere). Each region launches its own AMI, the
+newest `Purpose=github-runner` image there: fcvm publishes in us-west-1 and `ami-replicator`
+copies the newest two of each architecture to Ohio every hour. A region's AMI is looked up only
+when the walk reaches the region, so a launch Ohio takes makes no call to us-west-1, and a
+region with no image, or whose lookup fails, is skipped. A pool that refused in this invocation
+or failed for capacity recently goes behind the other region's pools as well, so the second
+launch of a batch goes straight to us-west-1 instead of asking Ohio's refused pools again. Hosts
+in both regions are counted toward the caps, reused and reaped, and the launch grants allow
+exactly the listed regions' subnets, security groups and runner AMIs. Ohio is first for price:
+on 2026-10-03 its `c7gd.metal` spot was $0.38/h against $1.16 in us-west-1, so a fallback
+runner costs about three times as much. A region taken off the list is no longer reaped, so
+drop one only once no runner is left in it.
+
+The fallback must not cost the invocation: the webhook runs one execution at a time with a
+30-second timeout it cannot catch. Each launch call goes through its own region's client
+(one attempt, 2 s to connect, 8 s to answer; `LAUNCH_CALL_SECONDS` 10) and starts only while
+that and `LAUNCH_FINISH_SECONDS` (4, for the credential and the decision line) are left. A walk
+that runs out of time ends that launch with the last refusal, and the cleanup poll, which only
+invokes the webhook and whose queue scan keeps its own 120-second budget, is the retry. An
+answer that has not come in 8 seconds is an unknown outcome: spot moves on, on-demand stops.
+
 **One execution at a time, and what it costs.** The webhook Lambda has run with
 `reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent
 invocations all read the same runner count before any launch and put up more instances than
@@ -1434,17 +1463,23 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — two
 public `/24`s sharing one route table and internet gateway, both dual-stack IPv6 with a
 public IP on launch: `10.1.2.0/24` in **`us-west-1c`** (`aws_subnet.runner_us_west_1c`) and
-`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). `local.runner_launch_subnets` in
-`runner-vpc.tf` is the order the launcher uses (it reaches the Lambda as `LAUNCH_SUBNETS`),
-and the launch and IPv6 IAM grants are pinned to exactly that list.
+`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). The fcvm runners' primary region,
+Ohio, has a VPC of the same shape (`ohio.tf`, `10.11.0.0/16`, one subnet in each of
+`us-east-2a`, `b` and `c`, its own `github-runner-sg`). `local.runner_networks` in
+`runner-vpc.tf` holds each region's subnets, in the order the launcher uses, and security
+group; `local.runner_fcvm_launch_networks` lists them in `local.runner_regions` order and
+reaches the webhook as `LAUNCH_NETWORKS`, and the fcvm launch and IPv6 IAM grants are pinned
+to exactly the listed regions' subnets and groups. `local.runner_launch_subnets`, the two
+us-west-1 subnets, is the app runners' list (`LAUNCH_SUBNETS` in `runner-app.tf`).
 
-The launcher tries every instance type in us-west-1c before any in us-west-1a, for both
-architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
+Within a region the launcher tries every instance type in one subnet before any in the next,
+and the regions in list order (see "Regions" under Pattern B). In us-west-1, us-west-1c comes
+first for both architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
 no instance, while us-west-1c ARM metal spot was 60–67% cheaper and had a better
 single-instance placement score (4 against 2). x86 prices were about the same in both, so
 there the second AZ adds resilience. Capacity backoff is kept per (type, AZ), so an
 exhausted pool in one AZ never holds back the same type in the other. If `run_instances`
-refuses every pair, the launch fails and the cleanup poll is the retry.
+refuses every pair in every region, the launch fails and the cleanup poll is the retry.
 
 The AMI builder stays in us-west-1a: fcvm's `scripts/build-ami.sh` looks up exactly one
 subnet by `Name=github-runner-subnet`, and `github-actions-ami-builder` may launch only
