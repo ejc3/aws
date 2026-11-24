@@ -1891,7 +1891,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   backend lock as Terraform, clones the running task definition changing only its image, and
   records the successful digest in `/fcvm-fleet/stage/coordinator-image`. Terraform reads that
   software release pointer and tracks the latest active task revision; no task/service fields
-  are ignored. Before its first ECS mutation the function increments the pointer's parameter
+  are ignored. A release may also set the coordinator's Lambda lane (`FLEET_LAMBDA_IMAGE`, a digest
+  `keep-<stack>-current` holds in the stack's own lane repository); the function records it in
+  `/fcvm-fleet/<stack>/lambda-image` (`none` without one), Terraform renders the variable from it, and
+  every release refuses while that pointer and the running task disagree. Before its first ECS mutation the function increments the pointer's parameter
   version. An ephemeral apply-time check rejects a saved plan made before that increment,
   including when a failed release restores the previous image. A failed release returns only
   `status`, `errorType`, the `step` that failed and, for an AWS error or a failed release check,

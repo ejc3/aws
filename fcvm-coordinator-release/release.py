@@ -4,13 +4,13 @@ A release may also carry `lambda_digest`, the Lambda tiles' lane image the stack
 fleet/coord/publish.py, fleet/lambda/release.py). The function sets the coordinator's FLEET_LAMBDA_IMAGE to
 LANE_REPOSITORY_URL@lambda_digest only when keep-<stack>-current in the stack's own lane repository holds that
 digest, so CI cannot make a coordinator run an image nothing protects; when the repository cannot be read or the tag holds another
-digest, it refuses and changes nothing. A release without `lambda_digest` is the release without a lane. Read-only
+digest, it refuses and changes nothing. A release without `lambda_digest` keeps the lane the coordinator runs. Read-only
 `lane` returns the lane digest the coordinator runs and the commit tags of its coordinator image, which CI uses to
 skip a release of an ancestor of what runs.
 
 Terraform renders the coordinator's task definition, so the lane it runs is also kept in LANE_PARAMETER
 (/fcvm-fleet/<stack>/lambda-image): "none", or LANE_REPOSITORY_URL@<digest>. A release with `lambda_digest` refuses
-unless that pointer names the lane the coordinator runs, writes it with the image pointer, and restores it on
+unless that pointer names the lane the coordinator runs (as does every release), writes it with the image pointer, and restores it on
 rollback; Terraform renders FLEET_LAMBDA_IMAGE from it, so an apply keeps the lane instead of dropping it.
 
 One function per stack (STACK, CLUSTER, SERVICE, FAMILY): staging's (fcvm-fleet-ci.tf) and
@@ -375,14 +375,16 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         previous = ssm.get_parameter(Name=parameter)["Parameter"]["Value"]
         if image_of(old) != previous:
             raise Refused("pointer-mismatch", "release pointer and running task disagree")
+        # Every release, with a lane or not: a lane pointer that disagrees with the task would make the next
+        # Terraform apply change the lane unasked.
+        lane_previous = ssm.get_parameter(Name=os.environ["LANE_PARAMETER"])["Parameter"]["Value"]
+        if lane_previous != lane_value(lane_of(old)):
+            raise Refused("lane-pointer-mismatch", "lane pointer and running task disagree")
         if lane is not None:
             # Under the lock and before any change: a lane digest CI selected, and nothing else.
             progress["step"] = "lane"
             lane_selected(lane_ecr, name, lane)
             progress["step"] = "inspect"
-            lane_previous = ssm.get_parameter(Name=os.environ["LANE_PARAMETER"])["Parameter"]["Value"]
-            if lane_previous != lane_value(lane_of(old)):
-                raise Refused("lane-pointer-mismatch", "lane pointer and running task disagree")
             if force and lane != lane_of(old):
                 # force skips the viewer hold to return to an image prod ran before; a lane prod does not run is
                 # not a rollback. Change it in a release that waits for the hold.
@@ -422,10 +424,11 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
             if service(ecs)["taskDefinition"] in (old_arn, new_arn):
                 update(ecs, old_arn)
                 wait_for(ecs, old_arn, time.monotonic() + 150)
-                ssm.put_parameter(Name=parameter, Value=previous, Type="String", Overwrite=True)
+                # The lane pointer first: one left ahead of the task would make the next apply change the lane.
                 if lane_written:
                     ssm.put_parameter(Name=os.environ["LANE_PARAMETER"], Value=lane_previous, Type="String",
                                       Overwrite=True)
+                ssm.put_parameter(Name=parameter, Value=previous, Type="String", Overwrite=True)
                 ecs.deregister_task_definition(taskDefinition=new_arn)
             progress["step"] = failed_step
         raise

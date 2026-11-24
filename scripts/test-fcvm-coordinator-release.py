@@ -33,7 +33,8 @@ DIGEST = "sha256:" + "a" * 64
 EVENT = {"commit": "b" * 40, "digest": DIGEST}
 ENV = {"REPOSITORY_URL": REPO, "LOCK_TABLE": "locks", "LOCK_ID": "state-bucket/state-key",
        "IMAGE_PARAMETER": "/fleet/stage/image", "STACK": "stage", "CLUSTER": "fcvm-fleet",
-       "SERVICE": "fcvm-fleet-coordinator", "FAMILY": "fcvm-fleet-coordinator"}
+       "SERVICE": "fcvm-fleet-coordinator", "FAMILY": "fcvm-fleet-coordinator",
+       "LANE_PARAMETER": "/fleet/stage/lambda-image"}
 
 
 class AWS:
@@ -467,6 +468,18 @@ class LaneReleaseTests(unittest.TestCase):
             self.run_release({**EVENT, "lambda_digest": LANE})
         self.assertEqual((self.aws.arn, self.aws.image, self.aws.lane_pointer), (OLD, before, "none"))
         self.assertEqual(writes.count(LANE_ENV["LANE_PARAMETER"]), 2)
+        # The lane pointer is restored before the image pointer: if that restore fails too, nothing is left ahead.
+        rollback = writes[writes.index(ENV["IMAGE_PARAMETER"], writes.index(LANE_ENV["LANE_PARAMETER"])) + 1:]
+        self.assertEqual(rollback[:2], [LANE_ENV["LANE_PARAMETER"], ENV["IMAGE_PARAMETER"]])
+
+    def test_a_release_without_a_lane_still_refuses_a_lane_pointer_ahead_of_the_task(self):
+        # A pointer left ahead (a Lambda that died between its two pointer writes) would make the next Terraform
+        # apply change the lane unasked: every release refuses it, not only one that carries a lane.
+        self.aws.lane_pointer = LANE_URL + "@" + LANE
+        with self.assertRaises(release.Refused) as refused:
+            self.run_release(EVENT)
+        self.assertEqual(refused.exception.code, "lane-pointer-mismatch")
+        self.assertEqual((self.aws.calls, self.aws.arn), (["lock", "unlock"], OLD))
 
     def test_the_same_lane_and_image_are_unchanged_and_write_nothing(self):
         self.aws.image = REPO + "@" + DIGEST
