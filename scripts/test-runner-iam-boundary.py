@@ -173,7 +173,7 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
     def test_controller_wildcard_allow_contains_no_mutating_ec2_actions(self):
         for item in statements(self.controller):
             if re.search(r'Effect\s*=\s*"Allow"', item) and re.search(r'Resource\s*=\s*"\*"', item):
-                self.assertEqual(actions(item), {'ec2:DescribeImages', 'ec2:DescribeInstances'})
+                self.assertEqual(actions(item), {'ec2:DescribeImages', 'ec2:DescribeInstances', 'ec2:DescribeSnapshots'})
         self.assertIn('["pat", "user-data"]', self.controller)
         self.assertNotIn('parameter/github-runner/*', self.controller)
         self.assertNotIn('arn:aws:logs:*:*:*', self.controller)

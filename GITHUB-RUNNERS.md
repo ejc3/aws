@@ -387,7 +387,9 @@ mean the row was lost rather than never written; drains runners past the 12h sof
 `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray `ami-builder-temp` instances older than
 2 hours (pure EC2, no PAT); deregisters runner images the builder never published
 (`Purpose=github-runner-candidate` or `github-runner-failed`) a day after their creation,
-with their snapshots, at most three per poll, and never an image tagged `github-runner`; reaps launches still `pending` after 15 minutes; and counts
+with their snapshots, at most three per poll, and never an image tagged `github-runner`; deletes
+runner image snapshots older than a day that no image names any more (a delete refused after its
+image was deregistered), also at most three per poll; reaps launches still `pending` after 15 minutes; and counts
 GitHub's queued jobs to launch what the queue actually needs. GitHub doesn't redeliver
 webhooks, so this poll is the retry, and it passes the per-architecture queued count along
 so the decision record has the demand side too.

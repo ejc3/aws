@@ -75,11 +75,14 @@ class FakeEC2:
     def __init__(self, instances=(), run_instances_errors=None, terminate_error=None,
                  lookup_error=None, journal=None, create_tags_error=None,
                  create_tags_reject_keys=None, images=(), deregister_error=None,
-                 delete_snapshot_error=None):
+                 delete_snapshot_error=None, snapshots=()):
         self.instances = list(instances)
         # The image records a tag:Purpose lookup for unpublished runner images returns (the
         # cleanup function's prune). Every other DescribeImages keeps the one launch image.
+        # Also every image of the account, for a DescribeImages with no filter at all.
         self.images = list(images)
+        # The snapshots a DescribeSnapshots returns.
+        self.snapshots = list(snapshots)
         self.deregister_error = deregister_error
         self.delete_snapshot_error = delete_snapshot_error
         self.run_instances_errors = run_instances_errors or {}
@@ -133,14 +136,19 @@ class FakeEC2:
     def describe_images(self, **kw):
         self.calls.append(("describe_images", kw))
         purposes = [v for f in kw.get("Filters", []) if f["Name"] == "tag:Purpose" for v in f["Values"]]
-        if "github-runner-candidate" in purposes:
+        if "github-runner-candidate" in purposes or not kw.get("Filters"):
             return {"Images": list(self.images)}
         return {"Images": [{"ImageId": "ami-test", "CreationDate": "2026-08-01T00:00:00Z"}]}
+
+    def describe_snapshots(self, **kw):
+        self.calls.append(("describe_snapshots", kw))
+        return {"Snapshots": list(self.snapshots)}
 
     def deregister_image(self, **kw):
         self.calls.append(("deregister_image", kw))
         if self.deregister_error:
             raise self.deregister_error
+        self.images = [image for image in self.images if image["ImageId"] != kw["ImageId"]]
         return {}
 
     def delete_snapshot(self, **kw):
@@ -3070,7 +3078,55 @@ def case_unpublished_runner_images_are_pruned_after_a_day_and_published_ones_nev
     assert order == ["deregister_image", "delete_snapshot", "deregister_image", "delete_snapshot",
                      "deregister_image"], order
     assert result == {"deregistered": ["ami-old-candidate", "ami-old-failed", "ami-failed-without-snapshot"],
-                      "snapshots_deleted": ["snap-old-candidate", "snap-old-failed"], "errors": 0}, result
+                      "snapshots_deleted": ["snap-old-candidate", "snap-old-failed"],
+                      "orphan_snapshots_deleted": [], "errors": 0}, result
+
+
+def runner_snapshot(snapshot_id, age_hours, purpose="github-runner"):
+    """One DescribeSnapshots record of a runner image's snapshot."""
+    return {"SnapshotId": snapshot_id, "StartTime": NOW - timedelta(hours=age_hours),
+            "Tags": [{"Key": "Purpose", "Value": purpose}]}
+
+
+def case_a_snapshot_whose_delete_was_refused_is_collected_on_a_later_poll():
+    """DeleteSnapshot refused after DeregisterImage leaves a snapshot no image leads to. The
+    next poll finds it by its tag and deletes it; the poll that failed does not ask twice."""
+    ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")],
+                  snapshots=[runner_snapshot("snap-old", 48)],
+                  delete_snapshot_error=FakeClientError("RequestLimitExceeded"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert first["deregistered"] == ["ami-old"] and first["errors"] == 1, first
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == ["snap-old"], ec2.calls
+
+    ec2.delete_snapshot_error = None
+    ec2.calls.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        second = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert second == {"deregistered": [], "snapshots_deleted": [],
+                      "orphan_snapshots_deleted": ["snap-old"], "errors": 0}, second
+    listing = next(kw for name, kw in ec2.calls if name == "describe_snapshots")
+    assert listing == {"OwnerIds": ["self"],
+                       "Filters": [{"Name": "tag:Purpose", "Values": ["github-runner"]}]}, listing
+
+
+def case_only_old_unreferenced_runner_snapshots_are_orphans_and_a_poll_deletes_a_bounded_number():
+    """A snapshot some image names is in use, published or not. A young one may belong to an
+    image still being created. One with another tag is not a runner image's, whatever the
+    listing returned."""
+    ec2 = FakeEC2(
+        images=[runner_image("ami-published", "github-runner", 300, "snap-published"),
+                runner_image("ami-new-candidate", "github-runner-candidate", 1, "snap-candidate")],
+        snapshots=[runner_snapshot("snap-published", 300), runner_snapshot("snap-candidate", 1),
+                   runner_snapshot("snap-young-orphan", 23), runner_snapshot("snap-other", 300, "backup")]
+        + [runner_snapshot(f"snap-orphan-{n}", 30 + n) for n in range(5)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert result == {"deregistered": [], "snapshots_deleted": [],
+                      "orphan_snapshots_deleted": ["snap-orphan-0", "snap-orphan-1", "snap-orphan-2"],
+                      "errors": 0}, result
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == [
+        "snap-orphan-0", "snap-orphan-1", "snap-orphan-2"], ec2.calls
 
 
 def case_one_poll_prunes_a_bounded_number_of_images():

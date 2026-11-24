@@ -1665,8 +1665,9 @@ resource "aws_iam_role_policy" "runner_lambda" {
         ]])
       },
       {
+        # DescribeSnapshots: the cleanup function looks for snapshots of runner images that no longer exist.
         Effect   = "Allow"
-        Action   = ["ec2:DescribeImages", "ec2:DescribeInstances"]
+        Action   = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeSnapshots"]
         Resource = "*"
       },
       {
@@ -1784,9 +1785,9 @@ resource "aws_iam_role_policy" "runner_lambda" {
         }
       },
       {
-        # The snapshot of a pruned image. The builder tags every runner image's snapshot Purpose=github-runner,
-        # published or not, and EC2 refuses to delete a snapshot a registered image uses, so this removes the
-        # snapshot of an image that is already gone and no other.
+        # The snapshot of a pruned image, at once or on a later poll as an orphan. The builder tags every runner
+        # image's snapshot Purpose=github-runner, published or not, and EC2 refuses to delete a snapshot a
+        # registered image uses, so this removes the snapshot of an image that is already gone and no other.
         Sid      = "DeletePrunedRunnerImageSnapshot"
         Effect   = "Allow"
         Action   = "ec2:DeleteSnapshot"
@@ -3733,11 +3734,13 @@ data "archive_file" "runner_cleanup" {
       # record, whatever the filter returned, and IAM allows DeregisterImage on the two unpublished values only.
       UNPUBLISHED_IMAGE_PURPOSES = ('github-runner-candidate', 'github-runner-failed')
       UNPUBLISHED_IMAGE_MAX_AGE_HOURS = 24
-      # Each image costs up to three bounded calls; the rest wait for the next poll.
+      # Each image costs up to three bounded calls; the rest wait for the next poll. The same bound holds for
+      # the orphan snapshots below.
       UNPUBLISHED_IMAGE_PRUNES_PER_POLL = 3
 
       def prune_unpublished_runner_images(now):
-          result = {'deregistered': [], 'snapshots_deleted': [], 'errors': 0}
+          result = {'deregistered': [], 'snapshots_deleted': [], 'orphan_snapshots_deleted': [], 'errors': 0}
+          attempted = set()
           client = ec2.clients[BUILDER_REGION]
           images = client.describe_images(Owners=['self'], Filters=[
               {'Name': 'tag:Purpose', 'Values': list(UNPUBLISHED_IMAGE_PURPOSES)}]).get('Images', [])
@@ -3757,16 +3760,48 @@ data "archive_file" "runner_cleanup" {
                   client.deregister_image(ImageId=image_id)
                   result['deregistered'].append(image_id)
                   for snapshot in snapshots:
+                      attempted.add(snapshot)
                       try:
                           client.delete_snapshot(SnapshotId=snapshot)
                           result['snapshots_deleted'].append(snapshot)
                       except Exception as error:
-                          # The image is gone, so no later poll finds this snapshot through it.
+                          # The image is gone, so this snapshot is no longer found through it. The orphan
+                          # pass below finds it by its tag on a later poll.
                           result['errors'] += 1
                           print(f'IMAGE PRUNE LEFT SNAPSHOT {snapshot} of {image_id}: {type(error).__name__}')
               except Exception as error:
                   result['errors'] += 1
                   print(f'IMAGE PRUNE FAILED for {image_id}: {type(error).__name__}')
+
+          # Orphans: a snapshot whose delete failed after its image was deregistered, on this poll or any
+          # earlier one, has no image left to lead to it. It is one that carries the runner image tag (read
+          # from the record again), is at least a day old, and that no image of this account names. A day
+          # also keeps this away from an image still being created, whose record names no snapshot yet. A
+          # snapshot an image does use is never asked for, and EC2 would refuse it.
+          try:
+              old = []
+              for snapshot in client.describe_snapshots(OwnerIds=['self'], Filters=[
+                      {'Name': 'tag:Purpose', 'Values': ['github-runner']}]).get('Snapshots', []):
+                  tags = {tag.get('Key'): tag.get('Value') for tag in snapshot.get('Tags', [])}
+                  if tags.get('Purpose') != 'github-runner' or snapshot.get('SnapshotId') in attempted:
+                      continue
+                  if (now - snapshot['StartTime']).total_seconds() >= UNPUBLISHED_IMAGE_MAX_AGE_HOURS * 3600:
+                      old.append(snapshot['SnapshotId'])
+              if old:
+                  in_use = {mapping['Ebs']['SnapshotId']
+                            for image in client.describe_images(Owners=['self']).get('Images', [])
+                            for mapping in image.get('BlockDeviceMappings', [])
+                            if isinstance(mapping.get('Ebs'), dict) and mapping['Ebs'].get('SnapshotId')}
+                  for snapshot in sorted(old):
+                      if snapshot in in_use:
+                          continue
+                      if len(result['orphan_snapshots_deleted']) >= UNPUBLISHED_IMAGE_PRUNES_PER_POLL:
+                          break
+                      client.delete_snapshot(SnapshotId=snapshot)
+                      result['orphan_snapshots_deleted'].append(snapshot)
+          except Exception as error:
+              result['errors'] += 1
+              print(f'ORPHAN SNAPSHOT PRUNE FAILED: {type(error).__name__}')
           return result
 
       def handler(event, context):
@@ -4379,7 +4414,7 @@ data "archive_file" "runner_cleanup" {
               image_prune = prune_unpublished_runner_images(now)
           except Exception as error:
               print(f'IMAGE PRUNE FAILED: {type(error).__name__}')
-              image_prune = {'deregistered': [], 'snapshots_deleted': [], 'errors': 1}
+              image_prune = {'deregistered': [], 'snapshots_deleted': [], 'orphan_snapshots_deleted': [], 'errors': 1}
           print(json.dumps({'event': 'runner_image_prune', **image_prune}))
 
           # Phase 5: Reap launches that never came up
