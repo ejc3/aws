@@ -118,9 +118,11 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Action   = "ec2:RunInstances"
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
         Condition = {
+          # One builder type per runner image: c7gd.8xlarge builds the arm64 image and c5d.9xlarge the x86_64 one
+          # (AMI_ARCH in ejc3/fcvm scripts/build-ami.sh). Both have the local NVMe the host kernel build runs on.
           StringEquals = {
             "aws:RequestTag/Name"    = "ami-builder-temp"
-            "ec2:InstanceType"       = "c7gd.8xlarge"
+            "ec2:InstanceType"       = ["c7gd.8xlarge", "c5d.9xlarge"]
             "ec2:MetadataHttpTokens" = "required"
           }
           NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = "1" }

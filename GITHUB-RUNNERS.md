@@ -41,7 +41,7 @@ The trust chain:
   the owner may approve publishing the image used by future shared runners.
 - **Permissions:** Canonical Ubuntu images; the isolated runner subnet/security
   group; tagged builder instances, volumes and ENIs; image creation from those
-  builders; c7gd.8xlarge with IMDSv2 and encrypted 40 GiB gp3 root; `PassRole` only on `ami-builder-role` and
+  builders; c7gd.8xlarge (the arm64 image) or c5d.9xlarge (the x86_64 image) with IMDSv2 and encrypted 40 GiB gp3 root; `PassRole` only on `ami-builder-role` and
   only to EC2. It cannot mutate IAM, assume another role, read state/SSM parameters/
   Secrets Manager payloads, or launch the administrator profile.
 - **Builder host** `ami-builder-profile`: SSM agent connectivity and progress tags,

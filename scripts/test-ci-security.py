@@ -80,7 +80,9 @@ class CISecurityTests(unittest.TestCase):
         self.assertNotIn('"ssm:SendCommand"', policy)
         self.assertIn('"ssm:GetCommandInvocation"', policy.split('NeverChangeIdentityOrReadReusableCredentials')[1])
         self.assertIn('"ec2:InstanceType"', policy)
-        self.assertIn('"c7gd.8xlarge"', policy)
+        # exactly the two builder types, one per runner image architecture
+        self.assertRegex(policy, r'"ec2:InstanceType"\s+= \["c7gd\.8xlarge", "c5d\.9xlarge"\]\n')
+        self.assertEqual(policy.count('"ec2:InstanceType"'), 1)
         self.assertIn('"ec2:Encrypted"', policy)
         self.assertIn('"ec2:MetadataHttpTokens"', policy)
         self.assertIn('"ec2:MetadataHttpPutResponseHopLimit"', policy)
