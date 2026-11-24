@@ -1512,10 +1512,25 @@ Available if a task needs them; neither needs a key on disk.
 - **run.cloud** (cloud iOS simulators: create one, install a simulator build, tap, type,
   screenshot, read the pasteboard). The fallback when every Mac simulator is busy.
   `run-cloud/api-key` in us-west-1, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same
-  admin/dev-role read boundary as ElevenLabs. Fetch it at use time as `RUN_CLOUD_API_KEY`
+  admin/dev-role read boundary as ElevenLabs plus the reaper's role (next bullet). Fetch it at use time as `RUN_CLOUD_API_KEY`
   (with `RUN_CLOUD_API_URL=https://api.run.cloud`) for the `runcloud` CLI or `@run-cloud/sdk`.
   Billed per active simulator minute: give each session an inactivity and a hard timeout,
   and delete it when done. Terraform owns only the container and grants.
+- **The run.cloud reaper** (`run-cloud-reaper.tf`, `scripts/run-cloud-reaper.py`): the Lambda `run-cloud-reaper` runs every 5
+  minutes, reads that key, lists the account's active iOS and Android sessions, sandboxes and boxes, and deletes an active
+  session or a running, non-persistent sandbox that has no inactivity and no hard timeout or one over its cap (once it is 5 minutes
+  old), that has been idle 10 minutes, or that is older than 60 minutes (a sandbox: its current run) whatever its timeouts. The
+  caps are those same 10 minutes (inactivity timeout, a sandbox's idle pause) and 60 minutes (hard timeout, a sandbox's lifetime);
+  all three numbers are Terraform variables (`run_cloud_reaper_*`). Only sandboxes report last activity: a simulator session does
+  not, so for simulators the idle rule is age (run.cloud's own inactivity timer, which the cap keeps at 10 minutes or less, plus the
+  60-minute rule). It never deletes a session or sandbox with the run.cloud tag `keep=true` (`tags` on create in the SDK;
+  `runcloud sandbox create --tag keep=true`), a persistent sandbox (idle pause 0
+  or no lifetime limit: `--persistent`, `--expose`), one behind a box, or a sandbox that is not running; persistent ones and boxes
+  are logged on every run. Each run logs one JSON line per session (log group `/aws/lambda/run-cloud-reaper`) and publishes
+  `SessionsReaped` and `ActiveSessions` in namespace `RunCloud`; a failed delete is retried by the next run. Its role reads that one
+  secret, writes its own log group and publishes its own namespace, nothing else. Alarms (cost-alerts): two failed runs in 15
+  minutes, or no run for 15. `aws lambda invoke --function-name run-cloud-reaper --payload '{"dry_run": true}'
+  --cli-binary-format raw-in-base64-out /dev/stdout` shows the decisions without deleting anything.
 
 - **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
   uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as

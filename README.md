@@ -404,6 +404,12 @@ read -rs T; printf '{"RUN_CLOUD_API_KEY":"%s"}' "$T" | aws secretsmanager put-se
   --region us-west-1 --secret-id run-cloud/api-key --secret-string file:///dev/stdin; unset T
 ```
 
+The `run-cloud-reaper` Lambda (`run-cloud-reaper.tf`) also reads that key, every 5 minutes, and deletes the run.cloud
+simulator sessions and running non-persistent sandboxes left running: no inactivity and no hard timeout or one over its
+cap (after 5 minutes), idle for 10 minutes (sandboxes only report activity, so for simulators it goes by age), or older
+than 60 minutes, whatever its timeouts. Anything tagged `keep=true`, persistent sandboxes and boxes are never deleted. The
+three numbers are the `run_cloud_reaper_*` variables; `{"dry_run": true}` shows the decisions without deleting.
+
 The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
 as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
 session, not an official API key. Terraform manages only its empty container and grants;
