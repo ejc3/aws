@@ -825,6 +825,23 @@ fallback_order() {
   done | sort -s -t' ' -k1,1nr
 }
 
+# Run on a new box: print its kernel, with a warning when the release lacks Linux 25ae123db10b. Before that commit the
+# kernel runs one rcu_barrier() per dying bridge under a single RTNL hold, so fcvm VMs stopping together stall every
+# network operation on the box for seconds and numbers measured there are wrong (ejc3/fcvm#1563). The fix is in 6.18.60
+# and later 6.18 releases, in 7.2 and later, and in Ubuntu's AWS 7.0 kernel from 7.0.0-1017 (its changelog lists the
+# commit); every other release, and one this cannot parse, gets the warning. A box runs the kernel of its image
+# (ohio-pbox.tf, pbox-fallback.tf): this only reports, it does not reboot. Single-quoted: it expands on the box.
+# shellcheck disable=SC2016
+KERNEL_CHECK='k=$(uname -r); v=${k%%-*}; a=${v%%.*}; r=${v#*.}; b=${r%%.*}; c=${r#*.}; n=${k#7.0.0-}; n=${n%-aws}
+  case "$a$b$c" in *[!0-9]*|"") a=0; b=0; c=0 ;; esac
+  case "$n" in *[!0-9]*|"") n=0 ;; esac
+  if [ "$a" -gt 7 ] || { [ "$a" -eq 7 ] && [ "$b" -ge 2 ]; } || { [ "$a" -eq 6 ] && [ "$b" -eq 18 ] && [ "$c" -ge 60 ]; } ||
+     { [ "$k" = "7.0.0-$n-aws" ] && [ "$n" -ge 1017 ]; }; then
+    echo "  kernel: $k"
+  else
+    echo "  kernel: $k WARNING: no bridge teardown fix (Linux 25ae123db10b); fcvm numbers measured on this kernel are not valid"
+  fi'
+
 # Run on a GPU box: wait for the boot script, then list each NVIDIA function and fail unless every one is vfio-pci's,
 # has its /dev/vfio group node, and its whole IOMMU group is usable: VFIO opens a group only when every device in it is
 # unbound or on vfio-pci, pci-stub or pcieport (a bridge), so a GPU sharing a group with the NIC or a disk would report
@@ -892,7 +909,7 @@ wait_ready() {
          -o BatchMode=yes "ubuntu@$IP" true 2>/dev/null; then
       say "Ready at $IP"
       ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
-        'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"' >&2 2>/dev/null || true
+        'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"; '"$KERNEL_CHECK" >&2 2>/dev/null || true
       if [ "$MODE" = "kvm" ]; then
         # Prepare a new box for KVM. Reusing an incumbent with --local-nvme only checks it.
         local kvm_message=""

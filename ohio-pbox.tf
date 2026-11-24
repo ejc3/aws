@@ -65,7 +65,7 @@ resource "aws_servicequotas_service_quota" "ohio_spot_standard" {
 variable "parallel_box_ami_ohio" {
   description = "Ubuntu 24.04 arm64 in us-east-2 (the same family as var.parallel_box_ami in us-west-2)"
   type        = string
-  default     = "ami-0dcc74e3bca0f40dc" # ubuntu-noble-24.04-arm64-server-20260923
+  default     = "ami-09c4af6de8b9844f6" # ubuntu-noble-24.04-arm64-server-20261120
 }
 
 # The x86_64 build of the same Ubuntu image, for the one x86 flavor (kvm-gpu-96 = g4dn.metal, pbox-flavors.tf). The launch
@@ -74,7 +74,7 @@ variable "parallel_box_ami_ohio" {
 variable "parallel_box_ami_ohio_x86" {
   description = "Ubuntu 24.04 amd64 in us-east-2 (the x86_64 build of var.parallel_box_ami_ohio), for x86 pbox flavors"
   type        = string
-  default     = "ami-0fa99aa8f97f9e30b" # ubuntu-noble-24.04-amd64-server-20260923
+  default     = "ami-09cdee81def788c75" # ubuntu-noble-24.04-amd64-server-20261120
 }
 
 # ============================================================ network

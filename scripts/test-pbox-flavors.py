@@ -317,6 +317,40 @@ class GpuQuota(unittest.TestCase):
         self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"L-3819A6DF"', tf)), 3)
 
 
+class KernelCheckRuns(unittest.TestCase):
+    """The script's KERNEL_CHECK, run with a fake uname: a release without Linux 25ae123db10b gets a warning that names
+    it, and `up` prints the line with the box's cores and work disk."""
+
+    def line(self, release):
+        script = (Path(__file__).resolve().parent / "parallel-box.sh").read_text()
+        check = re.search(r"^KERNEL_CHECK='(.*?)'$", script, re.S | re.M).group(1)
+        with tempfile.TemporaryDirectory() as root:
+            uname = Path(root) / "uname"
+            uname.write_text("#!/bin/sh\necho " + release + "\n")
+            uname.chmod(0o755)
+            out = subprocess.run(["bash", "-c", check], text=True, capture_output=True, check=True,
+                                 env={**os.environ, "PATH": root + ":" + os.environ["PATH"]})
+        return out.stdout.strip()
+
+    def test_releases_with_the_fix_print_the_kernel_alone(self):
+        for release in ("6.18.60", "6.18.61-fcvm-0123456789ab", "7.2.0", "7.3.3-fcvm-0123456789ab", "8.1.0-3-aws",
+                        "7.0.0-1017-aws", "7.0.0-1018-aws"):
+            with self.subTest(release=release):
+                self.assertEqual(self.line(release), "kernel: " + release)
+
+    def test_releases_without_the_fix_get_a_warning_naming_the_kernel(self):
+        for release in ("7.0.0-1013-aws", "7.0.0-1016-aws", "7.0.0-1018-generic", "6.14.0-1018-aws", "6.18.59", "6.19.9",
+                        "7.1.12", "6.18", "unknown"):
+            with self.subTest(release=release):
+                self.assertTrue(self.line(release).startswith("kernel: " + release + " WARNING: no bridge teardown fix"),
+                                self.line(release))
+
+    def test_up_prints_it_when_the_box_is_ready(self):
+        script = (Path(__file__).resolve().parent / "parallel-box.sh").read_text()
+        ready = script.split('say "Ready at $IP"', 1)[1].split("\n      if ", 1)[0]
+        self.assertIn("\"$KERNEL_CHECK\" >&2", ready)
+
+
 class GpuCheckRuns(unittest.TestCase):
     """The script's GPU_CHECK, run against a fake sysfs: ready only when every GPU is vfio-pci's with its group node, and
     its whole IOMMU group is unbound or vfio-pci, pci-stub or pcieport."""
