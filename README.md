@@ -1800,8 +1800,11 @@ or is at least 85% used, and stops as soon as neither holds. First it erases, la
 `Shutdown` and whose `device.plist` is 6 hours old (`xcrun simctl erase` keeps each device and its UDID, so the
 runners' named devices stay where jobs look; erasing the 32 stale ones freed about 27 GB). Then it removes entries
 of `~/Library/Developer/Xcode/DerivedData` and of `admin`'s TMPDIR that nothing has modified for 24 hours and no
-process has open, oldest first. Before every action it takes the mac-build cleanup admission lock and every slot
-lock exclusively without waiting, so it does nothing while a test command runs; it never visits `~/runners`. It
+process has open, oldest first. A simulator named for a runner (`mini-N`) is erased only while that runner has no
+job (no `Runner.Worker` under `~/runners/mini-N`, checked again just before the erase); every other simulator and
+every DerivedData entry wait while the mac-build cleanup admission lock or any slot lock is held; a temp entry needs
+only its own checks, repeated just before it goes. Until 2026-11-24 every action waited for the whole VM to be idle,
+which under steady CI never happened: the volume filled and two runners crashed (#1033). It never visits `~/runners`. It
 logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
 `/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
 
