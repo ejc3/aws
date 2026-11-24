@@ -84,7 +84,24 @@ class AccessTests(unittest.TestCase):
         self.assertNotIn("fcvm_dev_direct_stage_host", api + agents)
         self.assertNotIn("fcvm_dev_site_stage_host", api + agents)
         self.assertEqual(re.findall(r'id = cloudflare_zero_trust_access_policy\.(\w+)\.id', site),
-                         ["fcvm_dev_stage_owner", "fcvm_stage_ci"])
+                         ["fcvm_dev_stage_owner", "fcvm_stage_ci", "workers_stage_agents"])
+
+    def test_the_metal_agents_staging_token_opens_the_page_and_api_and_nothing_else(self):
+        # #1032: agents check a fleet deploy headless with the token that opens the <site>-stage Workers.
+        ref = "cloudflare_zero_trust_access_policy.workers_stage_agents.id"
+        for app in ("fcvm_dev_api_stage", "fcvm_dev_site_stage"):
+            self.assertEqual(block(f'resource "cloudflare_zero_trust_access_application" "{app}"').count(ref), 1, app)
+        self.assertNotIn(ref, block('resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent"'))
+        self.assertEqual(TF.count(ref), 2)
+        # Never on production's applications.
+        prod = (Path(__file__).resolve().parent.parent / "fcvm-dev-prod.tf").read_text()
+        self.assertNotIn("workers_stage_agents", prod)
+        # The policy admits that one service token and is not an identity rule.
+        stage = (Path(__file__).resolve().parent.parent / "workers-stage.tf").read_text()
+        pol = stage.split('resource "cloudflare_zero_trust_access_policy" "workers_stage_agents"', 1)[1].split("\n}\n", 1)[0]
+        self.assertIn('decision         = "non_identity"', pol)
+        self.assertEqual(re.findall(r"token_id = ([\w.]+)", pol),
+                         ["cloudflare_zero_trust_access_service_token.workers_stage_agents.id"])
 
     def test_the_connector_requires_an_access_token_on_every_path(self):
         cfg = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"')

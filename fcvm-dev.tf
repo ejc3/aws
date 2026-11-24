@@ -13,7 +13,9 @@
 # STAGING ONLY, behind Access, the gate created before either hostname exists (owner-only, as Lattice staging):
 #   fleet-api-stage.fcvm.dev  -> tunnel fcvm-fleet-coordinator -> the coordinator in its task (localhost:8080). The
 #                                connector requires an Access token on every path: the owner's, or at /agent the agents'
-#                                service token (its own application, so it is never a bypass).
+#                                service token (its own application, so it is never a bypass). The metal-box agents'
+#                                staging token (workers-stage-agents) opens this host and the page too, as it opens
+#                                the <site>-stage Workers (#1032); never production's.
 #   stage.fcvm.dev            -> the fcvm-fleet-stage Worker (deployed from ejc3/fcvm), gated by its owner/CI application.
 #                                Its fallback forwards /live and /poster.jpg to fleet-api-stage with its service token.
 #   fleet-api-direct-stage.fcvm.dev -> /live only, gated by the page's Access application and exact audience. Sign-in
@@ -96,6 +98,9 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_api_stage" {
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
     { id = cloudflare_zero_trust_access_policy.fcvm_fleet_stage_worker.id, precedence = 3 },
+    # The metal-box agents' staging token (workers-stage.tf), to check a fleet deploy headless as for the
+    # <site>-stage Workers (ejc3/aws#1032). Staging only: production's applications are fcvm-dev-prod.tf's.
+    { id = cloudflare_zero_trust_access_policy.workers_stage_agents.id, precedence = 4 },
   ]
 }
 
@@ -118,6 +123,8 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_site_stage" {
   policies = [
     { id = cloudflare_zero_trust_access_policy.fcvm_dev_stage_owner.id, precedence = 1 },
     { id = cloudflare_zero_trust_access_policy.fcvm_stage_ci.id, precedence = 2 },
+    # The metal-box agents' staging token, as on the API host (ejc3/aws#1032).
+    { id = cloudflare_zero_trust_access_policy.workers_stage_agents.id, precedence = 3 },
   ]
   # Eager sign-in redirects through both destinations. The new hostname must resolve
   # first; it reaches only the tunnel's 404 until this application gates its /live.
