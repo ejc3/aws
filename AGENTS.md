@@ -1919,6 +1919,22 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
   `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
   notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
+- **Host regions** (`local.fcvm_fleet_host_regions` in `fcvm-fleet.tf`; owner, 2026-11-24): one ordered list per stack
+  decides where its GPU hosts run (staging `["us-east-1", "us-west-2"]`, prod `["us-east-1"]`; prod refuses a region it
+  has no module in). Every listed region other than the publisher's compute region (us-east-1) is a copy region
+  (`fcvm-fleet-ami-release.tf`), so each build is copied there with no hand step, and gets a host template booting its
+  host copy from `/fcvm-fleet/ami-release-copies` (read with a schema postcondition and an apply-time guard, as the
+  pointer is). After each replication the publisher moves those templates onto the new copy, and back on a rollback
+  (`publish.py` `follow_copies`): an image-only version labelled for replay, outside the release's transaction; its role
+  may create versions and set defaults on exactly those templates. The coordinator is given the FIRST listed region only
+  (`local.fcvm_fleet_coordinator_host_regions`): it runs its awake hosts in every region it is given, in name order, with
+  no fallback (ejc3/fcvm#2114), so reordering the list moves the hosts; once it falls back in list order that local
+  becomes the whole list. Staging's task definition keeps that region us-east-1 until the release gate and critical
+  retirement cover another region. A newly listed region gets its template at the apply after the publisher's next replication
+  (or `replicate-active-release`); a `check` warns until then, and the coordinator's task definition refuses a first
+  region without one. Only us-east-1 yet: the release gate's placement and a critical release's retirement of old-image
+  hosts, and Windows, Minecraft and potato modes (a copy region's bootstrap and IPv4 ports serve the GPU slots and
+  phones). Prod's image release refuses copy regions until it has a copy step of its own.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile

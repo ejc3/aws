@@ -992,6 +992,38 @@ data "archive_file" "runner_webhook" {
           return ([c for c in ordered if not recently_failed(c[1], c[2])]
                   + [c for c in ordered if recently_failed(c[1], c[2])])
 
+      # Spot launches EC2 accepted moments ago: instance id -> (architecture, AZ, when).
+      # DescribeInstances is eventually consistent, so the launches of one batch may not
+      # see each other, and a pool refilled after a reclaim is exactly such a batch.
+      JUST_LAUNCHED = {}
+      JUST_LAUNCHED_SECONDS = 120
+
+      def spread_subnets(arch, subnets, instances, now):
+          """The launch subnets, the AZ holding the fewest live spot runners first.
+
+          A spot pool is one instance type in one AZ, and AWS reclaims a pool's
+          instances together. With every launch starting at the first subnet the
+          whole x86 pool sat in one AZ: on 2026-11-24 its five r5d.metal runners in
+          us-east-2a were reclaimed in the same minute, and all 13 x86 reclaims that
+          day were in that AZ while the five runners in us-east-2b ended normally.
+          Starting each launch in the emptiest AZ splits the pool, so one reclaim
+          takes the runners of one AZ. Ties keep Terraform's order, so a pool of one
+          launches where it always did, and the type order within a subnet and the
+          capacity-failure reordering in launch_candidates() are unchanged.
+          """
+          live, described = {}, set()
+          for instance in instances:
+              described.add(instance.get('InstanceId'))
+              if instance.get('State', {}).get('Name') in ('pending', 'running'):
+                  az = instance.get('Placement', {}).get('AvailabilityZone')
+                  live[az] = live.get(az, 0) + 1
+          for instance_id, (launched_arch, az, at) in list(JUST_LAUNCHED.items()):
+              if (now - at).total_seconds() > JUST_LAUNCHED_SECONDS:
+                  del JUST_LAUNCHED[instance_id]
+              elif launched_arch == arch and instance_id not in described:
+                  live[az] = live.get(az, 0) + 1
+          return sorted(subnets, key=lambda subnet: live.get(subnet[1], 0))
+
       def root_volume_initialization_rate(arch):
           """MiB/s at which EBS fills this architecture's root volume from its AMI snapshot.
 
@@ -1067,8 +1099,11 @@ data "archive_file" "runner_webhook" {
           # every retry re-picks the head of the list: on 2026-08-07 the poll
           # launched c5d.metal at 18:41, 18:46 and 18:51 and never reached
           # c5.metal, c6i.metal or m5d.metal at all.
-          recent = capacity_failures([instance for instance in describe_runner_instances(arch)
-              if (get_tag(instance, 'Market') or 'spot') == market], datetime.now(timezone.utc))
+          in_market = [instance for instance in describe_runner_instances(arch)
+              if (get_tag(instance, 'Market') or 'spot') == market]
+          if market == 'spot':
+              subnets = spread_subnets(arch, subnets, in_market, datetime.now(timezone.utc))
+          recent = capacity_failures(in_market, datetime.now(timezone.utc))
           if recent:
               pools = sorted(f'{instance_type} in {az or "an unknown AZ"}' for az, instance_type in recent)
               print(f'Recent capacity failures on {pools}, trying other pools first')
@@ -1226,6 +1261,8 @@ data "archive_file" "runner_webhook" {
               # a launch, a broker error must never launch another instance type.
               instance_id = response['Instances'][0]['InstanceId']
               ec2.owner[instance_id] = region
+              if market == 'spot':
+                  JUST_LAUNCHED[instance_id] = (arch, az, datetime.now(timezone.utc))
               print(f'Launched {instance_id} ({instance_type}) in {subnet_id} ({az or "unknown AZ"})')
               if not broker:
                   # Only the transitional, already-deployed script uses its old

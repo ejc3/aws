@@ -105,7 +105,10 @@ self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to *
 `c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
 in the us-west-1c runner subnet first and then in us-west-1a (see
 [Network posture](#network-posture)), with any type that recently failed for capacity in an
-AZ moved to the back for that AZ only. `r5d.metal` leads x86 because it has the same CPU
+AZ moved to the back for that AZ only. A spot launch starts in the runner subnet whose AZ holds
+the fewest live spot runners of its architecture (ties keep the listed order), so a pool is split
+across the AZs and one spot reclaim takes one AZ's runners: on 2026-11-24 every launch started in
+the first subnet, and five x86 runners there were reclaimed in the same minute. `r5d.metal` leads x86 because it has the same CPU
 generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, and its spot
 price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.

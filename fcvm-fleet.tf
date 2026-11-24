@@ -13,9 +13,10 @@
 #   the agents' Access service token) are fcvm-dev.tf's, written there with their values; here they are named by ARN.
 #
 # TWO GATES, both ON since ejc3/fcvm's fleet AMIs exist (built by fcvm's fleet/ami/build-ami.sh from fcvm-arm):
-# - local.fcvm_fleet_hosts_enabled: one spot GPU metal host per region that has a fleet AMI in var.fcvm_fleet_host_amis, which
-#   the coordinator launches while the fleet is awake and terminates while it sleeps. Only us-east-1 has one (and the only G
-#   spot quota), so one g4dn.metal: $4.76-5.44 an hour spot there on 2026-10-22. A region and architecture without an AMI
+# - local.fcvm_fleet_hosts_enabled: one spot GPU metal host in the first region of local.fcvm_fleet_host_regions.stage
+#   (us-east-1), which the coordinator launches while the fleet is awake and terminates while it sleeps: one g4dn.metal,
+#   $4.76-5.44 an hour spot there on 2026-10-22. The other listed regions keep a host template on the current release, which
+#   the coordinator is not given yet (local.fcvm_fleet_coordinator_host_regions). A region and architecture without an AMI
 #   gets no template.
 #   ON-DEMAND FALLBACK: when spot is refused for capacity the coordinator launches the host on demand in the same pass
 #   (modules/fcvm-fleet-region, "GPU hosts"), at most local.fcvm_fleet_on_demand_max = 2 on-demand hosts per stack
@@ -90,6 +91,31 @@ locals {
     }
   }
   fcvm_fleet_stage = local.fcvm_fleet_stacks.stage
+  # Where each stack's GPU hosts run, in order of preference: the one list to change to move them (owner, 2026-11-24:
+  # "our build should go to both naturally"). Every name must be a fleet region (local.fcvm_fleet_regions); the
+  # coordinators' task definitions refuse anything else. Tiles stay in us-east-1 whatever this says.
+  # - The image publisher's compute region (local.fcvm_ami_region, us-east-1) always keeps its host template, listed or
+  #   not: every release is published into it (fcvm-fleet-ami-pipeline.tf).
+  # - Another listed region gets a host template booting the publisher's copy of the live host image there
+  #   (fcvm-fleet-ami-release.tf: every listed region is a copy region, and its host AMI comes from the copy record),
+  #   and the publisher moves that template onto each new release's copy, and back on a rollback (publish.py,
+  #   follow_copies). A region listed for the first time gets its template at the apply after the publisher's next
+  #   replication (the next publication, or `replicate-active-release`) has recorded a copy there.
+  # - Production names only regions it has a region module in: us-east-1 (fcvm-fleet-prod.tf refuses others).
+  fcvm_fleet_host_regions = {
+    stage = ["us-east-1", "us-west-2"]
+    prod  = ["us-east-1"]
+  }
+  # The regions whose host templates and subnets each stack's coordinator is given (FLEET_HOST_TEMPLATES,
+  # FLEET_HOST_SUBNETS, and through the modules' hosts_enabled its host-launch IAM): the FIRST listed only. The
+  # coordinator runs its --awake-hosts count of hosts in every region it is given, taking the regions in name order
+  # with no fallback between them (ejc3/fcvm src/fleet/coord/hosts.rs, ejc3/fcvm#2114), so a second region would be a
+  # second awake host, not a fallback. Reordering local.fcvm_fleet_host_regions therefore moves a stack's hosts; the
+  # other listed regions' templates stay built and on the current release. Once ejc3/fcvm#2114 lets the coordinator
+  # fall back in list order, this becomes the whole list. Staging's coordinator task definition keeps this region
+  # us-east-1 while the release gate's placement and a critical release's retirement of old-image hosts cover only
+  # us-east-1 (publish.py fleet_placement, retire).
+  fcvm_fleet_coordinator_host_regions = { for stack, regions in local.fcvm_fleet_host_regions : stack => [for i, r in regions : r if i == 0] }
   # The stacks that exist: production only while its switch is on.
   fcvm_fleet_stacks_enabled = { for k, s in local.fcvm_fleet_stacks : k => s if k != "prod" || var.fcvm_fleet_prod_enabled }
   # Each stack's coordinator task role, which its scope policy is attached to.
@@ -113,12 +139,16 @@ locals {
   fcvm_fleet_on_demand_max       = 2
   fcvm_fleet_on_demand_alarm_arn = "arn:aws:cloudwatch:${local.fcvm_fleet_home_region}:${local.fcvm_fleet_account_id}:alarm:fcvm-fleet-on-demand-host-launches"
   fcvm_fleet_alert_topic_arns    = concat(module.fcvm_fleet_east2.alert_topic_arns, module.fcvm_fleet_west2.alert_topic_arns, module.fcvm_fleet_east1.alert_topic_arns)
-  # The coordinator's host launches (fcvm fleet coord, FLEET_HOST_TEMPLATES and FLEET_HOST_SUBNETS, ejc3/fcvm#1257): every
-  # region's host templates while the gate is on, and the subnets of the AZs that offer a host type. Environment, not
-  # arguments: an image from before ejc3/fcvm#1257 ignores them, where it would refuse an unknown argument and not start.
-  fcvm_fleet_host_templates = flatten([for r, m in local.fcvm_fleet_regional : [for t in m.host_template_names : "${r}:${t}"]])
-  fcvm_fleet_host_subnets = flatten([for r, m in local.fcvm_fleet_regional : [for s in m.host_subnet_ids : "${r}:${s}"]
-  if length(m.host_template_names) > 0])
+  # The coordinator's host launches (fcvm fleet coord, FLEET_HOST_TEMPLATES and FLEET_HOST_SUBNETS, ejc3/fcvm#1257): the
+  # host templates of the regions it is given (local.fcvm_fleet_coordinator_host_regions, in list order) while the gate
+  # is on, and the subnets of the AZs there that offer a host type. Environment, not arguments: an image from before
+  # ejc3/fcvm#1257 ignores them, where it would refuse an unknown argument and not start.
+  # A name that is not a fleet region is skipped here and refused by the task definition's precondition.
+  fcvm_fleet_host_templates = flatten([for r in local.fcvm_fleet_coordinator_host_regions.stage :
+  [for t in local.fcvm_fleet_regional[r].host_template_names : "${r}:${t}"] if contains(keys(local.fcvm_fleet_regional), r)])
+  fcvm_fleet_host_subnets = flatten([for r in local.fcvm_fleet_coordinator_host_regions.stage :
+    [for s in local.fcvm_fleet_regional[r].host_subnet_ids : "${r}:${s}"]
+  if contains(keys(local.fcvm_fleet_regional), r) && length(try(local.fcvm_fleet_regional[r].host_template_names, [])) > 0])
   # Whether the coordinator keeps its 8 EC2 tiles stopped between wakes and starts them at the next one (--ec2-pool,
   # ejc3/fcvm#1273) instead of launching them: a tile then reaches its first frame in about 16 s instead of 81 to 84 s.
   # Needs a coordinator image with --ec2-pool (an unknown flag stops the task). Standing cost: 8 stopped 32 GB gp3 root
@@ -164,8 +194,10 @@ locals {
   fcvm_fleet_aggregate_port     = 20300
   # The declared modes each region's security group admits over IPv4. us-east-1 admits every place (and the aggregator
   # when aggregated streaming is on): its host bootstrap is the one reviewed for starting Windows (ejc3/fcvm#1839) and
-  # Minecraft. us-east-2 and us-west-2 have no fleet host AMI, and in us-west-2 the shared group also serves independently
-  # launched lab hosts, so they admit the GPU slots only. Only these mode lists differ by region: every range is computed
+  # Minecraft. us-east-2 and us-west-2 admit the GPU slots only: their host bootstrap starts no Windows, Minecraft or potato
+  # mode (no mode image lists, ami_release_guarded off), so a host there serves the GPU slots and phones, and in us-west-2
+  # the shared group also serves independently launched lab hosts. Opening a mode there is its own reviewed change: the
+  # bootstrap and these ports together. Only these mode lists differ by region: every range is computed
   # from fcvm-fleet-published-ports.json by the one expression in fcvm_fleet_ipv4_viewer_ports, so a mode, count or base
   # fcvm changes reaches every region's group together.
   fcvm_fleet_ipv4_viewer_modes = {
@@ -512,16 +544,23 @@ resource "aws_iam_instance_profile" "fcvm_fleet_tile" {
 
 # ------------------------------------------------------------------------------------------------ the three regions
 module "fcvm_fleet_east2" {
-  fleet                     = local.fcvm_fleet_stage.fleet
-  name_prefix               = local.fcvm_fleet_stage.prefix
-  ip_options_bootstrap      = local.linux_ip_options_bootstrap
-  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  source                    = "./modules/fcvm-fleet-region"
-  providers                 = { aws = aws.fcvm_fleet }
-  cidr_block                = local.fcvm_fleet_cidrs["us-east-2"]
-  gpu_amis                  = lookup(local.fcvm_active_host_amis, "us-east-2", {})
-  tile_amis                 = lookup(local.fcvm_active_tile_amis, "us-east-2", {})
-  hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  fleet                   = local.fcvm_fleet_stage.fleet
+  name_prefix             = local.fcvm_fleet_stage.prefix
+  ip_options_bootstrap    = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256 = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+  source                  = "./modules/fcvm-fleet-region"
+  providers               = { aws = aws.fcvm_fleet }
+  cidr_block              = local.fcvm_fleet_cidrs["us-east-2"]
+  # While local.fcvm_fleet_host_regions.stage lists this region, the publisher's copy of the live host image here
+  # (fcvm-fleet-ami-release.tf), which the publisher moves this host template onto after each release; no host template
+  # otherwise. A plan made before the copy record last changed is refused at apply.
+  gpu_amis                      = local.fcvm_fleet_host_amis["us-east-2"]
+  ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_ami_copies_guard[*].version)
+  tile_amis                     = lookup(local.fcvm_active_tile_amis, "us-east-2", {})
+  hosts_enabled                 = local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-2")
+  # The fleet's one alert topic stays in us-east-1 (module.fcvm_fleet_east1), beside the host template the publisher always
+  # releases into; a host template here must not add a second topic and email subscription.
+  alert_topic               = false
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
@@ -535,16 +574,23 @@ module "fcvm_fleet_east2" {
 }
 
 module "fcvm_fleet_west2" {
-  fleet                     = local.fcvm_fleet_stage.fleet
-  name_prefix               = local.fcvm_fleet_stage.prefix
-  ip_options_bootstrap      = local.linux_ip_options_bootstrap
-  ip_options_guard_sha256   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
-  source                    = "./modules/fcvm-fleet-region"
-  providers                 = { aws = aws.fcvm_fleet_west2 }
-  cidr_block                = local.fcvm_fleet_cidrs["us-west-2"]
-  gpu_amis                  = lookup(local.fcvm_active_host_amis, "us-west-2", {})
-  tile_amis                 = lookup(local.fcvm_active_tile_amis, "us-west-2", {})
-  hosts_enabled             = local.fcvm_fleet_hosts_enabled
+  fleet                   = local.fcvm_fleet_stage.fleet
+  name_prefix             = local.fcvm_fleet_stage.prefix
+  ip_options_bootstrap    = local.linux_ip_options_bootstrap
+  ip_options_guard_sha256 = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+  source                  = "./modules/fcvm-fleet-region"
+  providers               = { aws = aws.fcvm_fleet_west2 }
+  cidr_block              = local.fcvm_fleet_cidrs["us-west-2"]
+  # While local.fcvm_fleet_host_regions.stage lists this region, the publisher's copy of the live host image here
+  # (fcvm-fleet-ami-release.tf), which the publisher moves this host template onto after each release; no host template
+  # otherwise. A plan made before the copy record last changed is refused at apply.
+  gpu_amis                      = local.fcvm_fleet_host_amis["us-west-2"]
+  ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_ami_copies_guard[*].version)
+  tile_amis                     = lookup(local.fcvm_active_tile_amis, "us-west-2", {})
+  hosts_enabled                 = local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-west-2")
+  # The fleet's one alert topic stays in us-east-1 (module.fcvm_fleet_east1), beside the host template the publisher always
+  # releases into; a host template here must not add a second topic and email subscription.
+  alert_topic               = false
   alert_email               = local.browser_manager_owner
   host_agent_args           = local.fcvm_fleet_host_agent_args
   tile_tls_secret           = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
@@ -565,11 +611,11 @@ module "fcvm_fleet_east1" {
   source                        = "./modules/fcvm-fleet-region"
   providers                     = { aws = aws.fcvm_fleet_east1 }
   cidr_block                    = local.fcvm_fleet_cidrs["us-east-1"]
-  gpu_amis                      = lookup(local.fcvm_active_host_amis, "us-east-1", {})
+  gpu_amis                      = local.fcvm_fleet_host_amis["us-east-1"]
   tile_amis                     = lookup(local.fcvm_active_tile_amis, "us-east-1", {})
   ami_release_guarded           = var.fcvm_ami_pipeline_enabled
   ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_ami_release_guard[*].version)
-  hosts_enabled                 = local.fcvm_fleet_hosts_enabled
+  hosts_enabled                 = local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")
   alert_email                   = local.browser_manager_owner
   host_agent_args               = local.fcvm_fleet_host_agent_args
   tile_tls_secret               = data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name
@@ -1424,6 +1470,26 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         nonsensitive(aws_ssm_parameter.fcvm_coordinator_lane.value),
       ))
       error_message = "The coordinator's lane must be none or an immutable digest in staging's own lane repository."
+    }
+    precondition {
+      condition = (
+        length(local.fcvm_fleet_host_regions.stage) > 0
+        && length(distinct(local.fcvm_fleet_host_regions.stage)) == length(local.fcvm_fleet_host_regions.stage)
+        && alltrue([for r in local.fcvm_fleet_host_regions.stage : contains(local.fcvm_fleet_regions, r)])
+      )
+      error_message = "local.fcvm_fleet_host_regions.stage must name fleet regions (local.fcvm_fleet_regions), each once."
+    }
+    # A coordinator given no host template runs no GPU host at all. A newly listed region gets its template once the
+    # publisher has recorded its copy of the live host image there, so it goes first only after that apply.
+    precondition {
+      condition     = !local.fcvm_fleet_hosts_enabled || length(local.fcvm_fleet_host_templates) > 0
+      error_message = "The first region in local.fcvm_fleet_host_regions.stage has no host template yet: list it second, let the publisher record its copy (the next publication or replicate-active-release), apply, then move it first."
+    }
+    # The release gate reads the hosts of the publisher's compute region only, and a critical release retires old-image
+    # hosts there only (publish.py fleet_placement, retire): a host elsewhere would be neither verified nor reclaimed.
+    precondition {
+      condition     = alltrue([for r in local.fcvm_fleet_coordinator_host_regions.stage : r == local.fcvm_ami_region])
+      error_message = "Staging's GPU hosts stay in us-east-1 (first in local.fcvm_fleet_host_regions.stage) until the release gate's placement and a critical release's retirement of old-image hosts cover another region."
     }
   }
 }
