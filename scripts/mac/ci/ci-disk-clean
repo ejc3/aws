@@ -12,14 +12,17 @@ or is at least 85% used, and stops as soon as neither holds. In order:
 
 What each action must first establish, without waiting:
 
-  - a simulator whose name names a runner (mini-N, as the runners name theirs): that runner has no job, no
-    Runner.Worker process under ~/runners/mini-N. Only that runner's jobs use its devices, so the other runners
-    may be busy. A busy runner's device is skipped and the run goes on. (Until 2026-11-24 every erase waited for
+  - a simulator whose name names a runner (mini-N, as the runners name theirs) that is known to be running here
+    (~/runners/mini-N/.runner, and its Runner.Listener in ps): that runner has no job, no Runner.Worker process
+    under its folder, checked again just before the erase. Only that runner's jobs use its devices, so the other
+    runners may be busy. A busy runner's device is skipped and the run goes on. A name whose runner cannot be
+    found that way (another folder, a renamed runner, "iPhone 13 mini-2") falls back to the guard below. (Until 2026-11-24 every erase waited for
     the whole VM to be idle; under steady CI that never happened, the volume filled, two runners crashed and
     one failed to code sign: #1033.)
-  - any other simulator, and a DerivedData entry (a new build reuses its project's folder): the cleanup
-    admission lock and every mac-build slot lock, exclusively. A test command holds the admission lock (shared)
-    for its whole life, so if any is held the run stops there.
+  - any other simulator, and a DerivedData entry: the cleanup admission lock and every mac-build slot lock,
+    exclusively. A test command holds the admission lock (shared) for its whole life, so while any is held that
+    entry waits for a later run and the run goes on. (Only test commands take those locks, so for DerivedData this
+    excludes tests, not builds; the 24-hour age is what protects a build's folder.)
   - a temp entry: nothing more than its own checks, repeated just before it goes: untouched for 24 hours and
     open in no process. No job picks up a day-old temp entry.
 
@@ -62,22 +65,29 @@ class RunnerBusy(Exception):
     """The runner a simulator belongs to is running a job (or its jobs cannot be read)."""
 
 
-def runner_busy(home, runner):
-    """Whether runner mini-N runs a job: a Runner.Worker under ~/runners/mini-N. Unreadable counts as busy."""
+def runner_state(home, runner):
+    """"idle" or "busy" for a runner known to run here (its .runner file and its Runner.Listener in ps, under the
+    folder's own path or its resolved one), else "unknown". An unreadable process list counts as busy."""
+    folder = home / "runners" / f"mini-{runner}"
+    if not (folder / ".runner").is_file():
+        return "unknown"
     try:
         out = subprocess.run([PS, "-axww", "-o", "command="], stdin=subprocess.DEVNULL, capture_output=True,
-                             text=True, timeout=30)
+                             text=True, errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
-        return True
+        return "busy"
     if out.returncode != 0 or not out.stdout.strip():
-        return True
-    prefix = str(home / "runners" / f"mini-{runner}") + "/"
-    return any("Runner.Worker" in line and prefix in line for line in out.stdout.splitlines())
+        return "busy"
+    prefixes = {str(folder) + "/", os.path.realpath(folder) + "/"}
+    mine = [line for line in out.stdout.splitlines() if any(prefix in line for prefix in prefixes)]
+    if any("Runner.Worker" in line for line in mine):
+        return "busy"
+    return "idle" if any("Runner.Listener" in line for line in mine) else "unknown"
 
 
 @contextlib.contextmanager
 def runner_idle(home, runner):
-    if runner_busy(home, runner):
+    if runner_state(home, runner) != "idle":
         raise RunnerBusy()
     yield
 
@@ -167,10 +177,15 @@ def device_states():
             for runtime in listing["devices"].values() for d in runtime}
 
 
-def guard(home, name):
-    """The guard one simulator's erase needs: its runner idle when its name names one, else no job at all."""
+def runner_of(home, name):
+    """The runner a simulator belongs to, when its name names one that is known to run here."""
     match = RUNNER.search(name)
-    return runner_idle(home, match.group(1)) if match else no_jobs(home)
+    return match.group(1) if match and runner_state(home, match.group(1)) != "unknown" else None
+
+
+def guard(home, runner):
+    """The guard one simulator's erase needs: its runner idle when it has one, else no job at all."""
+    return runner_idle(home, runner) if runner else no_jobs(home)
 
 
 def stale(devices, udid, cutoff):
@@ -199,11 +214,14 @@ def erase_simulators(home, device, now, apply, stats, short):
         if not apply:
             stats.add("simulators", before)
             continue
+        runner = runner_of(home, name)
         try:
-            with guard(home, name):
+            with guard(home, runner):
                 # Checked again under the guard: a job may have booted or used it since the listing.
                 if device_states().get(udid, (None,))[0] != "Shutdown" or not stale(devices, udid, cutoff):
                     continue
+                if runner and runner_state(home, runner) != "idle":
+                    raise RunnerBusy()  # a job started since: checked last, just before the erase
                 if simctl("erase", udid, check=False).returncode != 0:
                     stats.failed += 1
                     continue
@@ -298,8 +316,12 @@ def age_out_caches(home, now, apply, stats, short):
         # A temp entry needs only its own checks, repeated here; DerivedData waits for no job at all.
         try:
             with (no_jobs(home) if kind == "derived_data" else contextlib.nullcontext()):
-                if kind != "derived_data" and in_use(path, open_paths()):
-                    continue
+                if kind != "derived_data":
+                    # Without the locks, the open-file check is repeated, from a listing at most 10 seconds old.
+                    if time.monotonic() - listed > 10:
+                        opened, listed = open_paths(), time.monotonic()
+                    if in_use(path, opened):
+                        continue
                 try:
                     size, newest = tree(path, device)
                 except FileNotFoundError:
@@ -354,9 +376,14 @@ def clean(home, apply, now=None):
         result["status"] = "enough room"
     elif not short():
         result["status"] = "enough room"
-    elif stats.waiting:
-        # What needs the whole VM idle waits for a later run; everything else was done.
-        result["status"] = f"a mac-build job holds a slot; {stats.waiting} entries wait"
+    elif stats.waiting or stats.busy:
+        # What needs the whole VM idle, or a busy runner idle, waits for a later run; everything else was done.
+        waiting = []
+        if stats.waiting:
+            waiting.append(f"a mac-build job holds a slot; {stats.waiting} entries wait")
+        if stats.busy:
+            waiting.append(f"{stats.busy} simulators wait for their runners")
+        result["status"] = "; ".join(waiting)
     else:
         result["status"] = "nothing more to clean"
     return result

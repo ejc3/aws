@@ -98,6 +98,13 @@ class Cleaner(unittest.TestCase):
         self.devices.mkdir(parents=True)
         self.work = self.home / "runners/mini-1/_work"
         self.blob(self.work / "checkout/big", 2)
+        # Four registered runners, each with its service and Runner.Listener running, as on the VM: idle, not absent.
+        listeners = []
+        for n in range(1, 5):
+            (self.home / f"runners/mini-{n}").mkdir(parents=True, exist_ok=True)
+            (self.home / f"runners/mini-{n}/.runner").write_text("{}")
+            listeners.append(f"/bin/bash {self.home}/runners/mini-{n}/runsvc.sh")
+            listeners.append(f"{self.home}/runners/mini-{n}/bin/Runner.Listener run --startuptype service")
         self.sims, self.calls = self.root / "sims.json", self.root / "calls"
         self.sims.write_text("{}")
         self.calls.touch()
@@ -110,7 +117,7 @@ class Cleaner(unittest.TestCase):
                     "FAKE_PS_FAIL"):
             os.environ.pop(key, None)
         os.environ.update(HOME=str(self.home), TMPDIR=str(self.tmp), FAKE_SIMS=str(self.sims),
-                          FAKE_CALLS=str(self.calls))
+                          FAKE_CALLS=str(self.calls), FAKE_PS=";".join(listeners))
         self.m = load()
         self.m.XCRUN, self.m.LSOF, self.m.PS = str(self.root / "xcrun"), str(self.root / "lsof"), str(self.root / "ps")
         self.m.GETCONF = str(self.root / "no-getconf")  # not on Linux: the cleaner falls back to TMPDIR
@@ -293,31 +300,61 @@ class Cleaner(unittest.TestCase):
     def test_a_held_mac_build_lock_stops_derived_data_and_unnamed_simulators_only(self):
         # A runner's own devices need only that runner idle, and temp entries only their own checks; DerivedData and
         # a device no runner is named in still wait for no job at all.
-        self.sim(1, "Shutdown", 2, 12)                                 # runner mini-1's, which is idle
-        self.sim(2, "Shutdown", 3, 12, name="GWW UI 45120901896-1-ui")  # no runner named: waits
-        self.blob(self.derived / "Old-abc/Build/x", 1)
-        self.blob(self.tmp / "old-file", 1)
         admission = self.home / ".local/state/mac-build/admission.lock"
         slot = self.home / ".local/state/sim-slots/mac-build/slot.2"
-        for path, mode in ((admission, fcntl.LOCK_SH), (slot, fcntl.LOCK_EX)):
+        for n, (path, mode) in enumerate(((admission, fcntl.LOCK_SH), (slot, fcntl.LOCK_EX)), start=1):
             with self.subTest(lock=path.name):
+                named, unnamed = 10 * n + 1, 10 * n + 2
+                self.sim(named, "Shutdown", 2, 12, name="Dolphin Maps CI mini-1: iPhone 17")  # mini-1 is idle
+                self.sim(unnamed, "Shutdown", 3, 12, name="GWW UI 45120901896-1-ui")          # no runner: waits
+                self.blob(self.derived / f"Old-{n}/Build/x", 1)
+                self.blob(self.tmp / f"old-file-{n}", 1)
                 holder = self.hold(path, mode)
                 self.calls.write_text("")
                 try:
                     result, erased, out = self.run_clean(min_free_mib=10_000)
                 finally:
                     holder.communicate("")
-                self.assertIn(udid(1), erased)      # an idle runner's device, whatever lock is held
-                self.assertNotIn(udid(2), erased)   # a device no runner is named in waits
-                self.assertTrue((self.devices / udid(2) / "data/Containers/app").exists())
-                self.assertTrue((self.derived / "Old-abc").exists())
-                self.assertFalse((self.tmp / "old-file").exists())
+                self.assertIn(udid(named), erased)
+                self.assertNotIn(udid(unnamed), erased)
+                self.assertTrue((self.devices / udid(unnamed) / "data/Containers/app").exists())
+                self.assertTrue((self.derived / f"Old-{n}").exists())
+                self.assertFalse((self.tmp / f"old-file-{n}").exists())
                 self.assertIn("holds a slot;", result["status"])
                 self.assertIn("entries wait", result["status"])
         self.calls.write_text("")
         result, erased, _ = self.run_clean(min_free_mib=10_000)
-        self.assertIn(udid(2), erased)  # the unnamed device, once nothing holds a lock
-        self.assertFalse((self.derived / "Old-abc").exists())
+        self.assertIn(udid(12), erased)  # the unnamed devices, once nothing holds a lock
+        self.assertIn(udid(22), erased)
+        self.assertFalse((self.derived / "Old-1").exists())
+
+    def test_a_name_whose_runner_is_not_found_here_gets_the_whole_vm_guard(self):
+        # "mini-7" has no runner folder, and "iPhone 13 mini-2" names a device, not a runner: only a known runner's
+        # idleness is trusted, so a held slot keeps both.
+        self.sim(1, "Shutdown", 2, 12, name="Dolphin Maps CI mini-7: iPhone 17")
+        self.sim(2, "Shutdown", 2, 12, name="iPhone 13 mini-2")
+        os.environ["FAKE_PS"] = ""  # mini-2's Listener is not running either: unknown, not idle
+        holder = self.hold(self.home / ".local/state/sim-slots/mac-build/slot.1", fcntl.LOCK_EX)
+        try:
+            result, erased, out = self.run_clean(min_free_mib=10_000)
+        finally:
+            holder.communicate("")
+        self.assertEqual(erased, [])
+        self.assertIn("2 entries wait", result["status"])
+
+    def test_a_job_that_starts_after_the_scan_keeps_its_runners_device(self):
+        self.sim(2, "Shutdown", 3, 12)
+        real, calls = self.m.runner_state, []
+
+        def state(home, runner):
+            calls.append(runner)
+            return "busy" if len(calls) >= 3 else real(home, runner)  # the job starts before the last check
+
+        self.m.runner_state = state
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [])
+        self.assertEqual(calls, ["2", "2", "2"])
+        self.assertIn("1 simulators wait for their runners", result["status"])
 
     def test_a_busy_runners_devices_wait_while_the_others_are_erased(self):
         # #1033: under steady CI the whole VM was never idle, so nothing was ever erased and the volume filled.
@@ -333,7 +370,7 @@ class Cleaner(unittest.TestCase):
         self.assertEqual(erased, [udid(2), udid(3)])
         self.assertTrue((self.devices / udid(1) / "data/Containers/app").exists())
         self.assertIn("1 simulators of busy runners skipped", out)
-        self.assertEqual(result["status"], "nothing more to clean")
+        self.assertEqual(result["status"], "1 simulators wait for their runners")
 
     def test_a_runner_whose_jobs_cannot_be_read_counts_as_busy(self):
         self.sim(1, "Shutdown", 2, 12)
@@ -349,8 +386,19 @@ class Cleaner(unittest.TestCase):
         result, erased, out = self.run_clean(min_free_mib=10_000)
         self.assertEqual(erased, [udid(1)])
 
+    def clock(self, step):
+        """The cleaner's monotonic clock advances `step` seconds at each reading."""
+        ticks = [0.0]
+
+        def monotonic():
+            ticks[0] += step
+            return ticks[0]
+
+        self.m.time = type("Clock", (), {"monotonic": staticmethod(monotonic), "time": staticmethod(time.time)})
+
     def test_a_temp_entry_opened_after_the_scan_is_kept(self):
-        # Temp entries go without the locks, so their own checks are repeated just before removal.
+        # Temp entries go without the locks, so the open-file check is repeated just before removal from a listing
+        # at most 10 seconds old.
         self.blob(self.tmp / "old-dir/x", 1)
         real = self.m.open_paths
         calls = []
@@ -360,9 +408,22 @@ class Cleaner(unittest.TestCase):
             return real() | ({str(self.tmp / "old-dir/x")} if len(calls) > 1 else set())
 
         self.m.open_paths = opened
+        self.clock(11)  # more than 10 seconds between the scan's listing and the removal
         result, erased, out = self.run_clean(min_free_mib=10_000)
         self.assertTrue((self.tmp / "old-dir/x").exists())
         self.assertNotIn("temp entries removed", out)
+        self.assertEqual(len(calls), 2)
+
+    def test_a_listing_under_10_seconds_old_is_reused(self):
+        # One lsof per entry could time out on a loaded VM and fail the run (#1035 review): a recent one is enough.
+        for n in range(5):
+            self.blob(self.tmp / f"old-{n}", 1)
+        real, calls = self.m.open_paths, []
+        self.m.open_paths = lambda: calls.append(1) or real()
+        self.clock(1)
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertIn("5 temp entries removed", out)
+        self.assertEqual(len(calls), 1)
 
     def test_dry_run_changes_nothing_and_logs_no_names_or_paths(self):
         self.sim(1, "Shutdown", 2, 12)
