@@ -60,6 +60,16 @@ for path in filter(None, os.environ.get("FAKE_OPEN", "").split(":")):
     print("n" + path)
 '''
 
+# ps: the processes are FAKE_PS's lines (FAKE_PS_FAIL makes it fail), so a runner's job is a Runner.Worker line.
+PS = r'''#!/usr/bin/env python3
+import os, sys
+if os.environ.get("FAKE_PS_FAIL"):
+    sys.exit(1)
+print("/sbin/launchd")
+for line in filter(None, os.environ.get("FAKE_PS", "").split(";")):
+    print(line)
+'''
+
 
 def load():
     loader = importlib.machinery.SourceFileLoader("ci_disk_clean", str(SOURCE))
@@ -91,17 +101,18 @@ class Cleaner(unittest.TestCase):
         self.sims, self.calls = self.root / "sims.json", self.root / "calls"
         self.sims.write_text("{}")
         self.calls.touch()
-        for name, text in (("xcrun", XCRUN), ("lsof", LSOF)):
+        for name, text in (("xcrun", XCRUN), ("lsof", LSOF), ("ps", PS)):
             (self.root / name).write_text(text)
             (self.root / name).chmod(0o755)
         saved = dict(os.environ)
         self.addCleanup(lambda: (os.environ.clear(), os.environ.update(saved)))
-        for key in ("CI_SIM_STATE_DIR", "MAC_STATE_DIR", "FAKE_OPEN", "FAKE_TOUCH", "FAKE_TOUCH_TIME"):
+        for key in ("CI_SIM_STATE_DIR", "MAC_STATE_DIR", "FAKE_OPEN", "FAKE_TOUCH", "FAKE_TOUCH_TIME", "FAKE_PS",
+                    "FAKE_PS_FAIL"):
             os.environ.pop(key, None)
         os.environ.update(HOME=str(self.home), TMPDIR=str(self.tmp), FAKE_SIMS=str(self.sims),
                           FAKE_CALLS=str(self.calls))
         self.m = load()
-        self.m.XCRUN, self.m.LSOF = str(self.root / "xcrun"), str(self.root / "lsof")
+        self.m.XCRUN, self.m.LSOF, self.m.PS = str(self.root / "xcrun"), str(self.root / "lsof"), str(self.root / "ps")
         self.m.GETCONF = str(self.root / "no-getconf")  # not on Linux: the cleaner falls back to TMPDIR
         # The volume is the fake home's own bytes against a made-up capacity, so every removal shows up as free space.
         self.capacity = 1000 * MIB
@@ -119,7 +130,12 @@ class Cleaner(unittest.TestCase):
             os.utime(path, (mtime, mtime))
         return path
 
-    def sim(self, n, state, mib, plist_age_hours, **extra):
+    def worker(self, runner):
+        """A job on runner mini-N: its Runner.Worker, as ps lists it."""
+        line = f"{self.home}/runners/mini-{runner}/bin.2.338.2/Runner.Worker spawnclient 156 161"
+        os.environ["FAKE_PS"] = ";".join(filter(None, [os.environ.get("FAKE_PS", ""), line]))
+
+    def sim(self, n, state, mib, plist_age_hours, name=None, **extra):
         device = self.devices / udid(n)
         self.blob(device / "data/Containers/app", mib)
         plist = device / "device.plist"
@@ -127,7 +143,7 @@ class Cleaner(unittest.TestCase):
         stamp = self.now - plist_age_hours * HOUR
         os.utime(plist, (stamp, stamp))
         sims = json.loads(self.sims.read_text())
-        sims[udid(n)] = {"state": state, "name": f"Dolphin Maps CI mini-{n}: iPhone 17", **extra}
+        sims[udid(n)] = {"state": state, "name": name or f"Dolphin Maps CI mini-{n}: iPhone 17", **extra}
         self.sims.write_text(json.dumps(sims))
 
     def run_clean(self, min_free_mib, dry_run=False):
@@ -264,31 +280,89 @@ class Cleaner(unittest.TestCase):
         self.assertIn("1 temp entries removed", out)
         self.assertEqual(result["status"], "nothing more to clean")
 
-    def test_any_held_mac_build_lock_stops_every_action(self):
-        self.sim(1, "Shutdown", 2, 12)
+    def hold(self, path, mode):
+        """Another process holds `path` (a test command's admission lock shared, or its slot exclusively)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            ["python3", "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); "
+             f"fcntl.flock(f, {mode}); print('held', flush=True); sys.stdin.read()", str(path)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        self.assertEqual(holder.stdout.readline().strip(), "held")
+        return holder
+
+    def test_a_held_mac_build_lock_stops_derived_data_and_unnamed_simulators_only(self):
+        # A runner's own devices need only that runner idle, and temp entries only their own checks; DerivedData and
+        # a device no runner is named in still wait for no job at all.
+        self.sim(1, "Shutdown", 2, 12)                                 # runner mini-1's, which is idle
+        self.sim(2, "Shutdown", 3, 12, name="GWW UI 45120901896-1-ui")  # no runner named: waits
         self.blob(self.derived / "Old-abc/Build/x", 1)
+        self.blob(self.tmp / "old-file", 1)
         admission = self.home / ".local/state/mac-build/admission.lock"
         slot = self.home / ".local/state/sim-slots/mac-build/slot.2"
         for path, mode in ((admission, fcntl.LOCK_SH), (slot, fcntl.LOCK_EX)):
             with self.subTest(lock=path.name):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                # A test command holds the admission lock shared and its slot exclusively, in another process.
-                holder = subprocess.Popen(
-                    ["python3", "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); "
-                     f"fcntl.flock(f, {mode}); print('held', flush=True); sys.stdin.read()", str(path)],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+                holder = self.hold(path, mode)
+                self.calls.write_text("")
                 try:
-                    self.assertEqual(holder.stdout.readline().strip(), "held")
                     result, erased, out = self.run_clean(min_free_mib=10_000)
                 finally:
                     holder.communicate("")
-                self.assertEqual(erased, [])
-                self.assertTrue((self.devices / udid(1) / "data/Containers/app").exists())
+                self.assertIn(udid(1), erased)      # an idle runner's device, whatever lock is held
+                self.assertNotIn(udid(2), erased)   # a device no runner is named in waits
+                self.assertTrue((self.devices / udid(2) / "data/Containers/app").exists())
                 self.assertTrue((self.derived / "Old-abc").exists())
-                self.assertIn("holds a slot; stopped", result["status"])
+                self.assertFalse((self.tmp / "old-file").exists())
+                self.assertIn("holds a slot;", result["status"])
+                self.assertIn("entries wait", result["status"])
+        self.calls.write_text("")
         result, erased, _ = self.run_clean(min_free_mib=10_000)
-        self.assertEqual(erased, [udid(1)])
+        self.assertIn(udid(2), erased)  # the unnamed device, once nothing holds a lock
         self.assertFalse((self.derived / "Old-abc").exists())
+
+    def test_a_busy_runners_devices_wait_while_the_others_are_erased(self):
+        # #1033: under steady CI the whole VM was never idle, so nothing was ever erased and the volume filled.
+        self.sim(1, "Shutdown", 4, 12)   # mini-1 runs a job: its device waits
+        self.sim(2, "Shutdown", 3, 12)   # mini-2 is idle: erased while mini-1 works
+        self.sim(3, "Shutdown", 2, 12)
+        self.worker(1)
+        holder = self.hold(self.home / ".local/state/sim-slots/mac-build/slot.1", fcntl.LOCK_EX)  # mini-1's test
+        try:
+            result, erased, out = self.run_clean(min_free_mib=10_000)
+        finally:
+            holder.communicate("")
+        self.assertEqual(erased, [udid(2), udid(3)])
+        self.assertTrue((self.devices / udid(1) / "data/Containers/app").exists())
+        self.assertIn("1 simulators of busy runners skipped", out)
+        self.assertEqual(result["status"], "nothing more to clean")
+
+    def test_a_runner_whose_jobs_cannot_be_read_counts_as_busy(self):
+        self.sim(1, "Shutdown", 2, 12)
+        os.environ["FAKE_PS_FAIL"] = "1"
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [])
+        self.assertIn("1 simulators of busy runners skipped", out)
+
+    def test_another_runners_job_is_not_mistaken_for_this_runners(self):
+        # mini-10's worker is not mini-1's: the runner's directory is matched with its trailing slash.
+        self.sim(1, "Shutdown", 2, 12)
+        self.worker(10)
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [udid(1)])
+
+    def test_a_temp_entry_opened_after_the_scan_is_kept(self):
+        # Temp entries go without the locks, so their own checks are repeated just before removal.
+        self.blob(self.tmp / "old-dir/x", 1)
+        real = self.m.open_paths
+        calls = []
+
+        def opened():
+            calls.append(1)
+            return real() | ({str(self.tmp / "old-dir/x")} if len(calls) > 1 else set())
+
+        self.m.open_paths = opened
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertTrue((self.tmp / "old-dir/x").exists())
+        self.assertNotIn("temp entries removed", out)
 
     def test_dry_run_changes_nothing_and_logs_no_names_or_paths(self):
         self.sim(1, "Shutdown", 2, 12)
