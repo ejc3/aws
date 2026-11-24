@@ -41,10 +41,14 @@ camera) is yours to run: never hand the owner a step these phones can do.
   `--include-all-apps`. An app missing from it proves nothing.
 - Use the build testers run first: the project's TestFlight build, installed through TestFlight
   on the phone. Build and sign here only when no TestFlight build has the change.
-- **A locked phone refuses every launch** ("Unable to launch … because the device is locked"). Only
-  the owner can unlock it; a test phone should have Auto-Lock off. If it is locked, say so once and
-  stop: no retry loop.
-- Tap a link as a person would with a UI test, `XCUIDevice.shared.system.open(url)`; system
-  prompts belong to `XCUIApplication(bundleIdentifier: "com.apple.springboard")`; keep
-  screenshots with `XCTAttachment(screenshot:)`. Pass values to the runner as `TEST_RUNNER_<NAME>`
-  in `xcodebuild`'s environment (not as build settings); it sees `<NAME>`.
+- **A locked phone refuses every launch** ("Unable to launch … because the device is locked"). A
+  phone asleep with no passcode asked for (`devicectl device info lockState`) wakes in the test with
+  `XCUIDevice.shared.press(.home)` and a swipe up on the springboard; only a passcode needs the owner.
+- Open a link in the app with a UI test, `XCUIApplication(bundleIdentifier:).open(url)`, as iOS hands
+  it over once it has resolved a universal link. `XCUIDevice.shared.system.open(url)` opens an `https`
+  URL in the browser, never through universal links. Whether iOS routes the domain rests on the signed
+  entitlement and Apple's CDN copy of the association file; a real tap needs a link in another app.
+  System prompts belong to `XCUIApplication(bundleIdentifier: "com.apple.springboard")`, a sign-in
+  sheet's page to `com.apple.SafariViewService`; keep screenshots with `XCTAttachment(screenshot:)`.
+  Pass values to the runner as `TEST_RUNNER_<NAME>` in `xcodebuild`'s environment (not as build
+  settings); it sees `<NAME>`.
