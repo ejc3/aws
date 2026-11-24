@@ -47,7 +47,8 @@ The trust chain:
   `github-runner` (published) or `github-runner-failed`, and on nothing else. IAM does not count the boot tests, and
   still allows `github-runner` at creation (the image's snapshot carries it, and fcvm's build script before its
   two-step publish): the script, not IAM, makes the boot test come first until that is removed (#1038);
-  `PassRole` only on `ami-builder-role` and
+  reading the serial console of its own builders (`Name=ami-builder-temp`), which the build script prints,
+  with host names and addresses masked, when a leg fails; `PassRole` only on `ami-builder-role` and
   only to EC2. It cannot mutate IAM, assume another role, read state/SSM parameters/
   Secrets Manager payloads, or launch the administrator profile.
 - **Builder host** `ami-builder-profile`: SSM agent connectivity and progress tags,
