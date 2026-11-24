@@ -245,6 +245,7 @@ jobs:
         run: python3 -S -B scripts/test-astryx-join.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: |
+          command -v zsh >/dev/null || sudo apt-get install -y --no-install-recommends zsh  # the mac-agents-md tests need it
           python3 -S -B scripts/test-mac-setup.py
           python3 -S -B scripts/test-mac-artifact-clean.py
       - name: Mac mini simulator runner routing

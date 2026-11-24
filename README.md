@@ -1838,6 +1838,16 @@ build slots with `scripts/mac-setup.sh mini` from either client. New SSH shells 
 For other heavy commands use `mac-build COMMAND ...`. The host shares physical memory with both Tart
 VMs. Limit SwiftPM to two build workers initially and inspect `mac-build --status` before a large build.
 
+The same setup installs the iOS app toolchain on the host (`scripts/mac/ios-toolchain.zsh`: Node, pnpm,
+XcodeGen, Ruby 3.3 and CocoaPods, each pinned, under `~/agent-tools`; `source ~/agent-tools/env.zsh`) and
+writes the machine's `~/AGENTS.md` (`~/CLAUDE.md` links to it) from `scripts/mac/mini-AGENTS.md` and what is
+on the machine: the toolchain, the attached iPhones and the development-signing keychains made for agents.
+A LaunchAgent rewrites it hourly, so its device list stays current. It says how to sign a device build
+here (the login keychain refuses SSH sessions), and that a real-device check is the agent's to run on the
+attached phones (`devicectl` does not list App Store or TestFlight apps). After a merge that changes
+`scripts/mac-setup.sh` or `scripts/mac/`, the PR watch re-runs `scripts/mac-setup.sh mini` on fcvm-arm (the
+jumpbox has no route to the mini).
+
 Give each task its own checkout and build products. To build an exact committed Swift package from a
 Linux checkout, run the following in Bash. Copy any needed uncommitted inputs explicitly.
 
