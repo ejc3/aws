@@ -74,8 +74,14 @@ class FakeEC2:
 
     def __init__(self, instances=(), run_instances_errors=None, terminate_error=None,
                  lookup_error=None, journal=None, create_tags_error=None,
-                 create_tags_reject_keys=None):
+                 create_tags_reject_keys=None, images=(), deregister_error=None,
+                 delete_snapshot_error=None):
         self.instances = list(instances)
+        # The image records a tag:Purpose lookup for unpublished runner images returns (the
+        # cleanup function's prune). Every other DescribeImages keeps the one launch image.
+        self.images = list(images)
+        self.deregister_error = deregister_error
+        self.delete_snapshot_error = delete_snapshot_error
         self.run_instances_errors = run_instances_errors or {}
         # CreateTags rejected. With no reject_keys every write fails; with them,
         # only a write whose keys all fall inside the set fails, which models
@@ -126,7 +132,22 @@ class FakeEC2:
 
     def describe_images(self, **kw):
         self.calls.append(("describe_images", kw))
+        purposes = [v for f in kw.get("Filters", []) if f["Name"] == "tag:Purpose" for v in f["Values"]]
+        if "github-runner-candidate" in purposes:
+            return {"Images": list(self.images)}
         return {"Images": [{"ImageId": "ami-test", "CreationDate": "2026-08-01T00:00:00Z"}]}
+
+    def deregister_image(self, **kw):
+        self.calls.append(("deregister_image", kw))
+        if self.deregister_error:
+            raise self.deregister_error
+        return {}
+
+    def delete_snapshot(self, **kw):
+        self.calls.append(("delete_snapshot", kw))
+        if self.delete_snapshot_error:
+            raise self.delete_snapshot_error
+        return {}
 
     def run_instances(self, **kw):
         self.calls.append(("run_instances", kw))
@@ -3012,6 +3033,71 @@ def case_a_rejected_stuck_reap_does_not_kill_the_poll():
     # It is also the phase that matters most: GitHub does not redeliver webhooks,
     # so this poll is the only retry a queued job gets.
     assert invoker.arch_invokes() == {"arm64": 1}, invoker.arch_invokes()
+
+
+def runner_image(image_id, purpose, age_hours, snapshot=None):
+    """One DescribeImages record of a runner image, as ejc3/fcvm's build tags it."""
+    created = (NOW - timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    mappings = [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": snapshot}}] if snapshot else []
+    return {"ImageId": image_id, "CreationDate": created, "BlockDeviceMappings": mappings,
+            "Tags": [{"Key": "Purpose", "Value": purpose}]}
+
+
+def case_unpublished_runner_images_are_pruned_after_a_day_and_published_ones_never():
+    """A candidate no run judged and an image a run rejected go a day after creation, with their
+    snapshots. A younger one may still be under its boot test. An image tagged github-runner is
+    left alone even when the listing returns it: the tag is read from the record, not trusted
+    to the filter."""
+    ec2 = FakeEC2(images=[
+        runner_image("ami-old-candidate", "github-runner-candidate", 25, "snap-old-candidate"),
+        runner_image("ami-old-failed", "github-runner-failed", 300, "snap-old-failed"),
+        runner_image("ami-new-candidate", "github-runner-candidate", 23, "snap-new-candidate"),
+        runner_image("ami-published", "github-runner", 300, "snap-published"),
+        runner_image("ami-failed-without-snapshot", "github-runner-failed", 30),
+    ])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    listing = next(kw for name, kw in ec2.calls if name == "describe_images")
+    assert listing["Owners"] == ["self"], listing
+    assert listing["Filters"] == [{"Name": "tag:Purpose",
+                                   "Values": ["github-runner-candidate", "github-runner-failed"]}], listing
+    assert [kw["ImageId"] for name, kw in ec2.calls if name == "deregister_image"] == [
+        "ami-old-candidate", "ami-old-failed", "ami-failed-without-snapshot"], ec2.calls
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == [
+        "snap-old-candidate", "snap-old-failed"], ec2.calls
+    # an image is deregistered before its snapshot is deleted: EC2 refuses the other order
+    order = [name for name, _ in ec2.calls if name in ("deregister_image", "delete_snapshot")]
+    assert order == ["deregister_image", "delete_snapshot", "deregister_image", "delete_snapshot",
+                     "deregister_image"], order
+    assert result == {"deregistered": ["ami-old-candidate", "ami-old-failed", "ami-failed-without-snapshot"],
+                      "snapshots_deleted": ["snap-old-candidate", "snap-old-failed"], "errors": 0}, result
+
+
+def case_one_poll_prunes_a_bounded_number_of_images():
+    ec2 = FakeEC2(images=[runner_image(f"ami-{n}", "github-runner-failed", 48, f"snap-{n}") for n in range(7)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert result["deregistered"] == ["ami-0", "ami-1", "ami-2"], result
+
+
+def case_a_rejected_image_prune_does_not_kill_the_poll():
+    """The prune is optional work in the middle of the poll: a refused DeregisterImage or
+    DeleteSnapshot is counted and the launcher still runs."""
+    for errors in ({"deregister_error": FakeClientError("UnauthorizedOperation")},
+                   {"delete_snapshot_error": FakeClientError("InvalidSnapshot.InUse")}):
+        ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")], **errors)
+        queued = run(9, "queued")
+        github = FakeGitHub(runs=[queued], jobs={queued["id"]: [job("queued", "x86_64")]})
+        invoker = FakeLambdaClient()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = cleanup(ec2, github, invoker)["handler"]({}, None)
+        pruned = [] if "deregister_error" in errors else ["ami-old"]
+        assert result["unpublished_images_pruned"] == pruned, result
+        event = next(json.loads(line) for line in buf.getvalue().splitlines()
+                     if line.startswith("{") and '"runner_image_prune"' in line)
+        assert event["errors"] == 1, event
+        assert invoker.arch_invokes() == {"x86_64": 1}, invoker.arch_invokes()
 
 
 def case_a_rejected_ami_builder_terminate_does_not_kill_the_poll():

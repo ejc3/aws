@@ -385,7 +385,9 @@ roster lists that runner or it carries a `RunnerSeenAt` stamp or a renewed lease
 mean the row was lost rather than never written; drains runners past the 12h soft cap;
 **terminates any runner whose current job has been `in_progress` longer than
 `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray `ami-builder-temp` instances older than
-2 hours (pure EC2, no PAT); reaps launches still `pending` after 15 minutes; and counts
+2 hours (pure EC2, no PAT); deregisters runner images the builder never published
+(`Purpose=github-runner-candidate` or `github-runner-failed`) a day after their creation,
+with their snapshots, at most three per poll, and never an image tagged `github-runner`; reaps launches still `pending` after 15 minutes; and counts
 GitHub's queued jobs to launch what the queue actually needs. GitHub doesn't redeliver
 webhooks, so this poll is the retry, and it passes the per-architecture queued count along
 so the decision record has the demand side too.
@@ -1378,7 +1380,10 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 - **`github-runner-lambda-role`** (after cutoff): own Lambda logs; EC2 metadata reads;
   launches restricted to approved tagged images, exact network/profile and tagged,
   encrypted IMDSv2 hosts; lease/health tags only after launch; termination of runners
-  and the existing named temporary AMI builders only. `iam:PassRole` only on
+  and the existing named temporary AMI builders only; `DeregisterImage` only on us-west-1
+  images tagged `Purpose=github-runner-candidate` or `github-runner-failed`, and
+  `DeleteSnapshot` only on us-west-1 snapshots tagged `Purpose=github-runner` (EC2 refuses
+  one a registered image uses). `iam:PassRole` only on
   `github-runner-instance-role` and only to EC2, with explicit denies for other
   roles and services;
   `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;

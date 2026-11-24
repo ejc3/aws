@@ -154,6 +154,22 @@ class RunnerIAMBoundaryTests(unittest.TestCase):
         self.assertIn('"aws:ResourceTag/Name" = "ami-builder-temp"', statement(self.controller, 'ReapExistingTemporaryAMIBuilder'))
         self.assertNotIn('ec2:StopInstances', self.controller)
 
+    def test_image_pruning_only_covers_unpublished_runner_images(self):
+        # The cleanup function prunes the images the builder never published. It can never deregister a
+        # published one, and the only snapshots it can delete carry the runner image tag.
+        deregistering = [s for s in statements(self.controller) if 'ec2:DeregisterImage' in s]
+        self.assertEqual(len(deregistering), 1)
+        prune = statement(self.controller, 'PruneUnpublishedRunnerImage')
+        self.assertEqual(actions(prune), {'ec2:DeregisterImage'})
+        self.assertIn('"arn:aws:ec2:us-west-1::image/*"', prune)
+        self.assertIn('"aws:ResourceTag/Purpose" = ["github-runner-candidate", "github-runner-failed"]', prune)
+        deleting = [s for s in statements(self.controller) if 'ec2:DeleteSnapshot' in s]
+        self.assertEqual(len(deleting), 1)
+        snapshot = statement(self.controller, 'DeletePrunedRunnerImageSnapshot')
+        self.assertEqual(actions(snapshot), {'ec2:DeleteSnapshot'})
+        self.assertIn('"arn:aws:ec2:us-west-1::snapshot/*"', snapshot)
+        self.assertIn('"aws:ResourceTag/Purpose" = "github-runner"', snapshot)
+
     def test_controller_wildcard_allow_contains_no_mutating_ec2_actions(self):
         for item in statements(self.controller):
             if re.search(r'Effect\s*=\s*"Allow"', item) and re.search(r'Resource\s*=\s*"\*"', item):

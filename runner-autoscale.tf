@@ -1772,6 +1772,30 @@ resource "aws_iam_role_policy" "runner_lambda" {
         }
       },
       {
+        # The cleanup function also prunes the runner images the builder never published: a candidate no run
+        # judged, or an image a run rejected (ejc3/fcvm scripts/build-ami.sh). The builder role cannot
+        # deregister. Never a published image: Purpose=github-runner is not in the list.
+        Sid      = "PruneUnpublishedRunnerImage"
+        Effect   = "Allow"
+        Action   = "ec2:DeregisterImage"
+        Resource = "arn:aws:ec2:us-west-1::image/*" # images are built in us-west-1 only
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Purpose" = ["github-runner-candidate", "github-runner-failed"] }
+        }
+      },
+      {
+        # The snapshot of a pruned image. The builder tags every runner image's snapshot Purpose=github-runner,
+        # published or not, and EC2 refuses to delete a snapshot a registered image uses, so this removes the
+        # snapshot of an image that is already gone and no other.
+        Sid      = "DeletePrunedRunnerImageSnapshot"
+        Effect   = "Allow"
+        Action   = "ec2:DeleteSnapshot"
+        Resource = "arn:aws:ec2:us-west-1::snapshot/*"
+        Condition = {
+          StringEquals = { "aws:ResourceTag/Purpose" = "github-runner" }
+        }
+      },
+      {
         # Every controller launch uses github-runner-profile. This restriction
         # is independent of the later user-data and EC2 tag-policy migration.
         Sid      = "PassRunnerRoleToEC2Only"
@@ -3702,6 +3726,49 @@ data "archive_file" "runner_cleanup" {
           except Exception as e:
               print(f'Could not record the {arch} queue scan: {type(e).__name__}')
 
+      # Runner images the builder never published (ejc3/fcvm scripts/build-ami.sh): a candidate whose run ended
+      # before its boot test gave a verdict, or an image a run rejected. Each keeps a 40 GB snapshot, and the
+      # builder role cannot deregister, so they are pruned here a day after they were created, well past the
+      # longest build. An image tagged Purpose=github-runner is never touched: the tag is read again from each
+      # record, whatever the filter returned, and IAM allows DeregisterImage on the two unpublished values only.
+      UNPUBLISHED_IMAGE_PURPOSES = ('github-runner-candidate', 'github-runner-failed')
+      UNPUBLISHED_IMAGE_MAX_AGE_HOURS = 24
+      # Each image costs up to three bounded calls; the rest wait for the next poll.
+      UNPUBLISHED_IMAGE_PRUNES_PER_POLL = 3
+
+      def prune_unpublished_runner_images(now):
+          result = {'deregistered': [], 'snapshots_deleted': [], 'errors': 0}
+          client = ec2.clients[BUILDER_REGION]
+          images = client.describe_images(Owners=['self'], Filters=[
+              {'Name': 'tag:Purpose', 'Values': list(UNPUBLISHED_IMAGE_PURPOSES)}]).get('Images', [])
+          for image in images:
+              if len(result['deregistered']) + result['errors'] >= UNPUBLISHED_IMAGE_PRUNES_PER_POLL:
+                  break
+              image_id = image.get('ImageId') if isinstance(image, dict) else None
+              try:
+                  tags = {tag.get('Key'): tag.get('Value') for tag in image.get('Tags', [])}
+                  if tags.get('Purpose') not in UNPUBLISHED_IMAGE_PURPOSES:
+                      continue
+                  created = datetime.strptime(image['CreationDate'][:19], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=timezone.utc)
+                  if (now - created).total_seconds() < UNPUBLISHED_IMAGE_MAX_AGE_HOURS * 3600:
+                      continue
+                  snapshots = [mapping['Ebs']['SnapshotId'] for mapping in image.get('BlockDeviceMappings', [])
+                               if isinstance(mapping.get('Ebs'), dict) and mapping['Ebs'].get('SnapshotId')]
+                  client.deregister_image(ImageId=image_id)
+                  result['deregistered'].append(image_id)
+                  for snapshot in snapshots:
+                      try:
+                          client.delete_snapshot(SnapshotId=snapshot)
+                          result['snapshots_deleted'].append(snapshot)
+                      except Exception as error:
+                          # The image is gone, so no later poll finds this snapshot through it.
+                          result['errors'] += 1
+                          print(f'IMAGE PRUNE LEFT SNAPSHOT {snapshot} of {image_id}: {type(error).__name__}')
+              except Exception as error:
+                  result['errors'] += 1
+                  print(f'IMAGE PRUNE FAILED for {image_id}: {type(error).__name__}')
+          return result
+
       def handler(event, context):
           now = datetime.now(timezone.utc)
 
@@ -4306,6 +4373,15 @@ data "archive_file" "runner_cleanup" {
                           print(f'Terminating stale AMI builder: {instance_id} (age={age_hours:.1f}h)')
                           ami_builder_terminated.append(instance_id)
 
+          # Phase 4b: prune the runner images the builder never published. Optional work: it must not
+          # cost the poll the stalled-launch reap or the launcher below.
+          try:
+              image_prune = prune_unpublished_runner_images(now)
+          except Exception as error:
+              print(f'IMAGE PRUNE FAILED: {type(error).__name__}')
+              image_prune = {'deregistered': [], 'snapshots_deleted': [], 'errors': 1}
+          print(json.dumps({'event': 'runner_image_prune', **image_prune}))
+
           # Phase 5: Reap launches that never came up
           # A spot metal launch AWS cannot place sits in `pending`, where the lease
           # phase above cannot see it - that phase only walks `running` instances.
@@ -4412,7 +4488,7 @@ data "archive_file" "runner_cleanup" {
                   else:
                       terminate_failed.append(instance_id)
 
-          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
+          return {'terminated': terminated, 'renewed': renewed, 'expired': expired, 'over_age': over_age, 'draining': draining, 'hard_killed': hard_killed, 'held': held, 'terminate_failed': terminate_failed, 'stuck_terminated': stuck_terminated, 'stalled_launches': stalled_launches, 'orphans_cleaned': orphans_cleaned, 'ami_builder_terminated': ami_builder_terminated, 'unpublished_images_pruned': image_prune['deregistered'], 'retry_launched': launched, 'idle_terminated': idle_terminated, 'bootstrap_cleanup': bootstrap_cleanup}
     EOF
     filename = "lambda_function.py"
   }
