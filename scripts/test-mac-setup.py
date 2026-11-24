@@ -809,7 +809,8 @@ class Files(unittest.TestCase):
             ssh.chmod(0o755)
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
-            desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo"}
+            desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
+                       "mac-AGENTS.md"}
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
@@ -873,7 +874,7 @@ class AgentsMd(Base):
                         "echo 'A sim   ID-2 (UDID)   shutdown   iPhone 17   simulated'\n")
         fake.chmod(0o755)
         self.env.update(MAC_AGENTS_TEMPLATE=str(self.template), MAC_AGENTS_OUT=str(self.out),
-                        MAC_AGENTS_DEVICECTL=str(fake))
+                        MAC_AGENTS_DEVICECTL=str(fake), MAC_AGENTS_HOST="mini")
 
     def write(self):
         return self.run_("zsh", BIN / "mac-agents-md")
@@ -904,6 +905,18 @@ class AgentsMd(Base):
         text = self.out.read_text()
         self.assertIn("None physical right now.", text)
         self.assertIn("None: device builds cannot be signed here yet.", text)
+
+    def test_on_a_desktop_mac_lists_the_devices_and_no_mini_sections(self):
+        self.env["MAC_AGENTS_HOST"] = "mac"
+        kc = self.temp / "agent-work" / "signing"
+        kc.mkdir(parents=True)
+        (kc / "dev.keychain-db").write_text("")
+        (kc / "dev.keychain.pw").write_text("")
+        self.assertEqual(self.write().returncode, 0)
+        text = self.out.read_text()
+        self.assertIn("A phone", text)
+        self.assertNotIn("iOS toolchain", text)
+        self.assertNotIn("signing keychains", text)
 
     def test_refuses_without_its_template_and_leaves_no_file(self):
         self.env["MAC_AGENTS_TEMPLATE"] = str(self.temp / "missing.md")
@@ -943,6 +956,8 @@ class IosToolchain(unittest.TestCase):
         install = (ROOT / "scripts" / "mac" / "install.zsh").read_text()
         self.assertIn('/bin/zsh "$src/ios-toolchain.zsh"', install)
         self.assertIn('"$bin/mac-agents-md"', install)
+        self.assertIn('agents_md mini "$src/mini-AGENTS.md"', install)
+        self.assertIn('agents_md mac "$src/mac-AGENTS.md"', install)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

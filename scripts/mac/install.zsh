@@ -13,13 +13,39 @@ chmod 700 "$state/mac-setup" "$backup"
 
 [ "$(uname -sm)" = "Darwin arm64" ] || { echo "mac-setup: this is for an Apple silicon Mac (Darwin arm64)" >&2; exit 1; }
 
+# The machine's ~/AGENTS.md: its template ($2) and what is on the machine now, rewritten hourly by a
+# LaunchAgent so the attached devices it lists stay current. $1: mini or mac.
+agents_md() {
+  local share=$HOME/.local/share/mac-setup agent=$HOME/Library/LaunchAgents/com.ejc3.mac-agents-md.plist
+  mkdir -p "$share"
+  install -m 644 "$2" "$share/.AGENTS.template.md.new" && mv -f "$share/.AGENTS.template.md.new" "$share/AGENTS.template.md"
+  print -r -- "$1" > "$share/host"
+  mkdir -p "${agent:h}"
+  cat > "$agent.new" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.ejc3.mac-agents-md</string>
+  <key>ProgramArguments</key><array><string>$bin/mac-agents-md</string></array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+  mv -f "$agent.new" "$agent"
+  # Loaded once; a later setup changes only the files it reads.
+  launchctl print "gui/$(id -u)/com.ejc3.mac-agents-md" >/dev/null 2>&1 \
+    || launchctl bootstrap "gui/$(id -u)" "$agent" 2>/dev/null \
+    || echo "mac-setup: the AGENTS.md LaunchAgent is not loaded (no GUI session); it loads at the next login" >&2
+  "$bin/mac-agents-md"
+}
+
 tools=(mac-build mac-build-shim)
 if [[ $mode = --build-only ]]; then
   mkdir -p -m 700 "$HOME/agent-work"
   chmod 700 "$HOME/agent-work"
   tools+=(mac-agents-md)
 else
-  tools+=(mac-gui mac-lease peekaboo)
+  tools+=(mac-gui mac-lease peekaboo mac-agents-md)
   # A hand-made peekaboo wrapper predates this; keep the first copy we replace.
   if [ -f "$bin/peekaboo" ] && ! grep -q 'ejc3/aws scripts/mac-setup.sh' "$bin/peekaboo" && [ ! -e "$backup/peekaboo" ]; then
     cp -p "$bin/peekaboo" "$backup/peekaboo"
@@ -52,27 +78,7 @@ if [[ $mode = --build-only ]]; then
   # template from this repository and what is on the machine now, rewritten hourly by a LaunchAgent so
   # the attached devices it lists stay current.
   /bin/zsh "$src/ios-toolchain.zsh"
-  share=$HOME/.local/share/mac-setup
-  mkdir -p "$share"
-  install -m 644 "$src/mini-AGENTS.md" "$share/.mini-AGENTS.md.new" && mv -f "$share/.mini-AGENTS.md.new" "$share/mini-AGENTS.md"
-  agent=$HOME/Library/LaunchAgents/com.ejc3.mac-agents-md.plist
-  mkdir -p "${agent:h}"
-  cat > "$agent.new" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.ejc3.mac-agents-md</string>
-  <key>ProgramArguments</key><array><string>$bin/mac-agents-md</string></array>
-  <key>StartInterval</key><integer>3600</integer>
-  <key>RunAtLoad</key><true/>
-</dict></plist>
-PLIST
-  mv -f "$agent.new" "$agent"
-  # Loaded once; a later setup changes only the file, read at the next login or load.
-  launchctl print "gui/$(id -u)/com.ejc3.mac-agents-md" >/dev/null 2>&1 \
-    || launchctl bootstrap "gui/$(id -u)" "$agent" 2>/dev/null \
-    || echo "mac-setup: the AGENTS.md LaunchAgent is not loaded (no GUI session); it loads at the next login" >&2
-  "$bin/mac-agents-md"
+  agents_md mini "$src/mini-AGENTS.md"
   echo "mac-setup: ~/AGENTS.md written (and hourly); the iOS toolchain is in ~/agent-tools (source ~/agent-tools/env.zsh)"
   echo "mac-setup: build tools ready in $bin; create each workspace with mktemp -d ~/agent-work/task.XXXXXXXX"
   "$bin/mac-build" --status
@@ -118,6 +124,7 @@ else
   /bin/sh "$src/peekaboo-install.sh"
 fi
 
-echo "mac-setup: installed mac-gui, mac-lease, mac-build (+ swift/xcodebuild/xcrun shims), peekaboo into $bin"
+agents_md mac "$src/mac-AGENTS.md"
+echo "mac-setup: installed mac-gui, mac-lease, mac-build (+ swift/xcodebuild/xcrun shims), peekaboo, mac-agents-md into $bin; ~/AGENTS.md written (and hourly)"
 "$bin/mac-lease" status | sed 's/^/mac-setup: desktop lease: /'
 "$bin/mac-build" --status | sed 's/^/mac-setup: build /'

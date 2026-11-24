@@ -1,31 +1,24 @@
 #!/bin/zsh
-# mac-agents-md -- writes ~/AGENTS.md on the mini: the template ejc3/aws scripts/mac-setup.sh installed
-# (~/.local/share/mac-setup/mini-AGENTS.md) and what is on the machine now: the iOS toolchain's
-# versions, the attached devices, and the development-signing keychains made for agents. ~/CLAUDE.md
+# mac-agents-md -- writes ~/AGENTS.md on a Mac: the template ejc3/aws scripts/mac-setup.sh installed for
+# it (~/.local/share/mac-setup/AGENTS.template.md: mini-AGENTS.md or mac-AGENTS.md) and what is on the
+# machine now: the attached devices and, on the mini (MAC_AGENTS_HOST=mini), the iOS toolchain's
+# versions and the development-signing keychains made for agents. ~/CLAUDE.md
 # points at it, so Claude and Codex sessions here read the same file. Run by setup and hourly by its
 # LaunchAgent; idempotent; nothing it reads is changed.
 set -u
-template=${MAC_AGENTS_TEMPLATE:-$HOME/.local/share/mac-setup/mini-AGENTS.md}
+template=${MAC_AGENTS_TEMPLATE:-$HOME/.local/share/mac-setup/AGENTS.template.md}
+host=${MAC_AGENTS_HOST:-$(cat "$HOME/.local/share/mac-setup/host" 2>/dev/null || echo mini)}
 out=${MAC_AGENTS_OUT:-$HOME/AGENTS.md}
 devicectl=${MAC_AGENTS_DEVICECTL:-xcrun devicectl}
 [ -r "$template" ] || { echo "mac-agents-md: no template at $template" >&2; exit 1; }
-export DEVELOPER_DIR=${DEVELOPER_DIR:-$HOME/Applications/Xcode.app/Contents/Developer}
+# The mini's Xcode is in ~/Applications; elsewhere xcode-select's is used.
+[ -n "${DEVELOPER_DIR:-}" ] || [ ! -d "$HOME/Applications/Xcode.app/Contents/Developer" ] \
+  || export DEVELOPER_DIR=$HOME/Applications/Xcode.app/Contents/Developer
 
 tmp=$(mktemp "${out}.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT
 {
   cat "$template"
-  echo
-  echo "## Found: the iOS toolchain (\`source ~/agent-tools/env.zsh\`)"
-  echo
-  if [ -r "$HOME/agent-tools/env.zsh" ]; then
-    ( source "$HOME/agent-tools/env.zsh"
-      echo "- node $(node -v 2>/dev/null || echo missing), pnpm $(pnpm -v 2>/dev/null || echo missing)," \
-        "$(xcodegen --version 2>/dev/null | tail -1 || echo 'xcodegen missing')," \
-        "ruby $(ruby -e 'print RUBY_VERSION' 2>/dev/null || echo missing), pod $(pod --version 2>/dev/null || echo missing)" )
-  else
-    echo "- Not installed: run ejc3/aws \`scripts/mac-setup.sh mini\`."
-  fi
   echo
   echo "## Found: attached devices (\`xcrun devicectl list devices\`)"
   echo
@@ -38,16 +31,29 @@ trap 'rm -f "$tmp"' EXIT
     echo "- None physical right now."
   fi
   echo
-  echo "## Found: development-signing keychains for agents"
-  echo
-  found=0
-  for kc in $HOME/agent-work/*/*.keychain-db(N); do
-    pw=${kc%-db}.pw
-    [ -r "$pw" ] || continue
-    found=1
-    echo "- \`${kc/#$HOME/~}\`, its password in \`${pw/#$HOME/~}\`"
-  done
-  [ $found = 1 ] || echo "- None: device builds cannot be signed here yet."
+  if [ "$host" = mini ]; then
+    echo "## Found: the iOS toolchain (\`source ~/agent-tools/env.zsh\`)"
+    echo
+    if [ -r "$HOME/agent-tools/env.zsh" ]; then
+      ( source "$HOME/agent-tools/env.zsh"
+        echo "- node $(node -v 2>/dev/null || echo missing), pnpm $(pnpm -v 2>/dev/null || echo missing)," \
+          "$(xcodegen --version 2>/dev/null | tail -1 || echo 'xcodegen missing')," \
+          "ruby $(ruby -e 'print RUBY_VERSION' 2>/dev/null || echo missing), pod $(pod --version 2>/dev/null || echo missing)" )
+    else
+      echo "- Not installed: run ejc3/aws \`scripts/mac-setup.sh mini\`."
+    fi
+    echo
+    echo "## Found: development-signing keychains for agents"
+    echo
+    found=0
+    for kc in $HOME/agent-work/*/*.keychain-db(N); do
+      pw=${kc%-db}.pw
+      [ -r "$pw" ] || continue
+      found=1
+      echo "- \`${kc/#$HOME/~}\`, its password in \`${pw/#$HOME/~}\`"
+    done
+    [ $found = 1 ] || echo "- None: device builds cannot be signed here yet."
+  fi
   echo
   echo "_Written $(date -u +%Y-%m-%dT%H:%MZ) by mac-agents-md._"
 } > "$tmp"
