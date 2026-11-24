@@ -86,6 +86,14 @@ class AccessTests(unittest.TestCase):
         self.assertEqual(re.findall(r'id = cloudflare_zero_trust_access_policy\.(\w+)\.id', site),
                          ["fcvm_dev_stage_owner", "fcvm_stage_ci", "workers_stage_agents"])
 
+    def test_the_page_admits_no_one_the_api_host_does_not(self):
+        # The page Worker forwards /live and /poster.jpg to the API host on its own token, so a caller the page admits
+        # must be one the API host would admit anyway.
+        def policies(app):
+            return set(re.findall(r'id = cloudflare_zero_trust_access_policy\.(\w+)\.id',
+                                  block(f'resource "cloudflare_zero_trust_access_application" "{app}"')))
+        self.assertLessEqual(policies("fcvm_dev_site_stage"), policies("fcvm_dev_api_stage"))
+
     def test_the_metal_agents_staging_token_opens_the_page_and_api_and_nothing_else(self):
         # #1032: agents check a fleet deploy headless with the token that opens the <site>-stage Workers.
         ref = "cloudflare_zero_trust_access_policy.workers_stage_agents.id"
@@ -100,8 +108,10 @@ class AccessTests(unittest.TestCase):
         stage = (Path(__file__).resolve().parent.parent / "workers-stage.tf").read_text()
         pol = stage.split('resource "cloudflare_zero_trust_access_policy" "workers_stage_agents"', 1)[1].split("\n}\n", 1)[0]
         self.assertIn('decision         = "non_identity"', pol)
-        self.assertEqual(re.findall(r"token_id = ([\w.]+)", pol),
-                         ["cloudflare_zero_trust_access_service_token.workers_stage_agents.id"])
+        # Exactly one include, that service token: no identity, no everyone, no require or exclude to loosen it.
+        self.assertEqual(re.sub(r"\s+", " ", pol.split("include = ", 1)[1]).strip(),
+                         "[{ service_token = { token_id = cloudflare_zero_trust_access_service_token.workers_stage_agents.id } }]")
+        self.assertNotRegex(pol, r"\b(require|exclude)\b")
 
     def test_the_connector_requires_an_access_token_on_every_path(self):
         cfg = block('resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator"')

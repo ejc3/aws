@@ -165,7 +165,8 @@ resource "cloudflare_zero_trust_access_application" "fcvm_dev_agent" {
 # upgrade got Access's 302 to the login page, which a WebSocket cannot follow: the page said "Cannot reach the fleet
 # yet" until the window had visited the API host once. The Worker now forwards /live and /poster.jpg (and no other
 # path) with this token, which the API application admits and the site and /agent applications do not. Anyone the
-# Worker serves has already passed the site application, whose policies are the API application's own two.
+# Worker serves has already passed the site application, every one of whose policies the API application also admits
+# (the owner, CI, the metal agents' staging token; scripts/test-fcvm-dev.py keeps the page's a subset of the API's).
 # The token reaches the Worker as two secrets of ejc3/fcvm's main-only cloudflare-deploy environment, which the deploy
 # uploads with the version (wrangler deploy --secrets-file).
 # Rotate the secret in place: commit the next client_secret_version (initial default is 1) and an explicit RFC3339
@@ -245,7 +246,8 @@ resource "cloudflare_zero_trust_tunnel_cloudflared" "fcvm_fleet_coordinator" {
 }
 
 # The connector verifies the allowed application audiences itself. The browser-only route takes only /live with the
-# page application's audience, never a Worker or agent credential.
+# page application's audience, never the Worker's or the GPU hosts' agent credential (the page application does admit the
+# metal agents' staging token, #1032).
 resource "cloudflare_zero_trust_tunnel_cloudflared_config" "fcvm_fleet_coordinator" {
   account_id = var.cloudflare_account_id
   tunnel_id  = cloudflare_zero_trust_tunnel_cloudflared.fcvm_fleet_coordinator.id

@@ -212,8 +212,9 @@ locals {
   # the Worker sends (x-fleet-viewer-ip). Safe only because the tunnel's connector requires and verifies Access on every
   # request (fcvm-dev.tf, access.required); scripts/test-fcvm-fleet.py pins the two together.
   # --access-team-domain and the audiences (ejc3/fcvm c74ee76): the coordinator verifies each Access JWT itself, not only
-  # the connector. /live takes the API application's tokens (the owner, CI, the Worker) and the page application's
-  # (fleet-api-direct-stage); the viewer address then counts only for a verified service token. /agent answers 403
+  # the connector. /live takes the API application's tokens (the owner, CI, the Worker, the metal agents' staging token)
+  # and the page application's (fleet-api-direct-stage); the viewer address then counts only for a verified service token,
+  # so in staging the agents' token may also name its own viewer address (#1032: the owner's agents, staging only). /agent answers 403
   # without the agents' service token. No Turnstile here: every staging viewer passes Access and so counts as verified.
   fcvm_fleet_coordinator_command = concat(
     ["--listen", "0.0.0.0:${local.fcvm_fleet_coordinator_port}", "--trust-cf-connecting-ip", "--access-viewer-address", "--allowed-origin", "https://${local.fcvm_dev_site_stage_host}"],
