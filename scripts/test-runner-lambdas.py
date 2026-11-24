@@ -74,8 +74,17 @@ class FakeEC2:
 
     def __init__(self, instances=(), run_instances_errors=None, terminate_error=None,
                  lookup_error=None, journal=None, create_tags_error=None,
-                 create_tags_reject_keys=None):
+                 create_tags_reject_keys=None, images=(), deregister_error=None,
+                 delete_snapshot_error=None, snapshots=()):
         self.instances = list(instances)
+        # The image records a tag:Purpose lookup for unpublished runner images returns (the
+        # cleanup function's prune). Every other DescribeImages keeps the one launch image.
+        # Also every image of the account, for a DescribeImages with no filter at all.
+        self.images = list(images)
+        # The snapshots a DescribeSnapshots returns.
+        self.snapshots = list(snapshots)
+        self.deregister_error = deregister_error
+        self.delete_snapshot_error = delete_snapshot_error
         self.run_instances_errors = run_instances_errors or {}
         # CreateTags rejected. With no reject_keys every write fails; with them,
         # only a write whose keys all fall inside the set fails, which models
@@ -126,7 +135,31 @@ class FakeEC2:
 
     def describe_images(self, **kw):
         self.calls.append(("describe_images", kw))
+        purposes = [v for f in kw.get("Filters", []) if f["Name"] == "tag:Purpose" for v in f["Values"]]
+        if "github-runner-candidate" in purposes and getattr(self, "prune_listing_error", None):
+            raise self.prune_listing_error
+        if "github-runner-candidate" in purposes or not kw.get("Filters"):
+            return {"Images": list(self.images)}
         return {"Images": [{"ImageId": "ami-test", "CreationDate": "2026-08-01T00:00:00Z"}]}
+
+    def describe_snapshots(self, **kw):
+        self.calls.append(("describe_snapshots", kw))
+        return {"Snapshots": list(self.snapshots)}
+
+    def deregister_image(self, **kw):
+        self.calls.append(("deregister_image", kw))
+        if self.deregister_error:
+            raise self.deregister_error
+        self.images = [image for image in self.images if image["ImageId"] != kw["ImageId"]]
+        return {}
+
+    def delete_snapshot(self, **kw):
+        self.calls.append(("delete_snapshot", kw))
+        if self.delete_snapshot_error:
+            raise self.delete_snapshot_error
+        if kw["SnapshotId"] in getattr(self, "refused_snapshots", ()):
+            raise FakeClientError("InvalidSnapshot.InUse")
+        return {}
 
     def run_instances(self, **kw):
         self.calls.append(("run_instances", kw))
@@ -3012,6 +3045,167 @@ def case_a_rejected_stuck_reap_does_not_kill_the_poll():
     # It is also the phase that matters most: GitHub does not redeliver webhooks,
     # so this poll is the only retry a queued job gets.
     assert invoker.arch_invokes() == {"arm64": 1}, invoker.arch_invokes()
+
+
+def runner_image(image_id, purpose, age_hours, snapshot=None):
+    """One DescribeImages record of a runner image, as ejc3/fcvm's build tags it."""
+    created = (NOW - timedelta(hours=age_hours)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    mappings = [{"DeviceName": "/dev/sda1", "Ebs": {"SnapshotId": snapshot}}] if snapshot else []
+    return {"ImageId": image_id, "CreationDate": created, "BlockDeviceMappings": mappings,
+            "Tags": [{"Key": "Purpose", "Value": purpose}]}
+
+
+def case_unpublished_runner_images_are_pruned_after_a_day_and_published_ones_never():
+    """A candidate no run judged and an image a run rejected go a day after creation, with their
+    snapshots. A younger one may still be under its boot test. An image tagged github-runner is
+    left alone even when the listing returns it: the tag is read from the record, not trusted
+    to the filter."""
+    ec2 = FakeEC2(images=[
+        runner_image("ami-old-candidate", "github-runner-candidate", 25, "snap-old-candidate"),
+        runner_image("ami-old-failed", "github-runner-failed", 300, "snap-old-failed"),
+        runner_image("ami-new-candidate", "github-runner-candidate", 23, "snap-new-candidate"),
+        runner_image("ami-published", "github-runner", 300, "snap-published"),
+        runner_image("ami-failed-without-snapshot", "github-runner-failed", 30),
+    ])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    listing = next(kw for name, kw in ec2.calls if name == "describe_images")
+    assert listing["Owners"] == ["self"], listing
+    assert listing["Filters"] == [{"Name": "tag:Purpose",
+                                   "Values": ["github-runner-candidate", "github-runner-failed"]}], listing
+    assert [kw["ImageId"] for name, kw in ec2.calls if name == "deregister_image"] == [
+        "ami-old-candidate", "ami-old-failed", "ami-failed-without-snapshot"], ec2.calls
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == [
+        "snap-old-candidate", "snap-old-failed"], ec2.calls
+    # an image is deregistered before its snapshot is deleted: EC2 refuses the other order
+    order = [name for name, _ in ec2.calls if name in ("deregister_image", "delete_snapshot")]
+    assert order == ["deregister_image", "delete_snapshot", "deregister_image", "delete_snapshot",
+                     "deregister_image"], order
+    assert result == {"deregistered": ["ami-old-candidate", "ami-old-failed", "ami-failed-without-snapshot"],
+                      "snapshots_deleted": ["snap-old-candidate", "snap-old-failed"],
+                      "orphan_snapshots_deleted": [], "errors": 0}, result
+
+
+def runner_snapshot(snapshot_id, age_hours, purpose="github-runner"):
+    """One DescribeSnapshots record of a runner image's snapshot."""
+    return {"SnapshotId": snapshot_id, "StartTime": NOW - timedelta(hours=age_hours),
+            "Tags": [{"Key": "Purpose", "Value": purpose}]}
+
+
+def case_a_snapshot_whose_delete_was_refused_is_collected_on_a_later_poll():
+    """DeleteSnapshot refused after DeregisterImage leaves a snapshot no image leads to. The
+    next poll finds it by its tag and deletes it; the poll that failed does not ask twice."""
+    ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")],
+                  snapshots=[runner_snapshot("snap-old", 48)],
+                  delete_snapshot_error=FakeClientError("RequestLimitExceeded"))
+    with contextlib.redirect_stdout(io.StringIO()):
+        first = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert first["deregistered"] == ["ami-old"] and first["errors"] == 1, first
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == ["snap-old"], ec2.calls
+
+    ec2.delete_snapshot_error = None
+    ec2.calls.clear()
+    with contextlib.redirect_stdout(io.StringIO()):
+        second = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert second == {"deregistered": [], "snapshots_deleted": [],
+                      "orphan_snapshots_deleted": ["snap-old"], "errors": 0}, second
+    listing = next(kw for name, kw in ec2.calls if name == "describe_snapshots")
+    assert listing == {"OwnerIds": ["self"],
+                       "Filters": [{"Name": "tag:Purpose", "Values": ["github-runner"]}]}, listing
+
+
+def case_only_old_unreferenced_runner_snapshots_are_orphans_and_a_poll_deletes_a_bounded_number():
+    """A snapshot some image names is in use, published or not. A young one may belong to an
+    image still being created. One with another tag is not a runner image's, whatever the
+    listing returned."""
+    ec2 = FakeEC2(
+        images=[runner_image("ami-published", "github-runner", 300, "snap-published"),
+                runner_image("ami-new-candidate", "github-runner-candidate", 1, "snap-candidate")],
+        snapshots=[runner_snapshot("snap-published", 300), runner_snapshot("snap-candidate", 1),
+                   runner_snapshot("snap-a-young-orphan", 23), runner_snapshot("snap-a-other", 300, "backup")]
+        + [runner_snapshot(f"snap-orphan-{n}", 30 + n) for n in range(5)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert result == {"deregistered": [], "snapshots_deleted": [],
+                      "orphan_snapshots_deleted": ["snap-orphan-0", "snap-orphan-1", "snap-orphan-2"],
+                      "errors": 0}, result
+    assert [kw["SnapshotId"] for name, kw in ec2.calls if name == "delete_snapshot"] == [
+        "snap-orphan-0", "snap-orphan-1", "snap-orphan-2"], ec2.calls
+    # What "in use" means is every image of this account, disabled ones included: no tag filter.
+    listings = [kw for name, kw in ec2.calls if name == "describe_images" and not kw.get("Filters")]
+    assert listings == [{"Owners": ["self"], "IncludeDisabled": True}], ec2.calls
+
+
+def case_one_orphan_refused_on_every_poll_does_not_hold_back_the_others():
+    """The orphans go in a fixed order: a snapshot EC2 always refuses must cost one try, not the pass."""
+    ec2 = FakeEC2(snapshots=[runner_snapshot(f"snap-orphan-{n}", 30 + n) for n in range(4)])
+    ec2.refused_snapshots = {"snap-orphan-0"}
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert result["orphan_snapshots_deleted"] == ["snap-orphan-1", "snap-orphan-2"], result
+    assert result["errors"] == 1, result
+    assert "InvalidSnapshot.InUse" in buf.getvalue(), buf.getvalue()
+
+
+def case_one_poll_prunes_a_bounded_number_of_images():
+    ec2 = FakeEC2(images=[runner_image(f"ami-{n}", "github-runner-failed", 48, f"snap-{n}") for n in range(7)])
+    with contextlib.redirect_stdout(io.StringIO()):
+        result = cleanup(ec2, FakeGitHub())["prune_unpublished_runner_images"](NOW)
+    assert result["deregistered"] == ["ami-0", "ami-1", "ami-2"], result
+
+
+def case_a_rejected_image_prune_does_not_kill_the_poll():
+    """The prune is optional work in the middle of the poll: a refused DeregisterImage or
+    DeleteSnapshot is counted and the launcher still runs."""
+    for errors in ({"deregister_error": FakeClientError("UnauthorizedOperation")},
+                   {"delete_snapshot_error": FakeClientError("InvalidSnapshot.InUse")}):
+        ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")], **errors)
+        queued = run(9, "queued")
+        github = FakeGitHub(runs=[queued], jobs={queued["id"]: [job("queued", "x86_64")]})
+        invoker = FakeLambdaClient()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = cleanup(ec2, github, invoker)["handler"]({}, None)
+        pruned = [] if "deregister_error" in errors else ["ami-old"]
+        assert result["unpublished_images_pruned"] == pruned, result
+        event = next(json.loads(line) for line in buf.getvalue().splitlines()
+                     if line.startswith("{") and '"runner_image_prune"' in line)
+        assert event["errors"] == 1, event
+        assert invoker.arch_invokes() == {"x86_64": 1}, invoker.arch_invokes()
+
+
+def case_a_failing_prune_runs_last_and_never_costs_the_launcher():
+    """The prune is the poll's last work: a listing that raises is counted, and the launcher has already run.
+    With under a minute of the invocation left it is skipped."""
+    ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")])
+    ec2.prune_listing_error = FakeClientError("RequestLimitExceeded")
+    queued = run(9, "queued")
+    github = FakeGitHub(runs=[queued], jobs={queued["id"]: [job("queued", "x86_64")]})
+    invoker = FakeLambdaClient()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, github, invoker)["handler"]({}, None)
+    assert result["unpublished_images_pruned"] == [], result
+    assert invoker.arch_invokes() == {"x86_64": 1}, invoker.arch_invokes()
+    # Last: the prune's own listing is the poll's final EC2 call.
+    name, kw = ec2.calls[-1]
+    assert name == "describe_images" and "github-runner-candidate" in str(kw.get("Filters")), ec2.calls[-3:]
+    event = next(json.loads(line) for line in buf.getvalue().splitlines()
+                 if line.startswith("{") and '"runner_image_prune"' in line)
+    assert event["errors"] == 1, event
+
+    class Short:
+        def get_remaining_time_in_millis(self):
+            return 45000
+    ec2 = FakeEC2(images=[runner_image("ami-old", "github-runner-failed", 48, "snap-old")])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        result = cleanup(ec2, FakeGitHub(), FakeLambdaClient())["handler"]({}, Short())
+    assert result["unpublished_images_pruned"] == [], result
+    assert "Image prune skipped with under 60s" in buf.getvalue()
+    assert not [kw for name, kw in ec2.calls if name == "describe_images" and kw.get("Filters")
+                and "github-runner-candidate" in str(kw)], ec2.calls
 
 
 def case_a_rejected_ami_builder_terminate_does_not_kill_the_poll():

@@ -380,7 +380,7 @@ The same IMDS block with its pause removed does trace its token, so that check c
 **Reaping.** A second Lambda, `github-runner-cleanup`, runs every 5 minutes
 (`rate(5 minutes)`). Its first pass over the fleet is EC2-only and terminates every instance
 past the 13h30m hard ceiling before the PAT is read or GitHub is asked anything. It then
-does ten things, seven of them using the PAT: deregisters GitHub runners whose instance is
+does twelve things, seven of them using the PAT: deregisters GitHub runners whose instance is
 gone; renews the lease on busy runners (+60m), lets the lease of runners GitHub reports idle
 expire, then terminates anything past its lease, re-reading that one runner by id and
 deregistering it whenever the roster or its registration row supplied an id (instances
@@ -391,7 +391,14 @@ roster lists that runner or it carries a `RunnerSeenAt` stamp or a renewed lease
 mean the row was lost rather than never written; drains runners past the 12h soft cap;
 **terminates any runner whose current job has been `in_progress` longer than
 `MAX_JOB_RUNTIME_MINUTES` (180)**; terminates stray `ami-builder-temp` instances older than
-2 hours (pure EC2, no PAT); reaps launches still `pending` after 15 minutes; and counts
+2 hours (pure EC2, no PAT); deregisters runner images the builder never published
+(`Purpose=github-runner-candidate` or `github-runner-failed`) a day after their creation,
+with their snapshots, at most three per poll, and never an image tagged `github-runner`; deletes
+runner image snapshots older than a day that no image names any more (a delete refused after its image was
+deregistered, or the snapshot of any runner image deregistered by hand), also at most three tried per poll, each on its
+own, so one refused on every poll holds back nothing. Unpublishing an image by hand (deregistering it, or retagging it
+`github-runner-failed`) therefore also removes its snapshot within a poll or two: keep a copy first if it may be
+wanted back. The prune runs last in the poll and waits when under a minute is left; reaps launches still `pending` after 15 minutes; and counts
 GitHub's queued jobs to launch what the queue actually needs. GitHub doesn't redeliver
 webhooks, so this poll is the retry, and it passes the per-architecture queued count along
 so the decision record has the demand side too.
@@ -1384,7 +1391,10 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 - **`github-runner-lambda-role`** (after cutoff): own Lambda logs; EC2 metadata reads;
   launches restricted to approved tagged images, exact network/profile and tagged,
   encrypted IMDSv2 hosts; lease/health tags only after launch; termination of runners
-  and the existing named temporary AMI builders only. `iam:PassRole` only on
+  and the existing named temporary AMI builders only; `DeregisterImage` only on us-west-1
+  images tagged `Purpose=github-runner-candidate` or `github-runner-failed`, and
+  `DeleteSnapshot` only on us-west-1 snapshots tagged `Purpose=github-runner` (EC2 refuses
+  one a registered image uses). `iam:PassRole` only on
   `github-runner-instance-role` and only to EC2, with explicit denies for other
   roles and services;
   `ssm:GetParameter` only on `/github-runner/pat` and `/github-runner/user-data`;
