@@ -942,10 +942,10 @@ a week, so a quiet stretch banks room for a busy day.
   starts full. Time that moved backwards counts as no time. A gap longer than 3 hours (the controller was not running)
   counts as 3 hours: no host outlives 3 hours, so none can be owed for longer, and the refill lost for a longer outage
   errs on the safe side.
-- **What it bounds.** Over the long run, burst spend averages at most the group's daily budget ($50; dolphin $80). In any
-  one day a group can burst through at most its full bucket plus that day's refill, about $150 (dolphin $240), so a
+- **What it bounds.** Over the long run, burst spend averages at most the group's daily budget ($50; dolphin $120). In any
+  one day a group can burst through at most its full bucket plus that day's refill, about $150 (dolphin $360), so a
   quiet weekend banks room for a busy Monday. Over any 7 days it is at most 7 days of refill plus whatever was banked at
-  the start, so up to $450 (dolphin $720). A dolphin burst day alone can exceed the account's `ec2-daily` budget alert
+  the start, so up to $450 (dolphin $1,080). A dolphin burst day alone can exceed the account's `ec2-daily` budget alert
   ($150, `cost-alerts.tf`); that alert then reports a burst the bucket allowed. Two limits:
   - **Throttled, a group spends at most its refill, about $50 a day.** Imagine throttled holds at most 72 vCPUs on 8
     hosts ($2.07/h) against a refill of $2.08/h, and the dolphin repos together 176 on 14 ($4.98/h) against their $5.00/h. The exception is the
@@ -1523,7 +1523,7 @@ admits SSH only from itself and the operator addresses.
 **Cost limits.** Each repo may run at most its cap of VMs at once, enforced by the controller before every launch: for
 the budgeted repos the cap their [budget bucket](#budget-buckets) allows (64 hosts and 512 vCPUs in burst; throttled, the old host
 caps and the group's refill-rate vCPU cap), for colton-games 8. Each bucket bounds its group's spend to its daily budget on
-average ($50; dolphin $80), about three days' budget in any one day, and its daily budget while throttled. `too-many-app-runners` fires when the total stays above the sum of the burst ceilings (264; 328 with constellation) for 15 minutes: it
+average ($50; dolphin $120), about three days' budget in any one day, and its daily budget while throttled. `too-many-app-runners` fires when the total stays above the sum of the burst ceilings (264; 328 with constellation) for 15 minutes: it
 detects the controller launching past its caps, not the caps being reached. The reconcile terminates any VM older than
 3 hours, but only while reconciles run and `TerminateInstances` succeeds; a root job can suppress the VM's own shutdown,
 and if the reconcile stops, `github-app-runner-errors` or `github-app-runner-reconcile-silent` fires and the VM runs
