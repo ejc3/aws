@@ -127,10 +127,24 @@ class CISecurityTests(unittest.TestCase):
         self.assertRegex(publish, r'"aws:RequestTag/Purpose"\s+= \["github-runner", "github-runner-failed"\]\n')
         self.assertRegex(publish, r'"ForAllValues:StringEquals" = \{ "aws:TagKeys" = \["Purpose"\] \}')
 
-        # the images it may launch: Canonical's and its own candidates, nothing else
-        launches = [s for s in re.findall(r'\{\n\s+(?:#[^\n]*\n\s+)*Sid.*?\n      \}', policy, re.S)
-                    if 'ec2:RunInstances' in s and '::image/*' in s]
+        # Every condition operator here is StringEquals: a negated one would admit everything else.
+        for name, body in (('boot', boot), ('create', create), ('publish', publish)):
+            self.assertNotRegex(body, r'Not(Equals|Like)|IfExists|ForAnyValue', name)
+        self.assertRegex(boot, r'Condition = \{\n\s+StringEquals = \{')
+        self.assertRegex(publish, r'Condition = \{\n\s+StringEquals = \{')
+        # Publishing also needs its own account's image, as the boot test does.
+        self.assertRegex(publish, r'"ec2:Owner"\s+= data\.aws_caller_identity\.current\.account_id\n')
+        # Tagging outside creation is only the publish statement: the creation-time tag statement keeps its condition.
+        tag_created = statement('TagCreatedImage')
+        self.assertRegex(tag_created, r'Condition = \{ StringEquals = \{ "ec2:CreateAction" = "CreateImage" \} \}')
+
+        # The images it may launch: Canonical's and its own candidates, nothing else. Any Allow with RunInstances counts,
+        # including one on "*", which also covers images.
+        allows = [s for s in re.findall(r'\{\n\s+(?:#[^\n]*\n\s+)*Sid.*?\n      \}', policy, re.S)
+                  if re.search(r'Effect\s*=\s*"Allow"', s)]
+        launches = [s for s in allows if 'ec2:RunInstances' in s and re.search(r'::image/\*|Resource\s*=\s*"\*"', s)]
         self.assertEqual(len(launches), 2)
+        self.assertEqual(len([s for s in allows if 'ec2:RunInstances' in s and re.search(r'Resource\s*=\s*"\*"', s)]), 0)
 
     def test_codeartifact_cannot_restore_retired_ci_write_access(self):
         self.assertNotIn('GitHubActionsPublish', source('codeartifact.tf'))

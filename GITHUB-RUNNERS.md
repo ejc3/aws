@@ -42,9 +42,12 @@ The trust chain:
 - **Permissions:** Canonical Ubuntu images; the isolated runner subnet/security
   group; tagged builder instances, volumes and ENIs; image creation from those
   builders; c7gd.8xlarge (the arm64 image) or c5d.9xlarge (the x86_64 image) with IMDSv2 and encrypted 40 GiB gp3 root;
-  an image is created as `Purpose=github-runner-candidate`, which no launcher selects; one boot test of a candidate on
-  c7gd.metal or c5d.metal under the same launch conditions; one tag change on a candidate, to `github-runner` (published)
-  or `github-runner-failed`; `PassRole` only on `ami-builder-role` and
+  an image may be created as `Purpose=github-runner-candidate`, which no launcher selects; a boot test of its own
+  candidate on c7gd.metal or c5d.metal under the same launch conditions; a tag change on its own candidate, to
+  `github-runner` (published) or `github-runner-failed`, and on nothing else. IAM does not count the boot tests, and
+  still allows `github-runner` at creation (the image's snapshot carries it, and fcvm's build script before its
+  two-step publish): the script, not IAM, makes the boot test come first until that is removed (#1038);
+  `PassRole` only on `ami-builder-role` and
   only to EC2. It cannot mutate IAM, assume another role, read state/SSM parameters/
   Secrets Manager payloads, or launch the administrator profile.
 - **Builder host** `ami-builder-profile`: SSM agent connectivity and progress tags,

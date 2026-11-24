@@ -201,6 +201,7 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Resource = "arn:aws:ec2:us-west-1::image/*"
         Condition = {
           StringEquals = {
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
             "ec2:ResourceTag/Purpose" = "github-runner-candidate"
             "aws:RequestTag/Purpose"  = ["github-runner", "github-runner-failed"]
           }
