@@ -331,6 +331,16 @@ PORT='${local.claw_master_server_port}'
 REGION='${var.aws_region}'
 HOME_DIR=/var/lib/claude-master
 
+# ---------------------------------------------------------------- needrestart
+# The servers, Envoy and the tunnel change only through claw-master-rollout. On 2026-11-24 unattended-upgrades' needrestart
+# restarted claude-master-server@blue because an applied pin had replaced the binary it ran: a restart in place, a
+# 10-minute drain with no second color, and no rollout. List them as deferred instead; every other service still restarts.
+install -d -m 0755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/claw-master.conf.new <<'NEEDRESTART'
+$nrconf{override_rc}{qr(^(?:claude-master-server(?:@[a-z]+)?|envoy|cloudflared-claude-master)\.service$)} = 0;
+NEEDRESTART
+mv -f /etc/needrestart/conf.d/claw-master.conf.new /etc/needrestart/conf.d/claw-master.conf
+
 # ---------------------------------------------------------------- base packages
 apt-get update -y || true
 apt-get install -y curl jq unzip || echo "WARNING: some base packages failed"

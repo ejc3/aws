@@ -553,6 +553,21 @@ class ConvergenceTests(unittest.TestCase):
     def test_the_convergence_never_restarts_the_server(self):
         self.assertNotRegex(code(CONVERGE), r"systemctl\s+(restart|stop|start)")
 
+    def test_needrestart_defers_the_server_envoy_and_tunnel_and_nothing_else(self):
+        # An applied pin replaces the binary a running color uses; needrestart then restarted it in place (2026-11-24).
+        conf = re.search(r"cat > /etc/needrestart/conf\.d/claw-master\.conf\.new <<'NEEDRESTART'\n(.*?)\nNEEDRESTART", TF, re.S)
+        self.assertIsNotNone(conf)
+        rule = re.fullmatch(r"\$nrconf\{override_rc\}\{qr\((.*)\)\} = 0;", conf.group(1))
+        self.assertIsNotNone(rule, conf.group(1))
+        deferred = re.compile(rule.group(1))
+        for unit in ("claude-master-server@blue.service", "claude-master-server@green.service",
+                     "claude-master-server.service", "envoy.service", "cloudflared-claude-master.service"):
+            self.assertTrue(deferred.search(unit), unit)
+        for unit in ("ssh.service", "amazon-cloudwatch-agent.service", "claude-master-account-labels.service",
+                     "cloudflared.service", "systemd-journald.service"):
+            self.assertFalse(deferred.search(unit), unit)
+        self.assertLess(TF.index("/etc/needrestart/conf.d/claw-master.conf"), TF.index("apt-get install -y curl"))
+
 
 class TunnelTests(unittest.TestCase):
     """The Macs' path: an outbound Cloudflare tunnel to a LOOPBACK-only open listener."""
