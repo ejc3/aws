@@ -99,8 +99,8 @@ are the only ones whose `launch_count` or `claim_only` it honours. It acts on
 `action == "queued"` (and hands `completed` on, below), reads the job labels to pick
 an architecture
 (`x64`/`x86_64`/`amd64` → x86, else arm64), and launches a one-time spot instance from a
-self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **8 arm64 and
-4 x86 runners** (`local.runner_max_by_arch`, shared with the reuse and cleanup Lambdas as
+self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to **16 arm64 and
+8 x86 runners** (`local.runner_max_by_arch`, shared with the reuse and cleanup Lambdas as
 `MAX_RUNNERS_ARM64` and `MAX_RUNNERS_X86_64`). ARM tries
 `c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
 in the us-west-1c runner subnet first and then in us-west-1a (see
