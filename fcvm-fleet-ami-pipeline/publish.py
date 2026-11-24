@@ -145,7 +145,23 @@ class Publisher:
         self.clients = clients or {}
         self.clock = clock
         self.sleep = sleep
-        self.templates = json.loads(self.env["TEMPLATES_JSON"])
+        # Regions that receive a copy of every published pair: the stack's other GPU host
+        # regions and work kept off the compute region's quotas (agents' GPU boxes). Never the
+        # compute region itself. Comma-separated, not JSON: the environment is close to Lambda's
+        # 4 KB limit.
+        self.copy_regions = self.env["COPY_REGIONS"].split(",") if self.env["COPY_REGIONS"] else []
+        need(len(set(self.copy_regions)) == len(self.copy_regions)
+             and all(COPY_REGION.fullmatch(region) for region in self.copy_regions)
+             and self.env["COMPUTE_REGION"] not in self.copy_regions, "image copy configuration is outside its fixed scope")
+        configured = json.loads(self.env["TEMPLATES_JSON"])
+        need(isinstance(configured, list) and all(isinstance(t, dict) for t in configured),
+             "template configuration is outside the fixed image-pair scope")
+        # The release's four templates, all in the compute region. Everything else here (the
+        # transaction, the gate, retirement, the reviewed transitions) acts on these only.
+        self.templates = [t for t in configured if t.get("region") == self.env["COMPUTE_REGION"]]
+        # The host template of each other region the stack's GPU hosts may run in: it boots that
+        # region's copy of the released host, and follow_copies moves it after every replication.
+        self.copy_templates = [t for t in configured if t.get("region") != self.env["COMPUTE_REGION"]]
         need(len(self.templates) == 4 and len({t["id"] for t in self.templates}) == 4,
              "exactly four distinct configured templates are required")
         need(all(set(t) == {"region", "id", "kind", "arch"}
@@ -154,13 +170,12 @@ class Publisher:
                  and t["kind"] in {"host", "tile"} for t in self.templates)
              and sum(t["kind"] == "host" for t in self.templates) == 1,
              "template configuration is outside the fixed image-pair scope")
-        # Regions that receive a copy of every published pair, for work kept off the
-        # compute region's quotas (agents' GPU boxes). Never the compute region itself.
-        # Comma-separated, not JSON: the environment is close to Lambda's 4 KB limit.
-        self.copy_regions = self.env["COPY_REGIONS"].split(",") if self.env["COPY_REGIONS"] else []
-        need(len(set(self.copy_regions)) == len(self.copy_regions)
-             and all(COPY_REGION.fullmatch(region) for region in self.copy_regions)
-             and self.env["COMPUTE_REGION"] not in self.copy_regions, "image copy configuration is outside its fixed scope")
+        need(all(set(t) == {"region", "id", "kind", "arch"}
+                 and t["region"] in self.copy_regions and t["kind"] == "host" and t["arch"] == "x86_64"
+                 and re.fullmatch(r"lt-[0-9a-f]{17}", str(t["id"])) for t in self.copy_templates)
+             and len({t["region"] for t in self.copy_templates}) == len(self.copy_templates)
+             and not {t["id"] for t in self.copy_templates} & {t["id"] for t in self.templates},
+             "copy-region template configuration is outside the fixed host-copy scope")
         self.copies_parameter = self.env["RELEASE_PARAMETER"] + "-copies"
         # Where the factory builds and verifies candidates. The release (the launch templates) is in
         # COMPUTE_REGION; a candidate built elsewhere is copied there before it is promoted.
@@ -1165,7 +1180,7 @@ class Publisher:
                         self.retained_tiles(active)
                     self.check_reviewed_host_default(active, host_user_data)
                 self.committed = True
-                self.retain(active, self.replicate(active))
+                self.retain(active, self.spread(active))
                 return {"status": "promoted", "generation": generation}
             need(active == config["expected"], "reviewed transition requires its unchanged predecessor")
             prior = self.prior_transaction()
@@ -1185,7 +1200,7 @@ class Publisher:
             manifest = {"images": {kind: {"image_id": image} for kind, image in config["images"].items()}}
             result = self.promote(manifest, config["source_sha"], None, [], fence=fence,
                                   host_user_data=host_user_data, host_only=host_only)
-            self.retain(result, self.replicate(result))
+            self.retain(result, self.spread(result))
             return {"status": "promoted", "generation": result["generation"]}
 
     def event(self, event):
@@ -1478,8 +1493,8 @@ class Publisher:
                  and copied.get("ChecksumSHA256") == checksum,
                  "runtime destination differs; existing assets were not overwritten")
 
-    def current(self, template):
-        ec2 = self.client("ec2", True)
+    def current(self, template, region=None):
+        ec2 = self.client("ec2", True, region)
         rows = ec2.describe_launch_templates(LaunchTemplateIds=[template])["LaunchTemplates"]
         need(len(rows) == 1 and rows[0]["LaunchTemplateId"] == template, "configured template is missing")
         number = rows[0]["DefaultVersionNumber"]
@@ -1488,9 +1503,26 @@ class Publisher:
         need(len(versions) == 1 and versions[0]["VersionNumber"] == number, "default template version is missing")
         return versions[0]
 
-    def version(self, template, current, image, label, entry=None):
-        ec2 = self.client("ec2", True)
-        description = "fleet-image-" + digest(self.build_id + "/" + template + "/" + label)
+    def version_description(self, template, label, identity=None):
+        return "fleet-image-" + digest((self.build_id if identity is None else identity) + "/" + template + "/" + label)
+
+    def labelled_versions(self, template, description, region=None):
+        """Every version of the template carrying the label, or None past the discovery bound."""
+        ec2 = self.client("ec2", True, region)
+        found = []
+        arguments = {"LaunchTemplateId": template, "MaxResults": 100}
+        for _ in range(20):
+            page = ec2.describe_launch_template_versions(**arguments)
+            found.extend(item for item in page["LaunchTemplateVersions"]
+                         if item.get("VersionDescription") == description)
+            if not page.get("NextToken"):
+                return found
+            arguments["NextToken"] = page["NextToken"]
+        return None
+
+    def version(self, template, current, image, label, entry=None, *, region=None, identity=None):
+        ec2 = self.client("ec2", True, region)
+        description = self.version_description(template, label, identity)
         try:
             response = ec2.create_launch_template_version(LaunchTemplateId=template,
                 SourceVersion=str(current["VersionNumber"]), LaunchTemplateData={"ImageId": image},
@@ -1498,16 +1530,8 @@ class Publisher:
             created = response["LaunchTemplateVersion"]
         except Exception:
             # Never replay an uncertain create. Discover only our immutable label.
-            found = []
-            arguments = {"LaunchTemplateId": template, "MaxResults": 100}
-            for _ in range(20):
-                page = ec2.describe_launch_template_versions(**arguments)
-                found.extend(item for item in page["LaunchTemplateVersions"]
-                             if item.get("VersionDescription") == description)
-                if not page.get("NextToken"):
-                    break
-                arguments["NextToken"] = page["NextToken"]
-            else:
+            found = self.labelled_versions(template, description, region)
+            if found is None:
                 self.recovery_failed = True
                 raise Refused("uncertain template create exceeds the discovery bound") from None
             if len(found) != 1:
@@ -1528,16 +1552,17 @@ class Publisher:
              "candidate version changed infrastructure configuration")
         return created["VersionNumber"]
 
-    def select(self, template, version):
-        ec2 = self.client("ec2", True)
+    def select(self, template, version, region=None, identity=None):
+        ec2 = self.client("ec2", True, region)
         try:
             ec2.modify_launch_template(LaunchTemplateId=template, DefaultVersion=str(version),
-                ClientToken=digest(self.build_id + "/" + template + "/default/" + str(version)))
+                ClientToken=digest((self.build_id if identity is None else identity) + "/" + template
+                                   + "/default/" + str(version)))
         except Exception:
             # A lost response is resolved by reading the actual explicit default.
-            if self.current(template)["VersionNumber"] != version:
+            if self.current(template, region)["VersionNumber"] != version:
                 raise Refused("template default update was not confirmed") from None
-        need(self.current(template)["VersionNumber"] == version, "template default update was not confirmed")
+        need(self.current(template, region)["VersionNumber"] == version, "template default update was not confirmed")
 
     def record(self):
         self.save(self.env["STATE_PREFIX"] + "/publications/" + digest(self.build_id), self.transaction)
@@ -1762,8 +1787,9 @@ class Publisher:
         Runs only after the release is committed, and never changes it: a failure
         leaves the release live and is retried by the next invocation. A copy is
         found again by its name (unique per region), so a replay never starts a
-        second one. The copies are not in host_amis or tile_amis, so no copy region
-        gets launch templates or fleet hosts.
+        second one. The copies are not in host_amis or tile_amis: the release's
+        templates are the compute region's. A copy region's host template, where the
+        stack lists that region for its GPU hosts, follows the record (follow_copies).
         """
         compute = self.env["COMPUTE_REGION"]
         need(release.get("version") == 1 and type(release.get("generation")) is int
@@ -1819,6 +1845,53 @@ class Publisher:
         need(self.load(self.copies_parameter, True) == record, "image copy record was not confirmed")
         return record
 
+    # What a copy-region host version's label is made under, in place of a build: the label names
+    # the region, the version it was made from and the image, so every run wanting that change
+    # finds the same version.
+    COPY_FOLLOW_IDENTITY = "copy-region-host"
+
+    def follow_copies(self, record):
+        """Point each copy region's host template at that region's copy of the released host.
+
+        Runs after replicate() has confirmed the record, so a copy region's hosts follow every
+        release and rollback of the compute region and never run ahead of their copy. It is not
+        part of the release's transaction: the release is already committed, and a failure here
+        leaves it live for the next publication, redrive or replicate-active-release to finish.
+        Each new default differs from the current one only in ImageId and is labelled by its
+        region, the version it was made from and the image, so a replay selects the version an
+        earlier run made instead of making another; an uncertain create is never replayed
+        (version()).
+        """
+        for template in self.copy_templates:
+            region = template["region"]
+            image = ((record.get("images") or {}).get(region) or {}).get("host")
+            need(isinstance(image, str) and IMAGE.fullmatch(image), "the copy record names no host image in a copy region")
+            self.validated_image(self.client("ec2", True, region), image, "host")
+            current = self.current(template["id"], region)
+            if current["LaunchTemplateData"].get("ImageId") == image:
+                continue
+            label = region + "/" + str(current["VersionNumber"]) + "/" + image
+            description = self.version_description(template["id"], label, self.COPY_FOLLOW_IDENTITY)
+            found = self.labelled_versions(template["id"], description, region)
+            need(found is not None and len(found) <= 1, "a copy-region host version label is ambiguous")
+            if found:
+                made = found[0]
+                need(made.get("LaunchTemplateId") == template["id"] and type(made.get("VersionNumber")) is int
+                     and made["LaunchTemplateData"].get("ImageId") == image
+                     and without_image(made["LaunchTemplateData"]) == without_image(current["LaunchTemplateData"]),
+                     "candidate version changed infrastructure configuration")
+                number = made["VersionNumber"]
+            else:
+                number = self.version(template["id"], current, image, label, region=region,
+                                      identity=self.COPY_FOLLOW_IDENTITY)
+            self.select(template["id"], number, region, self.COPY_FOLLOW_IDENTITY)
+
+    def spread(self, release):
+        """Replicate the committed release, then move the copy regions' host templates onto it."""
+        record = self.replicate(release)
+        self.follow_copies(record)
+        return record
+
     @classmethod
     def is_drill_release(cls, release):
         source = release.get("source_sha")
@@ -1832,7 +1905,7 @@ class Publisher:
         self.build_id = "replicate-active-release"
         with self.publication_lock():
             release = self.load(self.env["RELEASE_PARAMETER"], True)
-            record = self.replicate(release)
+            record = self.spread(release)
             self.retain(release, record)
         return {"status": "replicated", "generation": record["generation"]}
 
@@ -1882,12 +1955,13 @@ class Publisher:
         """Deregister the retirable images (retirable()) that nothing needs, and delete their snapshots.
 
         Kept: the active release and the previous one (the release pointer and the copy record
-        name both), every launch template's default image, every image an instance or an open
-        Spot request in the region uses, and every copy of a kept image or image a kept copy was
-        made from, in any region (so a record without previous_images still keeps the previous
-        release's copies). At most RETAIN_LIMIT images go per region and run. A snapshot is
-        eligible for deletion only if CopyImage stamped its provenance at creation. Eligible
-        snapshots are tagged FleetRetired before deregistration, so a failed deletion is retried."""
+        name both), every configured launch template's default image (a copy region's host
+        template's too), every image an instance or an open Spot request in the region uses,
+        and every copy of a kept image or image a kept copy was made from, in any region (so a
+        record without previous_images still keeps the previous release's copies). At most
+        RETAIN_LIMIT images go per region and run. A snapshot is eligible for deletion only if
+        CopyImage stamped its provenance at creation. Eligible snapshots are tagged FleetRetired
+        before deregistration, so a failed deletion is retried."""
         keep = set()
         # Prod's release and its previous one (ProdPublisher): prod launches from them while staging moves on.
         for ids in self.prod_release().values():
@@ -1899,7 +1973,8 @@ class Publisher:
         for field in ("images", "previous_images"):
             for kinds in record.get(field, {}).values():
                 keep.update(kinds.values())
-        keep.update(self.current(template["id"])["LaunchTemplateData"].get("ImageId") for template in self.templates)
+        keep.update(self.current(template["id"], template["region"])["LaunchTemplateData"].get("ImageId")
+                    for template in self.templates + self.copy_templates)
         regions = sorted({self.env["COMPUTE_REGION"], self.build_region, *self.copy_regions})
         listed = {}
         for region in regions:
@@ -1977,8 +2052,9 @@ class Publisher:
                 self.save(name, request)
                 raise
         # Before the request is promoted: a failure leaves it awaiting publication, and the
-        # dispatcher redrives it until the copies and their record are confirmed.
-        record = self.replicate(result)
+        # dispatcher redrives it until the copies, their record and the copy regions' host
+        # templates are confirmed.
+        record = self.spread(result)
         request.update(status="promoted", generation=result["generation"])
         self.save(name, request)
         # After promotion: a failure here is raised, and the next publication retries it.
@@ -2089,6 +2165,12 @@ class ProdPublisher(Publisher):
     def __init__(self, env=None, clients=None, clock=time.time, sleep=time.sleep):
         # Never the staging bundle: its TEMPLATES_JSON names staging's templates.
         super().__init__(env, clients, clock, sleep, config=os.devnull + ".absent")
+        # COPY_REGIONS is prod's listed host regions other than its own (fcvm-fleet-prod-ci.tf). A
+        # move here commits only while prod sleeps and keeps no copy record, so it has no step that
+        # copies into another region or moves a host template there; until one is built and reviewed,
+        # any such configuration is refused rather than ignored (Terraform refuses it too).
+        need(not self.copy_regions and not self.copy_templates,
+             "prod's image release does not copy into other host regions yet")
 
     def gate_record(self):
         return self.load(self.env["GATE_PARAMETER"])

@@ -22,17 +22,24 @@ resource "aws_ssm_parameter" "fcvm_ami_release" {
   }
 }
 
-# Every published host and tile image is also copied into these regions, so agents'
-# GPU boxes and other work can run outside the staging fleet's region and quotas. The
-# copies stay out of host_amis and tile_amis: no copy region gets launch templates or
-# fleet hosts. Never the compute region (us-east-1).
+# Every published host and tile image is also copied into these regions: the fixed ones, so
+# agents' GPU boxes and other work can run outside the staging fleet's region and quotas, and
+# every other region staging lists for its GPU hosts (fcvm-fleet.tf, local.fcvm_fleet_host_regions),
+# so each build lands in every listed region with no hand step. Never the compute region
+# (us-east-1). The copies stay out of the release pointer's host_amis and tile_amis, which stay
+# the compute region's: a listed copy region's host template boots the copy record's host image
+# instead (local.fcvm_fleet_host_amis below), and the publisher moves that template onto each
+# release's copy once it has recorded it (publish.py, follow_copies). No copy region gets tiles.
 locals {
-  fcvm_ami_copy_regions = ["us-west-2"]
+  fcvm_ami_fixed_copy_regions = ["us-west-2"]
+  fcvm_ami_copy_regions = distinct(concat(local.fcvm_ami_fixed_copy_regions,
+  [for region in local.fcvm_fleet_host_regions.stage : region if region != local.fcvm_ami_region]))
 }
 
 # The ids of the active pair in the compute region and of its copies in each copy
 # region, written by the publisher after each publication (`replicate-active-release`
-# copies the active pair on demand). Tools read it; nothing launches from it.
+# copies the active pair on demand). Tools read it, and a listed host region's host
+# template boots its host image there.
 resource "aws_ssm_parameter" "fcvm_ami_copies" {
   provider    = aws.fcvm_fleet_east1
   name        = "${aws_ssm_parameter.fcvm_ami_release.name}-copies"
@@ -75,12 +82,67 @@ ephemeral "aws_ssm_parameter" "fcvm_ami_release_guard" {
   }
 }
 
+# The copy record, read the way the release pointer is: the host AMI of every other region staging
+# lists for its GPU hosts comes from it. Only well-formed fleet-region image ids are accepted.
+data "aws_ssm_parameter" "fcvm_ami_copies" {
+  provider        = aws.fcvm_fleet_east1
+  count           = var.fcvm_ami_pipeline_enabled ? 1 : 0
+  name            = aws_ssm_parameter.fcvm_ami_copies.name
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition = (
+        try(jsondecode(self.value).version, 0) == 1 &&
+        try(alltrue([for region, kinds in jsondecode(self.value).images : contains(local.fcvm_fleet_regions, region) && alltrue([
+          for kind, image in kinds : contains(["host", "tile"], kind) && can(regex("^ami-[0-9a-f]{17}$", image))
+        ])]), false)
+      )
+      error_message = "The Fleet AMI copy record's schema is incompatible; keep the current host templates and review the record."
+    }
+  }
+}
+
+# A saved plan made before the publisher last wrote the copy record would put a copy region's
+# host template back on an older copy: refuse it, as the release guard does for the pointer.
+ephemeral "aws_ssm_parameter" "fcvm_ami_copies_guard" {
+  provider        = aws.fcvm_fleet_east1
+  count           = var.fcvm_ami_pipeline_enabled ? 1 : 0
+  arn             = aws_ssm_parameter.fcvm_ami_copies.arn
+  with_decryption = false
+  lifecycle {
+    postcondition {
+      condition     = self.version == data.aws_ssm_parameter.fcvm_ami_copies[0].version
+      error_message = "The Fleet AMI copy record changed after planning; create a fresh plan."
+    }
+  }
+}
+
 locals {
   # SSM marks every value sensitive, including this explicitly non-secret image
   # manifest. Only the AMI maps are declassified so resource keys stay usable.
   fcvm_active_host_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).host_amis) : var.fcvm_fleet_host_amis
   fcvm_active_tile_amis = var.fcvm_ami_pipeline_enabled ? nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_release[0].value).tile_amis) : var.fcvm_fleet_tile_amis
-  fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates
+  # The publisher's copy of the live host image in each region of the copy record (never a tile: tiles stay in us-east-1).
+  fcvm_ami_copy_host_amis = var.fcvm_ami_pipeline_enabled ? {
+    for region, kinds in nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_copies[0].value).images) : region => kinds.host if can(kinds.host)
+  } : {}
+  # Each fleet region's GPU host AMIs, which give it a host template (modules/fcvm-fleet-region, gpu_amis): the compute
+  # region's from the release pointer, as always; another region's only while staging lists it for its GPU hosts, and
+  # then its copy of the live host image, once the publisher has recorded one there.
+  fcvm_fleet_host_amis = { for region in local.fcvm_fleet_regions : region => (
+    region == local.fcvm_ami_region || !var.fcvm_ami_pipeline_enabled ? lookup(local.fcvm_active_host_amis, region, {}) : (
+      contains(local.fcvm_fleet_host_regions.stage, region) && contains(keys(local.fcvm_ami_copy_host_amis), region)
+      ? { x86_64 = local.fcvm_ami_copy_host_amis[region] } : {}
+    )
+  ) }
+  # The templates the publisher releases into: the compute region's four, then the host template of each other region
+  # staging lists, which it moves onto that region's copy after each replication (publish.py, follow_copies). Only these
+  # templates' versions and defaults are the publisher's to change (fcvm-fleet-ami-pipeline.tf).
+  fcvm_ami_compute_templates = module.fcvm_fleet_east1.image_templates
+  fcvm_ami_copy_templates = flatten([for region in local.fcvm_fleet_host_regions.stage : [
+    for template in local.fcvm_fleet_regional[region].image_templates : template if template.kind == "host"
+  ] if region != local.fcvm_ami_region && contains(keys(local.fcvm_fleet_regional), region)])
+  fcvm_ami_templates = concat(local.fcvm_ami_compute_templates, local.fcvm_ami_copy_templates)
   # Manually verified legacy images, not sanitized CI bases. Keep this catalog
   # additive: moving a tag's resource_id revokes the old image's launch permission,
   # including an active or rollback release. Preserve the original resource keys.
@@ -105,6 +167,18 @@ locals {
     "host/x86_64/92a26793" = { image = "ami-09ac99f69700ec306", kind = "host" }
     "tile/x86_64/92a26793" = { image = "ami-094ca9c62a284a389", kind = "tile" }
     "host/x86_64/343b2287" = { image = "ami-05923927f810a2ce9", kind = "host" }
+  }
+}
+
+# A region newly listed for GPU hosts gets its host template only once the copy record names a host
+# image there: the publisher copies into it from its next publication on (COPY_REGIONS follows the
+# list), or at once with `replicate-active-release`. Until then this warns rather than fails.
+check "fcvm_fleet_listed_host_regions_have_a_copy" {
+  assert {
+    condition = !var.fcvm_ami_pipeline_enabled || alltrue([
+      for region in local.fcvm_fleet_host_regions.stage : region == local.fcvm_ami_region || contains(keys(local.fcvm_ami_copy_host_amis), region)
+    ])
+    error_message = "A region in local.fcvm_fleet_host_regions.stage has no copy of the live host image yet, so no host template: invoke the publisher's replicate-active-release (or wait for the next publication), then apply again."
   }
 }
 

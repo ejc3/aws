@@ -47,6 +47,11 @@ locals {
 
   # The prod region module, as a map so nothing below indexes an empty tuple while the stack is off.
   fcvm_fleet_prod_regional = { for m in module.fcvm_fleet_prod_east1 : local.fcvm_fleet_prod_region => m }
+  # Prod's GPU host regions other than its own (fcvm-fleet.tf, local.fcvm_fleet_host_regions.prod): its image release's
+  # COPY_REGIONS (fcvm-fleet-prod-ci.tf). None: prod has a region module in us-east-1 only, and its image release has no
+  # step that copies a release into another region and moves a host template there while prod sleeps; the coordinator's
+  # task definition and the release function refuse a list that needs one.
+  fcvm_fleet_prod_copy_regions = [for r in local.fcvm_fleet_host_regions.prod : r if r != local.fcvm_fleet_prod_region]
 
   # The prod release pointer's images (aws_ssm_parameter.fcvm_fleet_prod_ami_release): read from the resource, whose
   # state holds the live value after refresh, so the first apply needs no second pass.
@@ -102,9 +107,12 @@ locals {
   fcvm_fleet_prod_instance_arns     = ["arn:aws:ec2:${local.fcvm_fleet_prod_region}:${local.fcvm_fleet_account_id}:instance/*"]
   fcvm_fleet_prod_volume_arns       = ["arn:aws:ec2:${local.fcvm_fleet_prod_region}:${local.fcvm_fleet_account_id}:volume/*"]
 
-  fcvm_fleet_prod_host_templates = flatten([for r, m in local.fcvm_fleet_prod_regional : [for t in m.host_template_names : "${r}:${t}"]])
-  fcvm_fleet_prod_host_subnets = flatten([for r, m in local.fcvm_fleet_prod_regional : [for s in m.host_subnet_ids : "${r}:${s}"]
-  if length(m.host_template_names) > 0])
+  # The regions prod's coordinator is given, in list order (fcvm-fleet.tf, local.fcvm_fleet_coordinator_host_regions).
+  fcvm_fleet_prod_host_templates = flatten([for r in local.fcvm_fleet_coordinator_host_regions.prod :
+  [for t in local.fcvm_fleet_prod_regional[r].host_template_names : "${r}:${t}"] if contains(keys(local.fcvm_fleet_prod_regional), r)])
+  fcvm_fleet_prod_host_subnets = flatten([for r in local.fcvm_fleet_coordinator_host_regions.prod :
+    [for s in local.fcvm_fleet_prod_regional[r].host_subnet_ids : "${r}:${s}"]
+  if contains(keys(local.fcvm_fleet_prod_regional), r) && length(try(local.fcvm_fleet_prod_regional[r].host_template_names, [])) > 0])
 
   # The prod coordinator's arguments: staging's (fcvm-fleet.tf, fcvm_fleet_coordinator_command) for the prod stack, with
   # these differences:
@@ -380,7 +388,7 @@ module "fcvm_fleet_prod_east1" {
 
   ami_release_guarded           = true
   ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_fleet_prod_ami_release_guard[*].version)
-  hosts_enabled                 = local.fcvm_fleet_hosts_enabled
+  hosts_enabled                 = local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.prod, local.fcvm_fleet_prod_region)
   # Prod's alarms are their own PR (plan A5); the fcvm-fleet-alerts topic stays staging's.
   alert_topic     = false
   alert_email     = local.browser_manager_owner
@@ -983,6 +991,16 @@ resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator" {
     precondition {
       condition     = length(local.fcvm_fleet_prod_host_subnets) >= local.fcvm_fleet_prod_min_host_zones
       error_message = "The prod hosts need subnets in at least three us-east-1 zones that offer the host type (FLEET_HOST_SUBNETS)."
+    }
+    # Prod's GPU host regions (fcvm-fleet.tf, local.fcvm_fleet_host_regions.prod): only regions prod has a region module
+    # in, each once. Another region needs its prod module and a prod image release step that copies there first.
+    precondition {
+      condition = (
+        length(local.fcvm_fleet_host_regions.prod) > 0
+        && length(distinct(local.fcvm_fleet_host_regions.prod)) == length(local.fcvm_fleet_host_regions.prod)
+        && alltrue([for r in local.fcvm_fleet_host_regions.prod : contains(keys(local.fcvm_fleet_prod_regional), r)])
+      )
+      error_message = "local.fcvm_fleet_host_regions.prod may name only regions with a prod region module (us-east-1), each once."
     }
   }
 }

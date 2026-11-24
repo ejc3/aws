@@ -564,9 +564,12 @@ pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatc
 publication every five minutes within its 24-hour lease), and releases the copies there. After
 each publication it records the release's ids in every region in `/fcvm-fleet/ami-release-copies`
 (us-east-1): the us-east-1 copies, and in us-west-2 the factory's originals, or for an older
-pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
-`fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
-only, so us-west-2 gets no launch templates or fleet hosts. Pending or failed copies never
+pair built in us-east-1 a copy (`fcvm_ami_copy_regions`: us-west-2, plus every other region in
+`local.fcvm_fleet_host_regions.stage`). Agents' GPU boxes (fcvm `fleet/tools/gpubox.sh`) launch
+the us-west-2 entry. The release's image maps name us-east-1 only, so only us-east-1 gets tiles.
+A region staging lists for its GPU hosts gets a host template booting its recorded host copy, and
+the publisher moves that template onto each release's copy after recording it (and back on a
+rollback); the coordinator is given the first listed region only (ejc3/fcvm#2114). Pending or failed copies never
 replace the last available copy record. A confirmed failed copy gets up to two retry names;
 the publisher leaves the failed AMIs in place so interrupted retries can resume safely.
 After each publication and each

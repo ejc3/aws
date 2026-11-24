@@ -395,7 +395,7 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       FAILURE_PARAMETER = aws_ssm_parameter.fcvm_ami_failure.name
       LOCK_TABLE        = "ejc3-terraform-locks"
       LOCK_ID           = local.fcvm_stage_lock_id
-      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)
+      TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates) # retention keeps each one's default image
 
       PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
     }
@@ -721,7 +721,11 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = ["ec2:DescribeImages", "ec2:DescribeSnapshots", "ec2:DescribeInstances", "ec2:DescribeSpotInstanceRequests", "ec2:DescribeLaunchTemplateVersions", "ec2:DescribeLaunchTemplates"], Resource = "*" },
     { Effect = "Allow", Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplateVersions"],
-    Resource = [for template in local.fcvm_ami_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] },
+    Resource = [for template in local.fcvm_ami_compute_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] },
+    # The host template of each other region staging lists for its GPU hosts: a new default that changes only its image
+    # (publish.py, follow_copies). Nothing there is rolled back version by version, so no deletion.
+    { Sid = "FollowCopyRegionHostTemplates", Effect = "Allow", Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate"],
+    Resource = length(local.fcvm_ami_copy_templates) > 0 ? [for template in local.fcvm_ami_copy_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] : ["arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:launch-template/none"] },
     { Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_release_image_arns,
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true", "aws:RequestTag/FleetImageValidated" = "true" }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["FleetImageValidated"] } } },
     { Effect = "Allow", Action = "ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*",
