@@ -395,6 +395,15 @@ populate it with `put-secret-value` on stdin after applying. Tools fetch it when
 `STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
 The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
 
+The run.cloud key (cloud iOS simulators, the fallback when the Macs are busy) is
+`run-cloud/api-key` in the same region, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same two
+dev-role readers. Terraform creates its empty container; populate it on stdin after applying:
+
+```bash
+read -rs T; printf '{"RUN_CLOUD_API_KEY":"%s"}' "$T" | aws secretsmanager put-secret-value \
+  --region us-west-1 --secret-id run-cloud/api-key --secret-string file:///dev/stdin; unset T
+```
+
 The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
 as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
 session, not an official API key. Terraform manages only its empty container and grants;
