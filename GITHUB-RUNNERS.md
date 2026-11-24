@@ -114,30 +114,52 @@ price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with
 `["us-east-2", "us-west-1"]`, in launch order, and reaches the webhook as `LAUNCH_NETWORKS`:
 each region's security group and subnets (Ohio's three AZs, then us-west-1c and us-west-1a,
 the subnets named above). A launch tries every type in every Ohio subnet before any pool in
-us-west-1, so a job waits only when both regions refuse (owner, 2026-11-24: "Make sure CI
-spreads out across regions"). It leaves a pool, and so a region, on the refusals it always
-moved on from: any refusal for spot, and only `InsufficientInstanceCapacity`,
-`VcpuLimitExceeded` and `InstanceLimitExceeded` for on-demand (anything else may have been
-accepted, and must not buy a second host elsewhere). Each region launches its own AMI, the
-newest `Purpose=github-runner` image there: fcvm publishes in us-west-1 and `ami-replicator`
-copies the newest two of each architecture to Ohio every hour. A region's AMI is looked up only
-when the walk reaches the region, so a launch Ohio takes makes no call to us-west-1, and a
-region with no image, or whose lookup fails, is skipped. A pool that refused in this invocation
-or failed for capacity recently goes behind the other region's pools as well, so the second
-launch of a batch goes straight to us-west-1 instead of asking Ohio's refused pools again. Hosts
-in both regions are counted toward the caps, reused and reaped, and the launch grants allow
-exactly the listed regions' subnets, security groups and runner AMIs. Ohio is first for price:
-on 2026-10-03 its `c7gd.metal` spot was $0.38/h against $1.16 in us-west-1, so a fallback
-runner costs about three times as much. A region taken off the list is no longer reaped, so
-drop one only once no runner is left in it.
+us-west-1 (owner, 2026-11-24: "Make sure CI spreads out across regions"). It leaves a pool, and
+so a region, on the refusals it always moved on from: any refusal for spot, and only
+`InsufficientInstanceCapacity`, `VcpuLimitExceeded` and `InstanceLimitExceeded` for on-demand
+(anything else may have been accepted, and must not buy a second host elsewhere). Each region
+launches its own AMI, the newest `Purpose=github-runner` image there: fcvm publishes in
+us-west-1 and `ami-replicator` copies the newest two of each architecture to Ohio every hour. A
+region's AMI is looked up only when the walk reaches the region, so a launch Ohio takes makes no
+AMI lookup or `RunInstances` call in us-west-1, and a region with no image, or whose lookup
+fails, is skipped. The fleet reads are different: counting the pool, reuse and the capacity
+history read `DescribeInstances` in both regions on every launch decision, and a read that
+fails in either region fails the launch (fail closed: a host it cannot see may be over the cap).
+Hosts in both regions are counted toward the caps, reused and reaped, and the launch grants
+allow exactly the listed regions' subnets, security groups and runner AMIs. Ohio is first for
+price: on 2026-10-03 its `c7gd.metal` spot was $0.38/h against $1.16 in us-west-1, so a
+fallback runner costs about three times as much. The fallback's ceiling is us-west-1's 1,148
+vCPU Standard spot quota, which the app runners share: the fcvm pools at their caps plus
+headroom would take 1,216 to 1,408 vCPU there. A region taken off the list is no longer
+reaped, so drop one only once no runner is left in it.
+
+**Refusals are remembered for 10 minutes.** A pool that refused in this invocation
+(`failed_here`) or failed for capacity recently (instance records) goes to the back, behind the
+other region's pools as well. A `RunInstances` refusal for capacity or quota
+(`REMEMBERED_REFUSALS`: the three on-demand codes plus `MaxSpotInstanceCountExceeded`,
+`Unsupported`, `SpotMaxPriceTooLow`, `InsufficientCapacityOnHost` and `UnfulfillableCapacity`)
+is also written to the registration table, one row per architecture and market (key
+`refused-pools#ARCH#MARKET`, one attribute per `AZ|type` holding when it expires), and read by
+the next launches for `REFUSED_POOL_SECONDS` (600, the app runners' figure). Without it every
+delivery and poll asked every Ohio pool again: on 2026-11-12 an Ohio x86 refusal took about a
+second, so the 12 Ohio x86 pools ended 13 to 15 seconds into the invocation and left time for
+one or two us-west-1 pools, and us-west-1a x86 was never reached. With it the walk that meets
+the refusals pays once, and the next launches start in us-west-1 until Ohio's refusals expire.
+Any other error (throttling, an unknown outcome) is not remembered. The webhook writes and reads
+the row with the `GetItem`/`UpdateItem` grant it already has on that table (no new IAM); a
+runner's own grant reaches only its instance's row. A row that cannot be read or written is
+logged and ignored: the launch goes on in the usual order.
 
 The fallback must not cost the invocation: the webhook runs one execution at a time with a
-30-second timeout it cannot catch. Each launch call goes through its own region's client
-(one attempt, 2 s to connect, 8 s to answer; `LAUNCH_CALL_SECONDS` 10) and starts only while
-that and `LAUNCH_FINISH_SECONDS` (4, for the credential and the decision line) are left. A walk
-that runs out of time ends that launch with the last refusal, and the cleanup poll, which only
-invokes the webhook and whose queue scan keeps its own 120-second budget, is the retry. An
-answer that has not come in 8 seconds is an unknown outcome: spot moves on, on-demand stops.
+30-second timeout it cannot catch. Each launch call goes through its own region's client (one
+attempt, 2 s to connect, 6 s to answer; `LAUNCH_CALL_SECONDS` 8) and starts only while that and
+`LAUNCH_FINISH_SECONDS` (3, for the credential, one refusal-memory write and the decision line)
+are left, so calls start until about 19 seconds in. On 2026-11-12 a refusal took about 1.0 s
+and a launch with its credential about 2.7 s. The refusal memory has its own client (one
+attempt, 1 s to connect, 1 s to answer). A walk that runs out of time ends that launch with the
+last refusal, and the cleanup poll, which only invokes the webhook and whose queue scan keeps
+its own 120-second budget, is the retry. An answer that has not come in 6 seconds is an unknown
+outcome: spot moves on, on-demand stops.
 
 **One execution at a time, and what it costs.** The webhook Lambda has run with
 `reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent

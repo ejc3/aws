@@ -299,8 +299,11 @@ cutover is a separate act the owner schedules. The fcvm metal runners are region
 spreads out across regions"). A launch tries every subnet and instance type in Ohio and, once every pool there has refused
 (any refusal for spot; only capacity or quota for on-demand), those of us-west-1, each region with its own AMI (a region
 with none is skipped), subnets and security group (the webhook's `LAUNCH_NETWORKS`), and starts a call only while the
-webhook's invocation has time for it. So a job waits only when both regions are out of capacity, and a runner in us-west-1
-costs about three times Ohio's. Every listed region is counted, reused and reaped, and the launch IAM allows exactly the
+webhook's invocation has time for it. A capacity or quota refusal is remembered for 10 minutes (a `refused-pools#` row in
+the registration table), so the next launches skip to pools that have not just refused instead of spending the invocation
+on Ohio again; a walk that runs out of time is retried by the next poll. Every listed region is read on every launch
+decision, and a failed read in either fails the launch. A runner in us-west-1 costs about three times Ohio's, and a full
+fallback there meets its 1,148 vCPU spot quota, shared with the app runners. Every listed region is counted, reused and reaped, and the launch IAM allows exactly the
 listed regions' subnets, security groups and runner AMIs. A region left out of the list is no longer reaped: drop one only
 once no runner is left there. The control plane (SSM, DynamoDB, the Lambdas) stays in
 us-west-1; an instance uses `CONTROL_REGION` for those and its own region for EC2. The app runners (runner-app.tf) have not

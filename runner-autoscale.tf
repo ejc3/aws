@@ -19,6 +19,10 @@ locals {
   # these can take in the primary runner region is (8 + 2) x 64 for arm64 (c7gd, m7gd and
   # r7gd.metal are all 64 vCPU) plus (4 + 2) x 96 for x86 (128 when m6id.metal is the type
   # that launched). That shares the Standard spot quota with the parallel boxes (ohio-pbox.tf).
+  # Launches fall back to us-west-1 when Ohio refuses (runner_regions), where the same pools
+  # can take 640 + 576 to 768 = 1,216 to 1,408 vCPU: more than that region's 1,148 vCPU
+  # Standard spot quota (2026-11-24), which the app runners (runner-app.tf) share. A full
+  # fallback is refused by the quota first, and leaves the app runners less while it lasts.
   runner_max_by_arch = {
     arm64  = 8
     x86_64 = 4
@@ -214,16 +218,22 @@ data "archive_file" "runner_webhook" {
       #
       # Bounded as well, so one call fits LAUNCH_CALL_SECONDS: the launcher starts a call
       # only while that much of the invocation, and LAUNCH_FINISH_SECONDS after it, is
-      # left. A launch took about 3 seconds on 2026-09-13. An answer that has not come in
-      # 8 seconds is an unknown outcome: spot moves on to the next pool, as for any
-      # refusal, and on-demand stops.
-      LAUNCH_CLIENT = Config(connect_timeout=2, read_timeout=8, retries={'total_max_attempts': 1})
-      LAUNCH_CALL_SECONDS = 10
-      LAUNCH_FINISH_SECONDS = 4
+      # left. In the webhook's log on 2026-11-12 an Ohio refusal took about 1.0 second and
+      # a launch with its credential about 2.7, so 6 seconds is more than twice a whole
+      # launch. An answer that has not come by then is an unknown outcome:
+      # spot moves on to the next pool, as for any refusal, and on-demand stops. After
+      # the last call: the credential, and at most one REFUSAL_MEMORY_CLIENT write.
+      LAUNCH_CLIENT = Config(connect_timeout=2, read_timeout=6, retries={'total_max_attempts': 1})
+      LAUNCH_CALL_SECONDS = 8
+      LAUNCH_FINISH_SECONDS = 3
       launch_ec2 = {region: boto3.client('ec2', region_name=region, config=LAUNCH_CLIENT)
                     for region in RUNNER_REGIONS}
       ssm = boto3.client('ssm', region_name='us-west-1')
       dynamodb = boto3.client('dynamodb', region_name='us-west-1')
+      # The refusal memory's own client (remembered_refusals): one attempt, inside 2
+      # seconds, so a slow table costs a launch at most that and never blocks it.
+      REFUSAL_MEMORY_CLIENT = Config(connect_timeout=1, read_timeout=1, retries={'total_max_attempts': 1})
+      refusal_memory = boto3.client('dynamodb', region_name='us-west-1', config=REFUSAL_MEMORY_CLIENT)
       lambda_client = boto3.client('lambda', region_name='us-west-1')
 
       REPO = 'ejc3/fcvm'
@@ -888,6 +898,68 @@ data "archive_file" "runner_webhook" {
           """
           return deadline is None or time.monotonic() + LAUNCH_CALL_SECONDS + LAUNCH_FINISH_SECONDS <= deadline
 
+      # RunInstances refusals a later invocation should know about: capacity (the pool) and
+      # quota (the region, refused pool by pool). Any other error is not a verdict on the pool.
+      REMEMBERED_REFUSALS = ON_DEMAND_CAPACITY_REFUSALS | {
+          'MaxSpotInstanceCountExceeded', 'Unsupported', 'SpotMaxPriceTooLow',
+          'InsufficientCapacityOnHost', 'UnfulfillableCapacity'}
+      # How long a refused pool stays at the back. The app runners use the same 10 minutes
+      # (runner-app/app_runner.py, issue #991): two cleanup polls, after which the first
+      # launch asks the pool again.
+      REFUSED_POOL_SECONDS = 10 * 60
+
+      def refusal_memory_key(arch, market):
+          return {'InstanceArn': {'S': f'refused-pools#{arch}#{market}'}}
+
+      def remembered_refusals(arch, market):
+          """(AZ, type) pools that refused arch's `market` launches in the last REFUSED_POOL_SECONDS.
+
+          failed_here remembers a refusal for one invocation, and capacity_failures() reads
+          only the records of instances EC2 accepted. Without this, every delivery and poll
+          walked Ohio's refusing pools first, 12 for x86 at about a second each, which left
+          time for one or two us-west-1 pools (2026-11-12). One row per architecture and
+          market in the registration table (key refused-pools#ARCH#MARKET, beside the
+          poll's queue-scan# rows; a runner's own grant reaches only its instance's row),
+          one attribute per pool, "AZ|type", holding when its refusal expires. Only this
+          function and remember_refusal() use it, and the webhook runs one execution at a
+          time. A row that cannot be read is an empty set: today's order, never a refused
+          launch.
+          """
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table:
+              return set()
+          try:
+              item = refusal_memory.get_item(TableName=table, Key=refusal_memory_key(arch, market),
+                                             ConsistentRead=True).get('Item') or {}
+          except Exception as error:
+              print(f'Refusal memory unread ({type(error).__name__}); every pool in its usual order')
+              return set()
+          now = datetime.now(timezone.utc).timestamp()
+          pools = set()
+          for name, value in item.items():
+              az, _, instance_type = name.partition('|')
+              try:
+                  until = float(value['N'])
+              except (KeyError, TypeError, ValueError):
+                  continue
+              if az and instance_type and until > now:
+                  pools.add((az, instance_type))
+          return pools
+
+      def remember_refusal(arch, market, az, instance_type, error):
+          """Keep a capacity or quota refusal of one pool for REFUSED_POOL_SECONDS. Best effort."""
+          table = os.environ.get('REGISTRATION_TABLE', '')
+          if not table or not az or error_code(error) not in REMEMBERED_REFUSALS:
+              return
+          until = int(datetime.now(timezone.utc).timestamp()) + REFUSED_POOL_SECONDS
+          try:
+              refusal_memory.update_item(TableName=table, Key=refusal_memory_key(arch, market),
+                                         UpdateExpression='SET #pool = :until',
+                                         ExpressionAttributeNames={'#pool': f'{az}|{instance_type}'},
+                                         ExpressionAttributeValues={':until': {'N': str(until)}})
+          except Exception as write_error:
+              print(f'Refusal of {instance_type} in {az} not remembered ({type(write_error).__name__})')
+
       def launch_candidates(arch, subnets, failed=(), networks=()):
           """(subnet_id, availability_zone, instance_type) in the order to try them.
 
@@ -973,7 +1045,9 @@ data "archive_file" "runner_webhook" {
           launch to read, so without it each launch in a batch would retry every
           pair that had just refused, inside the 30-second function timeout.
           rate_refused, shared the same way, holds the architectures whose root
-          volume initialization rate run_instances refused in this invocation.
+          volume initialization rate run_instances refused in this invocation. A
+          capacity or quota refusal is also kept for REFUSED_POOL_SECONDS across
+          invocations (remembered_refusals), and those pools go to the back too.
 
           deadline is time.monotonic() when the invocation times out, or None. No call
           starts without time for it and the work after it
@@ -998,12 +1072,19 @@ data "archive_file" "runner_webhook" {
           if recent:
               pools = sorted(f'{instance_type} in {az or "an unknown AZ"}' for az, instance_type in recent)
               print(f'Recent capacity failures on {pools}, trying other pools first')
-          candidates = launch_candidates(arch, subnets, recent | failed_here, networks)
+          # And the refusals earlier invocations met: in a region that refuses, the next
+          # launch starts in the next region instead of asking every pool again.
+          remembered = remembered_refusals(arch, market)
+          if remembered:
+              pools = sorted(f'{instance_type} in {az}' for az, instance_type in remembered)
+              print(f'Refusals remembered on {pools}, trying other pools first')
+          candidates = launch_candidates(arch, subnets, recent | failed_here | remembered, networks)
           last_error = None
           out_of_time = False
 
           # Each region's AMI, looked up when the walk first reaches the region, so a
-          # launch the primary takes makes no call to another region. A region with none
+          # launch the primary takes makes no AMI lookup or RunInstances call in another
+          # region (the fleet reads above go to every listed region). A region with none
           # (fcvm has not published one there, or ami-replicator has not copied it yet),
           # or whose lookup fails, is skipped, never the launch.
           images = {}
@@ -1137,6 +1218,7 @@ data "archive_file" "runner_webhook" {
                       raise  # Common failure or uncertain delivery: do not try another pool or market.
                   last_error = e
                   failed_here.add((az, instance_type))
+                  remember_refusal(arch, market, az, instance_type, e)
                   print(f"Failed to launch {instance_type} in {az or subnet_id}: {e}, trying next...")
                   continue
 

@@ -97,8 +97,10 @@ locals {
   # Where the fcvm metal runners may run, in launch order, PRIMARY FIRST. A launch walks every subnet and instance type
   # of the primary, then, once every pool there has refused (any refusal for spot; capacity or quota for on-demand),
   # those of the next region, with that region's own AMI (a region with none is skipped), subnets and security group
-  # (local.runner_fcvm_launch_networks, the webhook's LAUNCH_NETWORKS). So a job waits only when every listed region is
-  # out of capacity. Every region listed is also counted, reused, reaped and allowed by IAM: exactly the listed regions'
+  # (local.runner_fcvm_launch_networks, the webhook's LAUNCH_NETWORKS), as far as the invocation's time allows. A
+  # capacity or quota refusal is remembered for 10 minutes, so later launches start with the pools that have not just
+  # refused, in either region. Every listed region is read on every launch decision, and a read that fails there fails
+  # the launch. Every region listed is also counted, reused, reaped and allowed by IAM: exactly the listed regions'
   # subnets, security groups and AMIs. Ohio (ohio.tf) is primary: its metal spot is 15-65% cheaper than us-west-1's,
   # where the runners ran until the 2026-10 move and which is the fallback now (owner, 2026-11-24: "Make sure CI spreads
   # out across regions"). The control plane (SSM, DynamoDB, the Lambdas) stays in us-west-1.
