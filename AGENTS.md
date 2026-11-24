@@ -1921,7 +1921,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   may create versions and set defaults on exactly those templates. The coordinator is given the FIRST listed region only
   (`local.fcvm_fleet_coordinator_host_regions`): it runs its awake hosts in every region it is given, in name order, with
   no fallback (ejc3/fcvm#2114), so reordering the list moves the hosts; once it falls back in list order that local
-  becomes the whole list. A newly listed region gets its template at the apply after the publisher's next replication
+  becomes the whole list. Staging's task definition keeps that region us-east-1 until the release gate and critical
+  retirement cover another region. A newly listed region gets its template at the apply after the publisher's next replication
   (or `replicate-active-release`); a `check` warns until then, and the coordinator's task definition refuses a first
   region without one. Only us-east-1 yet: the release gate's placement and a critical release's retirement of old-image
   hosts, and Windows, Minecraft and potato modes (a copy region's bootstrap and IPv4 ports serve the GPU slots and

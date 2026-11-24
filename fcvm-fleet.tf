@@ -112,7 +112,9 @@ locals {
   # with no fallback between them (ejc3/fcvm src/fleet/coord/hosts.rs, ejc3/fcvm#2114), so a second region would be a
   # second awake host, not a fallback. Reordering local.fcvm_fleet_host_regions therefore moves a stack's hosts; the
   # other listed regions' templates stay built and on the current release. Once ejc3/fcvm#2114 lets the coordinator
-  # fall back in list order, this becomes the whole list.
+  # fall back in list order, this becomes the whole list. Staging's coordinator task definition keeps this region
+  # us-east-1 while the release gate's placement and a critical release's retirement of old-image hosts cover only
+  # us-east-1 (publish.py fleet_placement, retire).
   fcvm_fleet_coordinator_host_regions = { for stack, regions in local.fcvm_fleet_host_regions : stack => [for i, r in regions : r if i == 0] }
   # The stacks that exist: production only while its switch is on.
   fcvm_fleet_stacks_enabled = { for k, s in local.fcvm_fleet_stacks : k => s if k != "prod" || var.fcvm_fleet_prod_enabled }
@@ -1482,6 +1484,12 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
     precondition {
       condition     = !local.fcvm_fleet_hosts_enabled || length(local.fcvm_fleet_host_templates) > 0
       error_message = "The first region in local.fcvm_fleet_host_regions.stage has no host template yet: list it second, let the publisher record its copy (the next publication or replicate-active-release), apply, then move it first."
+    }
+    # The release gate reads the hosts of the publisher's compute region only, and a critical release retires old-image
+    # hosts there only (publish.py fleet_placement, retire): a host elsewhere would be neither verified nor reclaimed.
+    precondition {
+      condition     = alltrue([for r in local.fcvm_fleet_coordinator_host_regions.stage : r == local.fcvm_ami_region])
+      error_message = "Staging's GPU hosts stay in us-east-1 (first in local.fcvm_fleet_host_regions.stage) until the release gate's placement and a critical release's retirement of old-image hosts cover another region."
     }
   }
 }

@@ -2154,6 +2154,12 @@ class HostRegionTests(unittest.TestCase):
         self.assertIn("alltrue([for r in local.fcvm_fleet_host_regions.stage : contains(local.fcvm_fleet_regions, r)])", stage)
         self.assertIn("length(distinct(local.fcvm_fleet_host_regions.stage)) == length(local.fcvm_fleet_host_regions.stage)", stage)
         self.assertIn("condition     = !local.fcvm_fleet_hosts_enabled || length(local.fcvm_fleet_host_templates) > 0", stage)
+        # The release gate's placement and critical retirement read us-east-1 only (publish.py fleet_placement,
+        # retire), so staging's coordinator keeps its hosts there until they cover another region.
+        self.assertIn("condition     = alltrue([for r in local.fcvm_fleet_coordinator_host_regions.stage : r == local.fcvm_ami_region])",
+                      stage)
+        self.assertEqual(json.loads(re.search(r'fcvm_ami_region\s*=\s*("[^"]+")', (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()).group(1)),
+                         self.host_regions()["stage"][0])
         prod = block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD)
         self.assertIn("alltrue([for r in local.fcvm_fleet_host_regions.prod : contains(keys(local.fcvm_fleet_prod_regional), r)])", prod)
 

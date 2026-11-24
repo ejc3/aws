@@ -245,9 +245,16 @@ class EC2:
         return {"LaunchTemplates": [{"LaunchTemplateId": key, "DefaultVersionNumber": self.templates[key]["default"]}
                                     for key in LaunchTemplateIds]}
 
-    def describe_launch_template_versions(self, LaunchTemplateId, Versions=None, **_kwargs):
+    def describe_launch_template_versions(self, LaunchTemplateId, Versions=None, Filters=None, **_kwargs):
         values = self.templates[LaunchTemplateId]["versions"]
-        return {"LaunchTemplateVersions": [copy.deepcopy(values[int(value)]) for value in Versions] if Versions else copy.deepcopy(list(values.values()))}
+        rows = [copy.deepcopy(values[int(value)]) for value in Versions] if Versions else copy.deepcopy(list(values.values()))
+        for item in Filters or []:
+            assert item["Name"] == "image-id" and len(item["Values"]) == 1
+            rows = [row for row in rows if row["LaunchTemplateData"].get("ImageId") in item["Values"]]
+        if getattr(self, "hide_labelled_versions", False):
+            # DescribeLaunchTemplateVersions lagging a create whose answer was lost.
+            rows = [row for row in rows if not row.get("VersionDescription", "").startswith("fleet-image-")]
+        return {"LaunchTemplateVersions": rows}
 
     def create_launch_template_version(self, LaunchTemplateId, SourceVersion, LaunchTemplateData, VersionDescription, ClientToken):
         assert set(LaunchTemplateData) == {"ImageId"} and SourceVersion.isdigit()
@@ -2267,6 +2274,28 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual((made["VersionNumber"], made["LaunchTemplateData"]["ImageId"]), (2, previous))
         self.assertIsNone(self.ddb.item)
 
+    def test_a_retried_gate_rollback_finishes_moving_the_copy_regions_host(self):
+        ten, eleven = self.generation_eleven_live()
+        record = copy.deepcopy(self.fleet_ssm.values["/release-copies"])
+        current, previous = record["images"]["us-west-2"]["host"], record["previous_images"]["us-west-2"]["host"]
+        self.west_host_template(current)
+        self.gate_instance(eleven)
+        event = self.gate_event("rollback")
+        self.west.fail_select = self.WEST_HOST
+        with self.assertRaisesRegex(MODULE.Refused, "template default update was not confirmed"):
+            self.publisher().gate(event)
+        # The rollback committed; its copy region did not follow, and the lock is free for the retry.
+        self.assertTrue(self.fleet_ssm.values["/release"]["build_id"].startswith("rollback-to-previous:"))
+        self.assertEqual(self.west_default()["LaunchTemplateData"]["ImageId"], current)
+        self.assertIsNone(self.ddb.item)
+        answer = self.publisher().gate(event)
+        self.assertEqual(answer["status"], "rolled_back")
+        self.assertEqual(self.main_ssm.values["/factory/gate"], answer["pointer"])
+        made = self.west_default()
+        self.assertEqual((made["VersionNumber"], made["LaunchTemplateData"]["ImageId"]), (2, previous))
+        self.assertEqual([entry for entry in self.west.created if entry[0] == self.WEST_HOST], [(self.WEST_HOST, 1, 2)])
+        self.assertIsNone(self.ddb.item)
+
     def test_the_gate_refuses_a_rollback_with_no_previous_release(self):
         _, eleven = self.generation_eleven_live()
         self.gate_instance(eleven)
@@ -3376,19 +3405,26 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.west_default()["VersionNumber"], 2)
         self.assertEqual(len(self.ec2.created), 4)
 
-    def test_a_copy_region_create_is_found_by_its_label_and_an_uncertain_one_never_replayed(self):
+    def test_a_copy_region_create_is_found_by_its_label_and_an_uncertain_one_releases_the_lock(self):
         self.west_host_template(self.old["host"])
         self.west.lose_create_response = True
         self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
         self.assertEqual((self.west.created, self.west_default()["VersionNumber"]), ([(self.WEST_HOST, 1, 2)], 2))
+        # A create whose answer is lost and which a lagging list does not show yet: the release is committed and
+        # the step is replay-safe, so Terraform's lock is released, and the next run selects that version by its label.
         self.setUp()
         self.west_host_template(self.old["host"])
-        self.west.unknown_create_response = True
-        with self.assertRaisesRegex(MODULE.Refused, "administrator reconciliation"):
+        self.west.lose_create_response = True
+        self.west.hide_labelled_versions = True
+        with self.assertRaisesRegex(MODULE.Refused, "uncertain template create"):
             self.publisher().run(self.event)
         self.assertEqual(self.fleet_ssm.values["/release"]["generation"], 1)
-        self.assertEqual((self.west.created, self.west_default()["VersionNumber"]), ([], 1))
-        self.assertIsNotNone(self.ddb.item, "an uncertain create keeps Terraform's lock for an administrator")
+        self.assertEqual((self.west.created, self.west_default()["VersionNumber"]), ([(self.WEST_HOST, 1, 2)], 1))
+        self.assertIsNone(self.ddb.item, "a replay-safe copy-region create never holds Terraform's lock")
+        self.west.hide_labelled_versions = False
+        self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
+        self.assertEqual((self.west.created, self.west_default()["VersionNumber"]), ([(self.WEST_HOST, 1, 2)], 2))
+        self.assertIsNone(self.ddb.item)
 
     def test_copy_region_templates_are_one_x86_64_host_per_copy_region(self):
         west = {"region": "us-west-2", "id": self.WEST_HOST, "kind": "host", "arch": "x86_64"}
@@ -3418,6 +3454,81 @@ class PublisherTests(unittest.TestCase):
         self.west.images[image]["Tags"].append({"Key": "FleetImageValidated", "Value": "true"})
         publisher.follow_copies({"images": {"us-west-2": {"host": image}}})
         self.assertEqual(self.west_default()["LaunchTemplateData"]["ImageId"], image)
+
+    def planted_west_version(self, image, number, **data):
+        """A version of the us-west-2 host template carrying the label follow_copies gives the move from
+        version 1 to `image`, as an earlier run would have made it (with `data` changed)."""
+        label = "us-west-2/1/" + image
+        description = self.publisher().version_description(self.WEST_HOST, label, MODULE.Publisher.COPY_FOLLOW_IDENTITY)
+        table = self.west.templates[self.WEST_HOST]
+        made = copy.deepcopy(table["versions"][1])
+        made.update(VersionNumber=number, VersionDescription=description)
+        made["LaunchTemplateData"].update(ImageId=image, **data)
+        table["versions"][number] = made
+
+    def test_a_labelled_copy_region_version_is_selected_only_if_unique_and_only_its_image_changed(self):
+        image = "ami-" + "9" * 17
+        self.west.images[image] = dict(copy.deepcopy(self.ec2.images[self.new["host"]]), ImageId=image)
+        self.west.images[image]["Tags"].append({"Key": "FleetImageValidated", "Value": "true"})
+        record = {"images": {"us-west-2": {"host": image}}}
+        for variant in ("configuration", "ambiguous"):
+            with self.subTest(variant=variant):
+                self.west_host_template(self.old["host"])
+                if variant == "configuration":
+                    self.planted_west_version(image, 2, SecurityGroupIds=["another-group"])
+                    expected = "changed infrastructure configuration"
+                else:
+                    self.planted_west_version(image, 2)
+                    self.planted_west_version(image, 3)
+                    expected = "label is ambiguous"
+                with self.assertRaisesRegex(MODULE.Refused, expected):
+                    self.publisher().follow_copies(record)
+                self.assertEqual((self.west_default()["VersionNumber"], self.west.selected, self.west.created), (1, [], []))
+        # The control: one labelled version that changes only the image is the one selected, with nothing created.
+        self.west_host_template(self.old["host"])
+        self.planted_west_version(image, 2)
+        self.publisher().follow_copies(record)
+        self.assertEqual((self.west_default()["VersionNumber"], self.west.created), (2, []))
+
+    def test_copy_region_version_discovery_reads_only_the_images_versions_within_its_bound(self):
+        image = "ami-" + "9" * 17
+        self.west.images[image] = dict(copy.deepcopy(self.ec2.images[self.new["host"]]), ImageId=image)
+        self.west.images[image]["Tags"].append({"Key": "FleetImageValidated", "Value": "true"})
+        self.west_host_template(self.old["host"])
+        original = self.west.describe_launch_template_versions
+        asked = []
+
+        def endless(**arguments):
+            asked.append(arguments)
+            if "Versions" in arguments:
+                return original(**arguments)
+            return dict(original(**arguments), NextToken="more")
+        with mock.patch.object(self.west, "describe_launch_template_versions", side_effect=endless):
+            with self.assertRaisesRegex(MODULE.Refused, "discovery exceeds its bound"):
+                self.publisher().follow_copies({"images": {"us-west-2": {"host": image}}})
+        listed = [arguments for arguments in asked if "Versions" not in arguments]
+        self.assertEqual(len(listed), 20)
+        self.assertTrue(all(item.get("Filters") == [{"Name": "image-id", "Values": [image]}] for item in listed))
+        self.assertEqual((self.west.created, self.west.selected), ([], []))
+
+    def test_a_drill_leaves_the_copy_region_host_on_the_last_ordinary_release(self):
+        self.active_new_pair()
+        self.west_host_template(self.old["host"])
+        self.publisher().run({"action": "replicate-active-release"})
+        healthy = self.fleet_ssm.values["/release-copies"]["images"]["us-west-2"]["host"]
+        self.assertEqual(self.west_default()["LaunchTemplateData"]["ImageId"], healthy)
+        safe = copy.deepcopy(self.fleet_ssm.values["/release"])
+        drill = next(iter(MODULE.Publisher.DRILLS.values()))
+        release = copy.deepcopy(safe)
+        release.update(generation=safe["generation"] + 1, build_id=drill["identity"] + ":example",
+                       source_sha=drill["source"], previous={k: v for k, v in safe.items() if k != "previous"})
+        release["host_amis"]["us-east-1"]["x86_64"] = drill["image"]
+        self.fleet_ssm.values["/release"] = release
+        created = list(self.west.created)
+        self.assertEqual(self.publisher().run({"action": "replicate-active-release"}),
+                         {"status": "replicated", "generation": safe["generation"]})
+        self.assertEqual(self.west_default()["LaunchTemplateData"]["ImageId"], healthy)
+        self.assertEqual(self.west.created, created)
 
     def test_retention_keeps_each_copy_region_host_templates_default(self):
         stale = "ami-" + "e6" * 8 + "e"

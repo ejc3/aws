@@ -1082,9 +1082,11 @@ class Publisher:
             live_receipt = self.gate_receipt(active)
             rolled_back = active["build_id"].startswith(self.ROLLBACK_PREFIX)
             if action == "rollback" and rolled_back and self.gate_receipt(active.get("previous") or {}) == receipt:
-                # The previous attempt may have committed its pointer before recording verification.
+                # The previous attempt may have committed its pointer before recording verification,
+                # or before its copies and the copy regions' host templates followed it.
                 if self.gate_record() != live_receipt:
                     self.save(self.env["STATE_PREFIX"] + "/gate", live_receipt)
+                self.retain(active, self.spread(active))
                 return self.gate_rollback_answer(active)
             need(live_receipt == receipt, "the live release is not that exact receipt")
             if action == "verify":
@@ -1506,11 +1508,16 @@ class Publisher:
     def version_description(self, template, label, identity=None):
         return "fleet-image-" + digest((self.build_id if identity is None else identity) + "/" + template + "/" + label)
 
-    def labelled_versions(self, template, description, region=None):
-        """Every version of the template carrying the label, or None past the discovery bound."""
+    def labelled_versions(self, template, description, region=None, image=None):
+        """Every version of the template carrying the label, or None past the discovery bound.
+
+        Given an image, only versions booting it are read: a copy region's host template keeps
+        every version it was ever moved to, and one image has few of them."""
         ec2 = self.client("ec2", True, region)
         found = []
         arguments = {"LaunchTemplateId": template, "MaxResults": 100}
+        if image is not None:
+            arguments["Filters"] = [{"Name": "image-id", "Values": [image]}]
         for _ in range(20):
             page = ec2.describe_launch_template_versions(**arguments)
             found.extend(item for item in page["LaunchTemplateVersions"]
@@ -1520,7 +1527,11 @@ class Publisher:
             arguments["NextToken"] = page["NextToken"]
         return None
 
-    def version(self, template, current, image, label, entry=None, *, region=None, identity=None):
+    def version(self, template, current, image, label, entry=None, *, region=None, identity=None, replayable=False):
+        """A new version of the template that changes only its image. A replayable one (follow_copies)
+        is labelled by its base version and image, and its ClientToken comes from that label, so the
+        next run finds it by the label or makes it under the same token: a doubt about it is refused
+        without holding Terraform's lock for an administrator."""
         ec2 = self.client("ec2", True, region)
         description = self.version_description(template, label, identity)
         try:
@@ -1530,17 +1541,21 @@ class Publisher:
             created = response["LaunchTemplateVersion"]
         except Exception:
             # Never replay an uncertain create. Discover only our immutable label.
-            found = self.labelled_versions(template, description, region)
+            found = self.labelled_versions(template, description, region, image if replayable else None)
             if found is None:
-                self.recovery_failed = True
+                if not replayable:
+                    self.recovery_failed = True
                 raise Refused("uncertain template create exceeds the discovery bound") from None
             if len(found) != 1:
-                self.recovery_failed = True
-                raise Refused("uncertain template create needs administrator reconciliation") from None
+                if not replayable:
+                    self.recovery_failed = True
+                raise Refused("uncertain template create is left for the next run to find by its label" if replayable
+                              else "uncertain template create needs administrator reconciliation") from None
             created = found[0]
         if not (created.get("LaunchTemplateId") == template and created.get("VersionDescription") == description
                 and type(created.get("VersionNumber")) is int):
-            self.recovery_failed = True
+            if not replayable:
+                self.recovery_failed = True
             raise Refused("created version identity cannot be reconciled")
         if entry is not None:
             entry["candidate"] = created["VersionNumber"]
@@ -1859,8 +1874,8 @@ class Publisher:
         leaves it live for the next publication, redrive or replicate-active-release to finish.
         Each new default differs from the current one only in ImageId and is labelled by its
         region, the version it was made from and the image, so a replay selects the version an
-        earlier run made instead of making another; an uncertain create is never replayed
-        (version()).
+        earlier run made instead of making another. An uncertain create is never replayed in the
+        same run (version()); it releases the lock, and the next run finds it by its label.
         """
         for template in self.copy_templates:
             region = template["region"]
@@ -1872,8 +1887,9 @@ class Publisher:
                 continue
             label = region + "/" + str(current["VersionNumber"]) + "/" + image
             description = self.version_description(template["id"], label, self.COPY_FOLLOW_IDENTITY)
-            found = self.labelled_versions(template["id"], description, region)
-            need(found is not None and len(found) <= 1, "a copy-region host version label is ambiguous")
+            found = self.labelled_versions(template["id"], description, region, image)
+            need(found is not None, "copy-region host version discovery exceeds its bound")
+            need(len(found) <= 1, "a copy-region host version label is ambiguous")
             if found:
                 made = found[0]
                 need(made.get("LaunchTemplateId") == template["id"] and type(made.get("VersionNumber")) is int
@@ -1883,7 +1899,7 @@ class Publisher:
                 number = made["VersionNumber"]
             else:
                 number = self.version(template["id"], current, image, label, region=region,
-                                      identity=self.COPY_FOLLOW_IDENTITY)
+                                      identity=self.COPY_FOLLOW_IDENTITY, replayable=True)
             self.select(template["id"], number, region, self.COPY_FOLLOW_IDENTITY)
 
     def spread(self, release):
