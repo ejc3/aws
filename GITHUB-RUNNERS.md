@@ -896,7 +896,7 @@ a week, so a quiet stretch banks room for a busy day.
 - **Groups.** Three buckets, `runner_budget_groups` in `runner-app.tf`: `imagine` (ejc3/imagine), `dolphin`
   (dolphin-labs, dolphin-films, dolphin-maps, and dolphin-family once its token gate is on; they share the `dolphin`
   label and one owner) and `constellation` (ejc3/constellation, once its token gate is on: until then the group has no
-  bucket, metric or alarm). `imagine` and `constellation` are **$50 a day**, `dolphin` **$80 a day** (raised from $50 on
+  bucket, metric or alarm). `imagine` and `constellation` are **$50 a day**, `dolphin` **$120 a day** (raised from $80 on 2026-11-24, from $50 on
   2026-11-22: throttled at $50, the four dolphin repos fit only two `l` jobs at once). The figures below are for a $50
   group; a dolphin figure is given where it differs. colton-games is in none and is capped by its 8 hosts as before.
 - **The bucket.** One DynamoDB item per group in `github-app-runner-budget`: `level_usd`, `updated_at`, the burn rate at
@@ -920,7 +920,7 @@ a week, so a quiet stretch banks room for a busy day.
   dolphin-films, dolphin-maps and dolphin-family 2), and the group's repos **together** may hold at most the group's
   `throttled_vcpus`: the refill rate's worth of vCPUs, less the overhead of every host the throttled caps allow, rounded
   down. Terraform computes it from the same constants, `floor((daily_usd / 24 - hosts x host_hour_usd) / vcpu_hour_usd)`:
-  **72** for imagine (8 hosts, $50 a day), **115** for dolphin (14 hosts, $80 a day) and **74** for constellation (4 hosts, $50 a day). Held there, a throttled group spends no
+  **72** for imagine (8 hosts, $50 a day), **176** for dolphin (14 hosts, $120 a day) and **74** for constellation (4 hosts, $50 a day). Held there, a throttled group spends no
   more than it refills, so the bucket cannot drain further while throttled. The cap is the group's because the bucket
   is: dolphin-labs' hosts count against dolphin-films' room. So that no job waits forever, a group holding nothing (no
   host and no launch in flight) may launch one host of any size; one `xl` alone ($1.74/h) is still under the $2.08/h
@@ -948,7 +948,7 @@ a week, so a quiet stretch banks room for a busy day.
   the start, so up to $450 (dolphin $720). A dolphin burst day alone can exceed the account's `ec2-daily` budget alert
   ($150, `cost-alerts.tf`); that alert then reports a burst the bucket allowed. Two limits:
   - **Throttled, a group spends at most its refill, about $50 a day.** Imagine throttled holds at most 72 vCPUs on 8
-    hosts ($2.07/h) against a refill of $2.08/h, and the dolphin repos together 115 on 14 ($3.33/h) against their $3.33/h. The exception is the
+    hosts ($2.07/h) against a refill of $2.08/h, and the dolphin repos together 176 on 14 ($4.98/h) against their $5.00/h. The exception is the
     hosts launched in burst, which run on after a throttle until their jobs end (3 hours at most) while the level is
     already at or near zero; that spend is not carried as debt. Measured over the 24 hours before this change, Imagine
     averaged about 42 vCPUs (about $28 a day at these constants, about $25 at the spot prices paid) and dolphin-labs
