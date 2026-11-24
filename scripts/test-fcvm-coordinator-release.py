@@ -525,7 +525,8 @@ class LaneReleaseTests(unittest.TestCase):
                 self.assertIn(f'"^(none|${{replace(aws_ecr_repository.{repository}.repository_url', definition)
                 # The release role reads and writes the pointer; the function names it.
                 rules = block(ci[stack], policy)
-                self.assertRegex(rules, r'Action = \["ssm:GetParameter", "ssm:PutParameter"(, "ssm:GetParameterHistory")?\]'
+                history = ', "ssm:GetParameterHistory"' if stack == "prod" else ""  # only prod has force
+                self.assertRegex(rules, r'Action = \["ssm:GetParameter", "ssm:PutParameter"' + re.escape(history) + r'\]'
                                  r'\s+Resource = [^\n]*'
                                  + re.escape(f"{ref}.arn"))
                 self.assertRegex(block(ci[stack], function), r"LANE_PARAMETER\s+= " + re.escape(f"{ref}.name"))
@@ -854,14 +855,34 @@ class ProdReleaseTests(unittest.TestCase):
 class ProdLaneRecordTests(ProdReleaseTests):
     """ejc3/fcvm's prod promotion records the set's lane image (lambda_digest) so a rollback returns to it."""
 
+    PROD_LANE = "registry.example/fcvm-fleet/lambda-tile-prod"
+
     def test_a_record_may_name_the_sets_lane_image(self):
         lane, earlier = "sha256:" + "4" * 64, "sha256:" + "5" * 64
-        first = {**self.entry(), "lambda_digest": lane, "previous": {**self.entry(generation=6), "lambda_digest": earlier}}
-        self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "recorded"})
-        self.assertEqual(json.loads(self.aws.record), first)
-        # The next record's previous is that entry, lane image included.
-        second = {**self.entry(), "lambda_digest": earlier, "previous": {k: v for k, v in first.items() if k != "previous"}}
-        self.assertEqual(self.run_release({"action": "record", "release": second}), {"status": "recorded"})
+        with patch.dict(os.environ, {"LANE_REPOSITORY_URL": self.PROD_LANE}):
+            self.aws.lane_pointer = self.PROD_LANE + "@" + lane  # prod runs the set's lane image
+            first = {**self.entry(), "lambda_digest": lane, "previous": {**self.entry(generation=6), "lambda_digest": earlier}}
+            self.assertEqual(self.run_release({"action": "record", "release": first}), {"status": "recorded"})
+            self.assertEqual(json.loads(self.aws.record), first)
+            # The next record's previous is that entry, lane image included.
+            self.aws.lane_pointer = self.PROD_LANE + "@" + earlier
+            second = {**self.entry(), "lambda_digest": earlier, "previous": {k: v for k, v in first.items() if k != "previous"}}
+            self.assertEqual(self.run_release({"action": "record", "release": second}), {"status": "recorded"})
+
+    def test_a_record_must_name_the_lane_prod_runs(self):
+        # A forced rollback returns to what the record names: a lane prod does not run would refuse it mid-incident,
+        # and a record without the lane prod runs would drop it.
+        lane = "sha256:" + "4" * 64
+        with patch.dict(os.environ, {"LANE_REPOSITORY_URL": self.PROD_LANE}):
+            for pointer, entry in (("none", {**self.entry(), "lambda_digest": lane}),
+                                   (self.PROD_LANE + "@sha256:" + "5" * 64, {**self.entry(), "lambda_digest": lane}),
+                                   (self.PROD_LANE + "@" + lane, self.entry())):
+                with self.subTest(pointer=pointer, lane=entry.get("lambda_digest")):
+                    self.aws.lane_pointer, before = pointer, self.aws.record
+                    with self.assertRaises(release.Refused) as refused:
+                        self.run_release({"action": "record", "release": {**entry, "previous": None}})
+                    self.assertEqual(refused.exception.code, "not-running")
+                    self.assertEqual(self.aws.record, before)
 
     def test_a_malformed_lane_image_is_refused(self):
         for value in ("latest", None, 7, "sha256:" + "A" * 64):

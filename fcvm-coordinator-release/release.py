@@ -282,6 +282,11 @@ def record(event, ssm):
     running = pointer_digest(ssm.get_parameter(Name=os.environ["IMAGE_PARAMETER"])["Parameter"]["Value"])
     if current["coordinator"]["digest"] != running:
         raise Refused("not-running", "the recorded coordinator is not the one prod runs")
+    # The set's lane image too, or none: a forced rollback returns to what the record names (ran_before), so a record
+    # naming a lane prod does not run would refuse that rollback mid-incident, or drop the lane silently.
+    lane_running = ssm.get_parameter(Name=os.environ["LANE_PARAMETER"])["Parameter"]["Value"]
+    if lane_running != lane_value(current.get("lambda_digest")):
+        raise Refused("not-running", "the recorded lane image is not the one prod runs")
     stored = load_record(ssm)
     if stored is not None and {k: v for k, v in stored.items() if k != "previous"} == current:
         return {"status": "unchanged"}
@@ -425,8 +430,9 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
             progress["step"] = "inspect"
         if force and (lane is not None or clear) and lane != lane_of(old) \
                 and not ran_before(ssm, os.environ["LANE_PARAMETER"], lane_value(lane)):
-            # force skips the viewer hold to return to a set prod ran before (ejc3/fcvm's rollback): its lane, or no
-            # lane, must be one the lane pointer has held. A lane prod never ran waits for the hold.
+            # force skips the viewer hold to return to a set prod ran before (ejc3/fcvm's rollback): its lane must be
+            # one the lane pointer has held. No lane always qualifies (the pointer starts at none), so a forced
+            # rollback may always drop the lane, the conservative direction. A lane prod never ran waits for the hold.
             raise Refused("not-a-rollback", "force returns only to a lane image prod ran before")
         if previous == image and (lane is None and not clear or lane_of(old) == lane):
             progress["step"] = "rollout"

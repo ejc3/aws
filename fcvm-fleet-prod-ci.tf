@@ -10,8 +10,10 @@
 #   the workflows the stack exists; without it they skip with a message.
 # - fcvm-prod-ci: the OIDC role of that environment only. It may invoke the two prod release functions below, and for
 #   the Lambda lane copy the image staging tested from staging's lane repository (read only) into prod's by digest and
-#   move keep-prod-* there. No coordinator image push (prod releases images staging already published), no staging
-#   function, no state.
+#   move keep-prod-* there. IAM cannot tell a copy from a push: the upload rights on prod's lane repository would
+#   accept any image, so "only the image staging tested" rests on the main-only workflow (ejc3/fcvm
+#   fleet/lambda/release.py), as the release itself does. No coordinator image push (prod releases images staging
+#   already published), no staging function, no state.
 # - fcvm-coordinator-release-prod: release.py with STACK=prod. It changes only the prod service's image, takes
 #   Terraform's backend lock as staging's does, and goes ahead only while ActiveViewers{Fleet=prod} (namespace
 #   FCVM/Fleet, ejc3/fcvm src/fleet/coord/metrics.rs) has been 0 for 5 minutes; otherwise it returns `held`. `force`
