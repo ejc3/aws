@@ -182,6 +182,15 @@ class DevCredentialBoundaryTests(unittest.TestCase):
                        'narrow, resource/tag-scoped IAM directly, never an admin-host hop']:
             self.assertIn(phrase, readme)
 
+    def test_builder_console_read_is_only_the_runner_image_builder(self):
+        # The runner image builder reports an early failure only on its serial console.
+        policy = block('dev-instance-common.tf', 'resource', 'dev_server_service_quotas_read', 'aws_iam_policy')
+        statement = re.search(r'Sid\s*= "ReadRunnerImageBuilderConsoles"\n(.*?)\n\s*},', policy, re.S).group(1)
+        self.assertRegex(statement, r'Action\s*= "ec2:GetConsoleOutput"\n')
+        self.assertIn('Resource  = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"', statement)
+        self.assertIn('Condition = { StringEquals = { "aws:ResourceTag/Name" = "ami-builder-temp" } }', statement)
+        self.assertEqual(len(re.findall(r'ec2:GetConsole', policy)), 1)
+
     def test_service_quotas_are_read_only_and_scoped_to_ec2(self):
         # #587: the metal boxes read the GPU quotas; requesting an increase stays with the owner.
         policy = block('dev-instance-common.tf', 'resource', 'dev_server_service_quotas_read', 'aws_iam_policy')
