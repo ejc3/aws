@@ -323,6 +323,11 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet" {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:GetParameterHistory"]
         Resource = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].arn
       },
+      # History: a forced rollback may return only to a lane the pointer has held (release.py ran_before).
+      {
+        Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:GetParameterHistory"]
+        Resource = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].arn
+      },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = aws_ssm_parameter.fcvm_prod_release_record[0].arn
@@ -363,6 +368,7 @@ resource "aws_lambda_function" "fcvm_coordinator_release_prod" {
       LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
       # Only to read which lane image staging's running task names (candidate); never read from or written to.
       STAGE_LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
+      LANE_PARAMETER            = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].name
       IMAGE_PARAMETER           = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
       STAGE_IMAGE_PARAMETER     = aws_ssm_parameter.fcvm_coordinator_release.name
       STAGE_CLUSTER             = aws_ecs_cluster.fcvm_fleet.name
@@ -423,8 +429,9 @@ resource "aws_iam_role_policy" "fcvm_ami_prod_release" {
       Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_prod_ami_state_prefix}/publications/*"
     },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.fcvm_ami_prod_release_fleet[0].arn },
+    # GetItem reads who holds the lock when the put finds it held: busy, or an orphaned publication (publish.py).
     {
-      Effect    = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"]
+      Effect    = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:GetItem"]
       Resource  = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks"
       Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } }
     },

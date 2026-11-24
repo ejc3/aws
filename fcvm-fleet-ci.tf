@@ -25,6 +25,20 @@ resource "aws_ssm_parameter" "fcvm_coordinator_release" {
   }
 }
 
+# The coordinator's Lambda lane image (FLEET_LAMBDA_IMAGE), a release pointer like the one above: "none", or
+# <lane repository>@sha256:... The release function writes it with the image pointer when a release carries
+# lambda_digest (fcvm-coordinator-release/release.py); Terraform renders FLEET_LAMBDA_IMAGE from it, so an apply keeps
+# the lane a release set instead of registering a revision without it.
+resource "aws_ssm_parameter" "fcvm_coordinator_lane" {
+  provider = aws.fcvm_fleet
+  name     = "/fcvm-fleet/stage/lambda-image"
+  type     = "String"
+  value    = "none"
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 data "aws_ssm_parameter" "fcvm_coordinator_release" {
   provider        = aws.fcvm_fleet
   name            = aws_ssm_parameter.fcvm_coordinator_release.name
@@ -219,7 +233,7 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet" {
       { Effect = "Allow", Action = "ecr:DescribeImages", Resource = aws_ecr_repository.fcvm_fleet_lambda_tile.arn },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
-        Resource = aws_ssm_parameter.fcvm_coordinator_release.arn
+        Resource = [aws_ssm_parameter.fcvm_coordinator_release.arn, aws_ssm_parameter.fcvm_coordinator_lane.arn]
       },
       {
         Effect    = "Allow", Action = "iam:PassRole"
@@ -251,6 +265,7 @@ resource "aws_lambda_function" "fcvm_coordinator_release" {
       RELEASE_ROLE        = aws_iam_role.fcvm_coordinator_release_fleet.arn
       REPOSITORY_URL      = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
       LANE_REPOSITORY_URL = aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url
+      LANE_PARAMETER      = aws_ssm_parameter.fcvm_coordinator_lane.name
       IMAGE_PARAMETER     = aws_ssm_parameter.fcvm_coordinator_release.name
       LOCK_TABLE          = "ejc3-terraform-locks"
       LOCK_ID             = local.fcvm_stage_lock_id

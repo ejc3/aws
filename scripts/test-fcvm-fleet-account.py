@@ -567,6 +567,12 @@ class LaneRepositoryPerStackTests(unittest.TestCase):
         # Staging's repository admits staging's CI; prod's admits nothing of staging's.
         self.assertIn("Principal = { AWS = aws_iam_role.fcvm_stage_ci.arn }", stage)
         self.assertNotRegex(prod, r"fcvm_stage_ci|fcvm_fleet_coordinator_task\b|fcvm_fleet_terraform")
+        # Two statements: prod's Lambda functions pull, and prod CI copies the tested image in and moves keep-prod-*
+        # (#1002). The only AWS principal is prod CI's role, with no delete or policy action; no wildcard.
+        self.assertEqual(prod.count("Effect"), 2)
+        self.assertEqual(re.findall(r"AWS = ([^ }]+)", prod), ["aws_iam_role.fcvm_prod_ci[0].arn"])
+        self.assertNotRegex(prod, r'Principal\s*=\s*"\*"')
+        self.assertNotRegex(prod, r'ecr:(BatchDelete|Delete|Set|Put(Lifecycle|Registry|Replication|ImageTag|ImageScanning))')
 
     def test_a_stack_pulls_only_from_its_own_repository(self):
         self.assertRegex(self.source, r'fcvm_lambda_repositories = merge\(\s+\{ stage = aws_ecr_repository.fcvm_fleet_lambda_tile \},\s+'

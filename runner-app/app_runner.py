@@ -118,6 +118,13 @@ AMBIGUOUS_CODES = {'InternalError', 'InternalFailure', 'ServiceUnavailable', 'Un
                    'RequestLimitExceeded', 'Throttling', 'ThrottlingException', 'RequestTimeout',
                    'RequestTimeoutException'}
 
+# A pool (instance type, AZ) that refused capacity goes to the back of the order for REFUSED_POOL_SECONDS, for every repo
+# and round, so the next launch starts with a pool that has not just said no. Issue #991: c7a in us-west-1c refused about
+# 108 launches in four hours, and every one of them tried it first before the c7i that then launched. One item in
+# BUDGET_TABLE (REFUSED_POOLS_KEY: {"type@az": until}), read and written only by this serialized controller.
+REFUSED_POOL_SECONDS = 10 * 60
+REFUSED_POOLS_KEY = 'pools/refused'
+
 
 class LaunchRefused(Exception):
     pass
@@ -703,9 +710,10 @@ for _client in (ec2, launch_ec2, ssm, secrets, dynamodb):
     _client.meta.events.register('before-call', refuse_after_deadline)
 
 
-def pages(repo, path, key, pat, budget):
+def pages(repo, path, key, pat, budget, complete=None):
     """Every item under `key` across a paginated GitHub list, 100 per page, while the shared
-    call budget and this repo's time share last (budget is a one-element list so callers share it)."""
+    call budget and this repo's time share last (budget is a one-element list so callers share it).
+    `complete`, a one-element list when given, is set True once the last page was read."""
     page = 1
     while budget[0] > 0 and not out_of_time():
         budget[0] -= 1
@@ -713,21 +721,33 @@ def pages(repo, path, key, pat, budget):
         items = github('GET', f'{path}{sep}per_page=100&page={page}', pat).get(key) or []
         yield from items
         if len(items) < 100:
+            if complete is not None:
+                complete[0] = True
             return
         page += 1
     print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls')
 
 
-def runs_oldest_first(repo, status, pat, budget):
+def run_key(run):
+    """A run's place in the oldest-first order."""
+    return (run.get('created_at') or '', int(run['id']))
+
+
+def runs_oldest_first(repo, status, pat, budget, after=None, complete=None):
     """This status's runs, OLDEST first, one page at a time. GitHub lists newest first, so page 1
     (read once, for total_count) holds the newest; walking back from the last page reaches the
-    oldest runs first however many newer ones there are."""
+    oldest runs first however many newer ones there are.
+
+    `after`, a run_key where the previous round's scan stopped, rotates the order: the runs after it first, then the
+    ones up to it from the oldest (they are on pages already read, so the wrap costs no call). `complete`, a one-element
+    list when given, is set True once every run was yielded."""
     if budget[0] <= 0 or out_of_time():
         return
     path = f'/repos/{repo}/actions/runs?status={status}&per_page=100'
     budget[0] -= 1
     first = github('GET', f'{path}&page=1', pat)
     last = min(MAX_RUN_PAGES, max(1, math.ceil(int(first.get('total_count') or 0) / 100)))
+    wrapped = []
     for page in range(last, 0, -1):
         if page == 1:
             body = first
@@ -736,7 +756,14 @@ def runs_oldest_first(repo, status, pat, budget):
         else:
             budget[0] -= 1
             body = github('GET', f'{path}&page={page}', pat)
-        yield from sorted(body.get('workflow_runs') or [], key=lambda r: (r.get('created_at') or '', r['id']))
+        for run in sorted(body.get('workflow_runs') or [], key=run_key):
+            if after is not None and run_key(run) <= after:
+                wrapped.append(run)
+            else:
+                yield run
+    yield from wrapped
+    if complete is not None:
+        complete[0] = True
 
 
 def queued_jobs(repo, cfg, pat, running_on=None):
@@ -751,8 +778,17 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     Reading every run page before any job could spend the whole share listing runs. Which status
     goes first alternates by round, so neither starves the other. Bounded by SCAN_CALL_BUDGET
     calls per reconcile (well inside 5,000/hour) and the repo's deadline.
+
+    A scan that stops there resumes next round after the last run whose jobs it read completely (scan_cursor, one
+    cursor per status), and wraps to the oldest run once it passes the newest, so a job far down a long list is still
+    reached: within 2 x ceil(N / k) rounds for a status with N runs, k >= 1 of which a round reads (a status goes first
+    every other round). Without that, every round read the same oldest runs again and a job past them was never seen
+    (issue #991). The jobs found are still returned oldest run first. What the scan saw is left in SCANNED[repo] for
+    reconcile_repo(), which moves the cursor only once the launches are done (next_cursor): past no run holding a job
+    that still waits, so a job the round found but could not launch is read again first, before newer runs.
     """
     found, seen, runs_seen, budget = [], set(), set(), [SCAN_CALL_BUDGET]
+    cursor, ages, runs, done, ended = scan_cursor(repo), {}, {}, {}, {}
     group = cfg.get('budget_group')
     if group and len(group_repos(group, repos := config()[0])) > 1 and not out_of_time():
         waiter = active_group_wait(group, repos)
@@ -767,20 +803,25 @@ def queued_jobs(repo, cfg, pat, running_on=None):
             cap = int(budget_groups()[group]['throttled_vcpus'])
             if size and min(size_vcpus(cfg, size), cap) == int(waiter['vcpus']['N']):
                 found.append((job_id, size))
+                ages[job_id] = queued_age(job)
             else:
                 # Definitive status or label change. Do not let a stale workflow listing
                 # resurrect it this scan or let the old reservation keep other jobs out.
                 dynamodb.put_item(TableName=BUDGET_TABLE, Item={'group': {'S': 'waiting/' + group}})
     statuses = ('queued', 'in_progress') if int(time.time() // 120) % 2 == 0 else ('in_progress', 'queued')
     for status in statuses:
-        for run in runs_oldest_first(repo, status, pat, budget):
+        complete, every_run, batch, done[status] = [False], True, [], []
+        for run in runs_oldest_first(repo, status, pat, budget, cursor.get(status), complete):
             if run['id'] in runs_seen:
                 continue
             runs_seen.add(run['id'])
             if budget[0] <= 0 or out_of_time():
-                print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls or its time share')
+                every_run = False
+                print(f'{repo}: queue scan stopped at its budget of {SCAN_CALL_BUDGET} GitHub calls or its time share; '
+                      f'the next round resumes its {status} runs where it stopped')
                 break
-            for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget):
+            listed = [False]
+            for job in pages(repo, f"/repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest", 'jobs', pat, budget, listed):
                 if running_on is not None and job.get('status') == 'in_progress' and job.get('runner_name'):
                     running_on.add(job['runner_name'])
                 if job.get('id') in seen or job.get('status') != 'queued':
@@ -788,8 +829,77 @@ def queued_jobs(repo, cfg, pat, running_on=None):
                 seen.add(job.get('id'))
                 size = job_size(cfg, job.get('labels'))
                 if size:
-                    found.append((str(job['id']), size))
+                    batch.append((run_key(run), str(job['id']), size))
+                    ages[str(job['id'])] = queued_age(job)
+                    runs[str(job['id'])] = (status, run_key(run))
+            if listed[0]:
+                done[status].append(run_key(run))
+            else:
+                every_run = False
+        ended[status] = complete[0] and every_run
+        found += [(job_id, size) for _, job_id, size in sorted(batch, key=lambda b: b[0])]
+    SCANNED[repo] = {'read': cursor, 'ages': ages, 'runs': runs, 'done': done, 'ended': ended}
     return found
+
+
+def next_cursor(scanned, waiting):
+    """Where the next round's scan starts, per status: after the last run read completely, in this round's scan order,
+    before the first run holding a job in `waiting` (found but not launched or covered: it waited at a cap, was deferred,
+    or every pool refused it, or the round ended before it). A status read to its end with nothing waiting starts again
+    from the oldest run; one whose first run read still holds a waiting job keeps its cursor."""
+    cursor = dict(scanned['read'])
+    held = {scanned['runs'][job] for job in waiting if job in scanned['runs']}
+    for status, keys in scanned['done'].items():
+        stop = next((i for i, key in enumerate(keys) if (status, key) in held), None)
+        if stop is None and scanned['ended'].get(status):
+            cursor.pop(status, None)
+        elif stop is None and keys:
+            cursor[status] = keys[-1]
+        elif stop:
+            cursor[status] = keys[stop - 1]
+    return cursor
+
+
+# Where each repo's last queue scan stopped, one item per repo in BUDGET_TABLE: {"queued": [created_at, run id], ...}.
+SCAN_CURSOR_PREFIX = 'scan/'
+SCANNED = {}  # repo -> what queued_jobs() saw this round; reconcile_repo() takes it
+
+
+def scan_cursor(repo):
+    """{status: run_key} where this repo's previous queue scan stopped; {} for none or an unreadable item (start from the
+    oldest run, as before cursors: a failed read must not cost the repo its round)."""
+    if not BUDGET_TABLE or out_of_time():
+        return {}
+    try:
+        item = dynamodb.get_item(TableName=BUDGET_TABLE, Key={'group': {'S': SCAN_CURSOR_PREFIX + repo}},
+                                 ConsistentRead=True).get('Item') or {}
+    except OutOfTime:
+        raise
+    except Exception as error:
+        print(f'{repo}: could not read where the last queue scan stopped ({type(error).__name__}); starting at the oldest run')
+        return {}
+    try:
+        return {status: (str(key[0]), int(key[1])) for status, key in json.loads(item['after']['S']).items()
+                if status in ('queued', 'in_progress')}
+    except (KeyError, TypeError, ValueError, IndexError, AttributeError):
+        return {}
+
+
+def save_scan_cursor(repo, cursor):
+    """Store where the scan stopped. Best effort: a lost write only makes the next round start from the oldest run."""
+    if not BUDGET_TABLE or out_of_time():
+        return
+    try:
+        dynamodb.put_item(TableName=BUDGET_TABLE, Item={'group': {'S': SCAN_CURSOR_PREFIX + repo},
+                                                        'after': {'S': json.dumps({k: list(v) for k, v in cursor.items()})}})
+    except Exception as error:
+        print(f'{repo}: could not store where the queue scan stopped ({type(error).__name__})')
+
+
+def queued_age(job):
+    """Seconds since GitHub queued `job` (0 when its record has no creation time)."""
+    created = parse_time(job.get('created_at'))
+    return max(0.0, (now() - created).total_seconds()) if created else 0.0
 
 
 def pool_assignments(repo, cfg, candidates):
@@ -945,83 +1055,122 @@ def runner_image(repo, cfg):
     return ssm.get_parameter(Name=CANONICAL_AMI_PARAM)['Parameter']['Value'], '/dev/sda1'
 
 
+def refused_pools():
+    """{"type@az": until} for the pools that refused capacity in the last REFUSED_POOL_SECONDS; {} when there are none or
+    the item cannot be read (every pool in its usual order: a failed read must not cost the launch)."""
+    if not BUDGET_TABLE or out_of_time():
+        return {}
+    try:
+        item = dynamodb.get_item(TableName=BUDGET_TABLE, Key={'group': {'S': REFUSED_POOLS_KEY}},
+                                 ConsistentRead=True).get('Item') or {}
+    except OutOfTime:
+        raise
+    except Exception as error:
+        print(f'could not read the recently refused pools ({type(error).__name__}); trying every pool in order')
+        return {}
+    try:
+        pools = {str(k): float(v) for k, v in json.loads(item['pools']['S']).items()}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return {}
+    t = now().timestamp()
+    return {k: v for k, v in pools.items() if v > t}
+
+
+def remember_refused(refused, instance_type, az):
+    """Put a refused pool at the back of the order for a while. Best effort: a lost write only means the next launch
+    tries that pool first again, and it is skipped when the repo's turn is over."""
+    refused[f'{instance_type}@{az}'] = now().timestamp() + REFUSED_POOL_SECONDS
+    if not BUDGET_TABLE or out_of_time():
+        return
+    try:
+        dynamodb.put_item(TableName=BUDGET_TABLE, Item={'group': {'S': REFUSED_POOLS_KEY},
+                                                        'pools': {'S': json.dumps(refused, sort_keys=True)}})
+    except Exception as error:
+        print(f'could not record the refused pool {instance_type} in {az} ({type(error).__name__})')
+
+
 def launch(repo, cfg, subnets, size, job_id, token, nonce):
-    """One spot VM for `size`, trying each subnet and instance type in order."""
+    """One spot VM for `size`, trying each subnet and instance type in order, the pools that refused capacity in the
+    last REFUSED_POOL_SECONDS last."""
     ami, root_device = runner_image(repo, cfg)
     labels = f"{cfg['label']},{size}"
     org_group = cfg.get('org_group')
     data = user_data(repo, labels, jit=bool(org_group))
     vcpus = known_vcpus(cfg, size)
     last_error, attempt = None, 0
+    refused = refused_pools()
+    pools = [(subnet, t) for subnet in subnets for t in cfg['sizes'][size]]
+    # Stable: the refused pools keep their order among themselves, and so do the others.
+    pools.sort(key=lambda p: f"{p[1]}@{p[0]['availability_zone']}" in refused)
     # Only these mean EC2 created nothing, so another pool is safe to try. Anything else -- a
     # timeout, a throttle, a 5xx -- may have launched an instance after all, so stop: the next
     # reconcile sees any host that did start (its JobId tag) and launches only if none did.
-    for subnet in subnets:
-        for instance_type in cfg['sizes'][size]:
-            # Reserve one full bounded attempt before the invocation's cleanup time. It may
-            # finish past this repo's turn, but the next pool may not start then.
-            if out_of_time(LAUNCH_ATTEMPT_SECONDS):
-                reason = ("repo turn ended" if time.monotonic() >= DEADLINE[0] else
-                          f"less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains")
-                print(f'{repo}: {reason}; deferring job {job_id} after {attempt} EC2 launch attempts')
-                return None, True
-            attempt += 1
-            try:
-                response = launch_ec2.run_instances(
-                    # botocore's own retries resend these exact arguments, so one token per
-                    # attempt makes a retried request return the instance it already created.
-                    # The claim's nonce prefixes it, which is how the claim finds its own host.
-                    ClientToken=f'{nonce}-{attempt}',
-                    MinCount=1, MaxCount=1, ImageId=ami, InstanceType=instance_type,
-                    NetworkInterfaces=[{
-                        'DeviceIndex': 0, 'SubnetId': subnet['subnet_id'],
-                        'Groups': [os.environ['SECURITY_GROUP_ID']],
-                        'AssociatePublicIpAddress': True, 'Ipv6AddressCount': 1,
-                    }],
-                    IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
-                    BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {
-                        'VolumeSize': VOLUME_GB, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}}],
-                    UserData=data,
-                    # InstanceMetadataTags: Inspector's SSM plugin reads InspectorEc2Exclusion from
-                    # instance metadata. Without it the tag only hides findings, and the plugin still
-                    # apt-installs its scanner mid-boot (GITHUB-RUNNERS.md, Inspector).
-                    MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
-                                     'InstanceMetadataTags': 'enabled'},
-                    InstanceInitiatedShutdownBehavior='terminate',
-                    InstanceMarketOptions={'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time'}},
-                    TagSpecifications=[
-                        {'ResourceType': 'instance', 'Tags': [
-                            {'Key': 'Name', 'Value': f"{ROLE}-{cfg['label']}-{size}"},
-                            {'Key': 'Role', 'Value': ROLE},
-                            {'Key': 'Repo', 'Value': repo},
-                            {'Key': 'Size', 'Value': size},
-                            {'Key': 'JobId', 'Value': job_id},
-                            {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
-                        ] + ([{'Key': 'Vcpus', 'Value': str(vcpus)}] if vcpus is not None else [])
-                          + ([{'Key': ORG_GROUP_TAG, 'Value': str(org_group)}] if org_group else [])},
-                        {'ResourceType': 'volume', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
-                        {'ResourceType': 'network-interface', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
-                    ])
-            except OutOfTime:
-                raise
-            except Exception as error:
-                last_error = error
-                code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
-                if code in CAPACITY_CODES:
-                    print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
-                    continue
-                if code is None or code in AMBIGUOUS_CODES:
-                    print(f"{repo}: launch for job {job_id} ended ambiguously ({type(error).__name__} {code}); "
-                          'not trying another pool this round')
-                    return None, False
-                # Definite (UnauthorizedOperation, InvalidAMIID.*, a quota ...): nothing was created,
-                # and retrying other pools or later rounds will not help. Make it loud.
-                # str(error) carries AWS's encoded authorization message for a denial; an
-                # administrator decodes it with `aws sts decode-authorization-message`.
-                raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}: {error}') from error
-            instance_id = response['Instances'][0]['InstanceId']
-            with handoff():
-                return settle(repo, instance_id, instance_type, subnet, job_id, labels, token)
+    for subnet, instance_type in pools:
+        # Reserve one full bounded attempt before the invocation's cleanup time. It may
+        # finish past this repo's turn, but the next pool may not start then.
+        if out_of_time(LAUNCH_ATTEMPT_SECONDS):
+            reason = ("repo turn ended" if time.monotonic() >= DEADLINE[0] else
+                      f"less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains")
+            print(f'{repo}: {reason}; deferring job {job_id} after {attempt} EC2 launch attempts')
+            return None, True
+        attempt += 1
+        try:
+            response = launch_ec2.run_instances(
+                # botocore's own retries resend these exact arguments, so one token per
+                # attempt makes a retried request return the instance it already created.
+                # The claim's nonce prefixes it, which is how the claim finds its own host.
+                ClientToken=f'{nonce}-{attempt}',
+                MinCount=1, MaxCount=1, ImageId=ami, InstanceType=instance_type,
+                NetworkInterfaces=[{
+                    'DeviceIndex': 0, 'SubnetId': subnet['subnet_id'],
+                    'Groups': [os.environ['SECURITY_GROUP_ID']],
+                    'AssociatePublicIpAddress': True, 'Ipv6AddressCount': 1,
+                }],
+                IamInstanceProfile={'Name': os.environ['INSTANCE_PROFILE']},
+                BlockDeviceMappings=[{'DeviceName': root_device, 'Ebs': {
+                    'VolumeSize': VOLUME_GB, 'VolumeType': 'gp3', 'DeleteOnTermination': True, 'Encrypted': True}}],
+                UserData=data,
+                # InstanceMetadataTags: Inspector's SSM plugin reads InspectorEc2Exclusion from
+                # instance metadata. Without it the tag only hides findings, and the plugin still
+                # apt-installs its scanner mid-boot (GITHUB-RUNNERS.md, Inspector).
+                MetadataOptions={'HttpTokens': 'required', 'HttpEndpoint': 'enabled', 'HttpPutResponseHopLimit': 1,
+                                 'InstanceMetadataTags': 'enabled'},
+                InstanceInitiatedShutdownBehavior='terminate',
+                InstanceMarketOptions={'MarketType': 'spot', 'SpotOptions': {'SpotInstanceType': 'one-time'}},
+                TagSpecifications=[
+                    {'ResourceType': 'instance', 'Tags': [
+                        {'Key': 'Name', 'Value': f"{ROLE}-{cfg['label']}-{size}"},
+                        {'Key': 'Role', 'Value': ROLE},
+                        {'Key': 'Repo', 'Value': repo},
+                        {'Key': 'Size', 'Value': size},
+                        {'Key': 'JobId', 'Value': job_id},
+                        {'Key': 'InspectorEc2Exclusion', 'Value': 'true'},
+                    ] + ([{'Key': 'Vcpus', 'Value': str(vcpus)}] if vcpus is not None else [])
+                      + ([{'Key': ORG_GROUP_TAG, 'Value': str(org_group)}] if org_group else [])},
+                    {'ResourceType': 'volume', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
+                    {'ResourceType': 'network-interface', 'Tags': [{'Key': 'Role', 'Value': ROLE}]},
+                ])
+        except OutOfTime:
+            raise
+        except Exception as error:
+            last_error = error
+            code = (getattr(error, 'response', None) or {}).get('Error', {}).get('Code')
+            if code in CAPACITY_CODES:
+                print(f"{repo}: {instance_type} in {subnet['availability_zone']} refused: {code}")
+                remember_refused(refused, instance_type, subnet['availability_zone'])
+                continue
+            if code is None or code in AMBIGUOUS_CODES:
+                print(f"{repo}: launch for job {job_id} ended ambiguously ({type(error).__name__} {code}); "
+                      'not trying another pool this round')
+                return None, False
+            # Definite (UnauthorizedOperation, InvalidAMIID.*, a quota ...): nothing was created,
+            # and retrying other pools or later rounds will not help. Make it loud.
+            # str(error) carries AWS's encoded authorization message for a denial; an
+            # administrator decodes it with `aws sts decode-authorization-message`.
+            raise LaunchRefused(f'{repo}: RunInstances refused job {job_id}: {code}: {error}') from error
+        instance_id = response['Instances'][0]['InstanceId']
+        with handoff():
+            return settle(repo, instance_id, instance_type, subnet, job_id, labels, token)
     print(f'{repo}: every pool refused a {size} runner for job {job_id}: {last_error}')
     return None, True
 
@@ -1415,6 +1564,10 @@ def reconcile(repo, cfg, subnets):
         print(f'{repo}: reconcile stopped at its time share, before {stop}')
         result['stopped'] = 'no time left'
         return result
+    except Exception as error:
+        # The round still publishes what its scan saw (OldestQueuedSeconds); nothing else of a failed repo is counted.
+        error.queued = {k: result[k] for k in ('label', 'oldest_queued_s') if k in result}
+        raise
 
 
 def reconcile_repo(repo, cfg, subnets, result):
@@ -1466,6 +1619,7 @@ def reconcile_repo(repo, cfg, subnets, result):
     if share_end != float('inf'):
         DEADLINE[0] = time.monotonic() + max(0.0, share_end - time.monotonic()) / 2
     running_on = set()
+    SCANNED.pop(repo, None)
     try:
         jobs = queued_jobs(repo, cfg, pat, running_on=running_on)
         if cfg.get('org_group') and jobs:
@@ -1479,23 +1633,35 @@ def reconcile_repo(repo, cfg, subnets, result):
         DEADLINE[0] = share_end
     # Busy AND named by an in-progress job: running another job, so not covering the one it is tagged for.
     busy = frozenset(name for name, runner in runners.items() if runner.get('busy') and name in running_on)
-    for job_id, size in jobs:
-        # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
-        # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
-        # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
-        # oldest first, and the one that waits keeps its turn for the room the next host frees.
-        if out_of_time(LAUNCH_ATTEMPT_SECONDS):
-            print(f'{repo}: deferring queued launches for the next turn: the repo turn ended or '
-                  f'less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains')
-            outcomes['deferred'] = outcomes.get('deferred', 0) + 1
-            break
-        outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        result['live'] = len(live)
-        if cfg.get('vcpus'):
-            result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
-        if outcome in ('cap', 'deferred'):
-            break
+    scanned, outcome_of = SCANNED.pop(repo, None), {}
+    try:
+        for job_id, size in jobs:
+            # Each ensure_runner costs a DynamoDB query and an EC2 scan, so a backlog must not run
+            # past this repo's time share. The cap is repo-wide: once hit, every later job waits too.
+            # Under a vCPU cap a later, smaller job might still fit, but it waits as well: the jobs come
+            # oldest first, and the one that waits keeps its turn for the room the next host frees.
+            if out_of_time(LAUNCH_ATTEMPT_SECONDS):
+                print(f'{repo}: deferring queued launches for the next turn: the repo turn ended or '
+                      f'less than {LAUNCH_ATTEMPT_SECONDS}s of invocation work time remains')
+                outcomes['deferred'] = outcomes.get('deferred', 0) + 1
+                break
+            try:
+                outcome, token = ensure_runner(repo, cfg, subnets, pat, job_id, size, live, token, busy)
+            except OutOfTime:
+                raise   # the round ran out, not the job: it keeps its place
+            except Exception:
+                outcome_of[job_id] = 'error'   # this job, not the scan: it must not hold the cursor every round
+                raise
+            outcomes[outcome] = outcomes.get(outcome, 0) + 1
+            outcome_of[job_id] = outcome
+            result['live'] = len(live)
+            if cfg.get('vcpus'):
+                result['vcpus'] = sum(host_vcpus(i, cfg) for i in live)
+            if outcome in ('cap', 'deferred'):
+                break
+    finally:
+        if scanned:
+            record_scan(repo, cfg, scanned, jobs, outcome_of, live, busy, result)
     # Jobs lost with a reclaimed spot host, after the launches: a rerun can wait a round, a queued job should not.
     reruns = reconcile_reruns(repo, cfg)
     if reruns:
@@ -1503,6 +1669,25 @@ def reconcile_repo(repo, cfg, subnets, result):
         print(f'{repo}: spot reruns {reruns}')
     print(f'{repo}: reconcile {outcomes or "nothing queued"}; {len(live)} live')
     return result
+
+
+def record_scan(repo, cfg, scanned, jobs, outcome_of, live, busy, result):
+    """After the launches, even ones cut short by the time share or an error: store the scan cursor and the round's
+    OldestQueuedSeconds. A job found but not reached (no outcome), or waiting at a cap or deferred, holds the cursor
+    (next_cursor); one that failed or raised does not, so a job no pool can ever serve cannot stop the scan for good.
+    The cursor write is skipped once the repo's turn is over (save_scan_cursor), and the next round then re-reads from
+    where this one started."""
+    cursor = next_cursor(scanned, {job for job, _ in jobs if outcome_of.get(job) in (None, 'cap', 'deferred')})
+    if cursor != scanned['read']:
+        save_scan_cursor(repo, cursor)
+    # The oldest queued job no live host covers (ensure_runner's 'exists' rule). A job GitHub still lists as queued while
+    # its own host runs it (issue #531) is covered, so it does not count: no in-progress job names that host, so it is not
+    # in `busy`, which holds only hosts running another job. Nor does one the listing still calls queued after its host
+    # finished it, which ensure_runner found 'not queued' in GitHub's own record.
+    covered = {tag(i, 'JobId') for i in live if i['InstanceId'] not in busy}
+    result['label'] = cfg['label']
+    result['oldest_queued_s'] = int(max([age for job, age in scanned['ages'].items()
+                                         if job not in covered and outcome_of.get(job) != 'not queued'], default=0))
 
 
 def reconcile_buckets(repos):
@@ -1538,7 +1723,11 @@ def publish_counts(results, buckets=()):
     spend alarm read it (runner-app.tf). Nothing reads a vCPU total, so none is published.
 
     Per budget group: BucketLevelUsd, Throttled (0 or 1) and SpendUsd7d (the last 168 hours of the bucket's drain), which
-    the throttled-hours and weekly-spend alarms read."""
+    the throttled-hours and weekly-spend alarms read.
+
+    Per runner label (the repos sharing one, the dolphin repos, together): OldestQueuedSeconds, the age of the oldest
+    queued job the round's scans found with no host, 0 when none. The queued-too-long alarm reads it; it is the
+    controller's own view, so it does not depend on anything in GitHub Actions running."""
     data = [{'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
              'Value': r['live'], 'Unit': 'Count'} for r in results if 'live' in r]
     data += [{'MetricName': 'LiveVcpus', 'Dimensions': [{'Name': 'Repo', 'Value': r['repo']}],
@@ -1546,6 +1735,12 @@ def publish_counts(results, buckets=()):
     if all('live' in r for r in results):
         data.append({'MetricName': 'LiveRunners', 'Dimensions': [{'Name': 'Repo', 'Value': 'ALL'}],
                      'Value': sum(r['live'] for r in results), 'Unit': 'Count'})
+    oldest = {}
+    for r in results:
+        if 'oldest_queued_s' in r:
+            oldest[r['label']] = max(oldest.get(r['label'], 0), r['oldest_queued_s'])
+    data += [{'MetricName': 'OldestQueuedSeconds', 'Dimensions': [{'Name': 'Label', 'Value': label}],
+              'Value': seconds, 'Unit': 'Seconds'} for label, seconds in sorted(oldest.items())]
     for state in buckets:
         dims = [{'Name': 'Group', 'Value': state['group']}]
         data += [{'MetricName': 'BucketLevelUsd', 'Dimensions': dims, 'Value': round(state['level_usd'], 4), 'Unit': 'None'},
@@ -1901,7 +2096,7 @@ def handler(event, context):
             except Exception as error:
                 failed.append(repo)
                 print(f'{repo}: reconcile failed: {type(error).__name__}: {error}')
-                results.append({'repo': repo, 'error': type(error).__name__})
+                results.append({'repo': repo, 'error': type(error).__name__, **getattr(error, 'queued', {})})
         RECONCILE_END[0] = None
         DEADLINE[0] = float('inf')
         publish_counts(results, buckets)

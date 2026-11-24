@@ -41,7 +41,10 @@ class ParityTests(unittest.TestCase):
         member = CT.split("nextjs_ct_deny_member = [", 1)[1].split("\n  ]\n", 1)[0]
         self.assertIn("Resource = local.nextjs_dev_parity_secrets", member)
         self.assertIn('"secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]', member)
-        self.assertIn("Resource = [aws_ssm_parameter.constellation.arn, aws_ssm_parameter.astryx.arn]", member)  # the pointers too
+        pointers = member.split('Sid    = "OwnerOnlyApplyPointers"', 1)[1].split("},", 1)[0]  # the pointers too
+        for name in ("aws_ssm_parameter.constellation.name", "aws_ssm_parameter.astryx.name", "module.family_account.pointer_name"):
+            self.assertIn(name, pointers, name)
+        self.assertIn('"arn:aws:ssm:*:*:parameter${name}"', pointers)
         self.assertIn("NotResource = local.nextjs_ct_member_bedrock", member)
         for action in ("bedrock-mantle:*", "aws-marketplace:Subscribe", "ses:*", "codeartifact:*", "sts:GetServiceBearerToken"):
             self.assertIn(f'"{action}"', member, action)

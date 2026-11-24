@@ -52,8 +52,8 @@ variable "enable_claw_master_server" {
 }
 
 locals {
-  claw_master_tag            = "claw-master-dee7046"
-  claw_master_sha256_aarch64 = "7c1406d4f4b793e995b046245eb6dc173165512401136293e69e4060621f4f75"
+  claw_master_tag            = "claw-master-3f960a6"
+  claw_master_sha256_aarch64 = "800112c9d9ba085aea2f13b47b540ea590a86c4eb4b7a75b02fee0fee6ccba09"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -83,6 +83,21 @@ locals {
   # list of what is served: the server serves every login that exists, these first, then any other in name order, so a
   # new subscription needs no edit here (claw-master-add-start / -finish below, or scripts/claw-master-login.sh --server).
   claw_master_profiles = ["claude-connor", "claude-colton", "claude-colin", "claude-thao", "claude-colby", "claude-ejc3"]
+
+  # Held-back subscriptions (claw-master --profile-reserve-file, ejc3/CLIProxyAPI#38; owner, 2026-11-22). A reserve of N
+  # keeps the last N% of that subscription's weekly allowance: once its weekly usage reaches (100 - N)%, the pool treats
+  # it as out, as if Anthropic had refused it (100: the pool never uses it). With last_resort = true it is instead ranked
+  # after every other subscription past that point, used only when all the others are out, still before the paid
+  # API-key backup. Below the point the normal draining rules apply. An apply rewrites /etc/claude-master/profile-reserve
+  # and the running server picks it up within about two minutes, with no restart.
+  claw_master_profile_reserve = {
+    "claude-colton-renewed-20261112" = { reserve = 30, last_resort = true }
+  }
+  claw_master_profile_reserve_file = join("", concat(
+    ["# PROFILE=N[ last-resort], written by Terraform from local.claw_master_profile_reserve (claw-master-server.tf)\n"],
+    [for p in sort(keys(local.claw_master_profile_reserve)) :
+    "${p}=${local.claw_master_profile_reserve[p].reserve}${local.claw_master_profile_reserve[p].last_resort ? " last-resort" : ""}\n"],
+  ))
 
   claw_master_admin_cidrs = concat(
     var.enable_jumpbox ? ["${aws_instance.jumpbox[0].private_ip}/32"] : [],
@@ -316,6 +331,16 @@ PORT='${local.claw_master_server_port}'
 REGION='${var.aws_region}'
 HOME_DIR=/var/lib/claude-master
 
+# ---------------------------------------------------------------- needrestart
+# The servers, Envoy and the tunnel change only through claw-master-rollout. On 2026-11-24 unattended-upgrades' needrestart
+# restarted claude-master-server@blue because an applied pin had replaced the binary it ran: a restart in place, a
+# 10-minute drain with no second color, and no rollout. List them as deferred instead; every other service still restarts.
+install -d -m 0755 /etc/needrestart/conf.d
+cat > /etc/needrestart/conf.d/claw-master.conf.new <<'NEEDRESTART'
+$nrconf{override_rc}{qr(^(?:claude-master-server(?:@[a-z]+)?|envoy|cloudflared-claude-master)\.service$)} = 0;
+NEEDRESTART
+mv -f /etc/needrestart/conf.d/claw-master.conf.new /etc/needrestart/conf.d/claw-master.conf
+
 # ---------------------------------------------------------------- base packages
 apt-get update -y || true
 apt-get install -y curl jq unzip || echo "WARNING: some base packages failed"
@@ -388,12 +413,17 @@ done
 [ $${#found[@]} -gt 0 ] || { echo "claw-master-serve: no subscription login under $profdir" >&2; exit 1; }
 args=("$${found[0]}")
 for p in "$${found[@]:1}"; do args+=(--next-profile "$p"); done
+# Held-back subscriptions, when the installed binary has the flag. Its help lists no flags (`serve --help` only says
+# --listen and --state-dir are required), so the binary itself is searched; a convergence that could not install the
+# pinned release leaves an older binary without it, which must still start.
+reserve=()
+if grep -qa -- --profile-reserve-file "$bin"; then reserve=(--profile-reserve-file /etc/claude-master/profile-reserve); fi
 exec "$bin" serve "$${args[@]}" \
   --listen ${local.claw_master_server_ip}:$port \
   --open-loopback 127.0.0.1:$open --state-dir /var/lib/claude-master/state \
   --log-level info --log-file /var/log/claude-master/server-$color.log --log-max-mb 20 --log-keep 5 --quota-log-interval 5m \
   --otlp-endpoint http://127.0.0.1:4318 --otlp-interval 60s --account-labels-file /etc/claude-master/account-labels \
-  --instance claw-master-$color $balancer
+  --instance claw-master-$color $balancer "$${reserve[@]}"
 EOF
 chmod 0755 /usr/local/bin/claw-master-serve
 
@@ -407,6 +437,12 @@ if [ ! -e /etc/claude-master/account-labels ]; then
 fi
 chown root:claude-master /etc/claude-master/account-labels
 chmod 0640 /etc/claude-master/account-labels
+
+# Held-back subscriptions (local.claw_master_profile_reserve), rewritten by every convergence with one rename, so the
+# server never reads a half-written file.
+tmp=$(mktemp /etc/claude-master/.profile-reserve.XXXXXX)
+printf '%s' '${base64encode(local.claw_master_profile_reserve_file)}' | base64 -d > "$tmp"
+chown root:claude-master "$tmp" && chmod 0640 "$tmp" && mv -f "$tmp" /etc/claude-master/profile-reserve
 
 # Run by systemd as root before each start (ExecStartPre=-+ in the unit) and every 10 minutes by its timer;
 # the running server reloads the file when it changes. It never stops a start: without a value, when the
@@ -1026,6 +1062,14 @@ resource "terraform_data" "claw_master_server_converge" {
     type     = aws_instance.claw_master_server[0].instance_type
     script   = sha256(local.claw_master_server_user_data)
     helper   = filesha256("${path.module}/scripts/ssm-claw-master-server.sh")
+  }
+
+  lifecycle {
+    precondition {
+      condition = alltrue([for p, r in local.claw_master_profile_reserve :
+      can(regex("^[a-z0-9][a-z0-9-]*$", p)) && floor(r.reserve) == r.reserve && r.reserve >= 0 && r.reserve <= 100])
+      error_message = "local.claw_master_profile_reserve: each key is a profile name ([a-z0-9-]) and each reserve a whole number 0..100; claw-master would refuse the file and keep the old reserves."
+    }
   }
 
   provisioner "local-exec" {

@@ -37,7 +37,8 @@ DIGEST = "sha256:" + "a" * 64
 EVENT = {"commit": "b" * 40, "digest": DIGEST}
 ENV = {"REPOSITORY_URL": REPO, "LOCK_TABLE": "locks", "LOCK_ID": "state-bucket/state-key",
        "IMAGE_PARAMETER": "/fleet/stage/image", "STACK": "stage", "CLUSTER": "fcvm-fleet",
-       "SERVICE": "fcvm-fleet-coordinator", "FAMILY": "fcvm-fleet-coordinator"}
+       "SERVICE": "fcvm-fleet-coordinator", "FAMILY": "fcvm-fleet-coordinator",
+       "LANE_PARAMETER": "/fleet/stage/lambda-image"}
 
 
 class AWS:
@@ -92,11 +93,19 @@ class AWS:
     def describe_task_definition(self, **kwargs):
         return copy.deepcopy(self.old)
 
+    lane_pointer = "none"
+
     def get_parameter(self, **kwargs):
+        if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            return {"Parameter": {"Value": self.lane_pointer}}
         return {"Parameter": {"Value": self.image, "Version": self.version}}
 
     def put_parameter(self, **kwargs):
         assert self.lock, "pointer write outside the Terraform backend lock"
+        if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            self.lane_pointer = kwargs["Value"]
+            self.calls.append("lane-pointer")
+            return
         self.image = kwargs["Value"]
         self.version += 1
         self.calls.append("pointer")
@@ -277,7 +286,7 @@ PROD_OLD = PROD_ENV["FAMILY"]
 
 LANE_URL = "registry.example/fcvm-fleet/lambda-tile"
 LANE = "sha256:" + "e" * 64
-LANE_ENV = {**ENV, "LANE_REPOSITORY_URL": LANE_URL}
+LANE_ENV = {**ENV, "LANE_REPOSITORY_URL": LANE_URL, "LANE_PARAMETER": "/fleet/stage/lambda-image"}
 
 
 class LaneECR:
@@ -425,6 +434,102 @@ class LaneReleaseTests(unittest.TestCase):
         self.assertEqual(self.aws.lock, "another operator")
         self.assertEqual(self.aws.calls, [])
 
+    def test_a_release_with_a_lane_records_it_where_terraform_renders_it(self):
+        # Terraform renders the task definition: without the pointer, the next apply drops the lane (#997's P1).
+        self.assertEqual(self.run_release({**EVENT, "lambda_digest": LANE})["status"], "deployed")
+        self.assertEqual(self.aws.lane_pointer, LANE_URL + "@" + LANE)
+        self.assertEqual(self.aws.calls, ["lock", "pointer", "register", NEW, "lane-pointer", "pointer", "unlock"])
+
+    def test_a_lane_pointer_that_disagrees_with_the_running_task_changes_nothing(self):
+        for running, pointer in ((None, LANE_URL + "@" + LANE), (LANE, "none"), (LANE, LANE_URL + "@sha256:" + "f" * 64)):
+            with self.subTest(running=running, pointer=pointer):
+                self.aws = AWS()
+                self.aws.describe_images = lambda **kwargs: {"imageDetails": [{
+                    "imageDigest": kwargs["imageIds"][0].get("imageDigest", DIGEST), "imageTags": ["b" * 40]}]}
+                if running:
+                    self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+                        {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + running})
+                self.aws.lane_pointer = pointer
+                with self.assertRaises(release.Refused) as refused:
+                    self.run_release({**EVENT, "lambda_digest": LANE})
+                self.assertEqual(refused.exception.code, "lane-pointer-mismatch")
+                self.assertEqual((self.aws.calls, self.aws.arn, self.aws.lane_pointer), (["lock", "unlock"], OLD, pointer))
+
+    def test_a_failed_rollout_restores_the_lane_pointer_with_the_image_pointer(self):
+        before = self.aws.image
+        self.aws.fail_rollout = True
+        with self.assertRaises(Exception):
+            self.run_release({**EVENT, "lambda_digest": LANE})
+        self.assertEqual((self.aws.arn, self.aws.image, self.aws.lane_pointer), (OLD, before, "none"))
+        self.assertNotIn("lane-pointer", self.aws.calls)
+
+    def test_a_failure_after_the_lane_pointer_is_written_restores_it(self):
+        before, writes = self.aws.image, []
+        put = self.aws.put_parameter
+        def failing_image_pointer(**kwargs):
+            writes.append(kwargs["Name"])
+            if kwargs["Name"] == ENV["IMAGE_PARAMETER"] and kwargs["Value"] == REPO + "@" + DIGEST:
+                raise RuntimeError("throttled")
+            return put(**kwargs)
+        self.aws.put_parameter = failing_image_pointer
+        with self.assertRaises(RuntimeError):
+            self.run_release({**EVENT, "lambda_digest": LANE})
+        self.assertEqual((self.aws.arn, self.aws.image, self.aws.lane_pointer), (OLD, before, "none"))
+        self.assertEqual(writes.count(LANE_ENV["LANE_PARAMETER"]), 2)
+        # The lane pointer is restored before the image pointer: if that restore fails too, nothing is left ahead.
+        rollback = writes[writes.index(ENV["IMAGE_PARAMETER"], writes.index(LANE_ENV["LANE_PARAMETER"])) + 1:]
+        self.assertEqual(rollback[:2], [LANE_ENV["LANE_PARAMETER"], ENV["IMAGE_PARAMETER"]])
+
+    def test_a_release_without_a_lane_still_refuses_a_lane_pointer_ahead_of_the_task(self):
+        # A pointer left ahead (a Lambda that died between its two pointer writes) would make the next Terraform
+        # apply change the lane unasked: every release refuses it, not only one that carries a lane.
+        self.aws.lane_pointer = LANE_URL + "@" + LANE
+        with self.assertRaises(release.Refused) as refused:
+            self.run_release(EVENT)
+        self.assertEqual(refused.exception.code, "lane-pointer-mismatch")
+        self.assertEqual((self.aws.calls, self.aws.arn), (["lock", "unlock"], OLD))
+
+    def test_the_same_lane_and_image_are_unchanged_and_write_nothing(self):
+        self.aws.image = REPO + "@" + DIGEST
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["image"] = self.aws.image
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
+        self.aws.lane_pointer = LANE_URL + "@" + LANE
+        self.assertEqual(self.run_release({**EVENT, "lambda_digest": LANE})["status"], "unchanged")
+        self.assertEqual(self.aws.calls, ["lock", "unlock"])
+
+    def test_terraform_renders_the_lane_from_the_pointer_in_both_stacks(self):
+        def block(text, header):
+            start = text.index(header)
+            return text[start:text.index("\n}\n", start) + 2]
+        cases = (("stage", "fcvm-fleet-ci.tf", "fcvm-fleet.tf", "fcvm_coordinator_lane", "",
+                  'resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"',
+                  'resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet"',
+                  'resource "aws_lambda_function" "fcvm_coordinator_release"', "fcvm_fleet_lambda_tile"),
+                 ("prod", "fcvm-fleet-prod.tf", "fcvm-fleet-prod.tf", "fcvm_fleet_prod_coordinator_lane", "[0]",
+                  'resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"',
+                  'resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet"',
+                  'resource "aws_lambda_function" "fcvm_coordinator_release_prod"', "fcvm_fleet_lambda_tile_prod[0]"))
+        ci = {"stage": (ROOT / "fcvm-fleet-ci.tf").read_text(), "prod": (ROOT / "fcvm-fleet-prod-ci.tf").read_text()}
+        for stack, pointer_file, task_file, pointer, index, task, policy, function, repository in cases:
+            with self.subTest(stack=stack):
+                param = block((ROOT / pointer_file).read_text(), f'resource "aws_ssm_parameter" "{pointer}"')
+                self.assertIn(f'name     = "/fcvm-fleet/{stack}/lambda-image"', param)
+                self.assertIn('value    = "none"', param)
+                self.assertRegex(param, r"ignore_changes = \[value\]")
+                ref = f"aws_ssm_parameter.{pointer}{index}"
+                definition = block((ROOT / task_file).read_text(), task)
+                self.assertIn(f"[for lane in [nonsensitive({ref}.value)] :", definition)
+                self.assertIn('{ name = "FLEET_LAMBDA_IMAGE", value = lane } if lane != "none"', definition)
+                # Only none or a digest in the stack's own lane repository is rendered.
+                self.assertIn(f'"^(none|${{replace(aws_ecr_repository.{repository}.repository_url', definition)
+                # The release role reads and writes the pointer; the function names it.
+                rules = block(ci[stack], policy)
+                self.assertRegex(rules, r'Action = \["ssm:GetParameter", "ssm:PutParameter"(, "ssm:GetParameterHistory")?\]'
+                                 r'\s+Resource = [^\n]*'
+                                 + re.escape(f"{ref}.arn"))
+                self.assertRegex(block(ci[stack], function), r"LANE_PARAMETER\s+= " + re.escape(f"{ref}.name"))
+
     def test_the_functions_read_only_the_lane_repository_and_name_it(self):
         def block(text, header):
             start = text.index(header)
@@ -459,6 +564,7 @@ class ProdAWS(AWS):
         self.stage_image = REPO + "@" + DIGEST
         self.record = "{}"
         self.tags = {DIGEST: ["b" * 40], "sha256:" + "c" * 64: ["e" * 40, "bdaa0003"]}
+        self.lane_history = ["none"]
 
     def get_metric_data(self, **kwargs):
         query = kwargs["MetricDataQueries"][0]["MetricStat"]
@@ -472,6 +578,8 @@ class ProdAWS(AWS):
 
     def get_parameter(self, **kwargs):
         name = kwargs["Name"]
+        if name == os.environ.get("LANE_PARAMETER"):
+            return super().get_parameter(**kwargs)
         if name == PROD_ENV["STAGE_IMAGE_PARAMETER"]:
             return {"Parameter": {"Value": self.stage_image}}
         if name == PROD_ENV["RELEASE_RECORD"]:
@@ -480,6 +588,9 @@ class ProdAWS(AWS):
         return super().get_parameter(**kwargs)
 
     def put_parameter(self, **kwargs):
+        if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            self.lane_history.append(kwargs["Value"])
+            return super().put_parameter(**kwargs)
         if kwargs["Name"] == PROD_ENV["RELEASE_RECORD"]:
             self.record = kwargs["Value"]
             self.calls.append("record")
@@ -488,8 +599,13 @@ class ProdAWS(AWS):
         super().put_parameter(**kwargs)
         self.history.append(kwargs["Value"])
 
+    lane_history = None
+
     def get_parameter_history(self, **kwargs):
-        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"] and kwargs["WithDecryption"] is False
+        assert kwargs["WithDecryption"] is False
+        if kwargs["Name"] == os.environ.get("LANE_PARAMETER"):
+            return {"Parameters": [{"Value": value} for value in (self.lane_history or ["none"])]}
+        assert kwargs["Name"] == PROD_ENV["IMAGE_PARAMETER"]
         return {"Parameters": [{"Value": value} for value in self.history]}
 
     def describe_services(self, **kwargs):
@@ -565,6 +681,27 @@ class ProdReleaseTests(unittest.TestCase):
         self.assertEqual(self.aws.calls, [])
         self.aws.history.insert(0, REPO + "@" + DIGEST)
         self.assertEqual(self.run_release({**EVENT, "force": True})["status"], "deployed")
+        self.assertEqual(self.aws.metric_reads, 0)
+
+    def test_force_cannot_change_the_lane(self):
+        # force skips the viewer hold to return to an image prod ran before; a lane prod does not run is no rollback.
+        lane_ecr = LaneECR(current=LANE)
+        prod_lane = "registry.example/fcvm-fleet/lambda-tile-prod"
+        self.aws.history.insert(0, REPO + "@" + DIGEST)
+        self.aws.viewers = [3.0]
+        with patch.dict(os.environ, {"LANE_REPOSITORY_URL": prod_lane, "LANE_PARAMETER": "/fleet/prod/lambda-image"}):
+            with self.assertRaises(release.Refused) as refused:
+                release.deploy({**EVENT, "force": True, "lambda_digest": LANE}, self.aws, self.aws, self.aws, self.aws,
+                               self.aws, lane_ecr=lane_ecr)
+            self.assertEqual(refused.exception.code, "not-a-rollback")
+            self.assertEqual((self.aws.calls, self.aws.arn), (["lock", "unlock"], OLD))
+            # The lane prod already runs may ride along with a forced rollback of the coordinator image.
+            self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+                {"name": "FLEET_LAMBDA_IMAGE", "value": prod_lane + "@" + LANE})
+            self.aws.lane_pointer = prod_lane + "@" + LANE
+            result = release.deploy({**EVENT, "force": True, "lambda_digest": LANE}, self.aws, self.aws, self.aws,
+                                    self.aws, self.aws, lane_ecr=lane_ecr)
+        self.assertEqual(result["status"], "deployed")
         self.assertEqual(self.aws.metric_reads, 0)
 
     def test_force_must_be_true_and_staging_takes_no_force_or_action(self):
@@ -732,6 +869,58 @@ class ProdLaneRecordTests(ProdReleaseTests):
                 self.run_release({"action": "record", "release": {**self.entry(), "lambda_digest": value, "previous": None}})
 
 
+class ProdForcedLaneTests(unittest.TestCase):
+    """force skips the viewer hold to return to a set prod ran before (ejc3/fcvm's rollback). Its lane image, or no
+    lane, must be one prod's lane pointer has held; a lane prod never ran waits for the hold like any release."""
+    PROD_LANE = "registry.example/fcvm-fleet/lambda-tile-prod"
+
+    def setUp(self):
+        self.aws, self.lane = ProdAWS(), LaneECR(current=LANE)
+        self.aws.history.insert(0, REPO + "@" + DIGEST)  # the coordinator image prod ran before
+        self.aws.viewers = [3.0]  # a viewer: only force can go ahead
+        p = patch.dict(os.environ, {**PROD_ENV, "LANE_REPOSITORY_URL": self.PROD_LANE,
+                                    "LANE_PARAMETER": "/fleet/prod/lambda-image"})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def running(self, lane):
+        self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
+            {"name": "FLEET_LAMBDA_IMAGE", "value": self.PROD_LANE + "@" + lane})
+        self.aws.lane_pointer = self.PROD_LANE + "@" + lane
+
+    def release(self, lane):
+        return release.deploy({**EVENT, "force": True, "lambda_digest": lane}, self.aws, self.aws, self.aws, self.aws,
+                              self.aws, lane_ecr=self.lane)
+
+    def test_force_returns_to_a_lane_prod_ran_before(self):
+        self.running("sha256:" + "9" * 64)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@" + LANE, self.PROD_LANE + "@sha256:" + "9" * 64]
+        self.assertEqual(self.release(LANE)["status"], "deployed")
+        self.assertEqual((self.aws.lane_pointer, self.aws.metric_reads), (self.PROD_LANE + "@" + LANE, 0))
+
+    def test_force_returns_to_no_lane_when_prod_ran_none(self):
+        self.running(LANE)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@" + LANE]
+        self.assertEqual(self.release(None)["status"], "deployed")
+        self.assertEqual(self.aws.lane_pointer, "none")
+
+    def test_force_refuses_a_lane_prod_never_ran(self):
+        self.running("sha256:" + "9" * 64)
+        self.aws.lane_history = ["none", self.PROD_LANE + "@sha256:" + "9" * 64]
+        with self.assertRaises(release.Refused) as refused:
+            self.release(LANE)
+        self.assertEqual(refused.exception.code, "not-a-rollback")
+        self.assertEqual((self.aws.calls, self.aws.arn), (["lock", "unlock"], OLD))
+
+    def test_force_refuses_no_lane_when_the_pointer_never_held_none(self):
+        self.running(LANE)
+        self.aws.lane_history = [self.PROD_LANE + "@" + LANE]
+        with self.assertRaises(release.Refused) as refused:
+            self.release(None)
+        self.assertEqual(refused.exception.code, "not-a-rollback")
+        self.assertEqual(self.aws.arn, OLD)
+
+
 class LaneClearTests(LaneReleaseTests):
     """A rollback to a set that ran no lane image (ejc3/fcvm --lambda-digest none) sends lambda_digest null: the
     function removes FLEET_LAMBDA_IMAGE and reads no tag."""
@@ -739,10 +928,13 @@ class LaneClearTests(LaneReleaseTests):
     def test_a_null_lane_digest_removes_the_lane_image(self):
         self.aws.old["taskDefinition"]["containerDefinitions"][0]["environment"].append(
             {"name": "FLEET_LAMBDA_IMAGE", "value": LANE_URL + "@" + LANE})
+        self.aws.lane_pointer = LANE_URL + "@" + LANE
         result = self.run_release({**EVENT, "lambda_digest": None})
         self.assertEqual(result, {"status": "deployed", "taskDefinition": NEW, "digest": DIGEST, "lambda_digest": None})
         self.assertEqual(self.lane.calls, [])
         self.assertEqual(self.coordinator_env(self.aws.registered), {"STATE": "bucket"})
+        # The lane pointer follows, so the next Terraform apply renders no lane either.
+        self.assertEqual(self.aws.lane_pointer, "none")
 
     def test_a_null_lane_digest_with_no_lane_image_running_is_unchanged(self):
         self.aws.image = REPO + "@" + DIGEST

@@ -1,0 +1,352 @@
+#!/usr/bin/python3
+"""Free the CI VM's data volume under disk pressure (ejc3/aws#1021).
+
+Runs hourly as the guest's admin from the LaunchAgent com.ejcampbell.ci-disk-clean, which
+scripts/mac/install-ci-sim-slots.sh installs. It acts only while the data volume has under 30 GiB free
+or is at least 85% used, and stops as soon as neither holds. In order:
+
+  1. erases (never deletes) simulators that are Shutdown and whose device.plist has not changed in 6 hours,
+     largest first; erasing keeps each device and its UDID, so the runners' named devices stay where jobs look;
+  2. removes entries of ~/Library/Developer/Xcode/DerivedData and of the user's TMPDIR that nothing has
+     modified (mtime or ctime, anywhere inside) for 24 hours and that no process has open, oldest first.
+
+Every action first takes the cleanup admission lock and every mac-build slot lock exclusively, without
+waiting. A test command holds the admission lock (shared) for its whole life, so if any is held the run
+stops and touches nothing. Nothing under ~/runners is visited. The log carries counts and bytes only.
+Python 3.9 (Xcode's /usr/bin/python3).
+"""
+
+import argparse
+import contextlib
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+GIB = 1024**3
+MIN_FREE = 30 * GIB
+MAX_USED = 0.85
+SIM_AGE = 6 * 3600
+CACHE_AGE = 24 * 3600
+VOLUME = "/System/Volumes/Data"
+XCRUN = "/usr/bin/xcrun"
+LSOF = "/usr/sbin/lsof"
+GETCONF = "/usr/bin/getconf"
+UDID = re.compile(r"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}$")
+
+
+class JobRunning(Exception):
+    """A mac-build job holds the admission lock or a slot lock."""
+
+
+def usage(volume):
+    disk = shutil.disk_usage(volume)
+    return disk.total, disk.free
+
+
+def pressure(total, free):
+    return free < MIN_FREE or total - free >= MAX_USED * total
+
+
+def tree(path, device):
+    """(bytes of blocks, newest mtime or ctime) under path: no links followed, nothing on another device."""
+    s = os.lstat(path)
+    size, newest = s.st_blocks * 512, max(s.st_mtime, s.st_ctime)
+    if not stat.S_ISDIR(s.st_mode):
+        return size, newest
+    stack = [path]
+    while stack:
+        try:
+            with os.scandir(stack.pop()) as entries:
+                for entry in entries:
+                    try:
+                        e = entry.stat(follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
+                    if e.st_dev != device:
+                        continue
+                    size += e.st_blocks * 512
+                    newest = max(newest, e.st_mtime, e.st_ctime)
+                    if stat.S_ISDIR(e.st_mode):
+                        stack.append(entry.path)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except PermissionError:
+            newest = float("inf")  # unreadable: never call it untouched
+    return size, newest
+
+
+def lock_paths(home):
+    """The admission lock first, then every existing slot file of both mac-build pools."""
+    admission = home / ".local/state/mac-build/admission.lock"
+    pools = {
+        Path(os.environ.get("CI_SIM_STATE_DIR", home / ".local/state/sim-slots")) / "mac-build",
+        home / ".local/state/sim-slots/mac-build",
+        Path(os.environ.get("MAC_STATE_DIR", home / ".local/state")) / "mac-build",
+        home / ".local/state/mac-build",
+    }
+    slots = set()
+    for pool in pools:
+        # A slot file nobody created yet is a slot nobody holds; mac-build takes the admission lock first.
+        slots.update(p for p in pool.glob("slot.*") if p.suffix[1:].isdigit())
+    return [admission, *sorted(slots)]
+
+
+@contextlib.contextmanager
+def no_jobs(home):
+    """Hold every mac-build lock exclusively for one action, or raise JobRunning."""
+    paths = lock_paths(home)
+    paths[0].parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with contextlib.ExitStack() as held:
+        for path in paths:
+            try:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            except FileNotFoundError:
+                continue
+            held.callback(os.close, fd)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise JobRunning() from None
+        yield
+
+
+def simctl(*args, check=True):
+    return subprocess.run(
+        [XCRUN, "simctl", *args], stdin=subprocess.DEVNULL, capture_output=True, check=check, timeout=300
+    )
+
+
+def device_states():
+    listing = json.loads(simctl("list", "devices", "--json").stdout)
+    return {d.get("udid"): d.get("state") for runtime in listing["devices"].values() for d in runtime}
+
+
+def stale(devices, udid, cutoff):
+    try:
+        s = os.lstat(devices / udid / "device.plist")
+    except FileNotFoundError:
+        return False
+    return stat.S_ISREG(s.st_mode) and s.st_mtime <= cutoff
+
+
+def erase_simulators(home, device, now, apply, stats, short):
+    devices = home / "Library/Developer/CoreSimulator/Devices"
+    cutoff = now - SIM_AGE
+    found = []
+    for udid, state in device_states().items():
+        if isinstance(udid, str) and UDID.match(udid) and state == "Shutdown" and stale(devices, udid, cutoff):
+            data = devices / udid / "data"
+            if os.path.isdir(data) and not os.path.islink(data):
+                try:
+                    found.append((tree(data, device)[0], udid))
+                except FileNotFoundError:
+                    continue
+    for before, udid in sorted(found, reverse=True):
+        if not short():
+            return True
+        if not apply:
+            stats.add("simulators", before)
+            continue
+        with no_jobs(home):
+            # Checked again under the locks: a job may have booted or used it since the listing.
+            if device_states().get(udid) != "Shutdown" or not stale(devices, udid, cutoff):
+                continue
+            if simctl("erase", udid, check=False).returncode != 0:
+                stats.failed += 1
+                continue
+        try:
+            left = tree(devices / udid / "data", device)[0]
+        except FileNotFoundError:
+            left = 0  # CoreSimulator recreates data/ when the device next boots
+        stats.add("simulators", before - left)
+    return False
+
+
+def temp_dir():
+    try:
+        out = subprocess.run([GETCONF, "DARWIN_USER_TEMP_DIR"], capture_output=True, text=True, timeout=15)
+        path = out.stdout.strip() if out.returncode == 0 else ""
+    except OSError:
+        path = ""
+    return path or os.environ.get("TMPDIR", "")
+
+
+def open_paths():
+    out = subprocess.run(
+        [LSOF, "-nP", "-Fn", "-u", str(os.getuid())], stdin=subprocess.DEVNULL, capture_output=True, timeout=120
+    )
+    if not out.stdout:
+        raise RuntimeError("lsof listed nothing")
+    return {line[1:] for line in os.fsdecode(out.stdout).splitlines() if line.startswith("n/")}
+
+
+def in_use(path, opened):
+    prefix = path + "/"
+    return any(p == path or p.startswith(prefix) for p in opened)
+
+
+def cache_roots(home):
+    roots = [("derived_data", str(home / "Library/Developer/Xcode/DerivedData"))]
+    tmp = temp_dir()
+    if tmp:
+        roots.append(("temp", os.path.realpath(tmp)))  # /var is a link to /private/var; lsof names the latter
+    runners = os.path.realpath(home / "runners")
+    for kind, root in roots:
+        try:
+            s = os.lstat(root)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid != os.getuid():
+            continue
+        if root == runners or root.startswith(runners + "/"):
+            continue
+        yield kind, root, s.st_dev
+
+
+def age_out_caches(home, now, apply, stats, short):
+    cutoff = now - CACHE_AGE
+    found = []
+    for kind, root, device in cache_roots(home):
+        with os.scandir(root) as entries:
+            for entry in entries:
+                if kind == "temp" and entry.name.startswith("com.apple."):
+                    continue  # system services keep sockets and state here for as long as they run
+                try:
+                    s = entry.stat(follow_symlinks=False)
+                except FileNotFoundError:
+                    continue  # removed since the listing
+                if s.st_dev != device or s.st_uid != os.getuid():
+                    continue
+                if not (stat.S_ISDIR(s.st_mode) or stat.S_ISREG(s.st_mode)):
+                    continue  # links, sockets and pipes stay
+                try:
+                    size, newest = tree(entry.path, device)
+                except FileNotFoundError:
+                    continue
+                if newest <= cutoff:
+                    found.append((newest, kind, entry.path, device, size))
+    opened, listed = set(), None
+    for _, kind, path, device, size in sorted(found):
+        if not short():
+            return True
+        if listed is None or time.monotonic() - listed > 60:
+            opened, listed = open_paths(), time.monotonic()
+        if in_use(path, opened):
+            continue
+        if not apply:
+            stats.add(kind, size)
+            continue
+        with no_jobs(home):
+            try:
+                size, newest = tree(path, device)
+            except FileNotFoundError:
+                continue
+            if newest > cutoff:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(path)
+        try:
+            left = tree(path, device)[0]
+        except FileNotFoundError:
+            left = 0
+        stats.add(kind, size - left)
+    return False
+
+
+class Stats:
+    def __init__(self):
+        self.counts, self.bytes, self.failed, self.estimate = {}, {}, 0, 0
+
+    def add(self, kind, freed):
+        self.counts[kind] = self.counts.get(kind, 0) + 1
+        self.bytes[kind] = self.bytes.get(kind, 0) + max(0, freed)
+        self.estimate += max(0, freed)
+
+
+def clean(home, apply, now=None):
+    now = time.time() if now is None else now
+    stats = Stats()
+    total, free = usage(VOLUME)
+    result = {"total": total, "free_before": free, "free_after": free, "stats": stats}
+    if not pressure(total, free):
+        result["status"] = "enough room"
+        return result
+
+    def short():
+        # Dry runs count what each action would free; real runs read the volume again.
+        current = usage(VOLUME)[1] if apply else free + stats.estimate
+        result["free_after"] = current
+        return pressure(total, current)
+
+    home_device = os.lstat(home).st_dev
+    try:
+        if erase_simulators(home, home_device, now, apply, stats, short):
+            result["status"] = "enough room"
+        elif age_out_caches(home, now, apply, stats, short):
+            result["status"] = "enough room"
+        else:
+            result["status"] = "enough room" if not short() else "nothing more to clean"
+    except JobRunning:
+        result["status"] = "a mac-build job holds a slot; stopped"
+        short()
+    return result
+
+
+def report(result, dry_run):
+    stats = result["stats"]
+    total = result["total"]
+    parts = []
+    names = (("simulators", "simulators erased"), ("derived_data", "DerivedData entries removed"),
+             ("temp", "temp entries removed"))
+    for key, label in names:
+        if stats.counts.get(key):
+            parts.append(f"{stats.counts[key]} {label} ({stats.bytes[key] / GIB:.1f} GiB)")
+    if stats.failed:
+        parts.append(f"{stats.failed} erases refused")
+    used = (total - result["free_after"]) / total * 100 if total else 0
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(
+        f"{stamp} ci-disk-clean{' (dry run)' if dry_run else ''}: {result['status']}; "
+        f"free {result['free_before'] / GIB:.1f} -> {result['free_after'] / GIB:.1f} GiB ({used:.0f}% used)"
+        + ("; " + ", ".join(parts) if parts else ""),
+        flush=True,
+    )
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--dry-run", action="store_true", help="report what would be freed; change nothing")
+    args = parser.parse_args(argv)
+    os.umask(0o077)
+    home = Path.home()
+    state = home / ".local/state/ci-disk-clean"
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (state / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("ci-disk-clean: another run is in progress", flush=True)
+            return 0
+        try:
+            report(clean(home, apply=not args.dry_run), args.dry_run)
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            # The type and errno only: an OSError's text names a path.
+            print(f"ci-disk-clean: failed: {type(error).__name__} {getattr(error, 'errno', '') or ''}".rstrip(),
+                  file=sys.stderr, flush=True)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

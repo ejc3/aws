@@ -1806,10 +1806,6 @@ key of `people/addresses`. `close_on_deletion = false` and `prevent_destroy`.
   photo of a house. Its key is written to `workers-stage/lights/terraform` and loaded with
   `scripts/workers-stage-secrets.sh lights`. The loader also reads `BROWSERBASE_API_KEY` and `BROWSERBASE_PROJECT_ID`
   from this account's `browserbase/credentials` for the inventory check. Run it after `deploy-lights-web` finishes. The Worker itself joins `workers-stage.tf` after its first deploy, as every staging Worker does.
-- **Open Fantasy's view on staging** (`workers-stage.tf`): the Worker `fantasy-stage`, a static site as Worker assets with no
-  script, deployed by ejc3/constellation (`deploy-fantasy-web.yml`) from the same `cloudflare-deploy` environment. It is one
-  of the staging Workers behind the shared "Site staging Workers" Access application, and its URLs turn on only after that
-  covers it.
 - **Lights on staging** (`workers-stage.tf`): the Worker `lights-stage`, the buying wizard as Worker assets plus a small
   script for `/api/*` (live Shopify prices and the photo reader), deployed by ejc3/constellation (`deploy-lights-web.yml`)
   from the same `cloudflare-deploy` environment. It is one of the staging Workers behind the shared "Site staging
@@ -1895,7 +1891,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   backend lock as Terraform, clones the running task definition changing only its image, and
   records the successful digest in `/fcvm-fleet/stage/coordinator-image`. Terraform reads that
   software release pointer and tracks the latest active task revision; no task/service fields
-  are ignored. Before its first ECS mutation the function increments the pointer's parameter
+  are ignored. A release may also set the coordinator's Lambda lane (`FLEET_LAMBDA_IMAGE`, a digest
+  `keep-<stack>-current` holds in the stack's own lane repository); the function records it in
+  `/fcvm-fleet/<stack>/lambda-image` (`none` without one), Terraform renders the variable from it, and
+  every release refuses while that pointer and the running task disagree. Before its first ECS mutation the function increments the pointer's parameter
   version. An ephemeral apply-time check rejects a saved plan made before that increment,
   including when a failed release restores the previous image. A failed release returns only
   `status`, `errorType`, the `step` that failed and, for an AWS error or a failed release check,
@@ -1980,6 +1979,33 @@ Astryx sync (the sync server of ejc3/astryx-swift: Postgres, zero-cache and the 
   application there. The API checks its own Bearer tokens, which are minted only at `/native/login`.
 - **State:** `astryx-terraform-state-<id>` in that account, versioned, private, objects for the apply role only.
 - Not yet covered: security monitoring like the Dolphin account's.
+
+### One account per app: modules/app-account, and the Family account (family-account.tf)
+
+Each app moves to a member account of its own (ejc3/constellation `docs/APP-ACCOUNTS.md`), built by one call of
+`modules/app-account`, which is what `astryx-account.tf` and `astryx-stage.tf` build for Astryx, generalised. Family is the
+first: `family`, in OU `Family`, root address the `family_account` key of `people/addresses`. What runs inside is
+ejc3/constellation's `infra/apps/family` (from its `infra/modules/app`), applied there with `family-terraform`.
+
+- **The module builds:** the account (`close_on_deletion = false`, `prevent_destroy`) and its OU; the guardrail SCP on that
+  OU only (the app's region, global services exempt; no leaving the organization; no IAM users, keys or console passwords;
+  no buckets elsewhere), ordered after the organization's policy types because the root id comes from
+  `aws_organizations_organization.security`; the account's public access block; `<app>-terraform-state-<id>`;
+  `<app>-terraform` (AdministratorAccess there, one-hour sessions) trusting dev-server-role pinned to fcvm-arm's instance
+  and nextjs-dev-role; a monthly budget emailing the owner (80% actual, 100% forecast); `/infra/<app>` (no credentials).
+- **Grants:** two statements per app in `assume-constellation-terraform` (assume the role, read the pointer; fcvm-arm's pin)
+  and two in `nextjs-dev-fcvm-parity.tf`; members' sessions deny `sts:AssumeRole` and every app pointer
+  (`OwnerOnlyApplyPointers` in `nextjs-ct-user-data.tf`, one statement for all of them).
+- **Staging host (optional):** a remote-managed tunnel whose token goes into the app's account as `<app>/nonprod/tunnel`, one
+  hostname, Access on the sign-in path only (also required at the connector), the API's own paths bypassed for its tokens,
+  zero-cache for the rest, a 404 for anything else. `login_path` must be a plain path, so no metacharacter can make the
+  connector's Access rule miss. Family: `family-sync-stage.dolphin-labs.dev`, sign-in at `/family/native/login` for the
+  family allowlist, `^/(family/(v1|native)/|healthz$)` to the API on :8081, zero-cache on :4848; the API's `/family/zero/*`
+  (zero-cache's calls on the task's localhost) is never routed.
+- **First apply** of a new account: the account first (`-target=module.<app>_account.aws_organizations_account.this`), then
+  everything, as for every account.
+- **Tests:** `scripts/test-app-account.py` (offline) pins the module and Family's call, including Family's regexes against
+  its real routes.
 
 ### Sending as the Dolphin Labs work address (dolphin-labs-email-send.tf)
 
@@ -2206,6 +2232,13 @@ Cloudflare's addresses instead of players'. Cloudflare's protections reach produ
   it activates). Take values from the real source, never from Vercel: a variable of type `sensitive` is never returned by any
   Vercel API, and `vercel env pull` writes the text `[SENSITIVE]` in its place. Use the site's non-production values where it
   has them (its own OAuth client, the non-production database) and fresh random ones where a value only has to be unguessable.
+  Two sites also get values Terraform makes, in a second container `workers-stage/<site>/terraform` in the Dolphin account
+  that the loader merges (refusing a name in both): dolphin-maps its moderation key (`dolphin-maps-moderation.tf`) and
+  dolphin-labs `FANTASY_ACCESS_AUD`, which the fantasy draft room checks Access tokens against: the AUD tag of the
+  hostname-level application on `dolphin-labs-stage.cc-games.workers.dev` (`dolphin-labs-stage-check.tf`; it takes precedence
+  over the Worker-native gate), written from that application's `aud`, never a literal (`dolphin-labs-stage-fantasy.tf`). Neither
+  name goes in the out-of-band container, and dolphin-aws does not manage either `/terraform` container. Order: apply, then
+  `scripts/workers-stage-secrets.sh dolphin-labs` after the site's deploy has finished (again if the application is re-created).
 - **AWS holds a record of every site's Vercel environment, too** (`vercel-env-secrets.tf`): `vercel-env/<site>/<target>`, one
   administration-only container per project per target (JSON name to value), so Vercel is not the only holder of a site's
   credentials. Vercel never returns a `sensitive` variable after it is saved, so `scripts/vercel-env-capture.py SITE TARGET` reads

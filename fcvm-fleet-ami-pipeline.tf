@@ -707,7 +707,8 @@ resource "aws_iam_role_policy" "fcvm_ami_publish" {
     { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/gate"] },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = aws_iam_role.fcvm_ami_publish_fleet.arn },
-    { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks", Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } } },
+    # GetItem reads who holds the lock when the put finds it held: busy, or an orphaned publication (publish.py).
+    { Effect = "Allow", Action = ["dynamodb:PutItem", "dynamodb:DeleteItem", "dynamodb:GetItem"], Resource = "arn:aws:dynamodb:${var.aws_region}:${data.aws_caller_identity.current.account_id}:table/ejc3-terraform-locks", Condition = { "ForAllValues:StringEquals" = { "dynamodb:LeadingKeys" = [local.fcvm_stage_lock_id] } } },
     { Effect = "Allow", Action = ["logs:CreateLogStream", "logs:PutLogEvents"], Resource = ["${aws_cloudwatch_log_group.fcvm_ami_publish.arn}:*", "${aws_cloudwatch_log_group.fcvm_ami_release_gate.arn}:*"] },
     { Effect = "Allow", Action = "lambda:InvokeFunction", Resource = aws_lambda_function.fcvm_ami_dispatch.arn }
   ] })

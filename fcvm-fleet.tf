@@ -1366,7 +1366,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
       readonlyRootFilesystem = true
       # The subzone's DNS server (fcvm-fleet-dns.tf). One protocol per port mapping; TCP reaches the same port.
       portMappings = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]
-      environment = [
+      environment = concat([
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = local.fcvm_fleet_stage.state_key },
         { name = "FLEET_REGIONS", value = join(",", local.fcvm_fleet_regions) },
@@ -1380,7 +1380,10 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         { name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_regional : "${r}:${m.security_group_id}"]) },
         # The coordinator logs its launches, scaling and agent connections at info; without this only warnings reach the log.
         { name = "RUST_LOG", value = "info" },
-      ]
+        # The Lambda lane a release set (fcvm-fleet-ci.tf, /fcvm-fleet/stage/lambda-image); absent while it is none.
+        ], [for lane in [nonsensitive(aws_ssm_parameter.fcvm_coordinator_lane.value)] :
+        { name = "FLEET_LAMBDA_IMAGE", value = lane } if lane != "none"
+      ])
       logConfiguration = {
         logDriver = "awslogs"
         options   = { awslogs-group = aws_cloudwatch_log_group.fcvm_fleet_coordinator.name, awslogs-region = local.fcvm_fleet_home_region, awslogs-stream-prefix = "coordinator" }
@@ -1413,6 +1416,13 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         nonsensitive(data.aws_ssm_parameter.fcvm_coordinator_release.value),
       ))
       error_message = "The coordinator release must be an immutable digest in its own ECR repository."
+    }
+    precondition {
+      condition = can(regex(
+        "^(none|${replace(aws_ecr_repository.fcvm_fleet_lambda_tile.repository_url, ".", "\\.")}@sha256:[0-9a-f]{64})$",
+        nonsensitive(aws_ssm_parameter.fcvm_coordinator_lane.value),
+      ))
+      error_message = "The coordinator's lane must be none or an immutable digest in staging's own lane repository."
     }
   }
 }

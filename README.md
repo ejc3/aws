@@ -855,9 +855,11 @@ charges by these tags.
 Each stack has its own lane repository (owner, 2026-11-23): staging's
 `fcvm-fleet/lambda-tile`, and prod's `fcvm-fleet/lambda-tile-prod` while prod is
 enabled. Each admits only its own stack's roles and its own stack's Lambda
-pull; nothing in staging reads or writes prod's. Staging CI and fcvm-arm push to
-staging's. A promotion copies the image staging tested into prod's by digest, on
-prod's own credentials. Each lifecycle policy expires every image outside the
+pull; no staging grant names prod's (staging's ECS execution role keeps AWS's
+managed pull-anywhere-in-the-account policy, read-only). Staging CI and fcvm-arm
+push to staging's. A promotion will copy the image staging tested into prod's by
+digest, on prod's own credentials; until that grant lands (#1002) prod's has no
+writer. Each lifecycle policy expires every image outside the
 newest five unless the image carries one of its stack's `keep-` tags:
 `keep-stage-current`, `-previous`, `-next` and `keep-built` in staging's,
 `keep-prod-current`, `-previous` and `-next` in prod's, the image a stack runs
@@ -1727,13 +1729,40 @@ ssh -o ProxyCommand='cloudflared access ssh --hostname %h' admin@skevh-mac-ssh.c
 - `com.ccgames.mini-ssh.cloudflared`: the host's connector.
 - `com.ejcampbell.tart.skevh` and `com.ejcampbell.tart.ci`: `tart run --no-graphics <vm>` (Tart 2.38.0 in
   `~/Applications/tart.app`, linked at `~/.local/bin/tart`). `ci` also mounts the mini's `~/Applications/Xcode.app`
-  read-only. A Mac runs at most two macOS VMs at once, so the mini is full: ci has 9 cores / 36 GB / 200 GB, skevh 4 /
+  read-only. A Mac runs at most two macOS VMs at once, so the mini is full: ci has 9 cores / 28 GB / 200 GB, skevh 4 /
   16 / 100.
+  Keep the two guests' memory well under the host's 64 GB. A guest fills all of its RAM (with its own file cache too), and
+  every page stays resident on the host, which also needs about 7 GB wired for itself. At 36 + 16 GB the host had 0.2 GB
+  free and macOS's memory killer, jetsam, killed its daemons in a loop until it hung (2026-11-22, #999). The
+  `JetsamEvent-*.ips` reports in `/Library/Logs/DiagnosticReports` list each process's resident size.
 - Inside each VM, its own connector as the guest's `admin` (`com.ccgames.mac-vm-<vm>.cloudflared`), keys-only sshd.
 
 **FileVault is on**, so the mini cannot log itself in: after a power cut or a reboot nothing above runs until someone
 signs in at the mini or over Screen Sharing on the LAN. For a planned reboot, `sudo fdesetup authrestart` skips the
 unlock once.
+
+**Phones on the mini, for device builds.** Two iPhones are plugged into the mini by USB, paired with `ejcampbell`,
+with Developer Mode on, and registered with the Apple developer team. Development builds signed on the mini install on
+either. The two run different iOS releases, so a build can be checked on both.
+
+| phone | iOS | name in the Apple team's device list |
+|---|---|---|
+| iPhone 14 Pro Max | 26 | `iPhone 14 Pro Max (Mac mini desk)` |
+| iPhone 12 (added 2026-11-23) | 27 | `iPhone` |
+
+`ssh mini 'xcrun devicectl list devices'` shows them (`physical`, `connected`). Each should read `paired`, Developer
+Mode `enabled` and developer services available.
+
+**Adding a phone** takes a person at it for two steps:
+1. Plug it in, unlock it, tap **Trust This Computer** and enter its passcode. Until then `devicectl` reads
+   `pairing in progress`.
+2. Turn on Settings > Privacy & Security > **Developer Mode**. The phone restarts and asks to confirm.
+
+Then, over `ssh mini`, `xcrun devicectl device info ddiServices --device <UDID>` mounts the developer disk image for the
+phone's iOS. Check that its UDID is in the team's device list: App Store Connect API `GET /v1/devices?filter[udid]=`
+with the `games-worth-watching/app-store-connect` key, and `POST /v1/devices` if it is missing. Xcode's automatic
+signing (`-allowProvisioningUpdates`) adds a registered phone to the development profile on the next build. Keep
+UDIDs out of this repository.
 
 **The CI VM's runners** are `mini-1` through `mini-4`. To rebuild them, run
 `scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
@@ -1759,6 +1788,22 @@ is the initial limit. Compare subsequent hang samples before changing
 shows the test slot holders. To update the shim on a running CI VM without touching
 registrations or restarting listeners, run `scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots`
 from the Mac on its LAN. The runners already search `/usr/local/bin` ahead of `/usr/bin`.
+
+**The CI VM cleans its own disk** (#1021). On 2026-11-23 its 200 GB data volume had 1.6 GB free and iOS builds
+failed with "No space left on device": 44 runner simulators held 64 GB, DerivedData 7.3 GB and the temp folders
+7.7 GB, and nothing in the VM cleaned any of it. The same install as the test slots (`--runners` or
+`--simulator-slots`, idempotent) puts `ci-disk-clean` in `/usr/local/libexec/mini-simulator` and the LaunchAgent
+`com.ejcampbell.ci-disk-clean` in `/Library/LaunchAgents`, loaded in `admin`'s session (where the simulators live),
+hourly and at load, at the lowest CPU and I/O priority. Like the runners, it relies on `admin`'s auto-login session:
+without one it does not run. It acts only while `/System/Volumes/Data` has under 30 GB free
+or is at least 85% used, and stops as soon as neither holds. First it erases, largest first, simulators that are
+`Shutdown` and whose `device.plist` is 6 hours old (`xcrun simctl erase` keeps each device and its UDID, so the
+runners' named devices stay where jobs look; erasing the 32 stale ones freed about 27 GB). Then it removes entries
+of `~/Library/Developer/Xcode/DerivedData` and of `admin`'s TMPDIR that nothing has modified for 24 hours and no
+process has open, oldest first. Before every action it takes the mac-build cleanup admission lock and every slot
+lock exclusively without waiting, so it does nothing while a test command runs; it never visits `~/runners`. It
+logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
+`/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
 
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
@@ -2275,6 +2320,23 @@ upstream default branch or a verified GitHub merge of the exact worktree head.
 `sudo nextjs-worktree-prune` previews the job without removing anything. The
 dedicated SSM association installs the timer without rerunning Next.js setup
 or starting cleanup during installation.
+fcvm-metal-arm runs the same job for its `ubuntu` account only, as
+`fcvm-worktree-prune.timer` (`--host-only`: no containers, no `machinectl`), from
+its own association; `sudo fcvm-worktree-prune --host-only` previews it there.
+There, after the merged-worktree pass and under the same pressure test, it also
+deletes regenerable build output from idle linked worktrees, oldest first, and
+stops once space recovers: only `node_modules`, `.next` and `target` directories
+at most three levels below the worktree root, each a real directory on the same
+disk, owned by `ubuntu`, ignored by Git and holding no tracked file. A worktree
+qualifies only when it is not locked, not marked interactive, not in use, its
+`HEAD` commit and newest `HEAD` reflog entry are over 7 days old, and no other
+file in it was modified in 7 days (file mtime; not the index's time, which any
+`git status` rewrites, nor ctime, which any new hard link changes). A worktree
+holding a nested clone (a `.git` entry below its root) is skipped, and a process
+running or mapping a file from it counts as use. Each directory is measured, then
+the whole check runs again, and only then does `rm -rf --one-file-system` remove
+it as `ubuntu`; a directory `rm` cannot fully remove is counted once. The run logs counts and sizes only,
+starts no new pass after 35 minutes, and the preview reports what it would free.
 
 **Memory pressure history.** `nextjs-memory-history.timer` samples the shared host
 every 30 seconds. The recorder keeps bounded, root-only files in
@@ -2776,19 +2838,6 @@ integration; Production and Preview already hold its URL, its server key and
 step here: `games-mp-migrate` applies every file under its `supabase/migrations` when it
 merges to `main`, before that release is promoted (`docs/games-multiplayer.md`, "Site
 migrations"). A dev box reads `colton-games/nonprod/*` itself and makes its own `AUTH_SECRET`.
-
-### Open Fantasy staging books
-
-`fantasy-books.tf` creates the private `fantasy-stage-books` R2 bucket (no public URL) that the staging Worker
-`fantasy-stage` binds as `BOOKS` in a later constellation change, serving `books/<id>.json` only behind the
-staging-Workers Access application. The uploader on fcvm-arm reads its bucket-scoped credentials from
-`fantasy/books-upload` in us-west-1. Only the administration set and the fcvm-arm instance session can read that
-secret. The protected Terraform state also contains the credentials.
-
-To rotate, add a second token with a distinct Terraform resource address and Cloudflare token name, the same
-bucket-only policy and the same replacement guard. Point `local.fantasy_books_credentials` at the new token and
-apply. Verify the uploader on fcvm-arm can upload and read back a test book with the new credentials. Then remove the old
-token resource and apply again to revoke it.
 
 ### Dolphin Maps road tiles
 
