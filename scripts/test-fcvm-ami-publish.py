@@ -84,6 +84,15 @@ class DDB:
             raise ConditionalCheckFailed("locked")
         self.item = copy.deepcopy(Item)
 
+    def get_item(self, TableName, Key, ConsistentRead, ProjectionExpression, ExpressionAttributeNames):
+        assert TableName == "locks" and ConsistentRead is True
+        assert ProjectionExpression == "#info" and ExpressionAttributeNames == {"#info": "Info"}
+        if getattr(self, "get_error", None):
+            raise self.get_error
+        if self.item is None or Key != {"LockID": self.item["LockID"]}:
+            return {}
+        return {"Item": {"Info": copy.deepcopy(self.item["Info"])}}
+
     def delete_item(self, TableName, Key, ConditionExpression, ExpressionAttributeNames, ExpressionAttributeValues):
         assert TableName == "locks" and Key == {"LockID": self.item["LockID"]}
         assert ConditionExpression == "#info = :ours" and ExpressionAttributeNames == {"#info": "Info"}
@@ -3707,6 +3716,58 @@ class ProdPublisherTests(unittest.TestCase):
                 raise KeyError("x")
         with mock.patch.object(MODULE, "ProdPublisher", Broken), self.assertRaisesRegex(RuntimeError, "prod image release failed"):
             MODULE.prod_handler({"action": "promote-prod", "receipt": self.receipt}, None)
+
+    def test_an_orphaned_publisher_lock_is_refused_for_an_administrator_not_busy(self):
+        # publication_lock keeps its lock when recovery fails, and a timeout or a lost put_item response leaves one too.
+        # No running function can hold a publisher's lock past Lambda's 900 s limit, so asking again would never clear
+        # it: refuse, naming the reconciliation. A younger one may be a running publication: busy.
+        def held(who, age, created=None):
+            stamp = datetime.datetime.fromtimestamp(time.time() - age, datetime.timezone.utc).isoformat()
+            info = json.dumps({"ID": "x", "Who": who, "Created": stamp if created is None else created})
+            self.ddb.item = {"LockID": {"S": "exact-backend/key"}, "Info": {"S": info}}
+            return info
+        cases = [("orphaned publication", "fcvm-image-publisher", 961, None, MODULE.Refused),
+                 ("running publication", "fcvm-image-publisher", 300, None, MODULE.Busy),
+                 ("unreadable publisher time", "fcvm-image-publisher", 0, "yesterday", MODULE.Refused),
+                 ("publisher time without a zone", "fcvm-image-publisher", 0, "2026-11-24T07:00:00", MODULE.Refused),
+                 ("a long Terraform apply", "ubuntu@ip-10-0-1-72", 7200, None, MODULE.Busy),
+                 ("the coordinator release", "fleet-prod-ci", 7200, None, MODULE.Busy)]
+        for name, who, age, created, expected in cases:
+            for action in ("promote-prod", "rollback-prod"):
+                with self.subTest(name=name, action=action):
+                    info = held(who, age, created)
+                    with self.assertRaises(expected) as raised:
+                        self.publisher().prod_event({"action": action, "receipt": self.receipt})
+                    self.assertIs(type(raised.exception), expected)
+                    if expected is MODULE.Refused:
+                        self.assertIn("administrator reconciliation", str(raised.exception))
+                    self.assertEqual(self.ddb.item["Info"]["S"], info)
+                    self.assertEqual((self.ec2.created, self.fleet_ssm.values["/prod/release"]), ([], self.prod_before))
+        self.assertEqual(MODULE.ORPHANED_PUBLISHER_LOCK_SECONDS, 960)
+        # The handler answers an orphaned lock as refused, with the reason.
+        held("fcvm-image-publisher", 3600)
+        publisher = self.publisher()
+        with mock.patch.object(MODULE, "ProdPublisher", lambda: publisher):
+            answer = MODULE.prod_handler({"action": "promote-prod", "receipt": self.receipt}, None)
+        self.assertEqual(answer["status"], "refused")
+        self.assertIn("administrator reconciliation", answer["reason"])
+
+    def test_a_lock_released_before_its_holder_is_read_is_busy_and_a_failed_read_is_a_failure(self):
+        class Vanishing(DDB):
+            def put_item(self, **kwargs):
+                self.item = None  # the holder released it between the put and the read
+                raise ConditionalCheckFailed("locked")
+        self.ddb = Vanishing()
+        with self.assertRaises(MODULE.Busy):
+            self.publisher().prod_event({"action": "promote-prod", "receipt": self.receipt})
+        self.ddb = DDB()
+        self.ddb.item = {"LockID": {"S": "exact-backend/key"}, "Info": {"S": "terraform-owner"}}
+        self.ddb.get_error = RuntimeError("throttled")
+        publisher = self.publisher()
+        with mock.patch.object(MODULE, "ProdPublisher", lambda: publisher), \
+                self.assertRaisesRegex(RuntimeError, "prod image release failed"):
+            MODULE.prod_handler({"action": "promote-prod", "receipt": self.receipt}, None)
+        self.assertEqual(self.ec2.created, [])
 
     def test_only_the_gate_verified_receipt_that_staging_runs_is_promoted(self):
         cases = {"unverified": lambda: self.main_ssm.values.__setitem__("/factory/gate", {"generation": 11, "build_id": "factory:old"}),

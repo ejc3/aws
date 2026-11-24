@@ -49,6 +49,12 @@ class Busy(RuntimeError):
     """Terraform's backend lock is held by someone else (an apply, a plan, another release): nothing ran."""
 
 
+# Lambda stops a function after at most 900 seconds, so an image publisher's lock older than that (plus a minute for
+# clock skew) has no running publication behind it: publication_lock kept it for administrator reconciliation, or a
+# timeout or a lost put_item response left it behind. Asking again cannot clear it.
+ORPHANED_PUBLISHER_LOCK_SECONDS = 900 + 60
+
+
 def need(value, message):
     if not value:
         raise Refused(message)
@@ -613,8 +619,29 @@ class Publisher:
         except Exception as error:
             self.lock_info = None
             if getattr(error, "response", {}).get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+                self.refuse_an_orphaned_publisher_lock()
                 raise Busy("Terraform's backend lock is held") from None
             raise
+
+    def refuse_an_orphaned_publisher_lock(self):
+        """A held lock is busy (an apply, a plan, a running release) unless it is an image publisher's that no running
+        function can still hold: that one needs an administrator, and asking again would wait on it forever."""
+        held = self.client("dynamodb").get_item(TableName=self.env["LOCK_TABLE"],
+            Key={"LockID": {"S": self.env["LOCK_ID"]}}, ConsistentRead=True,
+            ProjectionExpression="#info", ExpressionAttributeNames={"#info": "Info"}).get("Item")
+        try:
+            info = json.loads(held["Info"]["S"])
+        except (KeyError, TypeError, ValueError):
+            return  # released since the put, or a holder written in another format (Terraform's): busy
+        if not isinstance(info, dict) or info.get("Who") != "fcvm-image-publisher":
+            return
+        try:
+            created = datetime.datetime.fromisoformat(info["Created"])
+            age = self.clock() - created.timestamp() if created.tzinfo else None
+        except (KeyError, TypeError, ValueError):
+            age = None
+        if age is None or age > ORPHANED_PUBLISHER_LOCK_SECONDS:
+            raise Refused("an image publication left Terraform's backend lock held; it needs administrator reconciliation")
 
     def release(self):
         if self.lock_info is not None:
