@@ -425,6 +425,22 @@ resource "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_release" {
   }
 }
 
+# The coordinator's Lambda lane image (FLEET_LAMBDA_IMAGE), a release pointer like the one above (staging's is fcvm-fleet-ci.tf): "none", or
+# <lane repository>@sha256:... The release function writes it with the image pointer when a release carries
+# lambda_digest (fcvm-coordinator-release/release.py); Terraform renders FLEET_LAMBDA_IMAGE from it, so an apply keeps
+# the lane a release set instead of registering a revision without it.
+resource "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_lane" {
+  count    = local.fcvm_fleet_prod
+  provider = aws.fcvm_fleet
+  name     = "/fcvm-fleet/prod/lambda-image"
+  type     = "String"
+  value    = "none"
+  tags     = local.fcvm_fleet_prod_tags
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 # Re-opened at apply time under the backend lock, as staging's: a promotion between plan and apply invalidates the plan.
 ephemeral "aws_ssm_parameter" "fcvm_fleet_prod_coordinator_release_guard" {
   count           = local.fcvm_fleet_prod
@@ -911,7 +927,7 @@ resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator" {
       command                = local.fcvm_fleet_prod_coordinator_command
       readonlyRootFilesystem = true
       portMappings           = [{ containerPort = local.fcvm_fleet_dns_port, protocol = "udp" }]
-      environment = [
+      environment = concat([
         { name = "FLEET_STATE_BUCKET", value = aws_s3_bucket.fcvm_fleet_coordinator_state.bucket },
         { name = "FLEET_STATE_KEY", value = local.fcvm_fleet_prod_stack.state_key },
         { name = "FLEET_REGIONS", value = local.fcvm_fleet_prod_region },
@@ -921,7 +937,9 @@ resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator" {
         { name = "FLEET_EC2_SUBNETS", value = join(" ", [for r, m in local.fcvm_fleet_prod_regional : "${r}:${join(",", m.subnet_ids)}"]) },
         { name = "FLEET_EC2_SECURITY_GROUPS", value = join(" ", [for r, m in local.fcvm_fleet_prod_regional : "${r}:${m.security_group_id}"]) },
         { name = "RUST_LOG", value = "info" },
-      ]
+        ], [for lane in [nonsensitive(aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].value)] :
+        { name = "FLEET_LAMBDA_IMAGE", value = lane } if lane != "none"
+      ])
       # ejc3/fcvm src/cli/args.rs: --turnstile-secret and --turnstile-site-key from these two variables.
       secrets = [
         { name = "FLEET_TURNSTILE_SECRET", valueFrom = "${aws_secretsmanager_secret.fcvm_fleet_prod_turnstile[0].arn}:FLEET_TURNSTILE_SECRET::" },
@@ -952,6 +970,13 @@ resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator" {
         nonsensitive(aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].value),
       ))
       error_message = "The prod coordinator release must be an immutable digest in its own ECR repository."
+    }
+    precondition {
+      condition = can(regex(
+        "^(none|${replace(aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url, ".", "\\.")}@sha256:[0-9a-f]{64})$",
+        nonsensitive(aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].value),
+      ))
+      error_message = "The prod coordinator's lane must be none or an immutable digest in prod's own lane repository."
     }
     # --host-spread az places each host in a zone no live host is in; with two zones a replacement can only go to the
     # zone just reclaimed. us-east-1 offers g4dn.metal in five of its six zones.

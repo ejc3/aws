@@ -271,6 +271,10 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_prod_fleet" {
       },
       {
         Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
+        Resource = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].arn
+      },
+      {
+        Effect   = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"]
         Resource = aws_ssm_parameter.fcvm_prod_release_record[0].arn
       },
       # Staging's coordinator image, read only: the promotion's candidate.
@@ -307,6 +311,7 @@ resource "aws_lambda_function" "fcvm_coordinator_release_prod" {
       RELEASE_ROLE          = aws_iam_role.fcvm_coordinator_release_prod_fleet[0].arn
       REPOSITORY_URL        = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
       LANE_REPOSITORY_URL   = aws_ecr_repository.fcvm_fleet_lambda_tile_prod[0].repository_url
+      LANE_PARAMETER        = aws_ssm_parameter.fcvm_fleet_prod_coordinator_lane[0].name
       IMAGE_PARAMETER       = aws_ssm_parameter.fcvm_fleet_prod_coordinator_release[0].name
       STAGE_IMAGE_PARAMETER = aws_ssm_parameter.fcvm_coordinator_release.name
       RELEASE_RECORD        = aws_ssm_parameter.fcvm_prod_release_record[0].name

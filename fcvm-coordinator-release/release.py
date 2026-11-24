@@ -8,6 +8,11 @@ digest, it refuses and changes nothing. A release without `lambda_digest` is the
 `lane` returns the lane digest the coordinator runs and the commit tags of its coordinator image, which CI uses to
 skip a release of an ancestor of what runs.
 
+Terraform renders the coordinator's task definition, so the lane it runs is also kept in LANE_PARAMETER
+(/fcvm-fleet/<stack>/lambda-image): "none", or LANE_REPOSITORY_URL@<digest>. A release with `lambda_digest` refuses
+unless that pointer names the lane the coordinator runs, writes it with the image pointer, and restores it on
+rollback; Terraform renders FLEET_LAMBDA_IMAGE from it, so an apply keeps the lane instead of dropping it.
+
 One function per stack (STACK, CLUSTER, SERVICE, FAMILY): staging's (fcvm-fleet-ci.tf) and
 production's (fcvm-fleet-prod-ci.tf). Production adds:
 - a viewer hold: a release goes ahead only while the coordinator's ActiveViewers metric for
@@ -74,6 +79,7 @@ def stack():
 
 
 LANE_VARIABLE = "FLEET_LAMBDA_IMAGE"
+NO_LANE = "none"
 # One lane repository per stack (ejc3/aws#986): a stack's function reads and names only its own.
 LANE_REPOSITORIES = {"stage": "fcvm-fleet/lambda-tile", "prod": "fcvm-fleet/lambda-tile-prod"}
 
@@ -96,6 +102,11 @@ def lane_of(response):
     if len(values) != 1 or not values[0].startswith(prefix) or not DIGEST.fullmatch(values[0][len(prefix):]):
         raise Refused("lane-invalid", "the coordinator's lane image is not a digest in the lane repository")
     return values[0][len(prefix):]
+
+
+def lane_value(lane):
+    """The lane pointer's value for a lane digest: what Terraform renders as FLEET_LAMBDA_IMAGE, or none."""
+    return NO_LANE if lane is None else os.environ["LANE_REPOSITORY_URL"] + "@" + lane
 
 
 def lane_selected(lane_ecr, name, digest):
@@ -353,7 +364,7 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         if lock_holder(error) != info:
             return {"status": "busy"}
         # Our own token: an earlier attempt of this request took the lock and its reply was lost.
-    new_arn, previous = None, None
+    new_arn, previous, lane_previous, lane_written = None, None, None, False
     try:
         progress["step"] = "inspect"
         current = service(ecs)
@@ -369,6 +380,13 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
             progress["step"] = "lane"
             lane_selected(lane_ecr, name, lane)
             progress["step"] = "inspect"
+            lane_previous = ssm.get_parameter(Name=os.environ["LANE_PARAMETER"])["Parameter"]["Value"]
+            if lane_previous != lane_value(lane_of(old)):
+                raise Refused("lane-pointer-mismatch", "lane pointer and running task disagree")
+            if force and lane != lane_of(old):
+                # force skips the viewer hold to return to an image prod ran before; a lane prod does not run is
+                # not a rollback. Change it in a release that waits for the hold.
+                raise Refused("not-a-rollback", "force cannot change the lane image")
         if previous == image and (lane is None or lane_of(old) == lane):
             progress["step"] = "rollout"
             wait_for(ecs, old_arn, time.monotonic() + 60)
@@ -392,6 +410,9 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
         progress["step"] = "rollout"
         wait_for(ecs, new_arn, time.monotonic() + min(480, max(5, remaining_ms() / 1000 - 240)))
         progress["step"] = "pointer"
+        if lane is not None and lane_value(lane) != lane_previous:
+            lane_written = True
+            ssm.put_parameter(Name=os.environ["LANE_PARAMETER"], Value=lane_value(lane), Type="String", Overwrite=True)
         ssm.put_parameter(Name=parameter, Value=image, Type="String", Overwrite=True)
         return {"status": "deployed", "taskDefinition": new_arn, "digest": digest, **lane_result(lane)}
     except Exception:
@@ -402,6 +423,9 @@ def deploy(event, ddb, ecs, ssm, ecr, cloudwatch=None, *, remaining_ms=lambda: 8
                 update(ecs, old_arn)
                 wait_for(ecs, old_arn, time.monotonic() + 150)
                 ssm.put_parameter(Name=parameter, Value=previous, Type="String", Overwrite=True)
+                if lane_written:
+                    ssm.put_parameter(Name=os.environ["LANE_PARAMETER"], Value=lane_previous, Type="String",
+                                      Overwrite=True)
                 ecs.deregister_task_definition(taskDefinition=new_arn)
             progress["step"] = failed_step
         raise
