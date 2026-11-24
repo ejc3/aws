@@ -1501,6 +1501,14 @@ Available if a task needs them; neither needs a key on disk.
   Terraform owns only the container and grants. Pricing and capabilities must come from
   the current official API documentation; the web subscription and API credits differ.
 
+- **run.cloud** (cloud iOS simulators: create one, install a simulator build, tap, type,
+  screenshot, read the pasteboard). The fallback when every Mac simulator is busy.
+  `run-cloud/api-key` in us-west-1, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same
+  admin/dev-role read boundary as ElevenLabs. Fetch it at use time as `RUN_CLOUD_API_KEY`
+  (with `RUN_CLOUD_API_URL=https://api.run.cloud`) for the `runcloud` CLI or `@run-cloud/sdk`.
+  Billed per active simulator minute: give each session an inactivity and a hard timeout,
+  and delete it when done. Terraform owns only the container and grants.
+
 - **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
   uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
   SUNO_COOKIE at use time only. It is a full website session: never in files, command
