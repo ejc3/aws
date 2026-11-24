@@ -59,8 +59,12 @@ locals {
     "trustedadvisor:*",
     "waf:*",
   ]
-  # The one inference profile whose routed requests may land outside the three regions (see DenyOutsideMonitoredRegions).
+  # The inference profiles whose routed requests may land outside the three regions (see DenyOutsideMonitoredRegions).
   dolphin_haiku_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/${local.bedrock_haiku_profile}"
+  # The US Sonnet 5.5 profile, routed to the same three regions as Haiku's: dolphin-aws's x-handles role checks each
+  # beat writer a monthly refresh adds with it (dolphin-labs #2073). Without it, every call routed to us-east-2 was
+  # refused here (measured 2026-11-24 in CloudTrail: 16 of 16 Sonnet calls denied by this policy).
+  dolphin_sonnet_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/us.anthropic.claude-sonnet-5-5"
   dolphin_region_scp = {
     Version = "2012-10-17"
     Statement = [
@@ -71,13 +75,15 @@ locals {
         Resource  = "*"
         Condition = {
           StringNotEquals = { "aws:RequestedRegion" = local.dolphin_security_regions }
-          # One routed exception: the US cross-region inference profile for Claude Haiku 5.5, called in us-west-2, routes
+          # Two routed exceptions: the US cross-region inference profiles for Claude Haiku 5.5 and Sonnet 5.5, called in
+          # us-west-2. Each routes
           # each request to us-east-1, us-east-2 or us-west-2, and Bedrock checks the routed request in its destination,
           # so us-east-2 alone denied every call (measured 2026-10-20: 6 of 6 refused on the us-east-2 foundation model).
-          # The key is set only on requests that came through that exact profile, so nothing else outside the three
-          # regions gains anything: a direct call in us-east-2, any other model or profile, and every other service are
-          # still denied. dolphin-aws's news functions are the caller.
-          ArnNotEquals = { "bedrock:InferenceProfileArn" = local.dolphin_haiku_profile_arn }
+          # The key is set only on requests that came through one of those exact profiles, so nothing else outside the
+          # three regions gains anything: a direct call in us-east-2, any other model or profile, and every other service
+          # are still denied. dolphin-aws's news functions and its x-handles role are the callers. A negated condition
+          # with two values matches when the key equals neither.
+          ArnNotEquals = { "bedrock:InferenceProfileArn" = [local.dolphin_haiku_profile_arn, local.dolphin_sonnet_profile_arn] }
         }
       },
       {

@@ -69,12 +69,16 @@ class DolphinRegionScpTests(unittest.TestCase):
         self.assertNotIn("aws:PrincipalARN", SCP)
         self.assertNotIn("aws:PrincipalArn", SCP)
         self.assertNotRegex(SCP, r"ArnNotLike|StringNotLike")
-        # The one ARN condition is the Haiku inference profile's, never a principal's.
+        # The one ARN condition is the inference profiles', never a principal's.
         self.assertEqual(re.findall(r"ArnNotEquals = \{ \"([^\"]+)\"", SCP), ["bedrock:InferenceProfileArn"])
 
-    def test_only_the_haiku_profile_called_in_us_west_2_is_routed_outside(self):
-        self.assertIn('ArnNotEquals = { "bedrock:InferenceProfileArn" = local.dolphin_haiku_profile_arn }', SCP)
+    def test_only_the_haiku_and_sonnet_profiles_called_in_us_west_2_are_routed_outside(self):
+        self.assertIn('ArnNotEquals = { "bedrock:InferenceProfileArn" = [local.dolphin_haiku_profile_arn, local.dolphin_sonnet_profile_arn] }', SCP)
         self.assertIn('dolphin_haiku_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/${local.bedrock_haiku_profile}"', SCP)
+        self.assertIn('dolphin_sonnet_profile_arn = "arn:aws:bedrock:us-west-2:${aws_organizations_account.dolphin.id}:inference-profile/us.anthropic.claude-sonnet-5-5"', SCP)
+        # Only those two profiles, each pinned to us-west-2 and the Dolphin account: no wildcard region or account.
+        self.assertEqual(len(re.findall(r"dolphin_\w+_profile_arn = ", SCP)), 2)
+        self.assertNotRegex(SCP, r"inference-profile/\*|bedrock:\*:")
         # The exception sits in the region statement only; no other statement gains a Bedrock carve-out.
         self.assertEqual(SCP.count("bedrock:InferenceProfileArn"), 1)
 
