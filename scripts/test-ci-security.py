@@ -80,7 +80,9 @@ class CISecurityTests(unittest.TestCase):
         self.assertNotIn('"ssm:SendCommand"', policy)
         self.assertIn('"ssm:GetCommandInvocation"', policy.split('NeverChangeIdentityOrReadReusableCredentials')[1])
         self.assertIn('"ec2:InstanceType"', policy)
-        self.assertIn('"c7gd.8xlarge"', policy)
+        # exactly four types: a builder and a bare-metal boot test per runner image architecture
+        self.assertRegex(policy, r'"ec2:InstanceType"\s+= \["c7gd\.8xlarge", "c5d\.9xlarge", "c7gd\.metal", "c5d\.metal"\]\n')
+        self.assertEqual(policy.count('"ec2:InstanceType"'), 1)
         self.assertIn('"ec2:Encrypted"', policy)
         self.assertIn('"ec2:MetadataHttpTokens"', policy)
         self.assertIn('"ec2:MetadataHttpPutResponseHopLimit"', policy)
@@ -97,6 +99,52 @@ class CISecurityTests(unittest.TestCase):
         self.assertRegex(statement.group(), r'Resource\s*=\s*"arn:aws:ec2:us-west-1::image/\*"')
         self.assertRegex(statement.group(),
                          r'Condition\s*=\s*\{ StringEquals = \{ "aws:ResourceAccount" = "099720109477" \} \}')
+
+    def test_builder_boots_and_publishes_only_its_own_unpublished_candidates(self):
+        # A runner image is created as a candidate no launcher selects, booted once, and published by one tag
+        # change (ejc3/fcvm scripts/build-ami.sh). The role can launch a candidate, and can move a candidate to
+        # github-runner or github-runner-failed; it cannot retag a published image or change any other tag.
+        policy = resource('github-ami-builder.tf', 'aws_iam_role_policy', 'github_actions_ami_builder')
+
+        def statement(sid):
+            found = re.search(r'Sid\s*=\s*"' + sid + r'".*?\n      \}', policy, re.S)
+            self.assertIsNotNone(found, sid)
+            return found.group()
+
+        boot = statement('BootTestCandidateImage')
+        self.assertRegex(boot, r'Action\s*=\s*"ec2:RunInstances"')
+        self.assertRegex(boot, r'Resource\s*=\s*"arn:aws:ec2:us-west-1::image/\*"')
+        self.assertRegex(boot, r'"ec2:Owner"\s+= data\.aws_caller_identity\.current\.account_id\n')
+        self.assertRegex(boot, r'"ec2:ResourceTag/Purpose" = "github-runner-candidate"\n')
+
+        create = statement('CreateTaggedRunnerImage')
+        self.assertRegex(create, r'"aws:RequestTag/Purpose" = \["github-runner", "github-runner-candidate"\]')
+
+        publish = statement('PublishOrRejectCandidateImage')
+        self.assertRegex(publish, r'Action\s*=\s*"ec2:CreateTags"')
+        self.assertRegex(publish, r'Resource\s*=\s*"arn:aws:ec2:us-west-1::image/\*"')
+        self.assertRegex(publish, r'"ec2:ResourceTag/Purpose" = "github-runner-candidate"\n')
+        self.assertRegex(publish, r'"aws:RequestTag/Purpose"\s+= \["github-runner", "github-runner-failed"\]\n')
+        self.assertRegex(publish, r'"ForAllValues:StringEquals" = \{ "aws:TagKeys" = \["Purpose"\] \}')
+
+        # Every condition operator here is StringEquals: a negated one would admit everything else.
+        for name, body in (('boot', boot), ('create', create), ('publish', publish)):
+            self.assertNotRegex(body, r'Not(Equals|Like)|IfExists|ForAnyValue', name)
+        self.assertRegex(boot, r'Condition = \{\n\s+StringEquals = \{')
+        self.assertRegex(publish, r'Condition = \{\n\s+StringEquals = \{')
+        # Publishing also needs its own account's image, as the boot test does.
+        self.assertRegex(publish, r'"ec2:Owner"\s+= data\.aws_caller_identity\.current\.account_id\n')
+        # Tagging outside creation is only the publish statement: the creation-time tag statement keeps its condition.
+        tag_created = statement('TagCreatedImage')
+        self.assertRegex(tag_created, r'Condition = \{ StringEquals = \{ "ec2:CreateAction" = "CreateImage" \} \}')
+
+        # The images it may launch: Canonical's and its own candidates, nothing else. Any Allow with RunInstances counts,
+        # including one on "*", which also covers images.
+        allows = [s for s in re.findall(r'\{\n\s+(?:#[^\n]*\n\s+)*Sid.*?\n      \}', policy, re.S)
+                  if re.search(r'Effect\s*=\s*"Allow"', s)]
+        launches = [s for s in allows if 'ec2:RunInstances' in s and re.search(r'::image/\*|Resource\s*=\s*"\*"', s)]
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(len([s for s in allows if 'ec2:RunInstances' in s and re.search(r'Resource\s*=\s*"\*"', s)]), 0)
 
     def test_codeartifact_cannot_restore_retired_ci_write_access(self):
         self.assertNotIn('GitHubActionsPublish', source('codeartifact.tf'))

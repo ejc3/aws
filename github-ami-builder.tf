@@ -104,6 +104,20 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Condition = { StringEquals = { "aws:ResourceAccount" = "099720109477" } }
       },
       {
+        # The boot test: one instance from an image this account built and has not published yet. Every other
+        # launch condition (network, type, name tag, IMDSv2, volume) is the builder's, in the statements below.
+        Sid      = "BootTestCandidateImage"
+        Effect   = "Allow"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:us-west-1::image/*"
+        Condition = {
+          StringEquals = {
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
+            "ec2:ResourceTag/Purpose" = "github-runner-candidate"
+          }
+        }
+      },
+      {
         Sid    = "UseIsolatedRunnerNetwork"
         Effect = "Allow"
         Action = "ec2:RunInstances"
@@ -118,9 +132,12 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Action   = "ec2:RunInstances"
         Resource = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
         Condition = {
+          # Two types per runner image (AMI_ARCH in ejc3/fcvm scripts/build-ami.sh). The builder, with the local
+          # NVMe the host kernel build runs on: c7gd.8xlarge for arm64, c5d.9xlarge for x86_64. And the boot test
+          # of the candidate image, on bare metal of a family the launcher uses: c7gd.metal, c5d.metal.
           StringEquals = {
             "aws:RequestTag/Name"    = "ami-builder-temp"
-            "ec2:InstanceType"       = "c7gd.8xlarge"
+            "ec2:InstanceType"       = ["c7gd.8xlarge", "c5d.9xlarge", "c7gd.metal", "c5d.metal"]
             "ec2:MetadataHttpTokens" = "required"
           }
           NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = "1" }
@@ -166,11 +183,30 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Condition = { StringEquals = { "ec2:ResourceTag/Name" = "ami-builder-temp" } }
       },
       {
+        # An image is created as a candidate, which no launcher selects, and published by the statement below
+        # once it has booted. "github-runner" at creation stays allowed for the build script on fcvm's main
+        # until the two-step one lands, and for the image's snapshot.
         Sid       = "CreateTaggedRunnerImage"
         Effect    = "Allow"
         Action    = "ec2:CreateImage"
         Resource  = ["arn:aws:ec2:us-west-1::image/*", "arn:aws:ec2:us-west-1::snapshot/*"]
-        Condition = { StringEquals = { "aws:RequestTag/Purpose" = "github-runner" } }
+        Condition = { StringEquals = { "aws:RequestTag/Purpose" = ["github-runner", "github-runner-candidate"] } }
+      },
+      {
+        # Publication is one tag change on a candidate: to github-runner after its boot test, or to
+        # github-runner-failed. Nothing else about an image can be retagged, and a published image cannot be.
+        Sid      = "PublishOrRejectCandidateImage"
+        Effect   = "Allow"
+        Action   = "ec2:CreateTags"
+        Resource = "arn:aws:ec2:us-west-1::image/*"
+        Condition = {
+          StringEquals = {
+            "ec2:Owner"               = data.aws_caller_identity.current.account_id
+            "ec2:ResourceTag/Purpose" = "github-runner-candidate"
+            "aws:RequestTag/Purpose"  = ["github-runner", "github-runner-failed"]
+          }
+          "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Purpose"] }
+        }
       },
       {
         Sid       = "TagCreatedImage"
