@@ -146,8 +146,9 @@ resource "aws_secretsmanager_secret_policy" "suno_cookie" {
 }
 
 # run.cloud (cloud iOS simulators): the fallback when every Mac simulator is busy. JSON
-# {"RUN_CLOUD_API_KEY": ...}, value supplied by the owner out of band, never in git. Same read
-# boundary as the creative credentials: the administration set and the two dev roles.
+# {"RUN_CLOUD_API_KEY": ...}, value supplied by the owner out of band, never in git. Read boundary:
+# the administration set, the two dev roles, and the reaper Lambda's role (run-cloud-reaper.tf),
+# which reads this secret and no other.
 resource "aws_secretsmanager_secret" "run_cloud_api_key" {
   name                    = "run-cloud/api-key"
   description             = "run.cloud API key (cloud iOS simulators, fallback when the Macs are busy); value supplied out of band."
@@ -165,9 +166,13 @@ resource "aws_secretsmanager_secret_policy" "run_cloud_api_key" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.run_cloud_api_key.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.run_cloud_api_key_readers) } }
     }]
   })
+}
+
+locals {
+  run_cloud_api_key_readers = concat(local.elevenlabs_readers, [aws_iam_role.run_cloud_reaper.arn])
 }
 
 # Reuse elevenlabs_read above: dev-server-role is already at its managed-policy

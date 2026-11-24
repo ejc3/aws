@@ -51,3 +51,6 @@ pasteboard, open-URL and accessibility-tree calls, from the `runcloud` CLI or `@
   delete it when you are done (`runcloud ios delete <id>`), and never touch a session you did not
   start (`runcloud ios list` shows everyone's).
 - Simulator builds only: never sign or ship an app from it.
+- A reaper deletes any session older than 60 minutes, any with no timeouts (or timeouts over 10 minutes idle /
+  60 minutes total) once it is 5 minutes old, and sandboxes idle 10 minutes. Tag a session `keep=true` only when
+  you must keep it longer, and delete it yourself when done.
