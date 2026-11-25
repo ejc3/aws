@@ -140,7 +140,12 @@ class FakeEC2:
             raise self.prune_listing_error
         if "github-runner-candidate" in purposes or not kw.get("Filters"):
             return {"Images": list(self.images)}
-        return {"Images": [{"ImageId": "ami-test", "CreationDate": "2026-08-01T00:00:00Z"}]}
+        # The launch's runner image. A case sets runner_ami (None: this region has none)
+        # or runner_ami_error on one region's fake.
+        if getattr(self, "runner_ami_error", None):
+            raise self.runner_ami_error
+        ami = getattr(self, "runner_ami", "ami-test")
+        return {"Images": [{"ImageId": ami, "CreationDate": "2026-08-01T00:00:00Z"}] if ami else []}
 
     def describe_snapshots(self, **kw):
         self.calls.append(("describe_snapshots", kw))
@@ -170,7 +175,8 @@ class FakeEC2:
         error = (self.run_instances_errors.get((subnet, kw["InstanceType"]))
                  or self.run_instances_errors.get(kw["InstanceType"]))
         if error:
-            raise Exception(error)
+            # A string is an error message; an exception (a FakeClientError) is raised as it is.
+            raise error if isinstance(error, BaseException) else Exception(error)
         return {"Instances": [{"InstanceId": f"i-new-{kw['InstanceType']}"}]}
 
     def create_tags(self, **kw):
@@ -584,22 +590,30 @@ def capture_emf(emit, **kwargs):
 
 
 def load_lambda(source, ec2, ssm, lambda_client=None, github=None, env=None, now=NOW,
-                dynamodb=None, launch_ec2=None):
+                dynamodb=None, launch_ec2=None, regions=None):
     """exec the Lambda source with its AWS and GitHub edges replaced.
 
     os.environ is reset to the process baseline first: exec does not isolate
     imports, so the env vars below land in the REAL environment and would
     otherwise leak between cases (a WEBHOOK_SECRET set by one case must not
     still be set for the next).
+
+    regions, {region: FakeEC2} in RUNNER_REGIONS order, gives each runner region
+    its own EC2 (every EC2 client of that region, the launch client included).
+    The Lambda reads RUNNER_REGIONS as it loads, so that is set before the exec.
     """
     os.environ.clear()
     os.environ.update(_BASE_ENV)
+    if regions:
+        os.environ["RUNNER_REGIONS"] = json.dumps(list(regions))
     clients = {"ec2": ec2, "ssm": ssm, "lambda": lambda_client,
                "dynamodb": dynamodb or FakeDynamoDB()}
     fake_boto3 = types.ModuleType("boto3")
     client_options = []
     def client(service, **kw):
         client_options.append((service, kw))
+        if service == "ec2" and regions:
+            return regions[kw["region_name"]]
         # The webhook's RunInstances client is its one EC2 client built with a
         # config; a case can hand it a separate fake to see which calls use it.
         if service == "ec2" and "config" in kw and launch_ec2 is not None:
@@ -760,9 +774,45 @@ def case_aws_capacity_verdict_advances_the_type():
 def case_stalled_pending_launch_advances_the_type():
     """A launch still pending past the startup window is a capacity failure."""
     head = type_order()[0]
-    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c")])
+    # A runner in us-west-1a keeps the two AZs level, so the launch starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-stuck", head, "pending", 20, az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, az="us-west-1a")])
     webhook(ec2)["launch_runner"]("x86_64")
     assert launched_pools(ec2) == [(SUBNET_C, type_order()[1])], launched_pools(ec2)
+
+
+def case_a_batch_of_spot_launches_is_spread_across_the_zones():
+    """AWS reclaims a spot pool's instances together, so a pool that sits in one AZ is lost
+    together: on 2026-11-24 five x86 runners in one AZ went in the same minute. A batch, which
+    is how a pool is refilled after a reclaim, alternates between the AZs."""
+    head = type_order()[0]
+    ec2 = FakeEC2()
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["X64"]},
+                                 "launch_count": 4})}
+    result = webhook(ec2)["handler"](event, None)
+    assert "Launched 4 x86_64 runner(s)" in result["body"], result
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_A, head), (SUBNET_C, head), (SUBNET_A, head)], \
+        launched_pools(ec2)
+
+
+def case_a_spot_launch_starts_in_the_zone_with_the_fewest_live_spot_runners():
+    """Live means pending or running. A terminated runner, the other architecture's runners and
+    on-demand hosts (which are not reclaimed) do not count."""
+    head = type_order()[0]
+    fleet = [instance("i-c1", head, "running", 30, az="us-west-1c"),
+             instance("i-c2", head, "pending", 2, az="us-west-1c"),
+             instance("i-a1", head, "running", 30, az="us-west-1a"),
+             instance("i-a-gone", head, "terminated", 30, az="us-west-1a"),
+             instance("i-c-od", head, "running", 30, az="us-west-1c", tags={"Market": "on-demand"}),
+             instance("i-a-arm", type_order("arm64")[0], "running", 30, arch="arm64", az="us-west-1a")]
+    ec2 = FakeEC2(fleet)
+    webhook(ec2)["launch_runner"]("x86_64")
+    assert launched_pools(ec2) == [(SUBNET_A, head)], launched_pools(ec2)
+    # An on-demand launch is not spread: it keeps Terraform's order. The on-demand host sits in
+    # us-west-1c, so a spread that counted it would start in us-west-1a instead.
+    ec2 = FakeEC2(fleet)
+    webhook(ec2)["launch_runner"]("x86_64", market="on-demand")
+    assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
 
 def case_capacity_failed_tag_advances_the_type():
@@ -777,7 +827,9 @@ def case_capacity_failed_tag_advances_the_type():
 def case_pending_inside_the_startup_window_is_not_a_failure():
     """A metal instance that is merely still booting must not rotate the list."""
     head = type_order()[0]
-    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c")])
+    # A runner in us-west-1a keeps the two AZs level, so the launch starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-booting", head, "pending", 5, az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, az="us-west-1a")])
     webhook(ec2)["launch_runner"]("x86_64")
     assert launched_pools(ec2) == [(SUBNET_C, head)], launched_pools(ec2)
 
@@ -1339,9 +1391,9 @@ def case_terraform_hands_the_launcher_us_west_1c_first():
     assert re.search(r"\n      LAUNCH_SUBNETS\s*=\s*jsonencode\(\[for subnet in local\.runner_fcvm_launch_subnets : "
                      r"\{ subnet_id = subnet\.id, availability_zone = subnet\.availability_zone \}\]\)\n",
                      source), "LAUNCH_SUBNETS is not rendered from the PRIMARY region's subnets"
-    # The move to Ohio is two applies; the list must be one of its three states, never an arbitrary region.
-    assert re.search(r'\n  runner_regions\s*=\s*(\["us-west-1"\]|\["us-east-2", "us-west-1"\]|\["us-east-2"\])\n', vpc), \
-        "runner_regions is not one of the permitted states of the Ohio move"
+    # Ohio first, us-west-1 its fallback: never an arbitrary region, never the expensive one first.
+    assert re.search(r'\n  runner_regions\s*=\s*\["us-east-2", "us-west-1"\]\n', vpc), \
+        "runner_regions is not Ohio first with us-west-1 as its fallback"
     assert re.search(r"\n  runner_fcvm_launch_subnets\s*=\s*var\.enable_github_runner \? local\.runner_networks\[local\.runner_primary_region\]\.subnets", vpc)
     # Kept for the previous controller code during the apply; the first launch subnet, 1c today.
     assert re.search(r"\n      SUBNET_ID\s*=\s*local\.runner_fcvm_launch_subnets\[0\]\.id\n", source), \
@@ -1376,8 +1428,10 @@ def case_capacity_backoff_is_per_type_and_az():
     assert order[0] == (SUBNET_C, "us-west-1c", head), order
     assert order[-1] == (SUBNET_A, "us-west-1a", head), order
 
-    # The same failure in us-west-1c moves that AZ on to the next type instead.
-    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c")])
+    # The same failure in us-west-1c moves that AZ on to the next type instead. A runner in
+    # us-west-1a keeps the two AZs level, so the launch still starts in us-west-1c.
+    ec2 = FakeEC2([instance("i-stuck-c", head, "pending", 20, arch="arm64", az="us-west-1c"),
+                   instance("i-live-a", head, "running", 30, arch="arm64", az="us-west-1a")])
     webhook(ec2)["launch_runner"]("arm64")
     assert launched_pools(ec2) == [(SUBNET_C, second)], launched_pools(ec2)
 
@@ -1387,10 +1441,13 @@ def case_a_refused_pool_is_not_retried_within_one_batch():
     head, second = type_order("arm64")[:2]
     ec2 = FakeEC2(run_instances_errors={(SUBNET_C, head): "InsufficientInstanceCapacity"})
     event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
-                                 "launch_count": 2})}
+                                 "launch_count": 3})}
     result = webhook(ec2)["handler"](event, None)
-    assert "Launched 2 arm64 runner(s)" in result["body"], result
-    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_C, second)], \
+    assert "Launched 3 arm64 runner(s)" in result["body"], result
+    # The second launch starts in the other AZ (the first one holds a runner now). The third
+    # finds the AZs level and starts in us-west-1c again, where it must skip the pool that
+    # refused instead of asking it a second time.
+    assert launched_pools(ec2) == [(SUBNET_C, head), (SUBNET_C, second), (SUBNET_A, head), (SUBNET_C, second)], \
         launched_pools(ec2)
 
 
@@ -1420,6 +1477,459 @@ def case_unusable_launch_subnets_refuse_before_allocating_metal():
             raise AssertionError(f"LAUNCH_SUBNETS={value!r} was accepted")
         assert not ec2.ops("run_instances"), (value, ec2.calls)
         assert not any("registration-token" in url for url in github.requests), value
+
+
+# --------------------------------------------------------------------------
+# Cases: every pool of the primary region, then the next listed region
+# --------------------------------------------------------------------------
+
+OHIO_A, OHIO_B = "subnet-use2a", "subnet-use2b"
+# LAUNCH_NETWORKS as Terraform renders it from runner_regions = ["us-east-2", "us-west-1"].
+LAUNCH_NETWORKS = [
+    {"region": "us-east-2", "security_group_id": "sg-ohio",
+     "subnets": [{"subnet_id": OHIO_A, "availability_zone": "us-east-2a"},
+                 {"subnet_id": OHIO_B, "availability_zone": "us-east-2b"}]},
+    {"region": "us-west-1", "security_group_id": "sg-west", "subnets": LAUNCH_SUBNETS},
+]
+
+
+def two_regions(ohio_errors=None, west_errors=None):
+    """One fake EC2 per runner region, primary first, each with its own runner AMI."""
+    regions = {"us-east-2": FakeEC2(run_instances_errors=ohio_errors),
+               "us-west-1": FakeEC2(run_instances_errors=west_errors)}
+    regions["us-east-2"].runner_ami, regions["us-west-1"].runner_ami = "ami-ohio", "ami-west"
+    return regions
+
+
+def region_webhook(regions, **kw):
+    env = {"LAUNCH_NETWORKS": json.dumps(LAUNCH_NETWORKS), **kw.pop("env", {})}
+    kw.setdefault("github", FakeGitHub())
+    return load_lambda(WEBHOOK_SRC, regions["us-east-2"], kw.pop("ssm", FakeSSM()), regions=regions, env=env, **kw)
+
+
+def refusing(subnets, arch="arm64", error="InsufficientInstanceCapacity"):
+    """run_instances_errors refusing every type of arch in every one of subnets."""
+    return {(subnet, instance_type): error for subnet in subnets for instance_type in type_order(arch)}
+
+
+def case_every_pool_of_the_primary_region_is_tried_before_the_next_region():
+    """Ohio out of ARM metal spot is not CI waiting: the launch goes on to us-west-1,
+    with us-west-1's own AMI and security group, and the host belongs to us-west-1."""
+    types = type_order("arm64")
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B]))
+    ssm = FakeSSM()
+    module = region_webhook(regions, ssm=ssm)
+    instance_id, instance_type = module["launch_runner"]("arm64")
+    ohio, west = regions["us-east-2"], regions["us-west-1"]
+    assert launched_pools(ohio) == [(OHIO_A, t) for t in types] + [(OHIO_B, t) for t in types], launched_pools(ohio)
+    assert launched_pools(west) == [(SUBNET_C, types[0])], launched_pools(west)
+    assert instance_type == types[0], instance_type
+    for fake, ami, group in ((ohio, "ami-ohio", "sg-ohio"), (west, "ami-west", "sg-west")):
+        for call in fake.ops("run_instances"):
+            assert call["ImageId"] == ami and call["NetworkInterfaces"][0]["Groups"] == [group], call
+    # Its credential names the instance ARN of its own region, and the facade writes to it there.
+    assert module["ec2"].region_of(instance_id) == "us-west-1"
+    (put,) = ssm.puts
+    tags = {t["Key"]: t["Value"] for t in put["Tags"]}
+    assert tags["InstanceArn"] == f"arn:aws:ec2:us-west-1:{ACCOUNT_ID}:instance/{instance_id}", tags
+
+
+def case_a_launch_the_primary_region_takes_makes_no_launch_call_in_the_next_region():
+    """The next region's AMI is looked up only when the walk reaches it, so a launch Ohio
+    takes makes no AMI lookup or RunInstances call in us-west-1."""
+    regions = two_regions()
+    module = region_webhook(regions)
+    instance_id, _ = module["launch_runner"]("x86_64")
+    assert launched_pools(regions["us-east-2"]) == [(OHIO_A, type_order()[0])], launched_pools(regions["us-east-2"])
+    assert regions["us-east-2"].ops("run_instances")[0]["ImageId"] == "ami-ohio"
+    # Only the fleet read fans out to every listed region, as it always has.
+    assert {op for op, _ in regions["us-west-1"].calls} == {"describe_instances"}, regions["us-west-1"].calls
+    assert module["ec2"].region_of(instance_id) == "us-east-2"
+
+
+def case_a_failed_read_in_the_fallback_region_fails_the_launch_closed():
+    """Counting reads every listed region. A host in a region it cannot read may be one more
+    over the cap, so a failed read there fails the launch rather than launching blind."""
+    regions = two_regions()
+    regions["us-west-1"].describe_instances = lambda **kw: (_ for _ in ()).throw(FakeClientError("RequestLimitExceeded"))
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}})}
+    try:
+        region_webhook(regions)["handler"](event, None)
+    except FakeClientError as e:
+        assert e.response["Error"]["Code"] == "RequestLimitExceeded", e
+    else:
+        raise AssertionError("launched with us-west-1 unreadable")
+    assert not any(fake.ops("run_instances") for fake in regions.values())
+
+
+def case_the_refusal_memory_needs_no_new_grant_and_no_runner_can_write_it():
+    """The webhook's existing table grant covers the refused-pools# row; a runner's own grant
+    reaches only the row keyed by its instance ARN."""
+    source = TF_FILE.read_text()
+    policy = re.search(r'resource "aws_iam_role_policy" "runner_lambda" \{.*?\n\}\n', source, re.S).group()
+    table = policy[policy.index('"dynamodb:GetItem"'):].split("\n      }", 1)[0]
+    assert '"dynamodb:UpdateItem"' in table and "aws_dynamodb_table.runner_registration[0].arn" in table, table
+    boot = (TF_FILE.parent / "runner-bootstrap.tf").read_text()
+    assert '"dynamodb:LeadingKeys" = ["$${ec2:SourceInstanceARN}"]' in boot
+    assert "f'refused-pools#{arch}#{market}'" in WEBHOOK_SRC
+
+
+def case_a_region_without_a_runner_ami_is_skipped_not_the_launch():
+    head = type_order("arm64")[0]
+    for broken in ("no image", "lookup error"):
+        regions = two_regions()
+        if broken == "no image":
+            regions["us-east-2"].runner_ami = None
+        else:
+            regions["us-east-2"].runner_ami_error = FakeClientError("RequestLimitExceeded")
+        region_webhook(regions)["launch_runner"]("arm64")
+        assert regions["us-east-2"].ops("run_instances") == [], broken
+        assert launched_pools(regions["us-west-1"]) == [(SUBNET_C, head)], (broken, launched_pools(regions["us-west-1"]))
+        assert regions["us-west-1"].ops("run_instances")[0]["ImageId"] == "ami-west", broken
+    # With an AMI in no region, nothing is read, minted or launched.
+    regions = two_regions()
+    regions["us-east-2"].runner_ami = regions["us-west-1"].runner_ami = None
+    github, ssm = FakeGitHub(), FakeSSM()
+    try:
+        region_webhook(regions, github=github, ssm=ssm)["launch_runner"]("arm64")
+    except Exception as e:
+        assert "No runner AMI found for architecture: arm64" in str(e), e
+    else:
+        raise AssertionError("launched with no runner AMI in any region")
+    assert not any("registration-token" in url for url in github.requests), github.requests
+    assert not any("user-data" in entry for entry in ssm.journal), ssm.journal
+    assert not any(fake.ops("run_instances") for fake in regions.values())
+
+
+def case_on_demand_leaves_a_region_only_on_a_capacity_or_quota_refusal():
+    """The refusals on-demand always moved on from move it on to the next region too.
+    Anything else may have been accepted, and must not buy a second host elsewhere."""
+    head = type_order("arm64")[0]
+    for code, falls_back in (("InsufficientInstanceCapacity", True), ("VcpuLimitExceeded", True),
+                             ("InstanceLimitExceeded", True), ("UnauthorizedOperation", False)):
+        regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=FakeClientError(code)))
+        try:
+            region_webhook(regions)["launch_runner"]("arm64", market="on-demand")
+            launched = True
+        except Exception:
+            launched = False
+        ohio, west = len(regions["us-east-2"].ops("run_instances")), launched_pools(regions["us-west-1"])
+        if falls_back:
+            assert launched and ohio == 6 and west == [(SUBNET_C, head)], (code, ohio, west)
+        else:
+            assert not launched and ohio == 1 and west == [], (code, ohio, west)
+    # Refused everywhere: every pool of both regions asked once, then the on-demand verdict.
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=FakeClientError("VcpuLimitExceeded")),
+                          west_errors=refusing([SUBNET_C, SUBNET_A], error=FakeClientError("VcpuLimitExceeded")))
+    module = region_webhook(regions)
+    try:
+        module["launch_runner"]("arm64", market="on-demand")
+    except module["OnDemandCapacityUnavailable"]:
+        pass
+    else:
+        raise AssertionError("an on-demand launch refused in every region reported success")
+    assert [len(fake.ops("run_instances")) for fake in regions.values()] == [6, 6]
+
+
+def case_a_batch_does_not_ask_a_refusing_region_again():
+    """failed_here carries across regions: the batch's second launch goes straight to the
+    next region instead of asking the six Ohio pools that just refused."""
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B]))
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]},
+                                 "launch_count": 2})}
+    result = region_webhook(regions)["handler"](event, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert len(regions["us-east-2"].ops("run_instances")) == 6, launched_pools(regions["us-east-2"])
+    assert len(regions["us-west-1"].ops("run_instances")) == 2, launched_pools(regions["us-west-1"])
+
+
+class ClockedEC2(FakeEC2):
+    """Each RunInstances call takes `seconds` on a shared fake clock."""
+
+    def __init__(self, clock, seconds, **kw):
+        super().__init__(**kw)
+        self.clock, self.seconds = clock, seconds
+
+    def run_instances(self, **kw):
+        self.clock[0] += self.seconds
+        return super().run_instances(**kw)
+
+
+def case_the_next_region_is_tried_only_with_time_left_in_the_invocation():
+    """A Lambda timeout cannot be caught. A call starts only with LAUNCH_CALL_SECONDS and
+    LAUNCH_FINISH_SECONDS before the deadline, so a slow walk ends the launch, not the invocation."""
+    # Each Ohio call takes 3 s; `reserve` is the time a call and the work after it are given.
+    # With 12 s plus the reserve the fifth Ohio call (at 12 s) is the last. With 15 s plus the
+    # reserve every Ohio pool fits (the sixth starts at 15 s) and the walk stops at 18 s, before
+    # even the us-west-1 AMI lookup. With 18 s plus the reserve it reaches us-west-1 and launches.
+    reserve = region_webhook(two_regions())["LAUNCH_CALL_SECONDS"] + region_webhook(two_regions())["LAUNCH_FINISH_SECONDS"]
+    for start_by, ohio_calls, reaches_west in ((12, 5, False), (15, 6, False), (18, 6, True)):
+        deadline = float(start_by + reserve)
+        clock = [0.0]
+        regions = {"us-east-2": ClockedEC2(clock, 3, run_instances_errors=refusing([OHIO_A, OHIO_B])),
+                   "us-west-1": ClockedEC2(clock, 3)}
+        module = region_webhook(regions)
+        module["time"] = types.SimpleNamespace(monotonic=lambda: clock[0])
+        try:
+            module["launch_runner"]("arm64", deadline=deadline)
+            launched = True
+        except Exception as e:
+            launched = False
+            assert "InsufficientInstanceCapacity" in str(e), e
+        west = regions["us-west-1"]
+        assert launched is reaches_west, (deadline, launched)
+        assert len(regions["us-east-2"].ops("run_instances")) == ohio_calls, deadline
+        assert bool(west.ops("describe_images")) is reaches_west, (deadline, west.calls)
+        assert bool(west.ops("run_instances")) is reaches_west, (deadline, west.calls)
+    # No time at all: nothing is looked up or launched, and the reason says so.
+    regions = two_regions()
+    module = region_webhook(regions)
+    context = types.SimpleNamespace(get_remaining_time_in_millis=lambda: 5000,
+                                    invoked_function_arn="arn:aws:lambda:us-west-1:1:function:github-runner-webhook")
+    event = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}})}
+    try:
+        module["handler"](event, context)
+    except Exception as e:
+        assert "too little of the invocation left" in str(e), e
+    else:
+        raise AssertionError("a launch walk started with 5 s of the invocation left")
+    assert not any(fake.ops("run_instances") or fake.ops("describe_images") for fake in regions.values())
+
+
+def case_launch_calls_fit_the_time_they_are_given():
+    """One bounded call per attempt, inside LAUNCH_CALL_SECONDS, and a call plus the work
+    after it inside the function's own timeout."""
+    module = region_webhook(two_regions())
+    config = module["LAUNCH_CLIENT"]
+    assert config.retries == {"total_max_attempts": 1}, config
+    assert config.connect_timeout + config.read_timeout <= module["LAUNCH_CALL_SECONDS"], config
+    function = re.search(r'^resource "aws_lambda_function" "runner_webhook" \{\n.*?^\}', TF_FILE.read_text(),
+                         re.M | re.S).group()
+    timeout = int(re.search(r"\n  timeout\s*=\s*(\d+)\n", function).group(1))
+    assert module["LAUNCH_CALL_SECONDS"] + module["LAUNCH_FINISH_SECONDS"] < timeout, timeout
+    # A launch client in every runner region, and only those.
+    assert set(module["launch_ec2"]) == {"us-east-2", "us-west-1"}, module["launch_ec2"]
+    # The refusal memory's one write after the last call fits the time left for finishing.
+    memory = module["REFUSAL_MEMORY_CLIENT"]
+    assert memory.retries == {"total_max_attempts": 1}, memory
+    assert memory.connect_timeout + memory.read_timeout < module["LAUNCH_FINISH_SECONDS"], memory
+    # ... and the memory has a client of its own with that config, not the default DynamoDB one.
+    memory_clients = [kw for service, kw in module["_test_client_options"]
+                      if service == "dynamodb" and kw.get("config") is memory]
+    assert memory_clients == [{"region_name": "us-west-1", "config": memory}], module["_test_client_options"]
+
+
+OHIO_C = "subnet-use2c"
+# The live shape: three Ohio subnets, then us-west-1c and us-west-1a.
+OHIO_THREE_AZS = [
+    {"region": "us-east-2", "security_group_id": "sg-ohio",
+     "subnets": [{"subnet_id": OHIO_A, "availability_zone": "us-east-2a"},
+                 {"subnet_id": OHIO_B, "availability_zone": "us-east-2b"},
+                 {"subnet_id": OHIO_C, "availability_zone": "us-east-2c"}]},
+    LAUNCH_NETWORKS[1],
+]
+
+
+def memory_pools(dynamodb, arch, market="spot"):
+    """The pools the refusal memory holds for arch and market, as {"AZ|type": until}."""
+    item = dynamodb.items.get(f"refused-pools#{arch}#{market}", {})
+    return {name: int(value["N"]) for name, value in item.items() if name != "InstanceArn"}
+
+
+def x86_walk(dynamodb, refusal_seconds, now=NOW, start=2.8):
+    """One x86 spot launch in a 30 s invocation, as measured on 2026-11-12: Ohio refuses every
+    x86 pool, us-west-1c too, us-west-1a has capacity, every call takes refusal_seconds, and the
+    walk starts `start` seconds into the invocation. (launched, Ohio's pools, us-west-1's pools)."""
+    clock = [start]
+    capacity = FakeClientError("InsufficientInstanceCapacity")
+    ohio = ClockedEC2(clock, refusal_seconds,
+                      run_instances_errors=refusing([OHIO_A, OHIO_B, OHIO_C], "x86_64", capacity))
+    west = ClockedEC2(clock, refusal_seconds, run_instances_errors=refusing([SUBNET_C], "x86_64", capacity))
+    ohio.runner_ami, west.runner_ami = "ami-ohio", "ami-west"
+    module = region_webhook({"us-east-2": ohio, "us-west-1": west}, dynamodb=dynamodb, now=now,
+                            env={"LAUNCH_NETWORKS": json.dumps(OHIO_THREE_AZS)})
+    module["time"] = types.SimpleNamespace(monotonic=lambda: clock[0])
+    try:
+        module["launch_runner"]("x86_64", deadline=30.0)
+        launched = True
+    except Exception as e:
+        assert "InsufficientInstanceCapacity" in str(e), e
+        launched = False
+    return launched, launched_pools(ohio), launched_pools(west)
+
+
+def case_remembered_refusals_send_the_next_invocation_straight_to_us_west_1():
+    """failed_here lasts one invocation, so every delivery and poll walked Ohio's 12 refusing
+    x86 pools first (about 1 s each, ending 13 to 15 s in) and us-west-1a x86 was never reached.
+    Remembered for REFUSED_POOL_SECONDS, the refusals cost one walk."""
+    types_ = type_order("x86_64")
+    ohio_pools = {f"{az}|{t}" for az in ("us-east-2a", "us-east-2b", "us-east-2c") for t in types_}
+    west_c = {f"us-west-1c|{t}" for t in types_}
+    until = int(NOW.timestamp()) + 600
+
+    # At the measured 1.0 s the first walk only just reaches us-west-1a; the next goes straight there.
+    dynamodb = FakeDynamoDB()
+    launched, ohio, west = x86_walk(dynamodb, 1.0)
+    assert launched and len(ohio) == 12, (launched, ohio, west)
+    assert west == [(SUBNET_C, t) for t in types_] + [(SUBNET_A, types_[0])], west
+    assert memory_pools(dynamodb, "x86_64") == {pool: until for pool in ohio_pools | west_c}, memory_pools(dynamodb, "x86_64")
+    launched, ohio, west = x86_walk(dynamodb, 1.0)
+    assert launched and ohio == [] and west == [(SUBNET_A, types_[0])], (launched, ohio, west)
+
+    # At 1.2 s the first walk runs out of time in us-west-1c; the second launches in us-west-1a.
+    dynamodb = FakeDynamoDB()
+    launched, ohio, west = x86_walk(dynamodb, 1.2)
+    assert not launched and len(ohio) == 12 and SUBNET_A not in {s for s, _ in west}, (launched, ohio, west)
+    launched, ohio, west = x86_walk(dynamodb, 1.2)
+    assert launched and ohio == [] and west[-1] == (SUBNET_A, types_[0]), (launched, ohio, west)
+
+    # Once they expire, Ohio is asked first again.
+    launched, ohio, west = x86_walk(dynamodb, 1.0, now=NOW + timedelta(seconds=601))
+    assert ohio[:1] == [(OHIO_A, types_[0])], ohio
+
+
+def case_a_refusal_memory_that_cannot_be_read_or_written_still_launches():
+    """The memory only orders the walk: a failed read is an empty memory and a failed write is
+    logged, and the launch goes on exactly as without it."""
+    head = type_order("arm64")[0]
+    error = FakeClientError("ProvisionedThroughputExceededException")
+    capacity = FakeClientError("InsufficientInstanceCapacity")
+    for dynamodb in (FakeDynamoDB(get_error=error, update_error=error),
+                     FakeDynamoDB([{"InstanceArn": {"S": "refused-pools#arm64#spot"},
+                                    f"us-east-2a|{head}": {"S": "not a number"}, "garbage": {"N": "9999999999"},
+                                    f"|{head}": {"N": "9999999999"}}])):
+        regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=capacity))
+        instance_id, _ = region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64")
+        assert launched_pools(regions["us-east-2"])[0] == (OHIO_A, head), launched_pools(regions["us-east-2"])
+        assert launched_pools(regions["us-west-1"]) == [(SUBNET_C, head)], launched_pools(regions["us-west-1"])
+
+
+def case_only_capacity_and_quota_refusals_are_remembered_and_per_market():
+    """A throttle or an unknown outcome is not a verdict on the pool, and a spot refusal says
+    nothing about on-demand capacity."""
+    head = type_order("arm64")[0]
+    errors = {**refusing([OHIO_A], error=FakeClientError("MaxSpotInstanceCountExceeded")),
+              **refusing([OHIO_B], error=FakeClientError("RequestLimitExceeded"))}
+    dynamodb = FakeDynamoDB()
+    # No code at all in us-west-1c: an unknown outcome, which spot moves on from.
+    regions = two_regions(ohio_errors=errors, west_errors={(SUBNET_C, head): "read timeout"})
+    region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64")
+    assert launched_pools(regions["us-west-1"])[:1] == [(SUBNET_C, head)], launched_pools(regions["us-west-1"])
+    assert set(memory_pools(dynamodb, "arm64")) == {f"us-east-2a|{t}" for t in type_order("arm64")}, \
+        memory_pools(dynamodb, "arm64")
+    # The on-demand walk still starts with the pool spot just found out of quota.
+    regions = two_regions()
+    region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64", market="on-demand")
+    assert launched_pools(regions["us-east-2"]) == [(OHIO_A, head)], launched_pools(regions["us-east-2"])
+    assert memory_pools(dynamodb, "arm64", "on-demand") == {}
+
+
+def memory_calls(dynamodb, op):
+    return [kw for kw in dynamodb.ops(op) if kw["Key"]["InstanceArn"]["S"].startswith("refused-pools#")]
+
+
+def case_a_failed_refusal_memory_call_turns_it_off_for_the_rest_of_the_invocation():
+    """A table that cannot answer costs one bounded call per invocation, not one per refusal,
+    and a later invocation (the same warm container) uses the memory again."""
+    head = type_order("arm64")[0]
+    capacity = FakeClientError("InsufficientInstanceCapacity")
+    error = FakeClientError("ProvisionedThroughputExceededException")
+    batch = {"body": json.dumps({"action": "queued", "workflow_job": {"labels": ["ARM64"]}, "launch_count": 2})}
+
+    # Writes fail: the first refusal's write is the only one tried.
+    dynamodb = FakeDynamoDB(update_error=error)
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=capacity))
+    region_webhook(regions, dynamodb=dynamodb)["launch_runner"]("arm64")
+    assert len(regions["us-east-2"].ops("run_instances")) == 6
+    assert len(memory_calls(dynamodb, "update_item")) == 1, memory_calls(dynamodb, "update_item")
+    assert launched_pools(regions["us-west-1"]) == [(SUBNET_C, head)], launched_pools(regions["us-west-1"])
+
+    # The read fails: a batch of two neither reads again nor writes.
+    dynamodb = FakeDynamoDB(get_error=error)
+    regions = two_regions(ohio_errors=refusing([OHIO_A, OHIO_B], error=capacity))
+    module = region_webhook(regions, dynamodb=dynamodb)
+    result = module["handler"](batch, None)
+    assert "Launched 2 arm64 runner(s)" in result["body"], result
+    assert len(memory_calls(dynamodb, "get_item")) == 1, memory_calls(dynamodb, "get_item")
+    assert memory_calls(dynamodb, "update_item") == []
+    # The next invocation of the same module starts with the memory on again.
+    dynamodb.get_error = None
+    module["handler"](batch, None)
+    assert len(memory_calls(dynamodb, "get_item")) >= 2, memory_calls(dynamodb, "get_item")
+
+
+def case_nothing_is_remembered_for_a_pool_with_no_known_az():
+    """In the SUBNET_ID environment a pool's AZ is unknown, and a refusal recorded there would
+    match every AZ. Neither written nor read: a row's attribute must name an AZ and a type."""
+    head, second = type_order()[:2]
+    dynamodb = FakeDynamoDB()
+    ec2 = FakeEC2(run_instances_errors={head: FakeClientError("InsufficientInstanceCapacity")})
+    webhook(ec2, dynamodb=dynamodb, env={"LAUNCH_SUBNETS": "", "SUBNET_ID": "subnet-legacy"})["launch_runner"]("x86_64")
+    assert launched_pools(ec2) == [("subnet-legacy", head), ("subnet-legacy", second)], launched_pools(ec2)
+    assert memory_calls(dynamodb, "update_item") == [] and memory_pools(dynamodb, "x86_64") == {}
+    future, past = str(int(NOW.timestamp()) + 60), str(int(NOW.timestamp()) - 1)
+    dynamodb = FakeDynamoDB([{"InstanceArn": {"S": "refused-pools#x86_64#spot"},
+                              f"us-east-2a|{head}": {"N": future}, f"us-east-2b|{head}": {"N": past},
+                              f"|{head}": {"N": future}, "us-east-2a|": {"N": future}, "garbage": {"N": future},
+                              f"us-east-2c|{head}": {"S": future}}])
+    module = webhook(FakeEC2(), dynamodb=dynamodb)
+    assert module["remembered_refusals"]("x86_64", "spot") == {("us-east-2a", head)}
+
+
+def case_regions_stay_in_list_order_whatever_order_a_region_s_zones_are_in():
+    """Anything that reorders the subnets before launch_candidates (a spread across zones)
+    cannot move the next region's pools ahead of the primary's: in_region_order is stable
+    within a region."""
+    module = region_webhook(two_regions())
+    networks = module["get_launch_networks"]()
+    ohio_a, ohio_b, west_c, west_a = [subnet for _, _, subnets in networks for subnet in subnets]
+    assert (ohio_a, west_c) == ((OHIO_A, "us-east-2a"), (SUBNET_C, "us-west-1c"))
+    assert module["in_region_order"]([west_a, ohio_b, west_c, ohio_a], networks) == [ohio_b, ohio_a, west_a, west_c]
+    # In a launch: the subnets reach launch_candidates reversed, us-west-1's first.
+    regions = two_regions()
+    module = region_webhook(regions)
+    candidates = module["launch_candidates"]
+    module["launch_candidates"] = (lambda arch, subnets, failed=(), networks=():
+                                   candidates(arch, subnets[::-1], failed, networks))
+    module["launch_runner"]("arm64")
+    assert launched_pools(regions["us-east-2"]) == [(OHIO_B, type_order("arm64")[0])], launched_pools(regions["us-east-2"])
+    assert regions["us-west-1"].ops("run_instances") == [], launched_pools(regions["us-west-1"])
+
+
+def case_unusable_launch_networks_refuse_before_allocating_metal():
+    good = LAUNCH_NETWORKS
+    for value in ("not json", "null", "[]", "{}", '"us-east-2"', json.dumps([{"region": "us-east-2"}]),
+                  json.dumps([dict(good[0], region="eu-west-1")]),             # a region this controller does not reap
+                  json.dumps([dict(good[0], region={})]),
+                  json.dumps([good[0], good[0]]),                              # a region twice
+                  json.dumps([good[0], dict(good[1], subnets=good[0]["subnets"])]),  # a subnet twice
+                  json.dumps([dict(good[0], subnets=[])]),
+                  json.dumps([dict(good[0], security_group_id="")]),
+                  json.dumps([dict(good[0], subnets=[{"subnet_id": OHIO_A}])]),
+                  json.dumps([dict(good[0], subnets=[{"subnet_id": 7, "availability_zone": "us-east-2a"}])])):
+        regions, github = two_regions(), FakeGitHub()
+        module = region_webhook(regions, github=github, env={"LAUNCH_NETWORKS": value})
+        try:
+            module["launch_runner"]("arm64")
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"LAUNCH_NETWORKS={value!r} was accepted")
+        assert not any(fake.ops("run_instances") for fake in regions.values()), value
+        assert not any("registration-token" in url for url in github.requests), value
+
+
+def case_terraform_hands_the_launcher_every_listed_region_in_order():
+    vpc = (TF_FILE.parent / "runner-vpc.tf").read_text()
+    source = TF_FILE.read_text()
+    assert re.search(r"\n      LAUNCH_NETWORKS = jsonencode\(local\.runner_fcvm_launch_networks\)\n", source)
+    networks = re.search(r"\n  runner_fcvm_launch_networks = (.*?\n  \}\] : \[\])\n", vpc, re.S).group(1)
+    assert networks.startswith("var.enable_github_runner ? [for r in local.runner_regions : {"), networks
+    for line in ("region            = r",
+                 "security_group_id = local.runner_networks[r].security_group.id",
+                 "subnets           = [for subnet in local.runner_networks[r].subnets : "
+                 "{ subnet_id = subnet.id, availability_zone = subnet.availability_zone }]"):
+        assert line in networks, (line, networks)
 
 
 # --------------------------------------------------------------------------

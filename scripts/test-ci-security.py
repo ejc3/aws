@@ -146,6 +146,15 @@ class CISecurityTests(unittest.TestCase):
         self.assertEqual(len(launches), 2)
         self.assertEqual(len([s for s in allows if 'ec2:RunInstances' in s and re.search(r'Resource\s*=\s*"\*"', s)]), 0)
 
+    def test_builder_reads_only_its_own_builders_consoles(self):
+        policy = resource('github-ami-builder.tf', 'aws_iam_role_policy', 'github_actions_ami_builder')
+        found = re.search(r'Sid\s*=\s*"ReadBuilderConsole".*?\n      \}', policy, re.S)
+        self.assertIsNotNone(found)
+        self.assertRegex(found.group(), r'Action\s*=\s*"ec2:GetConsoleOutput"')
+        self.assertRegex(found.group(), r'Resource\s*=\s*"arn:aws:ec2:us-west-1:\$\{data\.aws_caller_identity\.current\.account_id\}:instance/\*"')
+        self.assertRegex(found.group(), r'"ec2:ResourceTag/Name" = "ami-builder-temp"')
+        self.assertEqual(policy.count('ec2:GetConsoleOutput'), 1)
+
     def test_codeartifact_cannot_restore_retired_ci_write_access(self):
         self.assertNotIn('GitHubActionsPublish', source('codeartifact.tf'))
         self.assertNotIn('aws_iam_role.github_actions_terraform.arn', source('codeartifact.tf'))

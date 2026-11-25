@@ -245,6 +245,7 @@ jobs:
         run: python3 -S -B scripts/test-astryx-join.py
       - name: Mac agent tools, lease, build cap and the pinned Peekaboo install (offline)
         run: |
+          command -v zsh >/dev/null || sudo apt-get install -y --no-install-recommends zsh  # the mac-agents-md tests need it
           python3 -S -B scripts/test-mac-setup.py
           python3 -S -B scripts/test-mac-artifact-clean.py
       - name: Mac mini simulator runner routing
@@ -363,6 +364,9 @@ jobs:
 
       - name: A wedged persistent box is rebooted and nothing else is (auto-reboot Lambda)
         run: python3 -S -B scripts/test-auto-reboot.py
+
+      - name: run.cloud sessions left running are deleted, persistent and keep=true ones never, the key never logged (run-cloud-reaper Lambda)
+        run: python3 -S -B scripts/test-run-cloud-reaper.py
 
       - name: "yourfantasymovie.com DNS (Fantasy Films): proxied records and routes to dolphin-films-prod, no switch, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py

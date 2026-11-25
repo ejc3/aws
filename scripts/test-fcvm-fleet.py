@@ -639,9 +639,9 @@ class OnDemandFallbackTests(unittest.TestCase):
         offerings = block('data "aws_ec2_instance_type_offerings" "host"', MOD)
         self.assertIn('location_type = "availability-zone"', offerings)
         self.assertIn("values = [local.host_types[each.key]]", offerings)
-        subnets = TF.split("fcvm_fleet_host_subnets = flatten(", 1)[1].split("\n\n", 1)[0]
-        self.assertIn('[for s in m.host_subnet_ids : "${r}:${s}"]', subnets)
-        self.assertIn("if length(m.host_template_names) > 0", subnets)
+        subnets = TF.split("fcvm_fleet_host_subnets = flatten(", 1)[1].split("\n  #", 1)[0]
+        self.assertIn('[for s in local.fcvm_fleet_regional[r].host_subnet_ids : "${r}:${s}"]', subnets)
+        self.assertIn("length(try(local.fcvm_fleet_regional[r].host_template_names, [])) > 0", subnets)
 
     def test_the_host_templates_reach_the_coordinator_in_its_environment(self):
         # An image from before ejc3/fcvm#1257 refuses an unknown argument and does not start, and the image after it has no
@@ -649,7 +649,7 @@ class OnDemandFallbackTests(unittest.TestCase):
         td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
         self.assertIn('{ name = "FLEET_HOST_TEMPLATES", value = join(",", local.fcvm_fleet_host_templates) }', td)
         self.assertIn('{ name = "FLEET_HOST_SUBNETS", value = join(",", local.fcvm_fleet_host_subnets) }', td)
-        self.assertIn('[for t in m.host_template_names : "${r}:${t}"]', TF)
+        self.assertIn('[for t in local.fcvm_fleet_regional[r].host_template_names : "${r}:${t}"]', TF)
         cmd = TF.split("fcvm_fleet_coordinator_command = concat(", 1)[1].split("\n  )\n", 1)[0]
         self.assertIn('["--sleep-when-idle"]', cmd)
         for gone in ("--scale-group", "--on-demand-group", "--spot-wait", "--host-template"):
@@ -1880,7 +1880,7 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("ami_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_fleet_prod_ami_release_guard[*].version)", mod)
         self.assertIn('name        = "/fcvm-fleet/prod/ami-release"', block('resource "aws_ssm_parameter" "fcvm_fleet_prod_ami_release"', PROD))
         release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
-        self.assertIn("fcvm_ami_templates    = module.fcvm_fleet_east1.image_templates", release)
+        self.assertIn("fcvm_ami_compute_templates = module.fcvm_fleet_east1.image_templates", release)
         for name in ("fcvm-fleet-ami-pipeline.tf", "fcvm-fleet-ami-release.tf"):
             self.assertNotIn("fcvm_fleet_prod", (ROOT / name).read_text(), name)
 
@@ -2039,6 +2039,11 @@ class ProdStackTests(unittest.TestCase):
         for arg in ("potato_host_amis", "windows_host_amis", "minecraft_host_amis", "minecraft_java_access",
                     "slot_tls_ports", "windows_count", "minecraft_count", "hosts_enabled"):
             pick = lambda text: re.sub(r"\s+", " ", re.search(r"\n  %s\s+= (.*?)\n  [a-z_]+\s+=" % arg, text, re.S).group(1))
+            if arg == "hosts_enabled":
+                # The same gate, each for its own stack's list (fcvm-fleet.tf, local.fcvm_fleet_coordinator_host_regions).
+                self.assertEqual(pick(stage), 'local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")')
+                self.assertEqual(pick(prod), "local.fcvm_fleet_hosts_enabled && contains(local.fcvm_fleet_coordinator_host_regions.prod, local.fcvm_fleet_prod_region)")
+                continue
             self.assertEqual(pick(stage), pick(prod), arg)
 
     # ------------------------------------------------------------------------------------------- DNS and broadcast
@@ -2095,13 +2100,18 @@ class ProdStackTests(unittest.TestCase):
                      '  name  = "fcvm-fleet-alerts"'):
             self.assertIn(line + "\n", staged)
         self.assertNotIn('"fcvm-fleet-${local.region}"', MOD)
-        # Staging keeps its default alert topic. All regions use the staging TLS secret; only east1 guards AMI releases.
+        # Staging keeps its default alert topic in us-east-1, the region whose host template the publisher always
+        # releases into; a listed copy region's host template adds no second topic and email subscription. All regions
+        # use the staging TLS secret; only east1 guards AMI releases.
         self.assertRegex(block('variable "alert_topic"', MOD), r"default\s+= true")
         self.assertRegex(block('variable "tile_tls_secret"', MOD), r'default\s+= ""')
         self.assertRegex(block('variable "ami_release_guarded"', MOD), r"default\s+= false")
         for name in ("east2", "west2", "east1"):
             mod = block('module "fcvm_fleet_%s"' % name)
-            self.assertNotIn("alert_topic", mod)
+            if name == "east1":
+                self.assertNotIn("alert_topic", mod)
+            else:
+                self.assertRegex(mod, r"\n  alert_topic\s+= false\n")
             self.assertIn("tile_tls_secret", mod)
             self.assertEqual("ami_release_guarded" in mod, name == "east1")
         self.assertIn("count = var.alert_topic && length(local.host_archs) > 0 ? 1 : 0", MOD)
@@ -2118,6 +2128,77 @@ class ProdStackTests(unittest.TestCase):
         self.assertIn("'${var.tile_tls_secret}'", cond)
         self.assertIn("systemctl restart --no-block fcvm-fleet-tls.service", cond)
         self.assertIn("ExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service", cond)
+
+
+class HostRegionTests(unittest.TestCase):
+    """One ordered list per stack decides where its GPU hosts run (owner, 2026-11-24). The coordinator is given the first
+    listed region only, until it falls back in list order (ejc3/fcvm#2114): it runs its awake hosts in every region it is
+    given, so a second region would be a second awake host."""
+
+    MODULES = {"us-east-2": "fcvm_fleet_east2", "us-west-2": "fcvm_fleet_west2", "us-east-1": "fcvm_fleet_east1"}
+
+    def host_regions(self):
+        body = TF.split("  fcvm_fleet_host_regions = {\n", 1)[1].split("\n  }\n", 1)[0]
+        return {stack: json.loads(value) for stack, value in re.findall(r"^\s+(\w+)\s+= (\[[^\]]*\])$", body, re.M)}
+
+    def test_each_stack_lists_fleet_regions_once_in_order_of_preference(self):
+        regions = self.host_regions()
+        self.assertEqual(regions, {"stage": ["us-east-1", "us-west-2"], "prod": ["us-east-1"]})
+        fleet = json.loads(re.search(r"fcvm_fleet_regions\s*=\s*(\[[^\]]+\])", (ROOT / "fcvm-fleet-account.tf").read_text()).group(1))
+        for stack, listed in regions.items():
+            self.assertTrue(listed and len(set(listed)) == len(listed) and set(listed) <= set(fleet), stack)
+        # The compute region stays first for staging, so its first choice is what it was.
+        self.assertEqual(regions["stage"][0], "us-east-1")
+        # Plan-time refusals for anything else: staging's to fleet regions, prod's to regions with a prod module.
+        stage = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        self.assertIn("alltrue([for r in local.fcvm_fleet_host_regions.stage : contains(local.fcvm_fleet_regions, r)])", stage)
+        self.assertIn("length(distinct(local.fcvm_fleet_host_regions.stage)) == length(local.fcvm_fleet_host_regions.stage)", stage)
+        self.assertIn("condition     = !local.fcvm_fleet_hosts_enabled || length(local.fcvm_fleet_host_templates) > 0", stage)
+        # The release gate's placement and critical retirement read us-east-1 only (publish.py fleet_placement,
+        # retire), so staging's coordinator keeps its hosts there until they cover another region.
+        self.assertIn("condition     = alltrue([for r in local.fcvm_fleet_coordinator_host_regions.stage : r == local.fcvm_ami_region])",
+                      stage)
+        self.assertEqual(json.loads(re.search(r'fcvm_ami_region\s*=\s*("[^"]+")', (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()).group(1)),
+                         self.host_regions()["stage"][0])
+        prod = block('resource "aws_ecs_task_definition" "fcvm_fleet_prod_coordinator"', PROD)
+        self.assertIn("alltrue([for r in local.fcvm_fleet_host_regions.prod : contains(keys(local.fcvm_fleet_prod_regional), r)])", prod)
+
+    def test_the_coordinator_is_given_the_first_listed_region_only_until_ejc3_fcvm_2114(self):
+        self.assertIn("  fcvm_fleet_coordinator_host_regions = { for stack, regions in local.fcvm_fleet_host_regions : "
+                      "stack => [for i, r in regions : r if i == 0] }\n", TF)
+        comment = TF.split("  fcvm_fleet_coordinator_host_regions = {", 1)[0].rsplit("  fcvm_fleet_host_regions = {", 1)[1]
+        self.assertIn("ejc3/fcvm#2114", comment)
+        self.assertIn("the FIRST listed only", comment)
+        # Every place that hands the coordinator a host region goes through that one local: its environment, in list
+        # order, and through each module's gate its host template ARNs (its launch IAM) and template names.
+        for local in ("fcvm_fleet_host_templates", "fcvm_fleet_host_subnets"):
+            self.assertIn("  %s = flatten([for r in local.fcvm_fleet_coordinator_host_regions.stage :\n" % local, TF)
+        for local in ("fcvm_fleet_prod_host_templates", "fcvm_fleet_prod_host_subnets"):
+            self.assertIn("  %s = flatten([for r in local.fcvm_fleet_coordinator_host_regions.prod :\n" % local, PROD)
+        for region, name in self.MODULES.items():
+            with self.subTest(module=name):
+                self.assertRegex(block('module "%s"' % name), r'\n  hosts_enabled\s+= local\.fcvm_fleet_hosts_enabled && '
+                                 r'contains\(local\.fcvm_fleet_coordinator_host_regions\.stage, "%s"\)\n' % region)
+        self.assertRegex(block('module "fcvm_fleet_prod_east1"', PROD), r"\n  hosts_enabled\s+= local\.fcvm_fleet_hosts_enabled && "
+                         r"contains\(local\.fcvm_fleet_coordinator_host_regions\.prod, local\.fcvm_fleet_prod_region\)\n")
+        self.assertIn("value = local.hosts_on ? [for t in aws_launch_template.host : t.arn] : []", block('output "host_template_arns"', MOD))
+        self.assertIn("hosts_on = var.hosts_enabled && length(local.host_archs) > 0", MOD)
+        # Nothing builds the coordinator's host regions from every region module any more: reordering the list moves the
+        # hosts in one line.
+        for text in (TF, PROD):
+            self.assertNotRegex(tf_code(text), r"for r, m in local\.fcvm_fleet(_prod)?_regional : \[for t in m\.host_template_names")
+
+    def test_a_listed_region_beyond_the_first_keeps_its_template_but_no_second_alert_topic(self):
+        # us-west-2 is listed: its host template exists (its gpu_amis come from the copy record), the coordinator is not
+        # given it, and it adds no second fcvm-fleet-alerts topic and unconfirmed email subscription.
+        west = block('module "fcvm_fleet_west2"')
+        self.assertRegex(west, r'\n  gpu_amis\s+= local\.fcvm_fleet_host_amis\["us-west-2"\]\n')
+        self.assertRegex(west, r"\n  alert_topic\s+= false\n")
+        self.assertNotIn("alert_topic", block('module "fcvm_fleet_east1"'))
+        # Its bootstrap starts no Windows, Minecraft or potato mode, matching its slot-only IPv4 ports.
+        for arg in ("ami_release_guarded", "potato_host_amis", "windows_host_amis", "minecraft_host_amis", "minecraft_java_access"):
+            self.assertNotIn(arg, west, arg)
+        self.assertIn('"us-west-2" = ["slot"]', TF)
 
 
 if __name__ == "__main__":

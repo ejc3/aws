@@ -139,11 +139,20 @@ class FacadeTests(unittest.TestCase):
             ec2.describe_instances(InstanceIds=["i-1"])
         self.assertEqual(ctx.exception.response["Error"]["Code"], "UnauthorizedOperation")
 
-    def test_image_lookups_and_launches_use_the_primary_region(self):
+    def test_the_facade_s_own_image_lookups_use_the_primary_region(self):
         ec2, ns, log = build(["us-east-2", "us-west-1"], {})
         ec2.describe_images(Owners=["self"])
         self.assertEqual(log, [("us-east-2", "describe_images", ())])
         self.assertEqual(ns["PRIMARY_REGION"], "us-east-2")
+
+    def test_a_launch_looks_up_its_ami_and_launches_in_the_region_it_tries(self):
+        # Not through the facade: one bounded launch client per runner region, picked by the candidate's region.
+        self.assertRegex(WEBHOOK, r"launch_ec2 = \{region: boto3\.client\('ec2', region_name=region, config=LAUNCH_CLIENT\)"
+                                  r"\s+for region in RUNNER_REGIONS\}")
+        self.assertIn("response = launch_ec2[region or PRIMARY_REGION].describe_images(", WEBHOOK)
+        self.assertEqual(WEBHOOK.count("launch_ec2[region].run_instances(**request)"), 2)
+        self.assertIn("ec2.owner[instance_id] = region\n", WEBHOOK)
+        self.assertNotIn("ec2.owner[instance_id] = PRIMARY_REGION", WEBHOOK)
 
     def test_a_malformed_record_is_ignored_not_a_crash(self):
         ec2, _, _ = build(["us-west-1"], {"us-west-1": [{"State": {}}]})
@@ -200,10 +209,31 @@ class FacadeTests(unittest.TestCase):
 
 
 class WiringTests(unittest.TestCase):
-    def test_the_runner_regions_are_one_of_the_three_states_of_the_ohio_move(self):
-        # [us-west-1] before, [us-east-2, us-west-1] while the old hosts drain (new runners in Ohio), [us-east-2] after.
-        self.assertRegex(VPC, r'\n  runner_regions\s*=\s*(\["us-west-1"\]|\["us-east-2", "us-west-1"\]|\["us-east-2"\])\n')
+    def test_the_runner_regions_are_ohio_then_its_us_west_1_fallback_each_with_a_network(self):
+        # Launch order: Ohio's cheaper metal first, us-west-1 when Ohio refuses (owner, 2026-11-24).
+        regions = json.loads(re.search(r'\n  runner_regions\s*=\s*(\[[^\]]*\])\n', VPC).group(1))
+        self.assertEqual(regions, ["us-east-2", "us-west-1"])
         self.assertIn("runner_primary_region = local.runner_regions[0]", VPC)
+        networks = re.search(r"\n  runner_networks = var\.enable_github_runner \? \{\n(.*?)\n  \} : \{\}\n", VPC, re.S).group(1)
+        self.assertEqual(re.findall(r'^    "([a-z0-9-]+)" = \{', networks, re.M), ["us-west-1", "us-east-2"])
+        for region in regions:
+            self.assertIn('"%s" = { subnets = ' % region, networks)
+
+    def test_the_launch_walks_exactly_the_networks_iam_allows(self):
+        # LAUNCH_NETWORKS and the launch grants come from the same runner_networks entries of the same region list,
+        # so the launcher never tries a subnet, security group or AMI region IAM refuses, and IAM allows no other.
+        launch = re.search(r"\n  runner_fcvm_launch_networks = (.*?\n  \}\] : \[\])\n", VPC, re.S).group(1)
+        self.assertTrue(launch.startswith("var.enable_github_runner ? [for r in local.runner_regions : {"))
+        self.assertIn("local.runner_networks[r].security_group.id", launch)
+        self.assertIn("[for subnet in local.runner_networks[r].subnets : ", launch)
+        self.assertIn("LAUNCH_NETWORKS = jsonencode(local.runner_fcvm_launch_networks)", TF)
+        iam = re.search(r'resource "aws_iam_role_policy" "runner_lambda" \{.*?\n\}\n', TF, re.S).group()
+        network = iam[iam.index('Sid    = "LaunchExactRunnerNetwork"'):].split("\n      },", 1)[0]
+        self.assertIn("concat(local.runner_fcvm_subnet_arns, local.runner_fcvm_sg_arns,", network)
+        self.assertNotIn(":subnet/", network)
+        self.assertNotIn(":security-group/", network)
+        image = iam[iam.index('Sid      = "LaunchApprovedRunnerImages"'):].split("\n      },", 1)[0]
+        self.assertIn('Resource = [for r in local.runner_regions : "arn:aws:ec2:${r}::image/*"]', image)
 
     def test_all_three_lambdas_are_told_the_regions(self):
         self.assertEqual(TF.count("RUNNER_REGIONS    = jsonencode(local.runner_regions)")

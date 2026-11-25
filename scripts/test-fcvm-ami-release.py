@@ -172,6 +172,8 @@ class ReleaseContracts(unittest.TestCase):
              "aws_ssm_parameter.fcvm_ami_release.arn", "data.aws_ssm_parameter.fcvm_ami_release[0].version"),
             (self.prod, "fcvm_fleet_prod_ami_release_guard", "local.fcvm_fleet_prod",
              "aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].arn", "aws_ssm_parameter.fcvm_fleet_prod_ami_release[0].version"),
+            (self.release, "fcvm_ami_copies_guard", "var.fcvm_ami_pipeline_enabled ? 1 : 0",
+             "aws_ssm_parameter.fcvm_ami_copies.arn", "data.aws_ssm_parameter.fcvm_ami_copies[0].version"),
         ):
             with self.subTest(guard=name):
                 guard = block(source, 'ephemeral "aws_ssm_parameter"', name)
@@ -197,7 +199,10 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("one(ephemeral.aws_ssm_parameter.fcvm_ami_release_guard[*].version)", east)
         self.assertRegex(east, r"ami_release_guarded\s*=\s*var.fcvm_ami_pipeline_enabled")
         for region in ("fcvm_fleet_east2", "fcvm_fleet_west2"):
-            self.assertNotIn("ami_release_guarded", block(self.fleet, "module", region))
+            body = block(self.fleet, "module", region)
+            self.assertNotIn("ami_release_guarded", body)
+            # A copy region's host template boots the copy record's image: a plan older than the record is refused.
+            self.assertIn("one(ephemeral.aws_ssm_parameter.fcvm_ami_copies_guard[*].version)", body)
 
     def test_bootstrap_pointer_has_no_launch_template_dependency_cycle(self):
         pointer = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_release")
@@ -237,7 +242,10 @@ class ReleaseContracts(unittest.TestCase):
 
     def test_automatic_mode_removes_the_old_exact_image_bypass(self):
         self.assertEqual(self.fleet.count("var.fcvm_ami_pipeline_enabled ? [] : flatten([for r, amis"), 2)
-        self.assertEqual(len(re.findall(r"lookup\(local\.fcvm_active_(?:host|tile)_amis,", self.fleet)), 6)
+        self.assertEqual(len(re.findall(r"lookup\(local\.fcvm_active_tile_amis,", self.fleet)), 3)
+        # Host AMIs come from one map (local.fcvm_fleet_host_amis): the pointer's in the compute region, else the copy record's.
+        self.assertNotIn("lookup(local.fcvm_active_host_amis,", self.fleet)
+        self.assertEqual(self.release.count("lookup(local.fcvm_active_host_amis, region, {})"), 1)
         # The image policy is managed separately: the existing inline policy was
         # already within five bytes of IAM's 10 KiB aggregate role limit.
         self.assertIn('resource "aws_iam_role_policy_attachment" "fcvm_ami_validated_images"', self.release)
@@ -309,9 +317,12 @@ class ReleaseContracts(unittest.TestCase):
 
     def test_published_images_are_copied_out_of_the_staging_region_only_as_a_record(self):
         pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
-        regions = re.search(r'fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]', self.release)
+        regions = re.search(r'fcvm_ami_fixed_copy_regions\s*=\s*\[([^\]]*)\]', self.release)
         self.assertIsNotNone(regions)
         self.assertEqual(re.findall(r'"([a-z0-9-]+)"', regions.group(1)), ["us-west-2"])
+        # Plus every other region staging lists for its GPU hosts, so each build reaches them without a hand step.
+        self.assertRegex(self.release, r"fcvm_ami_copy_regions = distinct\(concat\(local\.fcvm_ami_fixed_copy_regions,\s*"
+                         r"\[for region in local\.fcvm_fleet_host_regions\.stage : region if region != local\.fcvm_ami_region\]\)\)")
         record = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_copies")
         self.assertIn('"${aws_ssm_parameter.fcvm_ami_release.name}-copies"', record)
         self.assertRegex(record, r"ignore_changes\s*=\s*\[value\]")
@@ -384,7 +395,9 @@ class ReleaseContracts(unittest.TestCase):
         function = block(pipeline, 'resource "aws_lambda_function"', "fcvm_ami_publish")
         variables = function[function.index("variables = {"):]
         pairs = re.findall(r"^\s*([A-Z][A-Z0-9_]*)\s*=\s*(.+?)\s*$", variables, re.M)
-        copy_regions = re.search(r"fcvm_ami_copy_regions\s*=\s*\[([^\]]*)\]", self.release).group(1).count('"') // 2
+        # The copy regions are at most every fleet region but the compute region.
+        fleet_regions = re.search(r"fcvm_fleet_regions\s*=\s*(\[[^\]]+\])", (ROOT / "fcvm-fleet-account.tf").read_text()).group(1)
+        copy_regions = len(json.loads(fleet_regions)) - 1
         bounds = [
             (r'"[^"$]*"', lambda v: len(v) - 2),
             (r"local\.fcvm_fleet_account_id", lambda v: 12),
@@ -416,6 +429,81 @@ class ReleaseContracts(unittest.TestCase):
         for key in ("TEMPLATES_JSON", "SEED_RELEASE_JSON", "PHONE_AMI_JSON", "RENDERER_AMI_JSON", "POTATO_AMI_JSON", "HOST_FIX_AMI_JSON"):
             self.assertIn(key + " ", bundle)
         self.assertIn('filename = "publisher-config.json"', bundle)
+
+
+class HostRegionContracts(unittest.TestCase):
+    """Every region a stack lists for its GPU hosts (fcvm-fleet.tf, local.fcvm_fleet_host_regions) gets each build: a
+    copy region of the publisher, a host template booting its copy, and that template kept on the current release."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.release = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
+        cls.fleet = (ROOT / "fcvm-fleet.tf").read_text()
+        cls.pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        cls.prod = (ROOT / "fcvm-fleet-prod.tf").read_text()
+        cls.prod_ci = (ROOT / "fcvm-fleet-prod-ci.tf").read_text()
+
+    def test_the_copy_record_is_read_with_a_schema_postcondition(self):
+        data = block(self.release, 'data "aws_ssm_parameter"', "fcvm_ami_copies")
+        for line in ("provider        = aws.fcvm_fleet_east1", "count           = var.fcvm_ami_pipeline_enabled ? 1 : 0",
+                     "name            = aws_ssm_parameter.fcvm_ami_copies.name", "with_decryption = false",
+                     "try(jsondecode(self.value).version, 0) == 1",
+                     "contains(local.fcvm_fleet_regions, region)",
+                     'contains(["host", "tile"], kind) && can(regex("^ami-[0-9a-f]{17}$", image))'):
+            self.assertIn(line, data)
+        # Only the image map is declassified, as for the pointer.
+        self.assertIn("nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_copies[0].value).images)", self.release)
+        self.assertNotIn("nonsensitive(data.aws_ssm_parameter.fcvm_ami_copies[0].value)", self.release)
+
+    def test_only_a_listed_region_boots_its_copy_and_the_compute_region_boots_the_pointer(self):
+        amis = self.release.split("  fcvm_fleet_host_amis = {", 1)[1].split("\n  ) }\n", 1)[0]
+        self.assertIn("region == local.fcvm_ami_region || !var.fcvm_ami_pipeline_enabled ? lookup(local.fcvm_active_host_amis, region, {})", amis)
+        self.assertIn("contains(local.fcvm_fleet_host_regions.stage, region) && contains(keys(local.fcvm_ami_copy_host_amis), region)", amis)
+        self.assertIn("? { x86_64 = local.fcvm_ami_copy_host_amis[region] } : {}", amis)
+        # Hosts only: a copy region gets no tile (tiles stay in us-east-1).
+        self.assertIn("region => kinds.host if can(kinds.host)", self.release)
+        self.assertNotIn("kinds.tile", self.release)
+        for name, region in (("fcvm_fleet_east2", "us-east-2"), ("fcvm_fleet_west2", "us-west-2"), ("fcvm_fleet_east1", "us-east-1")):
+            with self.subTest(module=name):
+                body = block(self.fleet, "module", name)
+                self.assertRegex(body, r'\n  gpu_amis\s+= local\.fcvm_fleet_host_amis\["%s"\]\n' % region)
+                self.assertRegex(body, r'\n  tile_amis\s+= lookup\(local\.fcvm_active_tile_amis, "%s", \{\}\)\n' % region)
+        # A listed region with no copy yet warns at plan time instead of failing.
+        check = block(self.release, "check", "fcvm_fleet_listed_host_regions_have_a_copy")
+        self.assertIn("contains(keys(local.fcvm_ami_copy_host_amis), region)", check)
+
+    def test_the_publisher_moves_only_the_listed_regions_host_templates_and_may_not_delete_their_versions(self):
+        self.assertIn("fcvm_ami_compute_templates = module.fcvm_fleet_east1.image_templates", self.release)
+        copies = self.release.split("  fcvm_ami_copy_templates = flatten(", 1)[1].split("\n  fcvm_ami_templates", 1)[0]
+        self.assertIn("for region in local.fcvm_fleet_host_regions.stage", copies)
+        self.assertIn('template if template.kind == "host"', copies)
+        self.assertIn("if region != local.fcvm_ami_region", copies)
+        self.assertIn("fcvm_ami_templates = concat(local.fcvm_ami_compute_templates, local.fcvm_ami_copy_templates)", self.release)
+        bundle = block(self.pipeline, 'data "archive_file"', "fcvm_ami_publish")
+        self.assertIn("TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates)", bundle)
+        # The dispatcher's retention keeps every one of their default images.
+        self.assertRegex(block(self.pipeline, 'resource "aws_lambda_function"', "fcvm_ami_dispatch"),
+                         r"TEMPLATES_JSON\s*=\s*jsonencode\(local\.fcvm_ami_templates\)")
+        policy = block(self.pipeline, 'resource "aws_iam_role_policy"', "fcvm_ami_publish_fleet")
+        compute = policy.split('"ec2:DeleteLaunchTemplateVersions"],', 1)[1].split("},", 1)[0]
+        self.assertIn("for template in local.fcvm_ami_compute_templates :", compute)
+        follow = policy.split('"FollowCopyRegionHostTemplates"', 1)[1].split("},", 1)[0]
+        self.assertIn('Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate"]', follow)
+        self.assertNotIn("Delete", follow)
+        self.assertIn('[for template in local.fcvm_ami_copy_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"]', follow)
+        # Never empty (IAM refuses an empty Resource), never wider than an unmatchable name.
+        self.assertIn('["arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:launch-template/none"]', follow)
+        self.assertNotIn("launch-template/*", policy)
+        self.assertEqual(policy.count("local.fcvm_ami_templates"), 0)
+
+    def test_production_lists_only_its_own_region_and_its_release_copies_nowhere_yet(self):
+        self.assertIn("fcvm_fleet_prod_copy_regions = [for r in local.fcvm_fleet_host_regions.prod : r if r != local.fcvm_fleet_prod_region]", self.prod)
+        function = block(self.prod_ci, 'resource "aws_lambda_function"', "fcvm_ami_prod_release")
+        self.assertRegex(function, r'COPY_REGIONS\s*=\s*join\(",", local\.fcvm_fleet_prod_copy_regions\)')
+        self.assertIn("condition     = length(local.fcvm_fleet_prod_copy_regions) == 0", function)
+        self.assertRegex(function, r"TEMPLATES_JSON\s*=\s*jsonencode\(module\.fcvm_fleet_prod_east1\[0\]\.image_templates\)")
+        td = block(self.prod, 'resource "aws_ecs_task_definition"', "fcvm_fleet_prod_coordinator")
+        self.assertIn("contains(keys(local.fcvm_fleet_prod_regional), r)])", td)
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

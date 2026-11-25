@@ -53,6 +53,11 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.suno_cookie.arn]
   }
+  statement {
+    sid       = "ReadTheRunCloudKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.run_cloud_api_key.arn]
+  }
 }
 
 # Keep the existing immutable name/description to avoid replacing this live policy.
@@ -138,6 +143,36 @@ resource "aws_secretsmanager_secret_policy" "suno_cookie" {
       Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
     }]
   })
+}
+
+# run.cloud (cloud iOS simulators): the fallback when every Mac simulator is busy. JSON
+# {"RUN_CLOUD_API_KEY": ...}, value supplied by the owner out of band, never in git. Read boundary:
+# the administration set, the two dev roles, and the reaper Lambda's role (run-cloud-reaper.tf),
+# which reads this secret and no other.
+resource "aws_secretsmanager_secret" "run_cloud_api_key" {
+  name                    = "run-cloud/api-key"
+  description             = "run.cloud API key (cloud iOS simulators, fallback when the Macs are busy); value supplied out of band."
+  recovery_window_in_days = 7
+  tags                    = { Name = "run-cloud/api-key", Project = "dev" }
+}
+
+resource "aws_secretsmanager_secret_policy" "run_cloud_api_key" {
+  secret_arn = aws_secretsmanager_secret.run_cloud_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.run_cloud_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.run_cloud_api_key_readers) } }
+    }]
+  })
+}
+
+locals {
+  run_cloud_api_key_readers = concat(local.elevenlabs_readers, [aws_iam_role.run_cloud_reaper.arn])
 }
 
 # Reuse elevenlabs_read above: dev-server-role is already at its managed-policy

@@ -47,7 +47,8 @@ The trust chain:
   `github-runner` (published) or `github-runner-failed`, and on nothing else. IAM does not count the boot tests, and
   still allows `github-runner` at creation (the image's snapshot carries it, and fcvm's build script before its
   two-step publish): the script, not IAM, makes the boot test come first until that is removed (#1038);
-  `PassRole` only on `ami-builder-role` and
+  reading the serial console of its own builders (`Name=ami-builder-temp`), which the build script prints,
+  with host names and addresses masked, when a leg fails; `PassRole` only on `ami-builder-role` and
   only to EC2. It cannot mutate IAM, assume another role, read state/SSM parameters/
   Secrets Manager payloads, or launch the administrator profile.
 - **Builder host** `ami-builder-profile`: SSM agent connectivity and progress tags,
@@ -105,10 +106,67 @@ self-built AMI (`tag:Purpose = github-runner`, newest matching the arch) up to *
 `c7gd`/`m7gd`/`r7gd.metal`; x86 tries `r5d`/`c5d`/`m5d`/`m6id.metal`. That order is walked
 in the us-west-1c runner subnet first and then in us-west-1a (see
 [Network posture](#network-posture)), with any type that recently failed for capacity in an
-AZ moved to the back for that AZ only. `r5d.metal` leads x86 because it has the same CPU
+AZ moved to the back for that AZ only. A spot launch starts in the runner subnet whose AZ holds
+the fewest live spot runners of its architecture (ties keep the listed order), so a pool is split
+across the AZs and one spot reclaim takes one AZ's runners: on 2026-11-24 every launch started in
+the first subnet, and five x86 runners there were reclaimed in the same minute. `r5d.metal` leads x86 because it has the same CPU
 generation, 96 vCPUs and 4×900 GB NVMe as `c5d.metal` with four times the RAM, and its spot
 price was 17–20% lower in both AZs on 2026-09-13. Each instance is tagged with a
 `LeaseExpires` 60 minutes out.
+
+**Regions: Ohio first, then us-west-1.** `local.runner_regions` (`runner-vpc.tf`) is
+`["us-east-2", "us-west-1"]`, in launch order, and reaches the webhook as `LAUNCH_NETWORKS`:
+each region's security group and subnets (Ohio's three AZs, then us-west-1c and us-west-1a,
+the subnets named above). A launch tries every type in every Ohio subnet before any pool in
+us-west-1 (owner, 2026-11-24: "Make sure CI spreads out across regions"). It leaves a pool, and
+so a region, on the refusals it always moved on from: any refusal for spot, and only
+`InsufficientInstanceCapacity`, `VcpuLimitExceeded` and `InstanceLimitExceeded` for on-demand
+(anything else may have been accepted, and must not buy a second host elsewhere). Each region
+launches its own AMI, the newest `Purpose=github-runner` image there: fcvm publishes in
+us-west-1 and `ami-replicator` copies the newest two of each architecture to Ohio every hour. A
+region's AMI is looked up only when the walk reaches the region, so a launch Ohio takes makes no
+AMI lookup or `RunInstances` call in us-west-1, and a region with no image, or whose lookup
+fails, is skipped. The fleet reads are different: counting the pool, reuse and the capacity
+history read `DescribeInstances` in both regions on every launch decision, and a read that
+fails in either region fails the launch (fail closed: a host it cannot see may be over the cap).
+Hosts in both regions are counted toward the caps, reused and reaped, and the launch grants
+allow exactly the listed regions' subnets, security groups and runner AMIs. Ohio is first for
+price: on 2026-10-03 its `c7gd.metal` spot was $0.38/h against $1.16 in us-west-1, so a
+fallback runner costs about three times as much. The fallback's ceiling is us-west-1's 1,148
+vCPU Standard spot quota, which the app runners share: the fcvm pools at their caps plus
+headroom would take 1,216 to 1,408 vCPU there. A region taken off the list is no longer
+reaped, so drop one only once no runner is left in it.
+
+**Refusals are remembered for 10 minutes.** A pool that refused in this invocation
+(`failed_here`) or failed for capacity recently (instance records) goes to the back, behind the
+other region's pools as well. A `RunInstances` refusal for capacity or quota
+(`REMEMBERED_REFUSALS`: the three on-demand codes plus `MaxSpotInstanceCountExceeded`,
+`Unsupported`, `SpotMaxPriceTooLow`, `InsufficientCapacityOnHost` and `UnfulfillableCapacity`)
+is also written to the registration table, one row per architecture and market (key
+`refused-pools#ARCH#MARKET`, one attribute per `AZ|type` holding when it expires), and read by
+the next launches for `REFUSED_POOL_SECONDS` (600, the app runners' figure). Without it every
+delivery and poll asked every Ohio pool again: on 2026-11-12 an Ohio x86 refusal took about a
+second, so the 12 Ohio x86 pools ended 13 to 15 seconds into the invocation and left time for
+one or two us-west-1 pools, and us-west-1a x86 was never reached. With it the walk that meets
+the refusals pays once, and the next launches start in us-west-1 until Ohio's refusals expire.
+Any other error (throttling, an unknown outcome) is not remembered. The webhook writes and reads
+the row with the `GetItem`/`UpdateItem` grant it already has on that table (no new IAM); a
+runner's own grant reaches only its instance's row. A row that cannot be read or written is
+logged and ignored: the launch goes on in the usual order, and the memory is not called again
+for the rest of that invocation. A pool with no known AZ (the old `SUBNET_ID` environment) is
+never remembered: its refusal would match every AZ.
+
+The fallback must not cost the invocation: the webhook runs one execution at a time with a
+30-second timeout it cannot catch. Each launch call goes through its own region's client (one
+attempt, 2 s to connect, 6 s to answer; `LAUNCH_CALL_SECONDS` 8) and starts only while that and
+`LAUNCH_FINISH_SECONDS` (3, for the credential, one refusal-memory write and the decision line)
+are left, so calls start until about 19 seconds in. On 2026-11-12 a refusal took about 1.0 s
+and a launch with its credential about 2.7 s. The refusal memory has its own client (one
+attempt, 1 s to connect, 1 s to answer), so a call to it takes at most about 2 s, and an
+unreachable table costs one such call per invocation, not one per refusal. A walk that runs out of time ends that launch with the
+last refusal, and the cleanup poll, which only invokes the webhook and whose queue scan keeps
+its own 120-second budget, is the retry. An answer that has not come in 6 seconds is an unknown
+outcome: spot moves on, on-demand stops.
 
 **One execution at a time, and what it costs.** The webhook Lambda has run with
 `reserved_concurrent_executions = 1` since `60f3782` (2026-02-27), because concurrent
@@ -239,8 +297,8 @@ it is suppressed while GitHub is unreachable, where `online` is 0 by constructio
 
 The cleanup poll (every 5 minutes) publishes the fleet itself: `GitHubRunners/LiveRunners`
 (running `Role=github-runner` hosts) and `OldestRunnerAgeMinutes`. `too-many-runners` fires
-above 12 (both architecture pools' caps, `sum(values(local.runner_max_by_arch))`) for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
-legitimately reach that on a heavy day), and `runner-cleanup-silent` when no count arrives for
+above 12 (both architecture pools' caps, `sum(values(local.runner_max_by_arch))`) for 30 minutes, `runner-long-running` when a host outlives the age ceiling (12 hours plus the
+90-minute drain, and four polls: 830 minutes), which means the cleanup is not ending it, and `runner-cleanup-silent` when no count arrives for
 15 minutes, because then nothing is enforcing leases or age ceilings. These replace alarms
 that counted instances by tag through EC2 Metrics Insights, which cannot work (a tag is not a
 dimension) and so never fired.
@@ -1434,17 +1492,23 @@ personal access token" on `GET /repos/ejc3/fcvm/hooks`, which is the correct ans
 Runners live in an **isolated VPC** (`10.1.0.0/16`) with no peering to the dev VPC — two
 public `/24`s sharing one route table and internet gateway, both dual-stack IPv6 with a
 public IP on launch: `10.1.2.0/24` in **`us-west-1c`** (`aws_subnet.runner_us_west_1c`) and
-`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). `local.runner_launch_subnets` in
-`runner-vpc.tf` is the order the launcher uses (it reaches the Lambda as `LAUNCH_SUBNETS`),
-and the launch and IPv6 IAM grants are pinned to exactly that list.
+`10.1.1.0/24` in **`us-west-1a`** (`aws_subnet.runner`). The fcvm runners' primary region,
+Ohio, has a VPC of the same shape (`ohio.tf`, `10.11.0.0/16`, one subnet in each of
+`us-east-2a`, `b` and `c`, its own `github-runner-sg`). `local.runner_networks` in
+`runner-vpc.tf` holds each region's subnets, in the order the launcher uses, and security
+group; `local.runner_fcvm_launch_networks` lists them in `local.runner_regions` order and
+reaches the webhook as `LAUNCH_NETWORKS`, and the fcvm launch and IPv6 IAM grants are pinned
+to exactly the listed regions' subnets and groups. `local.runner_launch_subnets`, the two
+us-west-1 subnets, is the app runners' list (`LAUNCH_SUBNETS` in `runner-app.tf`).
 
-The launcher tries every instance type in us-west-1c before any in us-west-1a, for both
-architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
+Within a region the launcher tries every instance type in one subnet before any in the next,
+and the regions in list order (see "Regions" under Pattern B). In us-west-1, us-west-1c comes
+first for both architectures. Over the 7 days to 2026-09-13, 78% of ARM launch attempts in us-west-1a got
 no instance, while us-west-1c ARM metal spot was 60–67% cheaper and had a better
 single-instance placement score (4 against 2). x86 prices were about the same in both, so
 there the second AZ adds resilience. Capacity backoff is kept per (type, AZ), so an
 exhausted pool in one AZ never holds back the same type in the other. If `run_instances`
-refuses every pair, the launch fails and the cleanup poll is the retry.
+refuses every pair in every region, the launch fails and the cleanup poll is the retry.
 
 The AMI builder stays in us-west-1a: fcvm's `scripts/build-ami.sh` looks up exactly one
 subnet by `Name=github-runner-subnet`, and `github-actions-ami-builder` may launch only

@@ -395,6 +395,21 @@ populate it with `put-secret-value` on stdin after applying. Tools fetch it when
 `STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
 The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
 
+The run.cloud key (cloud iOS simulators, the fallback when the Macs are busy) is
+`run-cloud/api-key` in the same region, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same two
+dev-role readers. Terraform creates its empty container; populate it on stdin after applying:
+
+```bash
+read -rs T; printf '{"RUN_CLOUD_API_KEY":"%s"}' "$T" | aws secretsmanager put-secret-value \
+  --region us-west-1 --secret-id run-cloud/api-key --secret-string file:///dev/stdin; unset T
+```
+
+The `run-cloud-reaper` Lambda (`run-cloud-reaper.tf`) also reads that key, every 5 minutes, and deletes the run.cloud
+simulator sessions and running non-persistent sandboxes left running: no inactivity and no hard timeout or one over its
+cap (after 5 minutes), idle for 10 minutes (sandboxes only report activity, so for simulators it goes by age), or older
+than 60 minutes, whatever its timeouts. Anything tagged `keep=true`, persistent sandboxes and boxes are never deleted. The
+three numbers are the `run_cloud_reaper_*` variables; `{"dry_run": true}` shows the decisions without deleting.
+
 The optional offline Suno utility uses games/suno-cookie (us-west-1), fetched at use time
 as SUNO_COOKIE through the same two dev roles. This is a full authenticated website
 session, not an official API key. Terraform manages only its empty container and grants;
@@ -564,9 +579,12 @@ pair to us-east-1, waits for the copies (a pending copy refuses, and the dispatc
 publication every five minutes within its 24-hour lease), and releases the copies there. After
 each publication it records the release's ids in every region in `/fcvm-fleet/ami-release-copies`
 (us-east-1): the us-east-1 copies, and in us-west-2 the factory's originals, or for an older
-pair built in us-east-1 a copy (`fcvm_ami_copy_regions`). Agents' GPU boxes (fcvm
-`fleet/tools/gpubox.sh`) launch the us-west-2 entry. The release's image maps name us-east-1
-only, so us-west-2 gets no launch templates or fleet hosts. Pending or failed copies never
+pair built in us-east-1 a copy (`fcvm_ami_copy_regions`: us-west-2, plus every other region in
+`local.fcvm_fleet_host_regions.stage`). Agents' GPU boxes (fcvm `fleet/tools/gpubox.sh`) launch
+the us-west-2 entry. The release's image maps name us-east-1 only, so only us-east-1 gets tiles.
+A region staging lists for its GPU hosts gets a host template booting its recorded host copy, and
+the publisher moves that template onto each release's copy after recording it (and back on a
+rollback); the coordinator is given the first listed region only (ejc3/fcvm#2114). Pending or failed copies never
 replace the last available copy record. A confirmed failed copy gets up to two retry names;
 the publisher leaves the failed AMIs in place so interrupted retries can resume safely.
 After each publication and each
@@ -772,7 +790,7 @@ also lists the copy in `windows_host_amis`.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1a`, persistent Spot `m8gd.metal-24xl` | 1,000 GiB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 96-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `t4g.2xlarge` (8 vCPU / 32 GiB) | 900 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup; 16 GiB host swap | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `m7g.2xlarge` (8 vCPU / 32 GiB) | 900 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup; 16 GiB host swap | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
@@ -1826,6 +1844,16 @@ build slots with `scripts/mac-setup.sh mini` from either client. New SSH shells 
 For other heavy commands use `mac-build COMMAND ...`. The host shares physical memory with both Tart
 VMs. Limit SwiftPM to two build workers initially and inspect `mac-build --status` before a large build.
 
+The same setup installs the iOS app toolchain on the host (`scripts/mac/ios-toolchain.zsh`: Node, pnpm,
+XcodeGen, Ruby 3.3 and CocoaPods, each pinned, under `~/agent-tools`; `source ~/agent-tools/env.zsh`) and
+writes the machine's `~/AGENTS.md` (`~/CLAUDE.md` links to it) from `scripts/mac/mini-AGENTS.md` and what is
+on the machine: the toolchain, the attached iPhones and the development-signing keychains made for agents.
+A LaunchAgent rewrites it hourly, so its device list stays current. It says how to sign a device build
+here (the login keychain refuses SSH sessions), and that a real-device check is the agent's to run on the
+attached phones (`devicectl` does not list App Store or TestFlight apps). After a merge that changes
+`scripts/mac-setup.sh` or `scripts/mac/`, the PR watch re-runs `scripts/mac-setup.sh mini` on fcvm-arm (the
+jumpbox has no route to the mini).
+
 Give each task its own checkout and build products. To build an exact committed Swift package from a
 Linux checkout, run the following in Bash. Copy any needed uncommitted inputs explicitly.
 
@@ -2122,6 +2150,7 @@ pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
+pbox up 3 kvm-192 --local-nvme  # the same on 192 vCPU
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
 
@@ -2136,9 +2165,11 @@ a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` 
 `kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often.
 
-Use `--local-nvme` with `pbox up N kvm-96` when a workload needs both KVM and disposable local disks.
-The flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; it refuses an occupied slot with another
-instance type and leaves that box alone. `pbox capacity N kvm-96 --local-nvme` checks those same candidates.
+Use `--local-nvme` with `pbox up N kvm-96` or `pbox up N kvm-192` when a workload needs both KVM and disposable local
+disks. With kvm-96 the flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; with kvm-192 only `c8gd.metal-48xl`,
+`c9gd.metal-48xl` and `m8gd.metal-48xl` (six, three and six instance-store disks, 11,400 GB in all, made one RAID0 at
+`/mnt/nvme`). It refuses an occupied slot with another instance type and leaves that box alone. `pbox capacity N
+kvm-96 --local-nvme` (or kvm-192) checks those same candidates.
 
 `kvm-gpu-64` is a `g5g.metal` (Graviton2, 64 vCPU, 128 GiB, two NVIDIA T4G) for GPU passthrough into fcvm microVMs:
 `/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent

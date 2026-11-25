@@ -95,9 +95,11 @@ data "aws_iam_policy_document" "games_mp_observe" {
   }
 
   statement {
-    sid       = "ReadGamesAlarms"
-    actions   = ["cloudwatch:DescribeAlarms"]
-    resources = ["arn:aws:cloudwatch:${var.aws_region}:${data.aws_caller_identity.current.account_id}:alarm:games-*"]
+    # Every alarm's state and history, in every region of this account (owner, 2026-11-25: "let my dev boxes
+    # have alarm read access"). Alarms carry names, thresholds and states, never a credential.
+    sid       = "ReadAlarms"
+    actions   = ["cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory"]
+    resources = ["arn:aws:cloudwatch:*:${data.aws_caller_identity.current.account_id}:alarm:*"]
   }
 
   statement {
@@ -112,7 +114,7 @@ data "aws_iam_policy_document" "games_mp_observe" {
   statement {
     # Metric reads have no resource-level permissions; they are numbers, never secrets.
     sid       = "ReadMetrics"
-    actions   = ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics"]
+    actions   = ["cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics", "cloudwatch:DescribeAlarmsForMetric"]
     resources = ["*"]
   }
 }

@@ -245,6 +245,17 @@ class RunnerCostAlarmTests(unittest.TestCase):
         alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'too_many_runners')
         self.assertRegex(alarm, r'threshold\s*=\s*sum\(values\(local\.runner_max_by_arch\)\)')
 
+    def test_the_long_running_alarm_sits_just_past_the_age_ceiling(self):
+        # A host is reused until MAX_INSTANCE_AGE_HOURS and then drains for up to
+        # DRAIN_GRACE_MINUTES, so any threshold below that fires on a healthy busy fleet (the
+        # old 120 was in ALARM most hours of a heavy day). Four 5-minute polls of margin.
+        lambdas = source('runner-autoscale.tf')
+        hours = int(re.search(r'^\s*MAX_INSTANCE_AGE_HOURS = (\d+)$', lambdas, re.M).group(1))
+        grace = int(re.search(r'^\s*DRAIN_GRACE_MINUTES = (\d+)$', lambdas, re.M).group(1))
+        alarm = block('cost-alerts.tf', 'aws_cloudwatch_metric_alarm', 'runner_long_running')
+        threshold = int(re.search(r'threshold\s*=\s*(\d+)', alarm).group(1))
+        self.assertEqual(threshold, hours * 60 + grace + 20)
+
     def test_fleet_alarms_read_the_cleanup_metrics(self):
         emitted = source('runner-autoscale.tf')
         for name, metric in [('too_many_runners', 'LiveRunners'),

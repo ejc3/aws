@@ -490,7 +490,7 @@ resource "aws_lambda_function" "fcvm_ami_prod_release" {
       GUARD_SHA256            = local.fcvm_ami_guard_sha
       LOCK_TABLE              = "ejc3-terraform-locks"
       LOCK_ID                 = local.fcvm_stage_lock_id
-      COPY_REGIONS            = ""
+      COPY_REGIONS            = join(",", local.fcvm_fleet_prod_copy_regions) # none: the precondition below holds it
       BUILD_REGION            = local.fcvm_ami_build_region
       METRICS_REGION          = local.fcvm_fleet_home_region
       METRIC_FLEET            = local.fcvm_fleet_prod_stack.fleet
@@ -505,6 +505,12 @@ resource "aws_lambda_function" "fcvm_ami_prod_release" {
         && length(setintersection([for t in module.fcvm_fleet_prod_east1[0].image_templates : t.id], [for t in local.fcvm_ami_templates : t.id])) == 0
       )
       error_message = "The prod image release takes prod's four templates (one host) and none of staging's."
+    }
+    # publish.py ProdPublisher refuses COPY_REGIONS too: it has no step that copies a prod release into another region and
+    # moves a host template there while prod sleeps, and this role has no grant for one.
+    precondition {
+      condition     = length(local.fcvm_fleet_prod_copy_regions) == 0
+      error_message = "Prod's image release does not copy into other host regions yet: keep local.fcvm_fleet_host_regions.prod to us-east-1."
     }
   }
 }
