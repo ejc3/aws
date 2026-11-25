@@ -1884,6 +1884,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   The renders host class draws on the Standard quotas instead: Terraform asks for 384 vCPUs of Standard Spot
   (L-34B43A08) and of Standard on demand (L-1216C47A) in us-east-1 (`local.fcvm_fleet_standard_vcpus`). Their current
   values are not recorded here; read them on the jumpbox before applying.
+  The image factory's renders builder (one m8gd.metal-24xl at a time) draws on Standard on demand (L-1216C47A) in
+  us-west-2; Terraform asks for 96 vCPUs there (`local.fcvm_fleet_factory_standard_vcpus`) and never lowers a larger value.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, behind Access for the owner, the main-only CI service token and the metal agents' staging token (#1032): `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the

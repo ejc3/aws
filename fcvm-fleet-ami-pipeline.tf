@@ -24,6 +24,18 @@ variable "fcvm_ami_factory_paused" {
   default     = false
 }
 
+# The renders track (ejc3/fcvm fleet/ami/README.md, "The renders track"): pages mode's arm64 host image, built by a
+# CodeBuild project of its own (fcvm-fleet-image-factory-renders) on m8gd.metal-24xl, with its own queue, slots, lease,
+# release pointer (/fcvm-fleet/ami-release-renders) and failure record (dispatch.py, publish.py). Off until ejc3/fcvm's
+# executor has the track on main: an executor without it ignores FLEET_AMI_TRACK and runs the pair's flow, which the broker
+# refuses at its first launch (the renders build may use only renders slots), so every request would cost a failed build.
+# fcvm_ami_pipeline_enabled and fcvm_ami_factory_paused apply to this track as to the pair.
+variable "fcvm_ami_renders_track_enabled" {
+  description = "Build the renders host image on its own factory track for every admitted request"
+  type        = bool
+  default     = false
+}
+
 locals {
   # Reviewed legacy transitions never accept caller-supplied images or fake factory provenance.
   fcvm_ami_reviewed_seed = {
@@ -116,6 +128,17 @@ locals {
   fcvm_ami_guard_sha      = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
   # An older dispatcher still inherits this default; the new broker sets the per-build override.
   fcvm_ami_build_minutes = 240
+  # The renders track: its project, the type its builder and validator run on and their root (dispatch.py
+  # RENDERS_TYPES, RENDERS_VOLUMES), its slots, and its lease, which ejc3/fcvm's executor caps at 360 minutes
+  # (pipeline.py LEASE_MINUTES). No renders build has been measured against it yet.
+  fcvm_ami_renders_project = "fcvm-fleet-image-factory-renders"
+  fcvm_ami_renders_type    = "m8gd.metal-24xl"
+  fcvm_ami_renders_root    = 128
+  fcvm_ami_renders_slots   = ["renders-build", "renders-verify"]
+  fcvm_ami_renders_minutes = 360
+  # The renders host's launch templates the publisher moves onto each renders release, and retention reads: none
+  # until the renders host class exists (modules/fcvm-fleet-region, renders_image_templates).
+  fcvm_ami_renders_templates = []
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {
@@ -182,6 +205,18 @@ resource "aws_ssm_parameter" "fcvm_ami_failure" {
   lifecycle { ignore_changes = [value] }
 }
 
+# The renders track's failure record, written as the pair's is (with "track": "renders"), so a renders failure never
+# replaces the pair's latest one:
+#   aws --region us-east-1 ssm get-parameter --name /fcvm-fleet/ami-factory-failure-renders
+resource "aws_ssm_parameter" "fcvm_ami_renders_failure" {
+  provider    = aws.fcvm_fleet_east1
+  name        = "/fcvm-fleet/ami-factory-failure-renders"
+  description = "Sanitized cause of the latest failed renders image build; the factory dispatcher owns the value"
+  type        = "String"
+  value       = jsonencode({ version = 1, request_id = "" })
+  lifecycle { ignore_changes = [value] }
+}
+
 data "aws_ami" "fcvm_ami_canonical" {
   provider    = aws.fcvm_fleet_west2
   most_recent = true
@@ -200,11 +235,30 @@ data "aws_ami" "fcvm_ami_canonical" {
   }
 }
 
-# The builders' subnet is the fleet's in the build AZ, which must offer both builder types
-# (checked on the dispatcher below).
+# The renders track's first base: Canonical's arm64 Noble image, as ejc3/fcvm build-ami.sh reads it for `launch renders`.
+data "aws_ami" "fcvm_ami_canonical_arm64" {
+  provider    = aws.fcvm_fleet_west2
+  most_recent = true
+  owners      = ["099720109477"]
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"]
+  }
+  filter {
+    name   = "architecture"
+    values = ["arm64"]
+  }
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+}
+
+# The builders' subnet is the fleet's in the build AZ, which must offer every builder type, the renders
+# track's included (checked on the dispatcher below).
 data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" {
   provider      = aws.fcvm_fleet_west2
-  for_each      = toset(["g4dn.metal", "g4dn.xlarge"])
+  for_each      = toset(["g4dn.metal", "g4dn.xlarge", local.fcvm_ami_renders_type])
   location_type = "availability-zone"
   filter {
     name   = "instance-type"
@@ -270,7 +324,7 @@ resource "aws_iam_role" "fcvm_ami_codebuild" {
   name = "fcvm-fleet-ami-codebuild"
   assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
     Effect    = "Allow", Principal = { Service = "codebuild.amazonaws.com" }, Action = "sts:AssumeRole",
-    Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }, ArnEquals = { "aws:SourceArn" = "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:project/${local.fcvm_ami_project}" } }
+    Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id }, ArnEquals = { "aws:SourceArn" = [for project in [local.fcvm_ami_project, local.fcvm_ami_renders_project] : "arn:aws:codebuild:${var.aws_region}:${data.aws_caller_identity.current.account_id}:project/${project}"] } }
   }] })
 }
 
@@ -343,6 +397,12 @@ data "archive_file" "fcvm_ami_publish" {
       # Prod's image pointer (fcvm-fleet-prod-ci.tf): retention keeps its images and its previous ones. Absent while
       # the prod stack is off, which retention reads as no prod release.
       PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
+      # The renders track's publication (publish.py run_renders): its project, its pointer and its templates.
+      RENDERS_JSON = jsonencode({
+        project           = local.fcvm_ami_renders_project
+        release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name
+        templates         = local.fcvm_ami_renders_templates
+      })
     })
     filename = "publisher-config.json"
   }
@@ -358,7 +418,7 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
   lifecycle {
     precondition {
       condition     = alltrue([for o in data.aws_ec2_instance_type_offerings.fcvm_ami_builder : contains(o.locations, local.fcvm_ami_build_az)])
-      error_message = "The image factory's build AZ must offer g4dn.metal and g4dn.xlarge."
+      error_message = "The image factory's build AZ must offer g4dn.metal, g4dn.xlarge and the renders track's type."
     }
   }
   function_name                  = "fcvm-fleet-ami-dispatch"
@@ -398,6 +458,15 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
       TEMPLATES_JSON    = jsonencode(local.fcvm_ami_templates) # retention keeps each one's default image
 
       PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
+      # The renders track (dispatch.py renders_config): its project, pointer, failure record, first base and templates.
+      RENDERS_TRACK = jsonencode({
+        enabled           = var.fcvm_ami_renders_track_enabled
+        project           = local.fcvm_ami_renders_project
+        release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name
+        failure_parameter = aws_ssm_parameter.fcvm_ami_renders_failure.name
+        canonical_ami     = data.aws_ami.fcvm_ami_canonical_arm64.id
+        templates         = local.fcvm_ami_renders_templates
+      })
     }
   }
 }
@@ -434,6 +503,84 @@ resource "aws_codebuild_project" "fcvm_ami" {
     compute_type    = "BUILD_GENERAL1_SMALL"
     image           = "aws/codebuild/standard:7.0"
     privileged_mode = false
+    environment_variable {
+      name  = "FLEET_AMI_BROKER_ARN"
+      value = aws_lambda_alias.fcvm_ami_build.arn
+    }
+    environment_variable {
+      name  = "FLEET_AMI_WORKER_ROLE_ARN"
+      value = aws_iam_role.fcvm_ami_worker_fleet.arn
+    }
+    environment_variable {
+      name  = "FLEET_AMI_DOCUMENT"
+      value = aws_ssm_document.fcvm_ami_build.name
+    }
+    environment_variable {
+      name  = "FLEET_AMI_BUCKET"
+      value = aws_s3_bucket.fcvm_ami_pipeline.id
+    }
+    environment_variable {
+      name  = "FLEET_AMI_REGION"
+      value = local.fcvm_ami_build_region
+    }
+    environment_variable {
+      name  = "FLEET_AMI_SECRET_REGION"
+      value = local.fcvm_ami_region
+    }
+    environment_variable {
+      name  = "FLEET_AMI_ASSET_REGION"
+      value = local.fcvm_fleet_home_region
+    }
+    environment_variable {
+      name  = "FLEET_AMI_PUBLISHED_ASSET_BUCKET"
+      value = aws_s3_bucket.fcvm_fleet_assets.id
+    }
+    environment_variable {
+      name  = "FLEET_AMI_PUBLISHED_ASSET_REGION"
+      value = local.fcvm_fleet_home_region
+    }
+    environment_variable {
+      name  = "FLEET_AMI_TLS_BUILD_ARN"
+      value = aws_secretsmanager_secret.fcvm_ami_tls["build"].arn
+    }
+    environment_variable {
+      name  = "FLEET_AMI_TLS_TEST_ARN"
+      value = aws_secretsmanager_secret.fcvm_ami_tls["test"].arn
+    }
+  }
+  logs_config {
+    cloudwatch_logs { group_name = aws_cloudwatch_log_group.fcvm_ami_codebuild.name }
+  }
+}
+
+# The renders track's project: the same source and unchanged buildspec, the same broker alias and executor settings (the
+# executor reads the TLS ARNs as configuration and uses neither for this track), its own name, lease and concurrency, and
+# FLEET_AMI_TRACK=renders. Its builds log to the pair's group, one stream per build.
+resource "aws_codebuild_project" "fcvm_ami_renders" {
+  name                   = local.fcvm_ami_renders_project
+  description            = "Fixed two-slot renders host image factory; no Terraform or production credentials"
+  service_role           = aws_iam_role.fcvm_ami_codebuild.arn
+  build_timeout          = local.fcvm_ami_renders_minutes
+  queued_timeout         = 5
+  concurrent_build_limit = 1
+  artifacts { type = "NO_ARTIFACTS" }
+  cache { type = "NO_CACHE" }
+  source {
+    type            = "GITHUB"
+    location        = local.fcvm_ami_source
+    git_clone_depth = 1
+    buildspec       = file("${path.module}/fcvm-fleet-ami-pipeline/buildspec.yml")
+  }
+  environment {
+    type            = "LINUX_CONTAINER"
+    compute_type    = "BUILD_GENERAL1_SMALL"
+    image           = "aws/codebuild/standard:7.0"
+    privileged_mode = false
+    # The track is the project's, never an override (dispatch.py journal checks it).
+    environment_variable {
+      name  = "FLEET_AMI_TRACK"
+      value = "renders"
+    }
     environment_variable {
       name  = "FLEET_AMI_BROKER_ARN"
       value = aws_lambda_alias.fcvm_ami_build.arn
@@ -558,6 +705,8 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Sid = "Metadata", Effect = "Allow", Action = ["ec2:DescribeImages", "ec2:DescribeInstances", "ec2:DescribeSnapshots", "ec2:DescribeLaunchTemplateVersions"], Resource = "*" },
     { Sid = "CanonicalBase", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/${data.aws_ami.fcvm_ami_canonical.id}" },
+    # The renders track's first base: Canonical's arm64 image, as the pair's is its x86_64 one.
+    { Sid = "CanonicalRendersBase", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/${data.aws_ami.fcvm_ami_canonical_arm64.id}" },
     { Sid = "PrivateFactoryImages", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}::image/*",
     Condition = { StringEquals = { "ec2:Owner" = local.fcvm_fleet_account_id, "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true", "ec2:ResourceTag/GuardHelperSHA256" = local.fcvm_ami_guard_sha }, Bool = { "ec2:Public" = "false" } } },
     { Sid = "FixedNetwork", Effect = "Allow", Action = "ec2:RunInstances", Resource = ["arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:subnet/${local.fcvm_ami_builder_subnet}", aws_security_group.fcvm_ami_builder.arn] },
@@ -565,6 +714,13 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"], "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
     { Sid = "FixedRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:volume/*",
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "ec2:VolumeType" = "gp3" }, Bool = { "ec2:Encrypted" = "true" }, NumericLessThanEquals = { "ec2:VolumeSize" = 96 } } },
+    # The renders track's builder and validator: its type and its 128 GiB root, only in a renders slot. IAM cannot tie a
+    # volume's size to the instance type of the same launch, so both are tied to the FactorySlot tag the broker puts on
+    # the instance and its volume; FixedInstance and FixedRoot above stay the pair's and admit neither.
+    { Sid = "RendersInstance", Effect = "Allow", Action = "ec2:RunInstances", Resource = local.fcvm_ami_instance_arn,
+    Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots, "ec2:InstanceType" = local.fcvm_ami_renders_type, "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
+    { Sid = "RendersRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:volume/*",
+    Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots, "ec2:VolumeType" = "gp3" }, Bool = { "ec2:Encrypted" = "true" }, NumericLessThanEquals = { "ec2:VolumeSize" = local.fcvm_ami_renders_root } } },
     { Sid = "TaggedInterface", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:network-interface/*", Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag } } },
     { Sid = "TagAtLaunch", Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_created_arns,
     Condition = { StringEquals = { "ec2:CreateAction" = "RunInstances" }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Name", "Purpose", "FactoryBuild", "FactorySlot", "SourceSHA"] } } },
@@ -582,6 +738,9 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn,
     "arn:aws:ssm:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:parameter${local.fcvm_prod_ami_release_parameter}"] },
     { Sid = "SanitizedFailureReason", Effect = "Allow", Action = "ssm:PutParameter", Resource = aws_ssm_parameter.fcvm_ami_failure.arn },
+    # The renders track's base and retention read its pointer; its failures go to its own record.
+    { Sid = "RendersRelease", Effect = "Allow", Action = "ssm:GetParameter", Resource = aws_ssm_parameter.fcvm_ami_renders_release.arn },
+    { Sid = "RendersFailureReason", Effect = "Allow", Action = "ssm:PutParameter", Resource = aws_ssm_parameter.fcvm_ami_renders_failure.arn },
     { Effect = "Deny", Action = ["secretsmanager:GetSecretValue", "secretsmanager:BatchGetSecretValue", "s3:GetObject*", "sts:AssumeRole*", "iam:Create*", "iam:Put*", "iam:Attach*", "iam:Update*"], Resource = "*" }
   ] })
 }
@@ -593,6 +752,7 @@ resource "aws_iam_role_policy" "fcvm_ami_dispatch" {
     { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter", "ssm:GetParametersByPath"], Resource = local.fcvm_ami_state_arn },
     { Effect = "Allow", Action = ["codebuild:StartBuild", "codebuild:ListBuildsForProject"], Resource = aws_codebuild_project.fcvm_ami.arn },
     { Effect = "Allow", Action = ["codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = aws_codebuild_project.fcvm_ami.arn },
+    { Sid = "RendersProject", Effect = "Allow", Action = ["codebuild:StartBuild", "codebuild:ListBuildsForProject", "codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = aws_codebuild_project.fcvm_ami_renders.arn },
     { Effect = "Allow", Action = "sts:AssumeRole", Resource = [aws_iam_role.fcvm_ami_broker_fleet.arn, aws_iam_role.fcvm_ami_worker_fleet.arn] },
     { Effect = "Allow", Action = "sts:TagSession", Resource = aws_iam_role.fcvm_ami_worker_fleet.arn },
     { Sid = "RedriveOnlyTheFixedPublisher", Effect = "Allow", Action = "lambda:InvokeFunction", Resource = "arn:aws:lambda:${var.aws_region}:${data.aws_caller_identity.current.account_id}:function:fcvm-fleet-ami-publish" },
@@ -703,6 +863,8 @@ resource "aws_iam_role_policy" "fcvm_ami_publish" {
   role = aws_iam_role.fcvm_ami_publish.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami.arn },
+    { Sid = "RendersProjectBuilds", Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami_renders.arn },
+    { Sid = "RendersRequests", Effect = "Allow", Action = "ssm:PutParameter", Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/renders/requests/*" },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = local.fcvm_ami_state_arn },
     { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/gate"] },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
@@ -734,6 +896,13 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
       Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:spot-instances-request/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_ami_region } } },
     { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    # The renders track's publication: its pointer, the renders host template (none until the class exists), and on a
+    # critical release the renders hosts on an older image (publish.py retire_renders).
+    { Sid = "RendersRelease", Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = aws_ssm_parameter.fcvm_ami_renders_release.arn },
+    { Sid = "RendersTemplates", Effect = "Allow", Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplateVersions"],
+    Resource = length(local.fcvm_ami_renders_templates) > 0 ? [for template in local.fcvm_ami_renders_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] : ["arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:launch-template/none"] },
+    { Sid = "RetireOldRendersHosts", Effect = "Allow", Action = "ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*",
+    Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-renders", "ec2:InstanceType" = local.fcvm_ami_renders_type, "aws:RequestedRegion" = local.fcvm_ami_region } } },
     # Read only: retention keeps prod's images (fcvm-fleet-prod-ci.tf). Only the prod release function writes it.
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = "arn:aws:ssm:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:parameter${local.fcvm_prod_ami_release_parameter}" },
     { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
@@ -847,4 +1016,28 @@ resource "aws_lambda_permission" "fcvm_ami_success" {
   function_name = aws_lambda_function.fcvm_ami_publish.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.fcvm_ami_success.arn
+}
+
+# The renders track's successful builds, to the same publisher, which sends them to their own publication by project.
+resource "aws_cloudwatch_event_rule" "fcvm_ami_renders_success" {
+  name = "fcvm-fleet-image-factory-renders-success"
+  event_pattern = jsonencode({ source = ["aws.codebuild"], "detail-type" = ["CodeBuild Build State Change"],
+  account = [data.aws_caller_identity.current.account_id], detail = { "build-status" = ["SUCCEEDED"], "project-name" = [local.fcvm_ami_renders_project] } })
+}
+
+resource "aws_cloudwatch_event_target" "fcvm_ami_renders_success" {
+  rule = aws_cloudwatch_event_rule.fcvm_ami_renders_success.name
+  arn  = aws_lambda_function.fcvm_ami_publish.arn
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 185
+  }
+}
+
+resource "aws_lambda_permission" "fcvm_ami_renders_success" {
+  statement_id  = "OnlyFactorySuccessfulRendersBuilds"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.fcvm_ami_publish.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.fcvm_ami_renders_success.arn
 }

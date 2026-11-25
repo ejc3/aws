@@ -615,6 +615,19 @@ class QuotaTests(unittest.TestCase):
             " ".join(quota.split()),
         )
 
+    def test_the_renders_builder_has_standard_on_demand_in_the_build_region(self):
+        # One m8gd.metal-24xl (96 vCPUs) at a time: the renders validator launches after the builder has terminated.
+        self.assertIn("fcvm_fleet_factory_standard_vcpus = 96", TF)
+        source = block('data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2"')
+        quota = block('resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2"')
+        for section in (source, quota):
+            self.assertIn("provider     = aws.fcvm_fleet_west2", section)
+            self.assertIn('quota_code   = "L-1216C47A"', section)
+        self.assertIn("max(local.fcvm_fleet_factory_standard_vcpus, "
+                      "data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_standard_west2.value)", quota)
+        pipeline = (Path(__file__).resolve().parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertIn("fcvm_ami_build_region   = \"us-west-2\"", pipeline)
+
     def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
         # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
         self.assertIn("fcvm_fleet_spot_g_vcpus = 480", TF)
@@ -646,9 +659,12 @@ class QuotaTests(unittest.TestCase):
                 self.assertIn(f'quota_code   = "{code}"', section)
             # A quota AWS granted above the target is kept: a request can only raise one.
             self.assertIn(f"value        = max(local.fcvm_fleet_standard_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_{name}_east1.value)", quota)
-        # us-east-1 only, where the class runs, and once each.
-        for code in ("L-34B43A08", "L-1216C47A"):
-            self.assertEqual(len(re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n[^}]*"%s"' % code, TF)), 1, code)
+        # Once per region: us-east-1 where the class runs, and Standard on demand in us-west-2 for the image factory's
+        # renders builder (test_the_renders_builder_has_standard_on_demand_in_the_build_region).
+        owners = {code: sorted(re.search(r"provider\s+= (\S+)", body).group(1) for body in
+                               re.findall(r'resource "aws_servicequotas_service_quota" "\w+" \{\n([^}]*"%s"[^}]*)\}' % code, TF))
+                  for code in ("L-34B43A08", "L-1216C47A")}
+        self.assertEqual(owners, {"L-34B43A08": ["aws.fcvm_fleet_east1"], "L-1216C47A": ["aws.fcvm_fleet_east1", "aws.fcvm_fleet_west2"]})
         # The current values are not in the repository: the file says to read them before applying.
         self.assertIn("aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-east-1", TF)
 

@@ -1,4 +1,10 @@
-"""Fixed factory request queue and four-slot broker. No caller-defined EC2 parameters."""
+"""Fixed factory request queue and broker. No caller-defined EC2 parameters.
+
+Two tracks, each a CodeBuild project of its own (ejc3/fcvm fleet/ami/README.md): the pair (the GPU
+host and the EC2 tile, four slots) and the renders host (pages mode's arm64 CPU host, two slots,
+RENDERS_TRACK). A build's track is its project's; each track has its own queue, journal slots,
+lease, release pointer and failure record, and neither starts, stops, retires or collects the
+other's builds, instances or images."""
 import base64
 from contextlib import closing, contextmanager
 import copy
@@ -22,6 +28,22 @@ from publish import production_image_ids
 SLOTS = ("host-build", "tile-build", "host-verify", "tile-verify")
 TYPES = {"host": "g4dn.metal", "tile": "g4dn.xlarge"}
 VOLUMES = {"host": 96, "tile": 32}
+# The renders track's slots, type and root (ejc3/fcvm fleet/ami/pipeline.py RENDERS_SLOTS, build-ami.sh
+# RENDERS_TYPE and `launch renders`): the type the host runs on, arm64, 128 GiB. Kept apart from the
+# pair's tables: the pair's role caps its roots at the pair's largest volume.
+RENDERS_SLOTS = ("renders-build", "renders-verify")
+RENDERS_TYPES = {"renders": "m8gd.metal-24xl"}
+RENDERS_VOLUMES = {"renders": 128}
+TRACK_SLOTS = {"pair": SLOTS, "renders": RENDERS_SLOTS}
+TRACK_KINDS = {"pair": ("host", "tile"), "renders": ("renders",)}
+ALL_TYPES = {**TYPES, **RENDERS_TYPES}
+ALL_VOLUMES = {**VOLUMES, **RENDERS_VOLUMES}
+# Where the renders track keeps its queue under STATE_PREFIX. Journals (/builds/) and publication
+# receipts (/publications/) are keyed by the build id, which names its project, so they share the
+# pair's namespace.
+RENDERS_STATE = "/renders"
+# The renders executor exists only in sources with the six-hour lease (ejc3/fcvm pipeline.py LEASE_MINUTES).
+RENDERS_TIMEOUT_MINUTES = 360
 LEGACY_TIMEOUT_MINUTES = 240
 EXTENDED_TIMEOUT_MINUTES = 360
 # First fcvm revision whose executor accepts a six-hour broker lease (fcvm#1802).
@@ -41,7 +63,8 @@ PUBLIC_FIELDS = ("request_id", "status", "source_sha", "input_sha256", "priority
 FAILURE_VERSION = 1
 FAILURE_LOG_EVENTS = 200
 FAILURE_TAIL_BYTES = 32 * 1024
-PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake")}
+PHASES = {"host": ("prep", "build", "bake"), "tile": ("prep", "image", "trace", "bake"),
+          "renders": ("prep", "build", "bake")}
 FAILURE_REASONS = {
     "CodeBuild definitively rejected the request before starting": "start_rejected",
     "CodeBuild execution lease does not match its journal": "invalid_execution_lease",
@@ -54,6 +77,10 @@ EXECUTOR_ERRORS = (
     (re.compile(r"^RuntimeError: candidate viewer path failed:"), "viewer_path_failed"),
     (re.compile(r"^(?:__main__\.)?BuilderCommandFailed:"), "builder_command_failed"),
     (re.compile(r"^(?:[A-Za-z_][\w.]*\.)?TimeoutError:"), "executor_timeout"),
+    # The renders validator's verdicts (ejc3/fcvm fleet/ami/pipeline.py verify_renders).
+    (re.compile(r"^RuntimeError: candidate failed the renders host check \("), "renders_host_check_failed"),
+    (re.compile(r"^RuntimeError: candidate failed the agent check \("), "renders_agent_check_failed"),
+    (re.compile(r"^RuntimeError: candidate failed the agent unit's own words \("), "renders_unit_check_failed"),
 )
 DIAGNOSTIC_CODES = (
     (re.compile(r"no space left on device|disk quota exceeded", re.I), "disk_full"),
@@ -177,6 +204,21 @@ def trusted_ci(source):
     return {"ci_head_sha": head, "ci_run_id": run_id}
 
 
+def renders_config(raw):
+    """RENDERS_TRACK, Terraform's fixed configuration of the renders track; absent, there is no track."""
+    if not raw:
+        return None
+    value = json.loads(raw)
+    names = ("project", "release_parameter", "failure_parameter", "canonical_ami")
+    if not (isinstance(value, dict) and set(value) == {"enabled", "templates", *names} and type(value["enabled"]) is bool
+            and all(isinstance(value[name], str) and value[name] for name in names)
+            and isinstance(value["templates"], list) and len(value["templates"]) <= 4
+            and all(isinstance(t, dict) and set(t) == {"region", "id", "kind", "arch"} and t["kind"] == "renders"
+                    and t["arch"] == "arm64" for t in value["templates"])):
+        raise Refused("renders track configuration is outside its fixed scope")
+    return value
+
+
 def strict(event, allowed, required):
     if not isinstance(event, dict) or set(event) - set(allowed) or set(required) - set(event):
         raise Refused("invalid request fields")
@@ -189,7 +231,32 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
+        self.renders = renders_config(self.env.get("RENDERS_TRACK"))
         self.failures = []
+
+    def track_of(self, build_id):
+        """A build's track is its project's: the build id names it, and no caller can choose it."""
+        if self.renders is not None and isinstance(build_id, str) and build_id.startswith(self.renders["project"] + ":"):
+            return "renders"
+        return "pair"
+
+    def project_of(self, track):
+        return self.renders["project"] if track == "renders" else self.project
+
+    @staticmethod
+    def state(track):
+        return RENDERS_STATE if track == "renders" else ""
+
+    def enabled(self, track):
+        return self.env.get("ENABLED") == "true" and (track == "pair" or self.renders is not None and self.renders["enabled"])
+
+    def release_parameter(self, track):
+        return self.renders["release_parameter"] if track == "renders" else self.env["RELEASE_PARAMETER"]
+
+    def failure_parameter(self, track):
+        if track == "renders":
+            return self.renders["failure_parameter"] if self.renders is not None else None
+        return self.env.get("FAILURE_PARAMETER")
 
     def client(self, service, fleet=False, region=None):
         # COMPUTE_REGION is where the factory builds. Retention also reads the release-region
@@ -223,27 +290,29 @@ class Factory:
             raise Refused("factory metadata exceeds its fixed bound")
         self.client("ssm").put_parameter(Name=self.prefix + suffix, Type="String", Value=encoded, Overwrite=True)
 
-    def request_record(self, request_id):
+    def request_record(self, request_id, track="pair"):
         if not isinstance(request_id, str) or not INPUT.fullmatch(request_id):
             raise Refused("invalid request id")
-        record = self.load("/requests/" + request_id)
+        record = self.load(self.state(track) + "/requests/" + request_id)
         if record is None:
             raise Refused("unknown request")
         return record
 
     def ready(self, journal):
-        control = self.load("/control", {})
-        record = self.load("/requests/" + journal["request_id"], {})
+        track = self.track_of(journal["build_id"])
+        control = self.load(self.state(track) + "/control", {})
+        record = self.load(self.state(track) + "/requests/" + journal["request_id"], {})
         build = self.actual_build(journal["build_id"], active=False)
         return (control.get("active") == journal["build_id"] and record.get("status") not in (None, "superseded", "failed")
                 and build["buildStatus"] == "IN_PROGRESS" and build.get("resolvedSourceVersion") == journal["source_sha"]
                 and execution_deadline(build) == journal["deadline_unix"])
 
     def actual_build(self, build_id, active=True):
-        if not isinstance(build_id, str) or not build_id.startswith(self.project + ":") or not re.fullmatch(r"[0-9a-f-]{36}", build_id.split(":", 1)[1]):
+        project = self.project_of(self.track_of(build_id))
+        if not isinstance(build_id, str) or not build_id.startswith(project + ":") or not re.fullmatch(r"[0-9a-f-]{36}", build_id.split(":", 1)[1]):
             raise Refused("invalid build id")
         builds = self.client("codebuild").batch_get_builds(ids=[build_id])["builds"]
-        if len(builds) != 1 or builds[0]["projectName"] != self.project:
+        if len(builds) != 1 or builds[0]["projectName"] != project:
             raise Refused("unknown project build")
         build = builds[0]
         if active and build["buildStatus"] != "IN_PROGRESS":
@@ -258,6 +327,8 @@ class Factory:
         resolved = build.get("resolvedSourceVersion")
         if not SHA.fullmatch(source) or not INPUT.fullmatch(input_sha) or resolved not in (None, source) or active and resolved != source:
             raise Refused("build provenance does not match the request")
+        if self.track_of(build_id) == "renders" and variables.get("FLEET_AMI_TRACK") != "renders":
+            raise Refused("a renders build must run the renders track")
         suffix = "/builds/" + digest(build_id)
         journal = self.load(suffix)
         if journal is None:
@@ -286,7 +357,7 @@ class Factory:
         # instance can supply that terminal receipt without the profile proof.
         rows = [i for i in reported if all({t["Key"]: t["Value"] for t in i.get("Tags", [])}.get(key) == value
                 for key, value in (("Purpose", GUARD_PURPOSE), ("FactoryBuild", digest(journal["build_id"])), ("FactorySlot", slot)))
-            and i.get("InstanceType") == TYPES[slot.split("-", 1)[0]] and (
+            and i.get("InstanceType") == ALL_TYPES[slot.split("-", 1)[0]] and (
             i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] or (
                 "IamInstanceProfile" not in i and i["State"]["Name"] == "terminated"
                 and recorded.get("instance_id") == i["InstanceId"]))]
@@ -338,6 +409,40 @@ class Factory:
             raise Refused("initial base is not Canonical")
         return images[0]
 
+    def renders_base_image(self):
+        """The renders builder's base: the released renders image in this region, else arm64 Canonical.
+
+        The renders pointer names the build region's original beside the release region's copy, so
+        nothing else is read. Only a sanitized, validated renders image with the reviewed guard replaces
+        the Canonical base, as for the pair."""
+        image_id = self.renders["canonical_ami"]
+        try:
+            pointer = json.loads(self.release_ssm().get_parameter(Name=self.renders["release_parameter"], WithDecryption=False)["Parameter"]["Value"])
+            candidate = pointer["renders_amis"].get(self.env["COMPUTE_REGION"], {}).get("arm64")
+            if candidate is not None:
+                try:
+                    rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
+                except ClientError as error:
+                    if error.response.get("Error", {}).get("Code") != "InvalidAMIID.NotFound":
+                        raise
+                    rows = []
+                if rows:
+                    image = rows[0]
+                    tags = {t["Key"]: t["Value"] for t in image.get("Tags", [])}
+                    if (image["OwnerId"] == self.env["FLEET_ACCOUNT"] and not image.get("Public", True) and image.get("State") == "available"
+                            and image.get("Architecture") == "arm64" and tags.get("PipelineSanitized") == "true"
+                            and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == "renders"
+                            and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]):
+                        image_id = candidate
+        except (KeyError, AttributeError, self.release_ssm().exceptions.ParameterNotFound):
+            pass
+        images = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
+        if len(images) != 1 or images[0].get("State") != "available" or images[0].get("Architecture") != "arm64":
+            raise Refused("renders factory base is unavailable")
+        if image_id == self.renders["canonical_ami"] and images[0]["OwnerId"] != "099720109477":
+            raise Refused("initial renders base is not Canonical")
+        return images[0]
+
     def launch(self, suffix, journal, slot):
         if self.now() >= journal["deadline_unix"] - 60:
             raise Refused("factory deadline exhausted")
@@ -356,7 +461,7 @@ class Factory:
             if image.get("State") != "available":
                 raise Refused("candidate image is not available")
         else:
-            image = self.base_image(kind)
+            image = self.renders_base_image() if kind == "renders" else self.base_image(kind)
             image_id = image["ImageId"]
         entry = {"attempted": True, "image_id": image_id, "slot": slot}
         journal["slots"][slot] = entry
@@ -366,11 +471,11 @@ class Factory:
         guard = base64.b64encode(Path(__file__).with_name("guard.py").read_bytes()).decode()
         user_data = "#!/bin/bash\nset -eu\ncommand -v nft >/dev/null || { apt-get update -qq; apt-get install -y nftables; }\nprintf '%s' '" + guard + "' | base64 -d >/run/factory-guard.py\npython3 /run/factory-guard.py --apply\nrm -f /run/factory-guard.py\n"
         try:
-            response = self.client("ec2", True).run_instances(ImageId=image_id, InstanceType=TYPES[kind], MinCount=1, MaxCount=1,
+            response = self.client("ec2", True).run_instances(ImageId=image_id, InstanceType=ALL_TYPES[kind], MinCount=1, MaxCount=1,
             ClientToken=digest(journal["build_id"] + "/" + slot), IamInstanceProfile={"Arn": self.env["BUILDER_PROFILE"]},
             MetadataOptions={"HttpEndpoint": "enabled", "HttpTokens": "required", "HttpPutResponseHopLimit": 1},
             NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": self.env["SUBNET_ID"], "Groups": [self.env["SECURITY_GROUP"]], "AssociatePublicIpAddress": True, "DeleteOnTermination": True, "Ipv6PrefixCount": 1}],
-            BlockDeviceMappings=[{"DeviceName": image["RootDeviceName"], "Ebs": {"VolumeSize": VOLUMES[kind], "VolumeType": "gp3", "Encrypted": True, "DeleteOnTermination": True}}],
+            BlockDeviceMappings=[{"DeviceName": image["RootDeviceName"], "Ebs": {"VolumeSize": ALL_VOLUMES[kind], "VolumeType": "gp3", "Encrypted": True, "DeleteOnTermination": True}}],
             TagSpecifications=[{"ResourceType": t, "Tags": tags} for t in ["instance", "volume", "network-interface"]], UserData=user_data)
         except ClientError as error:
             code = error.response.get("Error", {}).get("Code")
@@ -394,7 +499,7 @@ class Factory:
             rows = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
             image_state = rows[0]["State"] if rows else "missing"
         return {"slot": slot, "instance_id": instance_id,
-                "state": instance["State"]["Name"] if instance else "terminated" if terminated_receipt(entry) else "rejected" if entry.get("no_instance") else "uncertain", "instance_type": TYPES[kind], "root_gib": VOLUMES[kind],
+                "state": instance["State"]["Name"] if instance else "terminated" if terminated_receipt(entry) else "rejected" if entry.get("no_instance") else "uncertain", "instance_type": ALL_TYPES[kind], "root_gib": ALL_VOLUMES[kind],
                 "image_id": image_id, "image_state": image_state, "region": self.env["COMPUTE_REGION"], "deadline_unix": journal["deadline_unix"],
                 "source_commit": journal["source_sha"], "input_sha256": journal["input_sha256"],
                 "asset_prefix": "builders/arn:aws:ec2:" + self.env["COMPUTE_REGION"] + ":" + self.env["FLEET_ACCOUNT"] + ":instance/" + instance_id + "/" if instance_id else None}
@@ -444,7 +549,11 @@ class Factory:
         resources += ["arn:aws:s3:::" + self.env["PIPELINE_BUCKET"] + "/" + p + "*" for p in prefixes.values() if p]
         policy = {"Version": "2012-10-17", "Statement": [
             {"Effect": "Allow", "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], "Resource": resources},
-            {"Effect": "Allow", "Action": ["ssm:SendCommand", "ssm:DescribeInstanceInformation", "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"], "Resource": "*"}]}
+            # The pair's executor writes and reads its two TLS canaries; the renders executor has none
+            # and gets no Secrets Manager action, so it cannot touch the pair's.
+            {"Effect": "Allow", "Action": ["ssm:SendCommand", "ssm:DescribeInstanceInformation"] + (
+                [] if self.track_of(journal["build_id"]) == "renders" else ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]),
+             "Resource": "*"}]}
         response = self.client("sts").assume_role(RoleArn=self.env["WORKER_ROLE"], RoleSessionName="factory-" + build_hash[:24],
             DurationSeconds=min(3600, max(900, int(journal["deadline_unix"] - self.now()))),
             Tags=[{"Key": "FactoryBuild", "Value": build_hash}], Policy=json.dumps(policy, separators=(",", ":")))
@@ -507,6 +616,7 @@ class Factory:
                 self.save("/requests/" + request_id, existing)
                 self.reconcile()
                 existing = self.request_record(request_id)
+            self.renders_step(self.mirror_renders, existing)
             return public_record(existing)
         current = public_github("git/ref/heads/main")["object"]["sha"]
         source = event["source_sha"]
@@ -542,7 +652,52 @@ class Factory:
         control["last_source"] = source
         self.save("/control", control)
         self.reconcile(checked_timeout=(request_id, source, record["build_timeout_minutes"]))
-        return public_record(self.request_record(request_id))
+        admitted = self.request_record(request_id)
+        self.renders_step(self.mirror_renders, admitted)
+        return public_record(admitted)
+
+    @staticmethod
+    def renders_step(step, *arguments):
+        """Run one renders-track step where the pair's work goes on regardless: a failure is logged by
+        its type, and the pair's answer, queue and cleanup are what they would be without the track."""
+        try:
+            step(*arguments)
+        except Exception as error:
+            print(json.dumps({"renders_track_error": type(error).__name__}))
+
+    def mirror_renders(self, record):
+        """Queue the renders build of a request the pair admitted: the same id, source, priority and CI
+        receipt, so the source fences and the daily window are the pair's. The renders queue then runs
+        on its own (its control, its records, its project); a newer request supersedes a queued older
+        one there as it does in the pair's queue."""
+        if not self.enabled("renders") or record.get("status") in ("superseded", "failed", "disabled"):
+            return
+        requests, control_key = RENDERS_STATE + "/requests/", RENDERS_STATE + "/control"
+        request_id = record["request_id"]
+        existing = self.load(requests + request_id)
+        if existing:
+            if record["priority"] == "critical" and existing["priority"] == "normal" and existing["status"] in ("queued", "building", "awaiting-publish"):
+                existing.update(priority="critical", not_before=int(self.now()))
+                self.save(requests + request_id, existing)
+                self.reconcile(track="renders")
+            return
+        mirrored = {key: record[key] for key in ("source_sha", "priority", "not_before", "ci_head_sha", "ci_run_id") if key in record}
+        mirrored.update(request_id=request_id, input_sha256=request_id, track="renders", status="queued", build_id=None,
+                        created=int(self.now()), deadline_unix=None, build_timeout_minutes=RENDERS_TIMEOUT_MINUTES)
+        control = self.load(control_key, {})
+        previous = self.request_record(control["pending"], "renders") if control.get("pending") else None
+        self.save(requests + request_id, mirrored)
+        if previous is not None and previous["request_id"] != request_id:
+            if previous["priority"] == "critical" and mirrored["priority"] == "normal":
+                mirrored.update(status="superseded", message="a critical request is pending")
+                self.save(requests + request_id, mirrored)
+                return
+            if previous["status"] == "queued" and not previous.get("start_attempted"):
+                previous.update(status="superseded", message="a newer input superseded this queued request")
+                self.save(requests + previous["request_id"], previous)
+        control["pending"] = request_id
+        self.save(control_key, control)
+        self.reconcile(track="renders")
 
     @contextmanager
     def control_lock(self):
@@ -583,6 +738,7 @@ class Factory:
         events = self.client("logs").get_log_events(logGroupName=group, logStreamName=stream,
             startFromHead=False, limit=FAILURE_LOG_EVENTS)["events"]
         error, receipt = None, None
+        kinds = TRACK_KINDS[self.track_of(build.get("id"))]
         for event in events:
             message = str(event.get("message", "")).strip()
             if message.startswith('{"phaseDiagnostics"'):
@@ -591,7 +747,7 @@ class Factory:
                 except (ValueError, KeyError, TypeError):
                     continue
                 kind = value.get("kind") if isinstance(value, dict) else None
-                if isinstance(kind, str) and value.get("phase") in PHASES.get(kind, ()):
+                if isinstance(kind, str) and kind in kinds and value.get("phase") in PHASES.get(kind, ()):
                     version = value.get("version_id")
                     if not isinstance(version, str) or not 0 < len(version) <= 1024 or version == "null":
                         version = None
@@ -617,7 +773,8 @@ class Factory:
 
     def publish_failure(self, record, journal=None, build=None):
         """Write fixed failure codes and validated build metadata; never forward free-form text."""
-        name = self.env.get("FAILURE_PARAMETER")
+        track = record.get("track", "pair")
+        name = self.failure_parameter(track)
         request_id, source = record.get("request_id"), record.get("source_sha")
         if (not name or record.get("status") != "failed" or not isinstance(request_id, str)
                 or not INPUT.fullmatch(request_id)):
@@ -630,6 +787,8 @@ class Factory:
                  "status": "failed", "reason": reason, "failed_at": int(self.now()),
                  "build_status": status if status in BUILD_STATUSES else None,
                  "executor_error": None, "phase": None, "diagnostic_codes": [], "unavailable": []}
+        if track == "renders":
+            value["track"] = "renders"
         receipt = None
         if build is not None:
             try:
@@ -656,16 +815,17 @@ class Factory:
     def queue_failure(self, record, journal=None, build=None):
         # A publisher rollback can leave a request failed before the dispatcher sees it.
         # Track the best-effort report separately from the request's terminal state.
-        if not self.env.get("FAILURE_PARAMETER") or record.get("failure_report_queued") is True:
+        track = record.get("track", "pair")
+        if not self.failure_parameter(track) or record.get("failure_report_queued") is True:
             return
         record["failure_report_queued"] = True
-        self.save("/requests/" + record["request_id"], record)
+        self.save(self.state(track) + "/requests/" + record["request_id"], record)
         self.failures.append((copy.deepcopy(record), copy.deepcopy(journal), build))
 
-    def reconcile(self, checked_timeout=None):
+    def reconcile(self, checked_timeout=None, track="pair"):
         self.failures = []
         try:
-            publication = self.reconcile_control(checked_timeout)
+            publication = self.reconcile_control(checked_timeout, track)
         finally:
             # In the order they were recorded, so the parameter ends on the newest.
             failures, self.failures = self.failures, []
@@ -691,14 +851,16 @@ class Factory:
                 and not request.get("start_attempted") and not request.get("build_id")
                 and request["source_sha"] != RETIRED_SOURCE_SHA)
 
-    def reconcile_control(self, checked_timeout=None):
-        control = self.load("/control", {})
+    def reconcile_control(self, checked_timeout=None, track="pair"):
+        control_key, requests = self.state(track) + "/control", self.state(track) + "/requests/"
+        project, enabled = self.project_of(track), self.enabled(track)
+        control = self.load(control_key, {})
         if not control.get("active") and not control.get("pending"):
             return
         # A queued request may have received the legacy limit when the ancestry lookup failed.
         # Recheck outside the backend mutex, and bind the proof to the exact request under it.
-        if control.get("pending") and self.env.get("ENABLED") == "true":
-            pending = self.request_record(control["pending"])
+        if control.get("pending") and enabled:
+            pending = self.request_record(control["pending"], track)
             if self.legacy_timeout_to_recheck(pending) and self.request_window_open(control, pending):
                 identity = (pending["request_id"], pending["source_sha"])
                 if checked_timeout is None or checked_timeout[:2] != identity:
@@ -708,11 +870,11 @@ class Factory:
         with self.control_lock() as acquired:
             if not acquired:
                 return
-            control = self.load("/control", {})
-            pending = self.request_record(control["pending"]) if control.get("pending") else None
+            control = self.load(control_key, {})
+            pending = self.request_record(control["pending"], track) if control.get("pending") else None
             active = control.get("active")
             if isinstance(active, dict):
-                start_record = self.request_record(active["intent"])
+                start_record = self.request_record(active["intent"], track)
                 if start_record.get("no_build"):
                     # A definitive rejection receipt survives a busy mutex.
                     # Clear this intent only; a newer pending request stays queued.
@@ -721,12 +883,12 @@ class Factory:
                         control["pending"] = None
                         pending = None
                     self.queue_failure(start_record)
-                    self.save("/control", control)
+                    self.save(control_key, control)
                     start_record = None
             elif active:
                 suffix, journal = self.journal(active, active=False)
                 build = self.actual_build(active, active=False)
-                record = self.request_record(journal["request_id"])
+                record = self.request_record(journal["request_id"], track)
                 preempt = pending and pending["priority"] == "critical" and pending["request_id"] != record["request_id"]
                 invalid_lease = execution_deadline(build) != journal["deadline_unix"]
                 succeeded = build["buildStatus"] == "SUCCEEDED" and not invalid_lease
@@ -737,7 +899,7 @@ class Factory:
                     publication = self.load("/publications/" + digest(active), {})
                     if publication.get("build_id") == active and publication.get("status") == "withdrawn":
                         release = json.loads(self.release_ssm().get_parameter(
-                            Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+                            Name=self.release_parameter(track), WithDecryption=False)["Parameter"]["Value"])
                         current = release.get("build_id")
                         if isinstance(current, str) and current and current != active:
                             # The publisher records intent before the pointer commits. Only a
@@ -745,12 +907,12 @@ class Factory:
                             # The request key can now name another retry: never overwrite it.
                             if record.get("build_id") == active and record["status"] not in ("failed", "promoted", "superseded"):
                                 record.update(status="failed", message="publication rolled back; automatic replay refused")
-                                self.save("/requests/" + record["request_id"], record)
+                                self.save(requests + record["request_id"], record)
                                 self.queue_failure(record, journal, build)
                             self.cleanup(journal)
                             if self.gone(suffix, journal):
                                 control["active"] = None
-                                self.save("/control", control)
+                                self.save(control_key, control)
                             return
                 if succeeded and record["status"] != "failed":
                     if not build.get("buildComplete") or not isinstance(build.get("endTime"), datetime.datetime):
@@ -758,7 +920,7 @@ class Factory:
                     publication_deadline = int(build["endTime"].timestamp()) + PUBLICATION_SECONDS
                     record["publication_deadline_unix"] = publication_deadline
                     if self.now() >= publication_deadline:
-                        release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+                        release = json.loads(self.release_ssm().get_parameter(Name=self.release_parameter(track), WithDecryption=False)["Parameter"]["Value"])
                         publication_expired = release.get("build_id") != active
                 if record["status"] == "failed":
                     # Preserve the publisher's rollback reason even after its lease expires.
@@ -769,7 +931,7 @@ class Factory:
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
-                    self.save("/control", control)
+                    self.save(control_key, control)
                 elif preempt or expired or failed or publication_expired or invalid_lease:
                     if build["buildStatus"] in ("IN_PROGRESS", "QUEUED"):
                         self.client("codebuild").stop_build(id=active)
@@ -779,37 +941,37 @@ class Factory:
                                "publication lease expired" if publication_expired else
                                "factory stopped or reached its fixed deadline")
                     record.update(status="superseded" if preempt else "failed", message=message)
-                    self.save("/requests/" + record["request_id"], record)
+                    self.save(requests + record["request_id"], record)
                     if record["status"] == "failed":
                         self.queue_failure(record, journal, build)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
-                    self.save("/control", control)
+                    self.save(control_key, control)
                 elif record["status"] in ("promoted", "superseded"):
                     self.cleanup(journal)
                     if not self.gone(suffix, journal):
                         return
                     control["active"] = None
-                    self.save("/control", control)
+                    self.save(control_key, control)
                 else:
                     if succeeded:
                         record["status"] = "awaiting-publish"
-                        self.save("/requests/" + record["request_id"], record)
+                        self.save(requests + record["request_id"], record)
                         if not self.gone(suffix, journal):
                             return  # Final EC2 shutdown can outlast the executor's compute lease.
                         due = self.now() - record.get("publication_last_attempt", 0) >= 300
                         if due:
                             record["publication_last_attempt"] = int(self.now())
-                        self.save("/requests/" + record["request_id"], record)
+                        self.save(requests + record["request_id"], record)
                         if due:
                             return {"source": "aws.codebuild", "detail-type": "CodeBuild Build State Change",
                                 "account": self.env["CONTROL_ACCOUNT"], "region": self.env["CONTROL_REGION"],
-                                "detail": {"build-status": "SUCCEEDED", "project-name": self.project,
+                                "detail": {"build-status": "SUCCEEDED", "project-name": project,
                                     "build-id": "arn:aws:codebuild:" + self.env["CONTROL_REGION"] + ":" + self.env["CONTROL_ACCOUNT"] + ":build/" + active}}
                     return
             if start_record is None:
-                if not pending or self.env.get("ENABLED") != "true":
+                if not pending or not enabled:
                     return
                 if pending.get("source_sha") == RETIRED_SOURCE_SHA:
                     if pending.get("start_attempted") or pending.get("build_id"):
@@ -818,9 +980,9 @@ class Factory:
                         raise Refused("retired pending request has an unexpected status")
                     # Save terminal status first so a lost control write can be retried safely.
                     pending.update(status="superseded", message=RETIRED_SOURCE_REASON)
-                    self.save("/requests/" + pending["request_id"], pending)
+                    self.save(requests + pending["request_id"], pending)
                     control["pending"] = None
-                    self.save("/control", control)
+                    self.save(control_key, control)
                     return
                 if not self.request_window_open(control, pending):
                     return
@@ -836,15 +998,15 @@ class Factory:
                         if checked_timeout[2] == EXTENDED_TIMEOUT_MINUTES:
                             start_record["build_timeout_minutes"] = EXTENDED_TIMEOUT_MINUTES
                     start_record["start_attempted"] = int(self.now())
-                    self.save("/requests/" + start_record["request_id"], start_record)
+                    self.save(requests + start_record["request_id"], start_record)
                 control["active"] = {"intent": start_record["request_id"]}
-                self.save("/control", control)
+                self.save(control_key, control)
         # No backend lock is held through StartBuild or its reconciliation.
         if is_new:
             try:
                 minutes = (EXTENDED_TIMEOUT_MINUTES if start_record.get("build_timeout_minutes") == EXTENDED_TIMEOUT_MINUTES
                            else LEGACY_TIMEOUT_MINUTES)
-                build = self.client("codebuild").start_build(projectName=self.project, sourceVersion=start_record["source_sha"],
+                build = self.client("codebuild").start_build(projectName=project, sourceVersion=start_record["source_sha"],
                     idempotencyToken=start_record["request_id"], timeoutInMinutesOverride=minutes, environmentVariablesOverride=[
                         {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
                         {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
@@ -853,12 +1015,12 @@ class Factory:
                 if error.response.get("Error", {}).get("Code") not in {
                         "AccountLimitExceededException", "InvalidInputException", "ResourceNotFoundException", "AccessDeniedException"}:
                     raise  # An unknown outcome still must never replay StartBuild.
-                record = self.request_record(start_record["request_id"])
+                record = self.request_record(start_record["request_id"], track)
                 record.update(status="failed", no_build=True, message="CodeBuild definitively rejected the request before starting")
-                self.save("/requests/" + record["request_id"], record)
+                self.save(requests + record["request_id"], record)
                 with self.control_lock() as acquired:
                     if acquired:
-                        control = self.load("/control", {})
+                        control = self.load(control_key, {})
                         if control.get("active") == {"intent": record["request_id"]}:
                             # Queue the failure while the durable no_build intent can still
                             # recover it, then clear the intent before publishing outside the lock.
@@ -866,10 +1028,10 @@ class Factory:
                             control["active"] = None
                             if control.get("pending") == record["request_id"]:
                                 control["pending"] = None
-                            self.save("/control", control)
+                            self.save(control_key, control)
                 return
         else:
-            ids = self.client("codebuild").list_builds_for_project(projectName=self.project, sortOrder="DESCENDING")["ids"][:20]
+            ids = self.client("codebuild").list_builds_for_project(projectName=project, sortOrder="DESCENDING")["ids"][:20]
             builds = self.client("codebuild").batch_get_builds(ids=ids)["builds"] if ids else []
             matches = [b for b in builds if any(v.get("name") == "INPUT_SHA256" and v.get("value") == start_record["request_id"] for v in b.get("environment", {}).get("environmentVariables", []))]
             if len(matches) != 1:
@@ -879,10 +1041,10 @@ class Factory:
         with self.control_lock() as acquired:
             if not acquired:
                 return
-            control = self.load("/control", {})
+            control = self.load(control_key, {})
             if control.get("active") != {"intent": start_record["request_id"]}:
                 raise Refused("build start no longer owns the control intent")
-            record = self.request_record(start_record["request_id"])
+            record = self.request_record(start_record["request_id"], track)
             record.update(status="superseded" if record["status"] == "superseded" else "building",
                           build_id=build["id"], deadline_unix=execution_deadline(build))
             control["active"] = build["id"]
@@ -890,8 +1052,8 @@ class Factory:
                 control["pending"] = None
             if record["priority"] == "normal":
                 control["last_normal_day"] = datetime.datetime.fromtimestamp(self.now(), datetime.timezone.utc).date().isoformat()
-            self.save("/requests/" + record["request_id"], record)
-            self.save("/control", control)
+            self.save(requests + record["request_id"], record)
+            self.save(control_key, control)
 
     def tick(self):
         # Server-held journals make cleanup independent of runner/GitHub lifetime.
@@ -901,7 +1063,11 @@ class Factory:
         for instance in rows:
             tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
             build_hash = tags.get("FactoryBuild", "")
-            if not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
+            if self.renders is not None and tags.get("FactorySlot") in RENDERS_SLOTS:
+                # A renders builder: its own slots and type, never the pair's.
+                if not INPUT.fullmatch(build_hash) or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") != RENDERS_TYPES["renders"]:
+                    continue
+            elif not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
                 continue
             journal = self.load("/builds/" + build_hash)
             if journal is not None:
@@ -915,8 +1081,14 @@ class Factory:
                 terminal = False
             if expired or terminal:
                 self.client("ec2", True).terminate_instances(InstanceIds=[instance["InstanceId"]])
-        self.reconcile()
-        self.collect_images()
+        try:
+            self.reconcile()
+            self.collect_images()
+        finally:
+            # The renders track's queue and images, whether or not the pair's raised.
+            if self.renders is not None:
+                self.renders_step(self.reconcile, None, "renders")
+                self.renders_step(self.collect_renders_images)
         return {"status": "checked"}
 
     def prod_factory_images(self, owned):
@@ -946,13 +1118,36 @@ class Factory:
 
     def collect_images(self):
         """Bounded cleanup: factory-only images, preserving every live/default/release reference."""
+        self.collect(self.project, self.pair_references)
+
+    def collect_renders_images(self):
+        """The renders track's own candidates: its project's images only, keeping what its pointer and its
+        template name. The pair's collection never sees them (their build ids name the renders project)."""
+        self.collect(self.renders["project"], self.renders_references)
+
+    def renders_references(self, ec2, owned):
+        """The renders images in use: the renders pointer's and its previous release's (the build region's
+        originals and the release region's copies), and each renders template's default image. A missing
+        pointer refuses: no collection without the release it would have to keep."""
+        pointer = json.loads(self.release_ssm().get_parameter(Name=self.renders["release_parameter"], WithDecryption=False)["Parameter"]["Value"])
+        referenced = set()
+        for bundle in [pointer, pointer.get("previous") or {}]:
+            for arches in bundle.get("renders_amis", {}).values():
+                referenced.update(v for v in arches.values() if v)
+        for template in self.renders["templates"]:
+            where = ec2 if template["region"] == self.env["COMPUTE_REGION"] else self.client("ec2", True, template["region"])
+            versions = where.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
+            referenced.update(v["LaunchTemplateData"]["ImageId"] for v in versions)
+        return referenced
+
+    def collect(self, project, references):
         ec2 = self.client("ec2", True)
         rows = ec2.describe_images(Owners=["self"], Filters=[{"Name": "tag:Purpose", "Values": ["fcvm-fleet"]},
             {"Name": "tag:PipelineSanitized", "Values": ["true"]}])["Images"]
         owned = []
         for image in rows:
             tags = {t["Key"]: t["Value"] for t in image.get("Tags", [])}
-            if image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and tags.get("Purpose") == "fcvm-fleet" and tags.get("PipelineSanitized") == "true" and tags.get("PipelineBuildId", "").startswith(self.project + ":"):
+            if image.get("OwnerId") == self.env["FLEET_ACCOUNT"] and tags.get("Purpose") == "fcvm-fleet" and tags.get("PipelineSanitized") == "true" and tags.get("PipelineBuildId", "").startswith(project + ":"):
                 owned.append((image, tags["PipelineBuildId"]))
         if not owned or len(owned) > 80:
             return
@@ -963,25 +1158,7 @@ class Factory:
         with self.control_lock() as acquired:
             if not acquired:
                 return
-            release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
-            referenced = self.prod_factory_images(owned)
-            for bundle in [release, release.get("previous") or {}]:
-                for key in ("host_amis", "tile_amis"):
-                    for arches in bundle.get(key, {}).values():
-                        referenced.update(v for v in arches.values() if v)
-            # The release's images in every region: a pair built here is released from its copies
-            # elsewhere, so the originals here are named only by the copy record.
-            try:
-                record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
-            except self.release_ssm().exceptions.ParameterNotFound:
-                record = {}
-            for field in ("images", "previous_images"):
-                for kinds in record.get(field, {}).values():
-                    referenced.update(v for v in kinds.values() if v)
-            for template in json.loads(self.env.get("TEMPLATES_JSON", "[]")):
-                where = ec2 if template["region"] == self.env["COMPUTE_REGION"] else self.client("ec2", True, template["region"])
-                versions = where.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
-                referenced.update(v["LaunchTemplateData"]["ImageId"] for v in versions)
+            referenced = references(ec2, owned)
             live = [i for r in ec2.describe_instances(Filters=[{"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped", "shutting-down"]}])["Reservations"] for i in r["Instances"]]
             referenced.update(i.get("ImageId") for i in live)
             for image, build_id in owned:
@@ -1005,6 +1182,30 @@ class Factory:
                             if error.response.get("Error", {}).get("Code") != "InvalidSnapshot.InUse":
                                 raise
 
+    def pair_references(self, ec2, owned):
+        """The pair's images in use: its release and previous release, production's, the copy record's and
+        every configured template's default."""
+        release = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"], WithDecryption=False)["Parameter"]["Value"])
+        referenced = self.prod_factory_images(owned)
+        for bundle in [release, release.get("previous") or {}]:
+            for key in ("host_amis", "tile_amis"):
+                for arches in bundle.get(key, {}).values():
+                    referenced.update(v for v in arches.values() if v)
+        # The release's images in every region: a pair built here is released from its copies
+        # elsewhere, so the originals here are named only by the copy record.
+        try:
+            record = json.loads(self.release_ssm().get_parameter(Name=self.env["RELEASE_PARAMETER"] + "-copies", WithDecryption=False)["Parameter"]["Value"])
+        except self.release_ssm().exceptions.ParameterNotFound:
+            record = {}
+        for field in ("images", "previous_images"):
+            for kinds in record.get(field, {}).values():
+                referenced.update(v for v in kinds.values() if v)
+        for template in json.loads(self.env.get("TEMPLATES_JSON", "[]")):
+            where = ec2 if template["region"] == self.env["COMPUTE_REGION"] else self.client("ec2", True, template["region"])
+            versions = where.describe_launch_template_versions(LaunchTemplateId=template["id"], Versions=["$Default"])["LaunchTemplateVersions"]
+            referenced.update(v["LaunchTemplateData"]["ImageId"] for v in versions)
+        return referenced
+
     def broker(self, event):
         strict(event, ["action", "build_id", "slot", "command_id", "capability"], ["action", "build_id", "capability"])
         action = event["action"]
@@ -1026,7 +1227,7 @@ class Factory:
         slot = event.get("slot")
         if action == "status" and slot is None:
             return {"build_id": journal["build_id"], "deadline_unix": journal["deadline_unix"], "source_commit": journal["source_sha"], "input_sha256": journal["input_sha256"], "ready": self.ready(journal), "slots": {s: self.slot_status(journal, s) for s in journal["slots"]}, "candidates": journal["candidates"]}
-        if slot not in SLOTS:
+        if slot not in TRACK_SLOTS[self.track_of(journal["build_id"])]:
             raise Refused("unknown fixed slot")
         if action == "command_status":
             return self.command_status(journal, slot, event.get("command_id"))
