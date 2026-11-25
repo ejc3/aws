@@ -603,15 +603,21 @@ on a factory track of its own: the CodeBuild project `fcvm-fleet-image-factory-r
 buildspec, with `FLEET_AMI_TRACK=renders` set on the project), its own queue under
 `/fcvm-fleet/ami-pipeline/renders/`, two slots (`renders-build`, `renders-verify`) on one
 m8gd.metal-24xl at a time with a 128 GiB root, a 360-minute lease, and the arm64 Canonical image
-or the released renders image as its base. Every request the pair admits is queued there too,
-with the same id, source, priority and daily window. Its failures go to
-`/fcvm-fleet/ami-factory-failure-renders` in us-east-1, never to the pair's record. Neither track's
-queue, slots, worker session, expiry sweep or image cleanup reads or changes the other's, and a
-renders build's worker session has no Secrets Manager action, so it cannot touch the pair's TLS
-canaries. The builder uses the Standard on-demand quota in us-west-2 (96 vCPUs,
-`fcvm-fleet-account.tf`). `fcvm_ami_renders_track_enabled` keeps the track off until ejc3/fcvm's
-executor has it on main: an older executor ignores the track and the broker refuses its first
-launch.
+or the released renders image as its base. A request the pair admits while it is live (queued,
+building or awaiting publication) is queued there too, with the same id, source, priority and daily
+window, and its own CodeBuild idempotency token; the next five-minute tick starts it. Its failures
+go to `/fcvm-fleet/ami-factory-failure-renders` in us-east-1, never to the pair's record. Neither
+track's queue, slots, worker session, expiry sweep or image cleanup reads or changes the other's.
+The renders builders run with their own instance profile (`fcvm-fleet-ami-renders-builder`), and a
+renders build's worker session has no Secrets Manager action, so neither can touch the pair's TLS
+canaries. A failing renders step is logged and fails the tick only after the pair's work is done; a
+bad renders configuration turns the track off and the pair runs. The builder uses the Standard
+on-demand quota in us-west-2 (96 vCPUs, `fcvm-fleet-account.tf`). `fcvm_ami_renders_track_enabled`
+keeps the track off until ejc3/fcvm's executor has it on main: an older executor ignores the track
+and the broker refuses its first launch. With it off these exist and do nothing: the renders
+project, the renders builders' role and profile, `/fcvm-fleet/ami-release-renders` (empty), the
+renders failure record, the broker, dispatcher and publisher grants for the track, the renders
+success rule (the publisher refuses a renders build while the flag is off), and the quota request.
 A successful renders build reaches the publisher through a rule of its own. The publisher checks
 its journal, its two terminated m8gd.metal-24xl builders and its manifest (`"track": "renders"`,
 one arm64 image, the build record and every boot proof), copies its store to

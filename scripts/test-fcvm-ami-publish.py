@@ -3844,6 +3844,24 @@ class PublisherTests(unittest.TestCase):
 
 RENDERS_PROJECT = "factory-renders"
 RENDERS_TEMPLATE = "lt-" + "9" * 17
+RENDERS_PROFILE = "arn:aws:iam::222222222222:instance-profile/factory-renders-builder"
+
+
+def renders_json(templates=True, **changes):
+    return json.dumps({"enabled": True, "project": RENDERS_PROJECT, "builder_profile": RENDERS_PROFILE,
+                       "release_parameter": "/release-renders",
+                       "templates": [{"region": "us-east-1", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "arm64"}] if templates else [],
+                       **changes})
+
+
+class PublisherTestsWithRendersConfigured(PublisherTests):
+    """Every pair publisher test again, with the renders track configured and on: no pair event may reach the
+    renders publication, and nothing of the pair's may change."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["RENDERS_JSON"] = renders_json()
+        self.assertIsNotNone(self.publisher().renders)
 
 
 class RendersPublisherTests(unittest.TestCase):
@@ -3853,8 +3871,7 @@ class RendersPublisherTests(unittest.TestCase):
     def setUp(self, templates=True):
         PublisherTests.setUp(self)
         self.env["BUILD_REGION"] = "us-west-2"
-        self.env["RENDERS_JSON"] = json.dumps({"project": RENDERS_PROJECT, "release_parameter": "/release-renders",
-            "templates": [{"region": "us-east-1", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "arm64"}] if templates else []})
+        self.env["RENDERS_JSON"] = renders_json(templates)
         self.build = RENDERS_PROJECT + ":00000000-0000-0000-0000-000000000009"
         self.pair_release = copy.deepcopy(self.fleet_ssm.values["/release"])
         start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
@@ -3897,7 +3914,7 @@ class RendersPublisherTests(unittest.TestCase):
             instance = "i-" + format(i, "017x")
             journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
             self.west.instances[instance] = {"InstanceId": instance, "State": {"Name": "terminated"}, "InstanceType": "m8gd.metal-24xl",
-                "IamInstanceProfile": {"Arn": self.env["BUILDER_PROFILE"]},
+                "IamInstanceProfile": {"Arn": RENDERS_PROFILE},
                 "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-ami-builder"}, {"Key": "FactoryBuild", "Value": MODULE.digest(self.build)},
                          {"Key": "FactorySlot", "Value": slot}]}
         self.main_ssm.values["/factory/renders/control"] = {"active": self.build}
@@ -3985,7 +4002,7 @@ class RendersPublisherTests(unittest.TestCase):
     def test_the_renders_publication_refuses_anything_but_its_own_proof(self):
         variants = ("pair-project", "pair-slots", "pair-candidates", "manifest-track", "manifest-host", "x86_64",
                     "builder-type", "agent-check", "host-problem", "kernel", "record-commit", "unvalidated-boot",
-                    "control", "request-track", "image-kind", "template-default")
+                    "control", "request-track", "image-kind", "template-default", "builder-profile")
         for variant in variants:
             with self.subTest(variant=variant):
                 self.setUp()
@@ -4021,6 +4038,8 @@ class RendersPublisherTests(unittest.TestCase):
                     del self.main_ssm.values["/factory/renders/requests/" + self.input]["track"]
                 elif variant == "image-kind":
                     next(t for t in self.west.images[self.candidate]["Tags"] if t["Key"] == "FleetImageKind")["Value"] = "host"
+                elif variant == "builder-profile":
+                    next(iter(self.west.instances.values()))["IamInstanceProfile"] = {"Arn": self.env["BUILDER_PROFILE"]}
                 elif variant == "template-default":
                     self.ec2.templates[RENDERS_TEMPLATE]["versions"][1]["LaunchTemplateData"]["ImageId"] = "ami-" + "5" * 17
                     self.ec2.copy_state = "available"
@@ -4092,14 +4111,45 @@ class RendersPublisherTests(unittest.TestCase):
 
     def test_the_renders_track_is_configured_apart_from_the_pairs(self):
         for variant, value in (("pair-project", {"project": "factory"}), ("pair-pointer", {"release_parameter": "/release"}),
+                               ("pair-profile", {"builder_profile": self.env["BUILDER_PROFILE"]}), ("flag", {"enabled": "yes"}),
                                ("pair-template", {"templates": [{"region": "us-east-1", "id": self.ids[0], "kind": "renders", "arch": "arm64"}]}),
                                ("other-region", {"templates": [{"region": "us-west-2", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "arm64"}]}),
                                ("x86_64", {"templates": [{"region": "us-east-1", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "x86_64"}]})):
             with self.subTest(variant=variant):
                 configured = json.loads(self.env["RENDERS_JSON"])
                 env = {**self.env, "RENDERS_JSON": json.dumps({**configured, **value})}
-                with self.assertRaisesRegex(MODULE.Refused, "renders track configuration"):
-                    MODULE.Publisher(env, {})
+                # A bad value turns the renders publication off and leaves the pair's to run.
+                with mock.patch("builtins.print") as said:
+                    self.assertIsNone(MODULE.Publisher(env, {}).renders)
+                self.assertIn("renders track configuration is outside its fixed scope", said.call_args[0][0])
+
+    def test_a_bad_renders_configuration_leaves_the_pair_publication_running(self):
+        pair = PublisherTests()
+        pair.setUp()
+        self.addCleanup(pair.doCleanups)
+        pair.env["RENDERS_JSON"] = "{"
+        with mock.patch("builtins.print"):
+            self.assertIsNone(pair.publisher().renders)
+            self.assertEqual(pair.publisher().run(copy.deepcopy(pair.event)), {"status": "promoted", "generation": 1})
+        self.assertEqual(pair.fleet_ssm.values["/release"]["build_id"], pair.build)
+
+    def test_the_flag_off_refuses_a_renders_build(self):
+        self.env["RENDERS_JSON"] = renders_json(enabled=False)
+        self.ec2.copy_state = "available"
+        with self.assertRaisesRegex(MODULE.Refused, "renders track is off"):
+            self.publisher().run(copy.deepcopy(self.event))
+        self.assertEqual(self.fleet_ssm.values["/release-renders"], self.renders_release)
+        self.assertEqual((self.ec2.created, self.ec2.copies, self.assets.copies), ([], [], []))
+
+    def test_the_renders_retention_never_deletes_a_snapshot_another_run_marked(self):
+        self.ec2.snapshots["snap-" + "4" * 17] = {"SnapshotId": "snap-" + "4" * 17, "OwnerId": "222222222222",
+            "Tags": [{"Key": "FleetPublisherCopy", "Value": "true"}, {"Key": "FleetRetired", "Value": "true"}]}
+        publisher = self.publisher()
+        publisher.retain_renders(self.renders_release)
+        self.assertEqual(self.ec2.deleted_snapshots, [])
+        # The pair's run sweeps it, as it did before the renders track.
+        publisher.remove_unneeded(set(), ["us-east-1"], lambda image, region: False)
+        self.assertEqual(self.ec2.deleted_snapshots, ["snap-" + "4" * 17])
 
     def test_terraform_gives_the_renders_publication_exactly_its_resources(self):
         pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
@@ -4107,6 +4157,8 @@ class RendersPublisherTests(unittest.TestCase):
             return re.search(r'^' + kind + r' "' + name + r'" \{\n.*?^\}', pipeline, re.S | re.M).group()
         bundle = block("data", "archive_file\" \"fcvm_ami_publish")
         for line in ("RENDERS_JSON = jsonencode({", "project           = local.fcvm_ami_renders_project",
+                     "enabled           = var.fcvm_ami_renders_track_enabled",
+                     "builder_profile   = aws_iam_instance_profile.fcvm_ami_renders_builder.arn",
                      "release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name",
                      "templates         = local.fcvm_ami_renders_templates"):
             self.assertIn(line, bundle)

@@ -65,6 +65,7 @@ class GrantTests(unittest.TestCase):
         not_here = {"dev_server", "jumpbox_admin", "runner", "runner_app_instance", "ami_builder", "runner_app_image_builder",
                     "mac_instance", "dolphin_redis", "fcvm_fleet_host", "fcvm_fleet_tile",
                     "fcvm_fleet_prod_host", "fcvm_fleet_prod_tile", "fcvm_fleet_gpubox", "fcvm_fleet_renders", "fcvm_ami_builder",
+                    "fcvm_ami_renders_builder",
                     "boot_race_ecs_host", "benchmark_worker"}
         profile_roles = set()
         for tf in ROOT.glob("*.tf"):
