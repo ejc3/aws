@@ -1976,9 +1976,10 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   `/fcvm-fleet/ami-release-renders`, which the image factory's renders track publishes, names an image in us-east-1.
   The renders track's publisher then moves the template onto each renders release; the pair's never touches it. The
   boot writes the host's own `FLEET_AGENT_ARGS` to `/etc/fcvm-fleet/agent.env` and starts the image's
-  `fcvm-fleet-renders-agent.service`, which runs the agent as `ubuntu` with the image's `renders.env`. Its frame socket
-  is reached over IPv4 through the agent's front on 443, with the certificate in `ubuntu`'s runtime directory
-  (`--tls-dir`). IPv6 waits on ejc3/fcvm: as `ubuntu` the agent refuses the host's prefix and cannot add `<prefix>::1`.
+  `fcvm-fleet-renders-agent.service`, which runs the agent as `ubuntu` with the image's `renders.env`. The boot passes
+  only what names the stack (`--dial`, `--access-secret`, `--tls-secret`, `--secret-region`, `--spot-notice-url`,
+  `--store-ready-file`); the image owns every frame-socket option that is the same on every renders host, including the
+  IPv6 prefix, and the renders role is in the staging certificate's resource policy.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile

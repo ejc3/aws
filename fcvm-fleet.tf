@@ -251,29 +251,20 @@ locals {
   # The renders host class: its instance type, and the host's own agent arguments (FLEET_AGENT_ARGS in agent.env). The
   # image's fcvm-fleet-renders-agent.service runs the agent as ubuntu with these, then the image's RENDERS_AGENT_ARGS
   # (--renders, the placeholder --image and --base-port a host without GPU slots needs, --host-from-imds and the
-  # module's options) and RENDERS_FRAME_ARGS (ejc3/fcvm fleet/ami/renders/host-check.py agent-env; empty, and set by
-  # renders.env after agent.env, so the boot cannot set it), so none of those is repeated here: the agent refuses an
-  # option given twice. Each one is spelled as in fcvm_fleet_host_agent_args (scripts/test-fcvm-fleet.py compares them),
-  # but one: --tls-dir. The frame server (ejc3/fcvm fleet/PROTOCOL.md, "The frame socket") serves with the certificate in
-  # --tls-dir, whose default, /run/fcvm-fleet/tls, ubuntu cannot create; the user's runtime directory exists from boot
-  # (the image enables lingering for uid 1000, renders.conf RENDERS_UID). The IPv4 path is the agent's front on port 443
-  # of --publish-ip (the image lowers net.ipv4.ip_unprivileged_port_start to 0), routed to the frame socket's declared
-  # port behind it, which the class's group does not admit. Not here: --ipv6-prefix-from-imds, which the agent refuses
-  # without root (src/fleet/agent/addr.rs check_routed_user) and whose <prefix>::1 it adds with `ip -6 addr replace`,
-  # which needs CAP_NET_ADMIN; and --frame-zone, which only GPU slots use.
-  fcvm_fleet_renders_type    = "m8gd.metal-24xl"
-  fcvm_fleet_renders_tls_dir = "/run/user/1000/fcvm-fleet-tls"
+  # module's options) and RENDERS_FRAME_ARGS (ejc3/fcvm fleet/ami/renders/host-check.py agent-env; read after
+  # agent.env, so the boot cannot set it). The image owns every option that is the same on every renders host: the
+  # frame socket's listen ports, --publish-ip, --tls-publish-base, the certificate directory, --public-ipv4-from-imds and
+  # the IPv6 prefix (taken by a root oneshot unit in the image). The boot owns only what names the stack, each one
+  # spelled as in fcvm_fleet_host_agent_args (scripts/test-fcvm-fleet.py compares them). The agent refuses an option
+  # given twice, so none of the image's is here.
+  fcvm_fleet_renders_type = "m8gd.metal-24xl"
   fcvm_fleet_renders_agent_args = join(" ", [
     "--dial wss://${local.fcvm_dev_agent_path}",
     "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
     "--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}",
     "--secret-region ${local.fcvm_fleet_home_region}",
-    "--publish-ip 0.0.0.0",
-    "--tls-publish-base ${local.fcvm_fleet_slot_tls_port_base}",
-    "--public-ipv4-from-imds",
     "--spot-notice-url http://169.254.169.254",
     "--store-ready-file /var/lib/fcvm-fleet/store-ready",
-    "--tls-dir ${local.fcvm_fleet_renders_tls_dir}",
   ])
 
   # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key and its
@@ -583,6 +574,15 @@ resource "aws_iam_role" "fcvm_fleet_renders" {
   provider = aws.fcvm_fleet
   count    = local.fcvm_fleet_renders_enabled ? 1 : 0
   name     = "fcvm-fleet-renders"
+  lifecycle {
+    # The class is built in us-east-1 only (module.fcvm_fleet_east1), and that module hands the coordinator its
+    # templates only while us-east-1 is one of staging's coordinator host regions: elsewhere the template would exist
+    # and never launch.
+    precondition {
+      condition     = contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")
+      error_message = "The renders host class runs in us-east-1 and needs us-east-1 among staging's coordinator host regions (local.fcvm_fleet_host_regions.stage)."
+    }
+  }
   assume_role_policy = jsonencode({
     Version   = "2012-10-17"
     Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]

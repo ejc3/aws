@@ -147,7 +147,9 @@ ephemeral "aws_ssm_parameter" "fcvm_ami_copies_guard" {
 # The renders pointer, read the way the release pointer is: the renders host class's image (fcvm-fleet.tf) comes from it,
 # and from nothing in the pair's pointer. renders_amis is { region = { arm64 = "ami-..." } }: the build region's original
 # and the release region's copy, which the publisher's renders track writes; only fleet regions, the arm64 key and exact
-# image ids are accepted.
+# image ids are accepted. The guard digest is checked once the pointer names an image: the empty pointer keeps the digest
+# it was created with (ignore_changes), and a guard change before the first renders release must not fail every plan.
+# A malformed pointer fails the plan on purpose: reading it as empty would plan the destruction of a live template.
 data "aws_ssm_parameter" "fcvm_ami_renders_release" {
   provider        = aws.fcvm_fleet_east1
   count           = var.fcvm_ami_pipeline_enabled ? 1 : 0
@@ -158,7 +160,8 @@ data "aws_ssm_parameter" "fcvm_ami_renders_release" {
       condition = (
         try(jsondecode(self.value).version, 0) == 1 &&
         try(jsondecode(self.value).track, "") == "renders" &&
-        try(jsondecode(self.value).guard_sha256, "") == filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py") &&
+        (try(length(jsondecode(self.value).renders_amis), 1) == 0 ||
+        try(jsondecode(self.value).guard_sha256, "") == filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")) &&
         try(alltrue([for region, arches in jsondecode(self.value).renders_amis : contains(local.fcvm_fleet_regions, region) && length(arches) == 1 && contains(keys(arches), "arm64") && alltrue([
           for arch, image in arches : can(regex("^ami-[0-9a-f]{17}$", image))
         ])]), false)

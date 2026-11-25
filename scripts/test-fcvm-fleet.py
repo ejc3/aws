@@ -982,12 +982,33 @@ class SecretTests(unittest.TestCase):
         self.assertIn('Principal = "*"', policy)
         self.assertIn('Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn', policy)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
-        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = \[(.*?)\]', policy, re.S)
+        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = concat\(\[(.*?)\], (.*?)\) \} \}', policy, re.S)
         self.assertIsNotNone(roles)
         self.assertEqual(set(re.findall(r"[\w.]+", roles[1])), {
             "aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
             "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage", "local.fcvm_fleet_access_role_arn",
         })
+        # The renders host's role exists only with its class.
+        self.assertEqual(roles[2], "aws_iam_role.fcvm_fleet_renders[*].arn")
+
+    def test_every_role_granted_the_staging_certificate_passes_its_resource_policy(self):
+        # The secret's policy denies every principal it does not list, so an identity grant alone is not enough: each
+        # role whose policy names the certificate (local.fcvm_fleet_secret_arn["tls"]) must be in that list.
+        listed = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = (.*?) \} \}',
+                           block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT), re.S)[1]
+        granted = set()
+        for name in ("fcvm-fleet.tf", "fcvm-fleet-lambda.tf", "fcvm-fleet-ci.tf", "fcvm-fleet-broadcast.tf"):
+            text = (ROOT / name).read_text()
+            for policy in re.finditer(r'^resource "aws_iam_(?:role_)?policy" "\w+" \{\n.*?^\}', text, re.S | re.M):
+                body = policy.group()
+                if 'local.fcvm_fleet_secret_arn["tls"]' not in body:
+                    continue
+                role = re.search(r"\n  role\s+= aws_iam_role\.(\w+)", body)
+                self.assertIsNotNone(role, "a policy granting the certificate names no role: " + body[:80])
+                granted.add(role[1])
+        self.assertIn("fcvm_fleet_renders", granted)
+        for role in granted:
+            self.assertRegex(listed, r"aws_iam_role\.%s(\[\*\])?\.arn" % role, role)
 
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
@@ -1761,11 +1782,12 @@ class StageSubzoneCertificateTests(unittest.TestCase):
         policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT)
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
-        principals = policy.split('"aws:PrincipalArn" = [', 1)[1].split("]", 1)[0]
+        principals, renders = policy.split('"aws:PrincipalArn" = concat([', 1)[1].split("]", 1)
         self.assertEqual(re.findall(r"[\w.\[\]]+(?=,)", principals),
                          ["aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
                           "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage",
                           "local.fcvm_fleet_access_role_arn"])
+        self.assertTrue(renders.startswith(", aws_iam_role.fcvm_fleet_renders[*].arn)"), renders[:60])
         self.assertNotIn("prod", policy)
         # Empty or unverified secrets must block every consumer, including targeted template or role plans.
         guard = block('data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls"', STAGE_CERT)
@@ -2222,6 +2244,10 @@ class RendersHostTests(unittest.TestCase):
     def template(self):
         return block('resource "aws_launch_template" "renders"', MOD)
 
+    @staticmethod
+    def renders_type():
+        return re.search(r'\n  fcvm_fleet_renders_type\s+= "([^"]+)"\n', TF)[1]
+
     def policy(self):
         return block('resource "aws_iam_policy" "fcvm_fleet_coordinator_renders"')
 
@@ -2373,7 +2399,7 @@ class RendersHostTests(unittest.TestCase):
         # Production adopts it later by passing the same inputs: until then nothing of it is in the prod files.
         for name in ("fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf", "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-ci.tf",
                      "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf", "fcvm-dev-prod.tf"):
-            self.assertNotRegex(tf_code((ROOT / name).read_text()), r"renders_|fcvm-fleet-renders|FLEET_RENDERS|c8g", name)
+            self.assertNotRegex(tf_code((ROOT / name).read_text()), r"renders_|fcvm-fleet-renders|FLEET_RENDERS|" + re.escape(self.renders_type()), name)
 
     def test_the_image_is_the_renders_pointers_and_an_empty_pointer_means_no_class(self):
         # The renders track's own pointer, never the pair's: a renders publication writes only it.
@@ -2381,7 +2407,7 @@ class RendersHostTests(unittest.TestCase):
         for line in ("count           = var.fcvm_ami_pipeline_enabled ? 1 : 0",
                      "name            = aws_ssm_parameter.fcvm_ami_renders_release.name",
                      'try(jsondecode(self.value).track, "") == "renders"', "try(jsondecode(self.value).version, 0) == 1",
-                     'try(jsondecode(self.value).guard_sha256, "") == filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")',
+                     '(try(length(jsondecode(self.value).renders_amis), 1) == 0 ||\n        try(jsondecode(self.value).guard_sha256, "") == filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py"))',
                      'contains(local.fcvm_fleet_regions, region) && length(arches) == 1 && contains(keys(arches), "arm64")',
                      'can(regex("^ami-[0-9a-f]{17}$", image))'):
             self.assertIn(line, data, line)
@@ -2402,22 +2428,16 @@ class RendersHostTests(unittest.TestCase):
     def test_the_agent_gets_only_the_hosts_own_arguments(self):
         host, renders = self.args("fcvm_fleet_host_agent_args"), self.args("fcvm_fleet_renders_agent_args")
         flag = lambda a: a.split(" ", 1)[0]
-        # Each one spelled exactly as the GPU host's, in the GPU host's order, then the certificate directory.
-        shared = [a for a in renders if a in host]
-        self.assertEqual(shared, [a for a in host if a in renders])
-        self.assertEqual([flag(a) for a in shared],
-                         ["--dial", "--access-secret", "--tls-secret", "--secret-region", "--publish-ip", "--tls-publish-base",
-                          "--public-ipv4-from-imds", "--spot-notice-url", "--store-ready-file"])
-        self.assertEqual([a for a in renders if a not in host], ["--tls-dir ${local.fcvm_fleet_renders_tls_dir}"])
-        # ubuntu's runtime directory (the image's RENDERS_UID), not the default /run/fcvm-fleet/tls it cannot create.
-        self.assertRegex(TF, r'\n  fcvm_fleet_renders_tls_dir\s+= "/run/user/1000/fcvm-fleet-tls"\n')
-        # The image's renders.env gives these (ejc3/fcvm fleet/ami/renders/host-check.py agent_args), and the agent
-        # refuses an option given twice.
-        for image_owned in ("--renders", "--image", "--base-port", "--host-from-imds", "--renders-arg"):
+        # Only what names the stack, each spelled exactly as the GPU host's, in the GPU host's order.
+        self.assertEqual(renders, [a for a in host if a in renders])
+        self.assertEqual([flag(a) for a in renders],
+                         ["--dial", "--access-secret", "--tls-secret", "--secret-region", "--spot-notice-url", "--store-ready-file"])
+        # The image owns the rest: its renders.env gives the mode's options and every frame-socket option that is the
+        # same on every renders host, and the agent refuses an option given twice.
+        for image_owned in ("--renders", "--image", "--base-port", "--host-from-imds", "--renders-arg", "--publish-ip",
+                            "--tls-publish-base", "--public-ipv4-from-imds", "--tls-dir", "--ipv6-prefix-from-imds",
+                            "--frame-zone"):
             self.assertNotIn(image_owned, map(flag, renders))
-        # A routed prefix needs root (addr.rs check_routed_user); --frame-zone names GPU slots only.
-        for left_out in ("--ipv6-prefix-from-imds", "--frame-zone"):
-            self.assertNotIn(left_out, map(flag, renders))
         definition = TF.split("fcvm_fleet_renders_agent_args = join(", 1)[1].split("\n\n", 1)[0]
         self.assertNotIn("PLACEHOLDER", TF)
         self.assertNotIn("fcvm_fleet_renders_mode_args", TF)
@@ -2524,7 +2544,7 @@ class RendersHostTests(unittest.TestCase):
         self.assertIn('StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-tile" }',
                       inline(CoordinatorLaunchSplit, "TileTemplatesAreTaggedTilesOnly"))
         for types_list in ("fcvm_fleet_host_types", "fcvm_fleet_tile_types"):
-            self.assertNotIn("c8g", re.search(r"\n  %s\s+= (\[[^\n]*\])\n" % types_list, TF).group(1))
+            self.assertNotIn(self.renders_type(), re.search(r"\n  %s\s+= (\[[^\n]*\])\n" % types_list, TF).group(1))
 
     def test_the_existing_denies_admit_the_class_only_while_it_has_a_template(self):
         # An explicit deny wins over the class's allows, so the two fleet-wide denies must name its type and Purpose;
@@ -2579,6 +2599,8 @@ class RendersHostTests(unittest.TestCase):
         self.assertNotIn("ListBucket", policy)
         self.assertIn('policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"',
                       block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_renders_ssm"'))
+        # The class is built in us-east-1 only; a plan that drops us-east-1 from the coordinator's regions refuses.
+        self.assertIn('condition     = contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")', role)
         # The GPU host's role is not widened for this class.
         self.assertNotIn("renders", block('resource "aws_iam_role_policy" "fcvm_fleet_host"'))
 

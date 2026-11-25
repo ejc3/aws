@@ -674,8 +674,7 @@ resource "aws_launch_template" "host" {
 
 # ------------------------------------------------------------------------------------------------ renders hosts
 # The renders host's own group: viewers reach its frame socket on 443 over both families (IPv4 through the agent's front
-# on the host's own address; IPv6 at <prefix>::1 once ejc3/fcvm's agent can take the prefix as ubuntu, fleet/PROTOCOL.md,
-# "The frame socket"). Nothing else in:
+# on the host's own address, IPv6 at <prefix>::1, ejc3/fcvm fleet/PROTOCOL.md, "The frame socket"). Nothing else in:
 # not the GPU slots' per-place IPv4 ports the fleet group admits, and not the renders frame socket's own IPv4 port
 # behind the front. Only where the class exists.
 resource "aws_security_group" "renders" {

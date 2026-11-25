@@ -11,8 +11,9 @@ resource "aws_secretsmanager_secret" "fcvm_fleet_stage_tls" {
   tags                    = { Name = local.fcvm_fleet_stage_tls_name, Project = "fcvm-fleet", Fleet = local.fcvm_fleet_stage.fleet }
 }
 
-# Whatever any other identity's IAM policy says, only staging's coordinator, hosts and tiles (and the role Terraform
-# applies through) read or write it: no prod role holds a staging key.
+# Whatever any other identity's IAM policy says, only staging's coordinator, hosts, renders host and tiles (and the role
+# Terraform applies through) read or write it: no prod role holds a staging key. The renders host's role exists only with
+# its class (fcvm-fleet.tf), hence the concat.
 resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls" {
   provider   = aws.fcvm_fleet
   secret_arn = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
@@ -24,13 +25,13 @@ resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls" {
       Principal = "*"
       Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
       Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn
-      Condition = { ArnNotEquals = { "aws:PrincipalArn" = [
+      Condition = { ArnNotEquals = { "aws:PrincipalArn" = concat([
         aws_iam_role.fcvm_fleet_coordinator_task.arn,
         aws_iam_role.fcvm_fleet_host.arn,
         aws_iam_role.fcvm_fleet_tile.arn,
         local.fcvm_lambda_tile_role_arns.stage,
         local.fcvm_fleet_access_role_arn,
-      ] } }
+      ], aws_iam_role.fcvm_fleet_renders[*].arn) } }
     }]
   })
 }
