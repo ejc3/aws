@@ -18,8 +18,10 @@ change `scripts/mac/mac-AGENTS.md` in ejc3/aws.
 
 ## Testing on the attached iPhone
 
-The phone below is on USB with Developer Mode on, signed in to the owner's account, with
-TestFlight. A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
+The phone below is on USB with Developer Mode on, signed in to the owner's account. **UI Automation
+is off** on it (checked 2026-11-25, ejc3/aws#1062): a UI test times out "enabling automation mode" until
+the owner turns on Settings › Developer › Enable UI Automation. Say so once and stop; do not change the
+setting. A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
 camera) is yours to run: never hand the owner a step this phone can do. The Mac mini has phones
 too; its `~/AGENTS.md` says how to build and sign there.
 
@@ -30,7 +32,8 @@ owner's other apps.
 - `xcrun devicectl device info apps` does not list App Store or TestFlight apps, not even with
   `--include-all-apps`. An app missing from it proves nothing.
 - Use the build testers run first: the project's TestFlight build, installed through TestFlight
-  on the phone.
+  on the phone. A development build signed here is covered by the "Agent wildcard dev MacBook
+  iPhone 13" profile.
 - A phone asleep with no passcode asked for (`devicectl device info lockState`) wakes in a UI test
   with `XCUIDevice.shared.press(.home)` and a swipe up on the springboard; only a passcode needs
   the owner.
