@@ -16,7 +16,13 @@
 #   Rotate (signs everyone out): terraform apply -replace='random_bytes.lights_token_key', then
 #   scripts/workers-stage-secrets.sh lights, after a deploy has finished.
 
+# ORDER, as workers-stage.tf's URL switches: (1) apply with lights_phone_bypass = false: the Worker's
+# settings exist, nothing skips Access; run scripts/workers-stage-secrets.sh lights after a deploy, and
+# check the lights-stage /api/health reports accessCheck: verified and phoneSignIn: on. (2) Only then
+# set lights_phone_bypass = true and apply. Before its Access settings arrive, the Worker can only check
+# that an Access token header is present on its other routes, which a bypassed request could forge.
 locals {
+  lights_phone_bypass       = false
   lights_stage_bearer_paths = ["${local.lights_stage_hostname}/api/v1/*"]
 }
 
@@ -25,6 +31,7 @@ resource "random_bytes" "lights_token_key" {
 }
 
 resource "cloudflare_zero_trust_access_policy" "lights_stage_bearer_paths" {
+  count      = local.lights_phone_bypass ? 1 : 0
   account_id = var.cloudflare_account_id
   name       = "Lights staging: the phone's bearer-token paths (the Worker is the gate)"
   decision   = "bypass"
@@ -33,6 +40,7 @@ resource "cloudflare_zero_trust_access_policy" "lights_stage_bearer_paths" {
 
 # A more specific path wins over the hostname's application, so only /api/v1/* skips Access.
 resource "cloudflare_zero_trust_access_application" "lights_stage_bearer_paths" {
+  count        = local.lights_phone_bypass ? 1 : 0
   account_id   = var.cloudflare_account_id
   name         = "Lights staging: the phone's bearer-token paths"
   type         = "self_hosted"
@@ -41,7 +49,7 @@ resource "cloudflare_zero_trust_access_application" "lights_stage_bearer_paths" 
 
   policies = [
     {
-      id         = cloudflare_zero_trust_access_policy.lights_stage_bearer_paths.id
+      id         = cloudflare_zero_trust_access_policy.lights_stage_bearer_paths[0].id
       precedence = 1
     },
   ]

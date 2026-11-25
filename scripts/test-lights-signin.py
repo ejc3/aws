@@ -24,13 +24,22 @@ class AccessTests(unittest.TestCase):
         app = block(TF, "cloudflare_zero_trust_access_application", "lights_stage_bearer_paths")
         self.assertIn("domain       = local.lights_stage_bearer_paths[0]", app)
         self.assertIn('destinations = [for uri in local.lights_stage_bearer_paths : { type = "public", uri = uri }]', app)
-        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+\.id)", app),
-                         ["cloudflare_zero_trust_access_policy.lights_stage_bearer_paths.id"])
+        self.assertEqual(re.findall(r"id\s*=\s*(cloudflare_zero_trust_access_policy\.\w+\[0\]\.id)", app),
+                         ["cloudflare_zero_trust_access_policy.lights_stage_bearer_paths[0].id"])
         policy = block(TF, "cloudflare_zero_trust_access_policy", "lights_stage_bearer_paths")
         self.assertIn('decision   = "bypass"', policy)
         # The bypass is attached to this application only, and nothing names /native here.
-        self.assertEqual(EVERYTHING.count("cloudflare_zero_trust_access_policy.lights_stage_bearer_paths.id"), 1)
+        self.assertEqual(EVERYTHING.count("cloudflare_zero_trust_access_policy.lights_stage_bearer_paths[0].id"), 1)
         self.assertNotIn("native", TF.split("locals {")[1])
+
+
+class OrderTests(unittest.TestCase):
+    def test_the_bypass_waits_for_the_workers_access_check(self):
+        # Step 1 of lights-signin.tf's ORDER: nothing skips Access until the Worker verifies it.
+        self.assertRegex(TF, r"(?m)^  lights_phone_bypass\s*= false$")
+        for kind in ("cloudflare_zero_trust_access_policy", "cloudflare_zero_trust_access_application"):
+            self.assertIn("count      = local.lights_phone_bypass ? 1 : 0".replace("      ", " " * (6 if kind.endswith("policy") else 8)),
+                          block(TF, kind, "lights_stage_bearer_paths"))
 
 
 class KeyTests(unittest.TestCase):
