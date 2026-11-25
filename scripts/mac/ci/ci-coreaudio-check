@@ -7,7 +7,7 @@ from then on every process that touched CoreAudio blocked for good (WebKit's GPU
 device I/O), and every dolphin-labs native test run failed. Each run:
 
   1. asks CoreAudio for the default output device in a child process (this file with --probe). The child says
-     "ready" once CoreAudio is loaded, so a slow start under load is not counted: only the request itself has 10
+     "ready" once CoreAudio is loaded (it has 60 seconds for that), and only the request itself is then timed, at 10
      seconds (a real hang lasts for good). Any answer, an error status included, is alive. A probe that cannot start
      or exits without answering says nothing about coreaudiod: it never causes a restart, and is logged once;
   2. when it does not answer, kills coreaudiod (launchd starts it again on the next request) once no runner has a

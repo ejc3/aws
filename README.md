@@ -1831,7 +1831,8 @@ and stayed that way. From then on, every process that touched CoreAudio blocked 
 AVPlayer, CoreSimulator's device I/O. Every dolphin-labs native test run failed. The same install puts
 `ci-coreaudio-check` beside the disk cleaner and loads the root LaunchDaemon `com.ejcampbell.ci-coreaudio-check`
 (`/Library/LaunchDaemons`), every 5 minutes and at load. Each run asks CoreAudio for the default output device in a
-child process and waits 5 seconds; any answer counts as alive. When there is no answer, it kills `coreaudiod`
+child process. The child has 60 seconds to load CoreAudio and say it is ready, then the request itself has 10;
+any answer counts as alive, and a probe that fails is logged once and never causes a restart. When there is no answer, it kills `coreaudiod`
 (`killall -KILL`; launchd starts it again) once no runner has a job, or after 30 minutes of no answer even with a job
 running, since a job that touches audio is already stuck. It restarts at most once every 15 minutes, then asks again.
 It logs outcomes and minutes only, to `/Library/Logs/ci-coreaudio-check.log`.
