@@ -373,6 +373,8 @@ jobs:
 
       - name: run.cloud sessions left running are deleted, persistent and keep=true ones never, the key never logged (run-cloud-reaper Lambda)
         run: python3 -S -B scripts/test-run-cloud-reaper.py
+      - name: Alerts reach Telegram as one readable line, flapping alarms muted, inert until configured, the token never logged (alert-telegram Lambda)
+        run: python3 -S -B scripts/test-alert-telegram.py
 
       - name: "yourfantasymovie.com DNS (Fantasy Films): proxied records and routes to dolphin-films-prod, no switch, one zone"
         run: python3 -S -B scripts/test-yourfantasymovie.py
