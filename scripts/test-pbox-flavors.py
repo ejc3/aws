@@ -848,6 +848,49 @@ class ScriptRuns(unittest.TestCase):
                          ["c8gd.metal-24xl", "m8gd.metal-24xl"])
         self.assertEqual(self.launched_types(), [])
 
+    def test_min_memory_narrows_the_local_nvme_types_at_launch_and_in_capacity(self):
+        rc, _, err = self.pbox("up", "5", "kvm-96", "--local-nvme", "--min-memory", "384")
+        self.assertEqual(rc, 3, err)  # fake home is out of capacity
+        self.assertEqual(self.launched_types(), ["m8gd.metal-24xl"])
+        self.assertIn("up 5 kvm-96 --local-nvme --min-memory 384 --fallback", err)
+
+        rc, out, err = self.pbox("capacity", "5", "kvm-96", "--local-nvme", "--min-memory=384")
+        self.assertEqual(rc, 0, err)
+        [call] = [c for c in self.calls() if "get-spot-placement-scores" in c]
+        self.assertEqual(call[call.index("--instance-types") + 1:call.index("--query")], ["m8gd.metal-24xl"])
+
+        rc, _, err = self.pbox("up", "5", "kvm-192", "--local-nvme", "--min-memory", "768")
+        self.assertEqual(rc, 3, err)
+        self.assertEqual(self.launched_types()[-1:], ["m8gd.metal-48xl"])
+        # a floor every type meets changes nothing
+        rc, out, err = self.pbox("capacity", "5", "kvm-96", "--local-nvme", "--min-memory", "192")
+        self.assertEqual(rc, 0, err)
+        call = [c for c in self.calls() if "get-spot-placement-scores" in c][-1]
+        self.assertEqual(call[call.index("--instance-types") + 1:call.index("--query")],
+                         ["c8gd.metal-24xl", "m8gd.metal-24xl"])
+
+    def test_min_memory_is_refused_where_it_cannot_be_met_or_does_not_apply(self):
+        for args, text in (
+            (("up", "5", "kvm-96", "--local-nvme", "--min-memory", "512"), "has 512 GiB"),
+            (("up", "5", "kvm-96", "--min-memory", "384"), "--min-memory only applies with --local-nvme"),
+            (("up", "5", "general-96", "--min-memory", "384"), "--min-memory only applies with --local-nvme"),
+            (("up", "5", "kvm-96", "--local-nvme", "--min-memory", "lots"), "--min-memory needs a whole number of GiB"),
+            (("up", "5", "kvm-96", "--local-nvme", "--min-memory"), "--min-memory needs a whole number of GiB"),
+            (("status", "--min-memory", "384"), "--min-memory only applies with --local-nvme"),
+        ):
+            with self.subTest(args=args):
+                rc, _, err = self.pbox(*args)
+                self.assertEqual(rc, 2, err)
+                self.assertIn(text, err)
+                self.assertEqual(self.launched_types(), [])
+
+    def test_min_memory_leaves_a_smaller_occupied_slot_alone(self):
+        rc, out, err = self.pbox("up", "5", "kvm-96", "--local-nvme", "--min-memory", "384", running="c8gd.metal-24xl")
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("Refusing --local-nvme", err)
+        self.assertIn("c8gd.metal-24xl", err)
+        self.assertEqual(self.launched_types(), [])
+
     def test_local_nvme_on_kvm192_tries_only_its_nvme_types(self):
         rc, _, err = self.pbox("up", "5", "kvm-192", "--local-nvme")
         self.assertEqual(rc, 3, err)  # fake home is out of capacity
