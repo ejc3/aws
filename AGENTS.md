@@ -1881,6 +1881,9 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   role can publish the coordinator image and invoke the scoped release function.
 - **Quotas** (#605, #937): G and VT Spot (L-3819A6DF) reached 480 vCPUs in us-east-1 on 2026-11-21.
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
+  The renders host class draws on the Standard quotas instead: Terraform asks for 384 vCPUs of Standard Spot
+  (L-34B43A08) and of Standard on demand (L-1216C47A) in us-east-1 (`local.fcvm_fleet_standard_vcpus`). Their current
+  values are not recorded here; read them on the jumpbox before applying.
   The image factory's renders builder (one m8gd.metal-24xl at a time) draws on Standard on demand (L-1216C47A) in
   us-west-2; Terraform asks for 96 vCPUs there (`local.fcvm_fleet_factory_standard_vcpus`) and never lowers a larger value.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
@@ -1965,6 +1968,18 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   region without one. Only us-east-1 yet: the release gate's placement and a critical release's retirement of old-image
   hosts, and Windows, Minecraft and potato modes (a copy region's bootstrap and IPv4 ports serve the GPU slots and
   phones). Prod's image release refuses copy regions until it has a copy step of its own.
+- **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `m8gd.metal-24xl`
+  per stack while the fleet is awake, launched by the coordinator as a GPU host is (`FLEET_RENDERS_TEMPLATES`,
+  `FLEET_RENDERS_SUBNETS`). Its template (`fcvm-fleet-renders-arm64`, instances tagged `Purpose=fcvm-fleet-renders`),
+  security group (443 over both families, nothing else), role and profile (`fcvm-fleet-renders`: the certificate, the
+  agent token, its store's parts, Session Manager), policy (`fcvm-fleet-coordinator-renders`) and those variables exist only once
+  `/fcvm-fleet/ami-release-renders`, which the image factory's renders track publishes, names an image in us-east-1.
+  The renders track's publisher then moves the template onto each renders release; the pair's never touches it. The
+  boot writes the host's own `FLEET_AGENT_ARGS` to `/etc/fcvm-fleet/agent.env` and starts the image's
+  `fcvm-fleet-renders-agent.service`, which runs the agent as `ubuntu` with the image's `renders.env`. The boot passes
+  only what names the stack (`--dial`, `--access-secret`, `--tls-secret`, `--secret-region`, `--spot-notice-url`,
+  `--store-ready-file`); the image owns every frame-socket option that is the same on every renders host, including the
+  IPv6 prefix, and the renders role is in the staging certificate's resource policy.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile

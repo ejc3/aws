@@ -24,6 +24,14 @@
 #   $7.824 an hour in us-east-1, so 2 is $15.65 an hour. The account's on-demand G and VT quota there (L-DB2E81BA) is
 #   local.fcvm_fleet_on_demand_g_vcpus (fcvm-fleet-account.tf), shared with the on-demand EC2 tiles (4 vCPU each), the
 #   gpubox test hosts and the AMI builders; other workloads can exhaust the regional quota before a coordinator reaches its cap.
+# - The renders host class ("One VM per page", working id renders) is behind neither switch but behind its image: a
+#   CPU-only arm64 host of its own per stack (local.fcvm_fleet_renders_type), woken and put to sleep with the fleet, spot
+#   first and on demand when spot is refused, in us-east-1. Staging only. Nothing of it exists until the renders pointer
+#   (/fcvm-fleet/ami-release-renders, the image factory's renders track) names a renders image in us-east-1
+#   (local.fcvm_active_renders_amis, fcvm-fleet-ami-release.tf): no launch template, security group, role or instance
+#   profile, no fcvm-fleet-coordinator-renders policy, no FLEET_RENDERS_* variables, and the task role's type and
+#   Purpose lists as they were. An m8gd.metal-24xl is $5.53536 an hour on demand in us-east-1 (AWS Price List,
+#   2026-11-25).
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
 #   month; 4 vCPU and 8 GB, about $115, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
@@ -149,6 +157,11 @@ locals {
   fcvm_fleet_host_subnets = flatten([for r in local.fcvm_fleet_coordinator_host_regions.stage :
     [for s in local.fcvm_fleet_regional[r].host_subnet_ids : "${r}:${s}"]
   if contains(keys(local.fcvm_fleet_regional), r) && length(try(local.fcvm_fleet_regional[r].host_template_names, [])) > 0])
+  # The same for the renders host class (FLEET_RENDERS_TEMPLATES, FLEET_RENDERS_SUBNETS, in the same <region>:<name>
+  # form): its templates, and the subnets of the AZs that offer its type. Both empty until a renders image exists.
+  fcvm_fleet_renders_templates = flatten([for r, m in local.fcvm_fleet_regional : [for t in m.renders_template_names : "${r}:${t}"]])
+  fcvm_fleet_renders_subnets = flatten([for r, m in local.fcvm_fleet_regional : [for s in m.renders_subnet_ids : "${r}:${s}"]
+  if length(m.renders_template_names) > 0])
   # Whether the coordinator keeps its 8 EC2 tiles stopped between wakes and starts them at the next one (--ec2-pool,
   # ejc3/fcvm#1273) instead of launching them: a tile then reaches its first frame in about 16 s instead of 81 to 84 s.
   # Needs a coordinator image with --ec2-pool (an unknown flag stops the task). Standing cost: 8 stopped 32 GB gp3 root
@@ -202,7 +215,7 @@ locals {
   # fcvm changes reaches every region's group together.
   fcvm_fleet_ipv4_viewer_modes = {
     "us-east-1" = var.fcvm_fleet_extra_ipv4_viewer_ports_enabled ? [
-      for m in keys(local.fcvm_fleet_tls_port_ranges) : m if m != "aggregate" || local.fcvm_fleet_aggregated
+      for m in keys(local.fcvm_fleet_tls_port_ranges) : m if(m != "aggregate" || local.fcvm_fleet_aggregated) && m != "renders"
     ] : ["slot"]
     "us-east-2" = ["slot"]
     "us-west-2" = ["slot"]
@@ -234,6 +247,25 @@ locals {
     "--aggregate-port ${local.fcvm_fleet_aggregate_port}",
     "--aggregate-tls-port ${local.fcvm_fleet_aggregate_tls_port}",
   ] : []))
+
+  # The renders host class: its instance type, and the host's own agent arguments (FLEET_AGENT_ARGS in agent.env). The
+  # image's fcvm-fleet-renders-agent.service runs the agent as ubuntu with these, then the image's RENDERS_AGENT_ARGS
+  # (--renders, the placeholder --image and --base-port a host without GPU slots needs, --host-from-imds and the
+  # module's options) and RENDERS_FRAME_ARGS (ejc3/fcvm fleet/ami/renders/host-check.py agent-env; read after
+  # agent.env, so the boot cannot set it). The image owns every option that is the same on every renders host: the
+  # frame socket's listen ports, --publish-ip, --tls-publish-base, the certificate directory, --public-ipv4-from-imds and
+  # the IPv6 prefix (taken by a root oneshot unit in the image). The boot owns only what names the stack, each one
+  # spelled as in fcvm_fleet_host_agent_args (scripts/test-fcvm-fleet.py compares them). The agent refuses an option
+  # given twice, so none of the image's is here.
+  fcvm_fleet_renders_type = "m8gd.metal-24xl"
+  fcvm_fleet_renders_agent_args = join(" ", [
+    "--dial wss://${local.fcvm_dev_agent_path}",
+    "--access-secret ${aws_secretsmanager_secret.fcvm_fleet_agent_access.name}",
+    "--tls-secret ${data.aws_secretsmanager_secret_versions.fcvm_fleet_stage_tls.secret_name}",
+    "--secret-region ${local.fcvm_fleet_home_region}",
+    "--spot-notice-url http://169.254.169.254",
+    "--store-ready-file /var/lib/fcvm-fleet/store-ready",
+  ])
 
   # The coordinator's arguments (fcvm fleet/PROTOCOL.md, "Coordinator", "Running it"); its state bucket and key and its
   # host templates come from the task's environment. The fleet sleeps after 10 minutes with no viewer (every GPU host
@@ -530,6 +562,72 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_ssm" {
   policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+# The renders host's own role (modules/fcvm-fleet-region, "Renders hosts"), only once the class exists: the agents' Access
+# service token, the fleet certificate its frame socket serves with (fcvm_fleet_renders_agent_args), its store's parts
+# (ejc3/fcvm fleet/ami/host/s3-cat.py reads factory/<input>/renders/store/<part> with GetObject alone) and Session
+# Manager.
+locals {
+  fcvm_fleet_renders_enabled = length(lookup(local.fcvm_active_renders_amis, "us-east-1", {})) > 0
+}
+
+resource "aws_iam_role" "fcvm_fleet_renders" {
+  provider = aws.fcvm_fleet
+  count    = local.fcvm_fleet_renders_enabled ? 1 : 0
+  name     = "fcvm-fleet-renders"
+  lifecycle {
+    # The class is built in us-east-1 only (module.fcvm_fleet_east1), and that module hands the coordinator its
+    # templates only while us-east-1 is one of staging's coordinator host regions: elsewhere the template would exist
+    # and never launch.
+    precondition {
+      condition     = contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")
+      error_message = "The renders host class runs in us-east-1 and needs us-east-1 among staging's coordinator host regions (local.fcvm_fleet_host_regions.stage)."
+    }
+  }
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17"
+    Statement = [{ Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole" }]
+  })
+  tags = { Name = "fcvm-fleet-renders", Fleet = local.fcvm_fleet_stage.fleet }
+}
+
+resource "aws_iam_role_policy" "fcvm_fleet_renders" {
+  provider = aws.fcvm_fleet
+  count    = length(aws_iam_role.fcvm_fleet_renders)
+  name     = "fleet-renders"
+  role     = aws_iam_role.fcvm_fleet_renders[0].id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "ReadTheCertificateAndTheAgentToken"
+        Effect   = "Allow"
+        Action   = "secretsmanager:GetSecretValue"
+        Resource = [local.fcvm_fleet_secret_arn["tls"], local.fcvm_fleet_secret_arn["agent-access-token"]]
+      },
+      {
+        Sid      = "ReadTheRendersStore"
+        Effect   = "Allow"
+        Action   = "s3:GetObject"
+        Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/factory/*/renders/store/*"
+      },
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_renders_ssm" {
+  provider   = aws.fcvm_fleet
+  count      = length(aws_iam_role.fcvm_fleet_renders)
+  role       = aws_iam_role.fcvm_fleet_renders[0].name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "fcvm_fleet_renders" {
+  provider = aws.fcvm_fleet
+  count    = length(aws_iam_role.fcvm_fleet_renders)
+  name     = "fcvm-fleet-renders"
+  role     = aws_iam_role.fcvm_fleet_renders[0].name
+}
+
 resource "aws_iam_instance_profile" "fcvm_fleet_host" {
   provider = aws.fcvm_fleet
   name     = "fcvm-fleet-host"
@@ -656,6 +754,12 @@ module "fcvm_fleet_east1" {
   tile_profile_name         = aws_iam_instance_profile.fcvm_fleet_tile.name
   flow_log_destination      = "${aws_s3_bucket.fcvm_fleet_flow_logs.arn}/vpc-flow"
   flow_log_bucket_policy_id = aws_s3_bucket_policy.fcvm_fleet_flow_logs.id
+  # The renders host class, in this region only: nothing until the renders pointer names its image here.
+  renders_amis                      = lookup(local.fcvm_active_renders_amis, "us-east-1", {})
+  renders_release_parameter_version = one(ephemeral.aws_ssm_parameter.fcvm_ami_renders_release_guard[*].version)
+  renders_agent_args                = local.fcvm_fleet_renders_agent_args
+  renders_instance_type             = local.fcvm_fleet_renders_type
+  renders_profile_name              = one(aws_iam_instance_profile.fcvm_fleet_renders[*].name)
 }
 
 locals {
@@ -699,6 +803,17 @@ locals {
   fcvm_fleet_host_types              = ["g4dn.metal", "g5g.metal"]
   # CreateFleet authorizes the fleet and its newly created instances/volumes separately from the resources in the
   # launch template (those still need RunInstances). Keep instance-only conditions off fleet and volume resources.
+  # The renders host class: what its templates launch and what a launch of one may reference (the subnets that offer
+  # its type, the fleet's group, the templates; its image is authorized by kind in the class's own policy). Every list
+  # is empty until a renders template exists, so until then the task role's inline policy renders as it did.
+  fcvm_fleet_renders_template_arns = flatten([for m in values(local.fcvm_fleet_regional) : m.renders_template_arns])
+  fcvm_fleet_renders_referenced_arns = concat(
+    flatten([for r, m in local.fcvm_fleet_regional : [for s in m.renders_subnet_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:subnet/${s}"] if length(m.renders_template_names) > 0]),
+    flatten([for r, m in local.fcvm_fleet_regional : [for g in m.renders_security_group_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${g}"] if length(m.renders_template_names) > 0]),
+    local.fcvm_fleet_renders_template_arns,
+  )
+  fcvm_fleet_renders_types      = distinct(flatten([for m in values(local.fcvm_fleet_regional) : m.renders_types]))
+  fcvm_fleet_renders_purposes   = length(local.fcvm_fleet_renders_templates) > 0 ? ["fcvm-fleet-renders"] : []
   fcvm_fleet_host_fleet_arns    = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:fleet/*"]
   fcvm_fleet_host_instance_arns = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:instance/*"]
   fcvm_fleet_host_volume_arns   = [for r in local.fcvm_fleet_regions : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:volume/*"]
@@ -1048,12 +1163,13 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
       {
         # A launch from a template can still override the instance type: only the fleet's four types, whatever the
-        # request says, and each template only its own kind (below).
+        # request says, and each template only its own kind (below). A fifth, the renders host's, once a renders
+        # template exists; fcvm-fleet-coordinator-renders holds that template to it.
         Sid       = "FleetTypesOnly"
         Effect    = "Deny"
         Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:*:*:instance/*"
-        Condition = { StringNotEquals = { "ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types) } }
+        Condition = { StringNotEquals = { "ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types, local.fcvm_fleet_renders_types) } }
       },
       {
         Sid      = "TileTemplatesLaunchTileTypesOnly"
@@ -1077,12 +1193,12 @@ resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task" {
       },
       {
         # The instance a launch creates must carry Purpose=fcvm-fleet-tile or fcvm-fleet-host, which is what termination
-        # is limited to.
+        # is limited to (or fcvm-fleet-renders, once a renders template exists; fcvm-fleet-coordinator-renders).
         Sid       = "FleetInstancesAreTagged"
         Effect    = "Deny"
         Action    = "ec2:RunInstances"
         Resource  = "arn:aws:ec2:*:*:instance/*"
-        Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"] } }
+        Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = concat(["fcvm-fleet-tile", "fcvm-fleet-host"], local.fcvm_fleet_renders_purposes) } }
       },
       {
         # These keys exist on RunInstances instances, not the generic CreateFleet parent or volumes/interfaces.
@@ -1252,6 +1368,108 @@ resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_java" {
   count      = length(aws_iam_policy.fcvm_fleet_coordinator_java)
   role       = aws_iam_role.fcvm_fleet_coordinator_task.name
   policy_arn = aws_iam_policy.fcvm_fleet_coordinator_java[count.index].arn
+}
+
+# The renders host class (modules/fcvm-fleet-region, "Renders hosts"), for the staging coordinator, and only once a
+# renders template exists. A managed policy, because the task role's inline policy is at its size limit. The shape is
+# the GPU hosts': the coordinator launches the class with CreateFleet, whose parent authorization the inline policy
+# already gives for every fleet region (LaunchHostsAsInstantFleets, LaunchFleetInstancesInFleetRegionsOnly), and whose
+# instances, volumes and interfaces are authorized as RunInstances through the class's templates only. Two inline denies
+# admit the class beside these (FleetTypesOnly, FleetInstancesAreTagged, by local.fcvm_fleet_renders_types and
+# local.fcvm_fleet_renders_purposes), and the stack's scope policy below adds Fleet = stage to the launch and the
+# terminate. It passes the class's own role (fcvm-fleet-renders), whose profile the template uses.
+resource "aws_iam_policy" "fcvm_fleet_coordinator_renders" {
+  provider    = aws.fcvm_fleet
+  count       = length(local.fcvm_fleet_renders_templates) > 0 ? 1 : 0
+  name        = "fcvm-fleet-coordinator-renders"
+  description = "The staging fleet coordinator launches and terminates renders hosts through their templates only."
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        # Created resources: only through a renders template, in the fleet regions.
+        Sid       = "LaunchRendersFromTheirTemplates"
+        Effect    = "Allow"
+        Action    = "ec2:RunInstances"
+        Resource  = local.fcvm_fleet_tile_created_arns
+        Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns } }
+      },
+      {
+        # Referenced resources: exactly the subnets that offer the type, the fleet's group and the renders templates,
+        # for both authorization actions (IfExists as in LaunchHostsWithTheirOwnResources).
+        Sid       = "LaunchRendersWithTheirOwnResources"
+        Effect    = "Allow"
+        Action    = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Resource  = local.fcvm_fleet_renders_referenced_arns
+        Condition = { ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns } }
+      },
+      {
+        # Its image by kind, as ValidatedHostImagesOnly admits a host's (fcvm-fleet-ami-release.tf): owned, private,
+        # validated, carrying the reviewed guard, and tagged FleetImageKind = renders, so a renders template cannot
+        # launch a host or tile image and a host or tile template cannot launch this one.
+        Sid      = "ValidatedRendersImagesOnly"
+        Effect   = "Allow"
+        Action   = ["ec2:RunInstances", "ec2:CreateFleet"]
+        Resource = [for region in local.fcvm_fleet_regions : "arn:aws:ec2:${region}::image/*"]
+        Condition = {
+          StringEquals = {
+            "ec2:Owner"                           = local.fcvm_fleet_account_id
+            "ec2:ResourceTag/Purpose"             = "fcvm-fleet"
+            "ec2:ResourceTag/FleetImageKind"      = "renders"
+            "ec2:ResourceTag/FleetImageValidated" = "true"
+            "ec2:ResourceTag/GuardHelperSHA256"   = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+          }
+          Bool            = { "ec2:Public" = "false" }
+          ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns }
+        }
+      },
+      {
+        # A renders template launches the class's type only. HostTemplatesLaunchHostTypesOnly and
+        # TileTemplatesLaunchTileTypesOnly (inline) keep the GPU templates from launching it.
+        Sid      = "RendersTemplatesLaunchRendersTypesOnly"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns }
+          StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_renders_types }
+        }
+      },
+      {
+        Sid      = "RendersTemplatesAreTaggedRendersOnly"
+        Effect   = "Deny"
+        Action   = "ec2:RunInstances"
+        Resource = "arn:aws:ec2:*:*:instance/*"
+        Condition = {
+          ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns }
+          StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-renders" }
+        }
+      },
+      {
+        # The class's own role, for its template's profile, and no other through this policy.
+        Sid       = "PassTheRendersRoleOnly"
+        Effect    = "Allow"
+        Action    = "iam:PassRole"
+        Resource  = aws_iam_role.fcvm_fleet_renders[*].arn
+        Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }
+      },
+      {
+        Sid       = "TerminateRendersInstancesOnly"
+        Effect    = "Allow"
+        Action    = "ec2:TerminateInstances"
+        Resource  = "arn:aws:ec2:*:*:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-renders", "aws:RequestedRegion" = local.fcvm_fleet_regions } }
+      },
+    ]
+  })
+  tags = { Fleet = local.fcvm_fleet_stage.fleet }
+}
+
+resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_renders" {
+  provider   = aws.fcvm_fleet
+  count      = length(aws_iam_policy.fcvm_fleet_coordinator_renders)
+  role       = aws_iam_role.fcvm_fleet_coordinator_task.name
+  policy_arn = aws_iam_policy.fcvm_fleet_coordinator_renders[count.index].arn
 }
 
 # Each stack's coordinator acts only on its own stack (ejc3/fcvm fleet production plan, invariant I2): the task role's
@@ -1430,6 +1648,13 @@ resource "aws_ecs_task_definition" "fcvm_fleet_coordinator" {
         # The Lambda lane a release set (fcvm-fleet-ci.tf, /fcvm-fleet/stage/lambda-image); absent while it is none.
         ], [for lane in [nonsensitive(aws_ssm_parameter.fcvm_coordinator_lane.value)] :
         { name = "FLEET_LAMBDA_IMAGE", value = lane } if lane != "none"
+        # The renders host class's templates and subnets, in the host variables' form. Environment, not arguments, for
+        # the same reason. Absent while the class has no template, so until then the task definition is as it was and
+        # an apply of this file does not replace the running coordinator.
+        ], [for v in [
+          { name = "FLEET_RENDERS_TEMPLATES", value = join(",", local.fcvm_fleet_renders_templates) },
+          { name = "FLEET_RENDERS_SUBNETS", value = join(",", local.fcvm_fleet_renders_subnets) },
+        ] : v if v.value != ""
       ])
       logConfiguration = {
         logDriver = "awslogs"
@@ -1552,6 +1777,7 @@ output "fcvm_fleet_infra" {
     cluster            = aws_ecs_cluster.fcvm_fleet.name
     coordinator_repo   = aws_ecr_repository.fcvm_fleet_coordinator.repository_url
     host_templates     = local.fcvm_fleet_host_templates
+    renders_templates  = local.fcvm_fleet_renders_templates
     on_demand_max      = local.fcvm_fleet_on_demand_max
     coordinator_on     = local.fcvm_fleet_coordinator_running
     tile_template_arns = local.fcvm_fleet_tile_template_arns

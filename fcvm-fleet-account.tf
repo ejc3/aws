@@ -16,7 +16,8 @@
 #   and invoke the image-only release function (fcvm-fleet-ci.tf). Only that function assumes the scoped release role;
 #   neither has Terraform-state or reusable-credential access.
 # - Quotas (ejc3/aws#605, #913): 480 vCPU of G spot in us-east-1 (production's two hosts and a replacement, staging's
-#   host and an image-factory build host); one region is enough.
+#   host and an image-factory build host); one region is enough. 384 vCPU of Standard spot and of Standard on demand
+#   there for the renders host class (fcvm-fleet.tf), a CPU-only type outside the G quotas.
 #   96 vCPU of Standard on demand in us-west-2 for the image factory's renders builder (fcvm-fleet-ami-pipeline.tf).
 #
 # First apply: the provider aliases need the account id, so apply the account first
@@ -39,6 +40,14 @@ locals {
   # whose Managed Instances are on-demand g4dn.xlarge in this account (fcvm-fleet-lambda.tf, 48 vCPUs a stack).
   fcvm_fleet_on_demand_g_base_vcpus = 768
   fcvm_fleet_on_demand_g_vcpus      = local.fcvm_fleet_on_demand_g_base_vcpus + 2 * local.fcvm_lambda_max_vcpus
+  # Standard (A, C, D, H, I, M, R, T, Z) vCPUs in us-east-1 for the renders host class (fcvm-fleet.tf, m8gd.metal-24xl,
+  # 96 vCPUs): one host per stack while its fleet is awake (staging and production, 2 x 96 = 192), and per stack the
+  # replacement that overlaps a host while a spot interruption drains it (2 x 96 = 192). 384, for each market: the
+  # coordinator tries spot first and takes the host or its replacement on demand when spot is refused, so either quota
+  # can hold all four. Nothing for the image factory: its builders and verifiers launch on demand in us-west-2
+  # (fcvm-fleet-ami-pipeline.tf, local.fcvm_ami_build_region), on that region's quotas. Nothing else in this account
+  # launches a Standard type in us-east-1 from this repository.
+  fcvm_fleet_standard_vcpus = 384
   # Standard on-demand vCPUs in us-west-2 for the image factory's renders track (fcvm-fleet-ami-pipeline.tf): one
   # m8gd.metal-24xl (96 vCPUs) at a time, since the renders validator launches only after the renders builder has
   # terminated, and the renders project runs one build at a time. The pair's builders are G and do not draw on it.
@@ -673,6 +682,39 @@ resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
     ? local.fcvm_fleet_on_demand_g_base_vcpus
     : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted)
   )
+}
+
+# The renders host class's quotas (local.fcvm_fleet_standard_vcpus): "All Standard (A, C, D, H, I, M, R, T, Z) Spot
+# Instance Requests" (L-34B43A08) and "Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances" (L-1216C47A).
+# The account's current values are not recorded in this repository: read both before the first apply
+# (aws service-quotas get-service-quota --service-code ec2 --quota-code L-1216C47A --region us-east-1, and L-34B43A08).
+# Where the value is below 384 the apply files an increase request, which AWS grants, partly grants or denies in its
+# own time; the data source is the effective quota, and a larger grant is never lowered. AWS accepts one open
+# increase per quota, so an apply fails on a quota that already has one open.
+data "aws_servicequotas_service_quota" "fcvm_fleet_spot_standard_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-34B43A08"
+}
+
+resource "aws_servicequotas_service_quota" "fcvm_fleet_spot_standard_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-34B43A08"
+  value        = max(local.fcvm_fleet_standard_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_spot_standard_east1.value)
+}
+
+data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-1216C47A"
+}
+
+resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_east1" {
+  provider     = aws.fcvm_fleet_east1
+  service_code = "ec2"
+  quota_code   = "L-1216C47A"
+  value        = max(local.fcvm_fleet_standard_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_standard_east1.value)
 }
 
 # The renders track's builder quota (local.fcvm_fleet_factory_standard_vcpus): "Running On-Demand Standard (A, C, D, H, I,

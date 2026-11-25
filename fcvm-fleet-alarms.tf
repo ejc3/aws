@@ -33,12 +33,13 @@ locals {
     }
     "fcvm-fleet-coordinator-degraded" = {
       metric = "CoordinatorDegraded"
-      # The failures that put the coordinator's `scale` component in its degraded set (hosts.rs) and its `text_check`
+      # The failures that put the coordinator's `scale` component (GPU hosts) or `scale-renders` component (the renders
+      # host) in its degraded set (hosts.rs, one line per host class: "GPU host" or "renders host") and its `text_check`
       # component (text_check.rs). A spot capacity refusal is not one of them: that is "spot launch refused".
-      pattern     = "?\"listing the GPU hosts failed\" ?\"terminating GPU hosts failed\" ?\"launching GPU hosts failed\" ?\"EC2 refused a GPU host launch\" ?\"asking a lost GPU host launch again failed\" ?\"text check failed\""
+      pattern     = "?\"listing the GPU hosts failed\" ?\"terminating GPU hosts failed\" ?\"launching GPU hosts failed\" ?\"EC2 refused a GPU host launch\" ?\"asking a lost GPU host launch again failed\" ?\"listing the renders hosts failed\" ?\"terminating renders hosts failed\" ?\"launching renders hosts failed\" ?\"EC2 refused a renders host launch\" ?\"asking a lost renders host launch again failed\" ?\"text check failed\""
       periods     = 2
       ok          = true
-      description = "The coordinator has reported a degraded state for 10 minutes: GPU host listing, launch or termination is failing, or the viewer word check is. Hosts may not wake, or may keep running while the fleet sleeps. Read /ecs/fcvm-fleet-coordinator; the budget backstop (fcvm-fleet-budget.tf) also shows up here as failing launches."
+      description = "The coordinator has reported a degraded state for 10 minutes: GPU host or renders host listing, launch or termination is failing, or the viewer word check is. Hosts may not wake, or may keep running while the fleet sleeps. Read /ecs/fcvm-fleet-coordinator; the budget backstop (fcvm-fleet-budget.tf) also shows up here as failing launches."
     }
     "fcvm-fleet-certificate-renewal-failed" = {
       metric = "CertificateRenewalFailed"

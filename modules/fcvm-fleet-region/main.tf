@@ -22,6 +22,17 @@
 #   g4dn.metal, and a spot launch there failed with InvalidFleetConfiguration (2026-10-24).
 # - EC2 tiles: a launch template per architecture (g4dn.xlarge, g5g.xlarge) with one IPv6 address; no group, since the
 #   coordinator launches and terminates tiles itself (its task role is limited to these templates).
+# - Renders hosts (optional, off by default): a second host class for the "One VM per page" mode, a CPU-only arm64 metal
+#   host (var.renders_instance_type) of its own, so the mode's VMs have a whole host's cores and its vCPUs count against
+#   the Standard quotas (fcvm-fleet-account.tf), not the G quota the GPU hosts share. It exists only where var.renders_amis
+#   names an arm64 image (the renders image's own pointer, /fcvm-fleet/ami-release-renders): a launch template
+#   <prefix>-renders-arm64 with an instance profile (var.renders_profile_name) and a security group (443 only, both
+#   families) of its own, the GPU host's public IPv4 address, delegated IPv6 /80 and IMDSv2 hop limit, its own user data
+#   (the image's fcvm-fleet-renders-agent.service, started with var.renders_agent_args in agent.env), and
+#   Purpose = fcvm-fleet-renders on its instances, so the coordinator finds, counts, meters and terminates this class
+#   apart from the GPU hosts. The coordinator launches it as it launches a GPU host (outputs renders_template_names,
+#   renders_subnet_ids). Its template is not in output image_templates, the pair's: the image publisher's renders
+#   track moves it onto each renders release (output renders_image_templates), and Terraform reads the same pointer.
 # - Stack: every template, and every instance and spot request one launches, is tagged Fleet = var.fleet. A stack's
 #   coordinator may act only on instances and spot requests that carry its own Fleet tag (fcvm-fleet.tf,
 #   aws_iam_policy.fcvm_fleet_stack_scope). The network's names and security groups carry var.name_prefix too, so a second
@@ -116,6 +127,48 @@ variable "host_agent_args" {
   description = "The host agent's arguments (fcvm fleet agent, FLEET_AGENT_ARGS in /etc/fcvm-fleet/agent.env); empty leaves the agent off"
   type        = string
   default     = ""
+}
+
+variable "renders_amis" {
+  description = "The renders host AMI per architecture in this region (arm64 only); empty leaves the class out: no template, no outputs"
+  type        = map(string)
+  default     = {}
+
+  validation {
+    condition     = alltrue([for arch, ami in var.renders_amis : arch == "arm64" && (ami == "" || can(regex("^ami-[0-9a-f]{17}$", ami)))])
+    error_message = "renders_amis takes an arm64 key only, holding an exact EC2 AMI ID or an empty string."
+  }
+}
+
+variable "renders_agent_args" {
+  description = "The renders host agent's arguments (fcvm fleet agent, FLEET_AGENT_ARGS in /etc/fcvm-fleet/agent.env); empty leaves the agent off"
+  type        = string
+  default     = ""
+
+  # The boot script writes the value inside single quotes.
+  validation {
+    condition     = can(regex("^[A-Za-z0-9 ._:/=,@+-]*$", var.renders_agent_args))
+    error_message = "renders_agent_args must be plain space-separated arguments (letters, digits and . _ : / = , @ + -)."
+  }
+}
+
+variable "renders_profile_name" {
+  description = "The renders host's instance profile; only its template uses it"
+  type        = string
+  default     = null
+}
+
+variable "renders_release_parameter_version" {
+  description = "Ephemeral version from the renders pointer's guard; only the renders template awaits it"
+  type        = number
+  ephemeral   = true
+  default     = null
+}
+
+variable "renders_instance_type" {
+  description = "The renders host's instance type: arm64 metal without a GPU"
+  type        = string
+  default     = "m8gd.metal-24xl"
 }
 
 variable "potato_host_amis" {
@@ -214,7 +267,7 @@ data "aws_region" "current" {}
 # A public listener may resume before cloud-init. Admit only images with the
 # persistent reviewed guard, including every nonempty caller-supplied override.
 data "aws_ami" "guarded" {
-  for_each = toset(compact(concat(values(var.gpu_amis), values(var.tile_amis))))
+  for_each = toset(compact(concat(values(var.gpu_amis), values(var.tile_amis), values(var.renders_amis))))
   owners   = ["self"]
   filter {
     name   = "image-id"
@@ -258,6 +311,15 @@ data "aws_ec2_instance_type_offerings" "host" {
   }
 }
 
+data "aws_ec2_instance_type_offerings" "renders" {
+  for_each      = toset(local.renders_archs)
+  location_type = "availability-zone"
+  filter {
+    name   = "instance-type"
+    values = [local.renders_types[each.key]]
+  }
+}
+
 locals {
   region = data.aws_region.current.region
   azs    = sort(data.aws_availability_zones.available.names)
@@ -271,6 +333,13 @@ locals {
   host_subnets = [for az in local.host_azs : aws_subnet.public[az].id if contains(local.azs, az)]
   # Whether the coordinator launches hosts here: enabled and an AMI exists.
   hosts_on = var.hosts_enabled && length(local.host_archs) > 0
+  # The renders class: one arm64 type, a template only where its AMI exists, launched only in the subnets of the AZs
+  # that offer the type, and handed to the coordinator behind the same gate as the GPU hosts.
+  renders_types   = { arm64 = var.renders_instance_type }
+  renders_archs   = [for a in sort(keys(local.renders_types)) : a if try(var.renders_amis[a], "") != ""]
+  renders_azs     = sort(distinct(flatten([for o in data.aws_ec2_instance_type_offerings.renders : o.locations])))
+  renders_subnets = [for az in local.renders_azs : aws_subnet.public[az].id if contains(local.azs, az)]
+  renders_on      = var.hosts_enabled && length(local.renders_archs) > 0
   # The subnet a tile launches in when the launch names none. The coordinator names each fleet subnet in turn
   # (FLEET_EC2_SUBNETS, fcvm-fleet.tf); an image older than that launches from the template alone, and an interface
   # without a subnet lands in the default VPC, where the fleet's security group does not exist and the task role may
@@ -400,6 +469,26 @@ locals {
     printf '[Service]\nEnvironment=FLEET_TLS_SECRET=%s\nExecStartPost=/usr/bin/systemctl --no-block start fcvm-fleet-nginx.service\n' '${var.tile_tls_secret}' > /etc/systemd/system/fcvm-fleet-tls.service.d/10-fleet-stack.conf
     systemctl daemon-reload
     systemctl restart --no-block fcvm-fleet-tls.service
+    %{endif~}
+  EOT
+  )
+  # The renders host boots with the GPU host's guard and none of its modes. The image's own unit,
+  # fcvm-fleet-renders-agent.service (ejc3/fcvm fleet/ami/renders), runs `fcvm fleet agent $FLEET_AGENT_ARGS
+  # $RENDERS_AGENT_ARGS $RENDERS_FRAME_ARGS` as ubuntu once /etc/fcvm-fleet/agent.env exists; the image writes the
+  # other two into /etc/fcvm-fleet/renders.env at build, and that file, read after agent.env, sets RENDERS_FRAME_ARGS
+  # itself. So the boot writes FLEET_AGENT_ARGS, the host's own arguments, and nothing else. The unit is enabled in the
+  # image but skipped at a first boot whose user data has not run yet, so the boot starts it. A local of its own, so
+  # local.user_data, whose digest the image publisher pins (output host_user_data_sha256), is not touched.
+  renders_user_data = base64encode(<<-EOT
+    #!/bin/bash
+    set -eu
+    ${var.ip_options_bootstrap}
+    echo "fcvm-fleet renders host booted $(date -u +%FT%TZ)" > /var/log/fcvm-fleet-boot.log
+    %{if var.renders_agent_args != ""~}
+    install -d -m 0755 /etc/fcvm-fleet
+    agent_args='${var.renders_agent_args}'
+    printf 'FLEET_AGENT_ARGS=%s\n' "$agent_args" > /etc/fcvm-fleet/agent.env
+    systemctl start --no-block fcvm-fleet-renders-agent.service
     %{endif~}
   EOT
   )
@@ -579,6 +668,88 @@ resource "aws_launch_template" "host" {
     precondition {
       condition     = length(local.user_data) * 3 / 4 - length(regex("=*$", local.user_data)) <= 16384
       error_message = "The Fleet host startup script exceeds EC2's 16 KiB user-data limit."
+    }
+  }
+}
+
+# ------------------------------------------------------------------------------------------------ renders hosts
+# The renders host's own group: viewers reach its frame socket on 443 over both families (IPv4 through the agent's front
+# on the host's own address, IPv6 at <prefix>::1, ejc3/fcvm fleet/PROTOCOL.md, "The frame socket"). Nothing else in:
+# not the GPU slots' per-place IPv4 ports the fleet group admits, and not the renders frame socket's own IPv4 port
+# behind the front. Only where the class exists.
+resource "aws_security_group" "renders" {
+  depends_on  = [data.aws_ami.guarded]
+  count       = length(local.renders_archs) > 0 ? 1 : 0
+  name        = "${var.name_prefix}-renders"
+  description = "fcvm fleet renders hosts: TCP 443 in from anywhere, nothing else in"
+  vpc_id      = aws_vpc.this.id
+
+  ingress {
+    description      = "HTTPS"
+    from_port        = 443
+    to_port          = 443
+    protocol         = "tcp"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  egress {
+    description      = "All outbound"
+    from_port        = 0
+    to_port          = 0
+    protocol         = "-1"
+    cidr_blocks      = ["0.0.0.0/0"]
+    ipv6_cidr_blocks = ["::/0"]
+  }
+
+  tags = { Name = "${var.name_prefix}-renders", Fleet = var.fleet }
+}
+
+# The GPU host's template without a GPU: its public IPv4 address, delegated IPv6 /80 and IMDSv2 hop limit, with the
+# class's own profile and group. No Minecraft group. The root volume is the AMI's as it is (128 GiB at build): no
+# initialization rate has been measured for this class. Its image is the renders pointer's, rechecked at apply time.
+resource "aws_launch_template" "renders" {
+  depends_on             = [var.renders_release_parameter_version]
+  update_default_version = true
+  for_each               = toset(local.renders_archs)
+  name                   = "${var.name_prefix}-renders-${each.key}"
+  description            = "fcvm fleet renders host, ${each.key} (${local.renders_types[each.key]}): CPU only, a delegated IPv6 /80, IMDSv2 hop 1"
+  image_id               = var.renders_amis[each.key]
+  instance_type          = local.renders_types[each.key]
+  user_data              = local.renders_user_data
+
+  iam_instance_profile {
+    name = var.renders_profile_name
+  }
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  network_interfaces {
+    device_index                = 0
+    security_groups             = [aws_security_group.renders[0].id]
+    associate_public_ip_address = true
+    ipv6_prefix_count           = 1
+    delete_on_termination       = true
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "fcvm-fleet-renders", Purpose = "fcvm-fleet-renders", Fleet = var.fleet }
+  }
+
+  tags = { Name = "${var.name_prefix}-renders-${each.key}", Fleet = var.fleet }
+
+  lifecycle {
+    ignore_changes = [description]
+
+    # EC2 counts decoded bytes, not the base64 length or Unicode characters.
+    precondition {
+      condition     = length(local.renders_user_data) * 3 / 4 - length(regex("=*$", local.renders_user_data)) <= 16384
+      error_message = "The Fleet renders host startup script exceeds EC2's 16 KiB user-data limit."
     }
   }
 }
@@ -890,4 +1061,34 @@ output "alert_topic_arns" {
 
 output "host_types" {
   value = [for a in local.host_archs : local.host_types[a]]
+}
+
+# The renders class, as the coordinator is given it (FLEET_RENDERS_TEMPLATES, FLEET_RENDERS_SUBNETS) and as its task
+# role is limited to it: empty unless the gate is on and the class has an AMI here.
+output "renders_template_names" {
+  value = local.renders_on ? [for a in local.renders_archs : aws_launch_template.renders[a].name] : []
+}
+
+output "renders_template_arns" {
+  value = local.renders_on ? [for t in aws_launch_template.renders : t.arn] : []
+}
+
+output "renders_subnet_ids" {
+  value = local.renders_subnets
+}
+
+# The renders class's own group, which a launch from its template references (the coordinator's role names it).
+output "renders_security_group_ids" {
+  value = [for g in aws_security_group.renders : g.id]
+}
+
+# The renders templates the image publisher's renders track moves onto each renders release (fcvm-fleet-ami-pipeline.tf,
+# local.fcvm_ami_renders_templates), whether or not the coordinator is given them.
+output "renders_image_templates" {
+  value = [for arch, template in aws_launch_template.renders : { region = local.region, id = template.id, kind = "renders", arch = arch }]
+}
+
+# The types those templates launch: what the coordinator's task role admits for this class.
+output "renders_types" {
+  value = local.renders_on ? [for a in local.renders_archs : local.renders_types[a]] : []
 }

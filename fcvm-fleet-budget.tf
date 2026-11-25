@@ -9,10 +9,10 @@
 # times a day and which can lag a day, so by the time this budget sees $750 for a day the fleet has spent more, and an
 # overrun late in a UTC day may only be seen the next day. It cannot be the only limit.
 #
-# - Scope: costs tagged Purpose=fcvm-fleet-host or Purpose=fcvm-fleet-tile, the tags every host and tile launch template
-#   puts on its instance (modules/fcvm-fleet-region), split by the Fleet tag every template also puts there: prod's
-#   budget counts Fleet=prod, staging's everything else (so an instance without a Fleet tag still counts against
-#   staging, as before the split). The gpubox test hosts (Purpose=fcvm-fleet-gpubox) and the AMI
+# - Scope: costs tagged Purpose=fcvm-fleet-host, fcvm-fleet-tile or fcvm-fleet-renders, the tags every host, tile and
+#   renders host launch template puts on its instance (modules/fcvm-fleet-region), split by the Fleet tag every template
+#   also puts there: prod's budget counts Fleet=prod, staging's everything else (so an instance without a Fleet tag
+#   still counts against staging, as before the split). The gpubox test hosts (Purpose=fcvm-fleet-gpubox) and the AMI
 #   builders (fcvm-fleet-ami-build) run in the same account, so an account-wide budget would stop the wall for their
 #   spend. Not counted: the coordinator's Fargate task, the DNS load balancer, S3, Bedrock and the hosts' and tiles'
 #   untagged EBS volumes, together a few dollars a day.
@@ -30,7 +30,7 @@
 
 locals {
   fcvm_fleet_daily_budget_usd = 750
-  fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]
+  fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-renders"]
   # The Fleet tags of the stacks other than staging: staging's budget counts what carries none of them.
   fcvm_fleet_budget_other_fleets = [for k, s in local.fcvm_fleet_stacks : s.fleet if k != "stage"]
   # Keep enforcing the existing budget while the new stage-only budget accumulates billing history.

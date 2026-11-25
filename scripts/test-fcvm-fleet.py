@@ -98,7 +98,7 @@ class NetworkTests(unittest.TestCase):
     def test_ipv4_opening_requires_all_supplied_images_to_have_the_private_reviewed_guard(self):
         self.assertIn('data "aws_ami" "guarded"', MOD, "Public IPv4 requires AMI guard admission first")
         admitted = block('data "aws_ami" "guarded"', MOD)
-        self.assertRegex(admitted, r"for_each\s*=\s*toset\(compact\(concat\(values\(var.gpu_amis\), values\(var.tile_amis\)\)\)\)")
+        self.assertRegex(admitted, r"for_each\s*=\s*toset\(compact\(concat\(values\(var.gpu_amis\), values\(var.tile_amis\), values\(var.renders_amis\)\)\)\)")
         self.assertRegex(admitted, r'owners\s*=\s*\["self"\]')
         validated = re.search(r'  dynamic "filter" \{\n.*?\n  \}', admitted, re.S)
         self.assertIsNotNone(validated)
@@ -786,9 +786,10 @@ class HealthAlarmTests(unittest.TestCase):
         """The coordinator filters match log calls from the staging image. CI verifies the excerpts at their source."""
         phrases = {
             "fcvm-fleet-state-not-written": ["state not written", "the last state was not stored"],
-            "fcvm-fleet-coordinator-degraded": ["listing the GPU hosts failed", "terminating GPU hosts failed",
-                                                "launching GPU hosts failed", "EC2 refused a GPU host launch",
-                                                "asking a lost GPU host launch again failed", "text check failed"],
+            # Both host classes' scale components (`scale`, `scale-renders`), then the text check.
+            "fcvm-fleet-coordinator-degraded": [p.replace("NOUN", noun) for noun in ("GPU host", "renders host") for p in (
+                "listing the NOUNs failed", "terminating NOUNs failed", "launching NOUNs failed", "EC2 refused a NOUN launch",
+                "asking a lost NOUN launch again failed")] + ["text check failed"],
             "fcvm-fleet-certificate-renewal-failed": ["certificate renewal failed", "the renewed certificate was not stored",
                                                       "the certificate secret could not be read"],
             "fcvm-fleet-tunnel-down": ["Serve tunnel error", "Unable to establish connection", "Retrying connection in up to"],
@@ -801,11 +802,17 @@ class HealthAlarmTests(unittest.TestCase):
         self.assertFalse([l for l in ALARMS.splitlines() if "pattern" in l and "spot launch refused" in l])
         revision, source = (ROOT / "scripts/fixtures/fcvm-coordinator-log-lines.txt").read_text().split("\n", 1)
         self.assertRegex(revision, r"^[0-9a-f]{40}$")
+        # hosts.rs words its host-class lines from the class's noun ("listing the {}s failed", cfg.class.noun()), so a
+        # phrase is a string literal's start, or a template's with each noun the fixture pins (HostClass::... => "...").
+        nouns = re.findall(r'HostClass::\w+ => "([^"]+)"', source)
+        self.assertEqual(nouns, ["GPU host", "renders host"])
+        written = [t.replace("{}", noun) for t in re.findall(r'"([^"]*\{\}[^"]*)", cfg\.class\.noun\(\)', source) for noun in nouns]
         for name, want in phrases.items():
             if name == "fcvm-fleet-tunnel-down":
                 continue
             for phrase in want:
-                self.assertIn('"' + phrase, source, f"{name}: {phrase!r} is missing from ejc3/fcvm at {revision}")
+                self.assertTrue('"' + phrase in source or any(w.startswith(phrase) for w in written),
+                                f"{name}: {phrase!r} is missing from ejc3/fcvm at {revision}")
 
 
 class SpendBackstopTests(unittest.TestCase):
@@ -814,7 +821,7 @@ class SpendBackstopTests(unittest.TestCase):
 
     def test_the_daily_budget_is_750_on_each_stacks_tagged_instances_only(self):
         self.assertIn("fcvm_fleet_daily_budget_usd = 750", BUDGET)
-        self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile"]', BUDGET)
+        self.assertIn('fcvm_fleet_budget_purposes  = ["fcvm-fleet-host", "fcvm-fleet-tile", "fcvm-fleet-renders"]', BUDGET)
         legacy = block('resource "aws_budgets_budget" "fcvm_fleet_daily"', BUDGET)
         stage = block('resource "aws_budgets_budget" "fcvm_fleet_stage_daily"', BUDGET)
         prod = block('resource "aws_budgets_budget" "fcvm_fleet_prod_daily"', BUDGET)
@@ -856,8 +863,9 @@ class SpendBackstopTests(unittest.TestCase):
             tag = block('resource "aws_ce_cost_allocation_tag" "%s"' % key, BUDGET)
             self.assertNotRegex(tag, r"provider\s+=")  # only the management account activates cost allocation tags
             self.assertIn("prevent_destroy = true", tag)
-        # Each host and tile launch template tags its instance with the Purpose the budget filters on.
+        # Each host, tile and renders host launch template tags its instance with a Purpose the budget filters on.
         self.assertEqual(len(re.findall(r'Purpose = "fcvm-fleet-host"', MOD)), 1)
+        self.assertEqual(len(re.findall(r'Purpose = "fcvm-fleet-renders"', MOD)), 1)
         self.assertGreaterEqual(len(re.findall(r'Purpose = "fcvm-fleet-tile"', MOD)), 3)
 
     def test_the_backstop_denies_only_new_launches_to_the_coordinator(self):
@@ -931,7 +939,8 @@ class CoordinatorTests(unittest.TestCase):
     def test_the_task_role_reaches_hosts_and_tiles_only(self):
         pol = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
         self.assertIn('"ec2:LaunchTemplate"', pol)
-        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"] } }', pol)
+        # A third Purpose only once a renders template exists (RendersHostTests).
+        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Purpose" = concat(["fcvm-fleet-tile", "fcvm-fleet-host"], local.fcvm_fleet_renders_purposes) } }', pol)
         self.assertIn('Condition = { StringEquals = { "ec2:CreateAction" = ["RunInstances", "CreateFleet"] } }', pol)
         self.assertIn('"ec2:ResourceTag/Purpose" = ["fcvm-fleet-tile", "fcvm-fleet-host"]', pol)
         self.assertIn("Resource  = [aws_iam_role.fcvm_fleet_host.arn, aws_iam_role.fcvm_fleet_tile.arn]", pol)
@@ -973,12 +982,33 @@ class SecretTests(unittest.TestCase):
         self.assertIn('Principal = "*"', policy)
         self.assertIn('Resource  = aws_secretsmanager_secret.fcvm_fleet_stage_tls.arn', policy)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
-        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = \[(.*?)\]', policy, re.S)
+        roles = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = concat\(\[(.*?)\], (.*?)\) \} \}', policy, re.S)
         self.assertIsNotNone(roles)
         self.assertEqual(set(re.findall(r"[\w.]+", roles[1])), {
             "aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
             "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage", "local.fcvm_fleet_access_role_arn",
         })
+        # The renders host's role exists only with its class.
+        self.assertEqual(roles[2], "aws_iam_role.fcvm_fleet_renders[*].arn")
+
+    def test_every_role_granted_the_staging_certificate_passes_its_resource_policy(self):
+        # The secret's policy denies every principal it does not list, so an identity grant alone is not enough: each
+        # role whose policy names the certificate (local.fcvm_fleet_secret_arn["tls"]) must be in that list.
+        listed = re.search(r'ArnNotEquals = \{ "aws:PrincipalArn" = (.*?) \} \}',
+                           block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT), re.S)[1]
+        granted = set()
+        for name in ("fcvm-fleet.tf", "fcvm-fleet-lambda.tf", "fcvm-fleet-ci.tf", "fcvm-fleet-broadcast.tf"):
+            text = (ROOT / name).read_text()
+            for policy in re.finditer(r'^resource "aws_iam_(?:role_)?policy" "\w+" \{\n.*?^\}', text, re.S | re.M):
+                body = policy.group()
+                if 'local.fcvm_fleet_secret_arn["tls"]' not in body:
+                    continue
+                role = re.search(r"\n  role\s+= aws_iam_role\.(\w+)", body)
+                self.assertIsNotNone(role, "a policy granting the certificate names no role: " + body[:80])
+                granted.add(role[1])
+        self.assertIn("fcvm_fleet_renders", granted)
+        for role in granted:
+            self.assertRegex(listed, r"aws_iam_role\.%s(\[\*\])?\.arn" % role, role)
 
     def test_only_the_certificate_container_is_created_here(self):
         names = re.findall(r'resource "aws_secretsmanager_secret" "[^"]+" \{[^}]*?\bname\s+= ([^\n]+)', TF, re.S)
@@ -1173,7 +1203,8 @@ class CoordinatorTileTypes(unittest.TestCase):
         s = stmt(CoordinatorLaunchSplit, "FleetTypesOnly")
         self.assertIn('Effect    = "Deny"', s)
         self.assertIn('Action    = "ec2:RunInstances"', s)
-        self.assertIn('"ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types)', s)
+        # A fifth type only once a renders template exists (RendersHostTests).
+        self.assertIn('"ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types, local.fcvm_fleet_renders_types) }', s)
         tagged = stmt(CoordinatorLaunchSplit, "FleetInstancesAreTagged")
         self.assertIn('Action    = "ec2:RunInstances"', tagged)
         t = stmt(CoordinatorLaunchSplit, "TileTemplatesLaunchTileTypesOnly")
@@ -1357,7 +1388,7 @@ class SlotV4Tests(unittest.TestCase):
         self.assertRegex(block(f'variable "{gate}"'), r"(?m)^  default\s*= true$")
         modes = re.search(r"  fcvm_fleet_ipv4_viewer_modes = \{(.*?)\n  \}", TF, re.S)[1]
         self.assertIn(f'"us-east-1" = var.{gate} ? [', modes)
-        self.assertIn('for m in keys(local.fcvm_fleet_tls_port_ranges) : m if m != "aggregate" || local.fcvm_fleet_aggregated', modes)
+        self.assertIn('for m in keys(local.fcvm_fleet_tls_port_ranges) : m if(m != "aggregate" || local.fcvm_fleet_aggregated) && m != "renders"', modes)
         self.assertIn('] : ["slot"]', modes)
         self.assertRegex(modes, r'(?m)^    "us-east-2" = \["slot"\]$')
         self.assertRegex(modes, r'(?m)^    "us-west-2" = \["slot"\]$')
@@ -1751,11 +1782,12 @@ class StageSubzoneCertificateTests(unittest.TestCase):
         policy = block('resource "aws_secretsmanager_secret_policy" "fcvm_fleet_stage_tls"', STAGE_CERT)
         self.assertIn('Effect    = "Deny"', policy)
         self.assertIn('Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]', policy)
-        principals = policy.split('"aws:PrincipalArn" = [', 1)[1].split("]", 1)[0]
+        principals, renders = policy.split('"aws:PrincipalArn" = concat([', 1)[1].split("]", 1)
         self.assertEqual(re.findall(r"[\w.\[\]]+(?=,)", principals),
                          ["aws_iam_role.fcvm_fleet_coordinator_task.arn", "aws_iam_role.fcvm_fleet_host.arn",
                           "aws_iam_role.fcvm_fleet_tile.arn", "local.fcvm_lambda_tile_role_arns.stage",
                           "local.fcvm_fleet_access_role_arn"])
+        self.assertTrue(renders.startswith(", aws_iam_role.fcvm_fleet_renders[*].arn)"), renders[:60])
         self.assertNotIn("prod", policy)
         # Empty or unverified secrets must block every consumer, including targeted template or role plans.
         guard = block('data "aws_secretsmanager_secret_versions" "fcvm_fleet_stage_tls"', STAGE_CERT)
@@ -2199,6 +2231,405 @@ class HostRegionTests(unittest.TestCase):
         for arg in ("ami_release_guarded", "potato_host_amis", "windows_host_amis", "minecraft_host_amis", "minecraft_java_access"):
             self.assertNotIn(arg, west, arg)
         self.assertIn('"us-west-2" = ["slot"]', TF)
+
+
+class RendersHostTests(unittest.TestCase):
+    """The renders host class ("One VM per page"): a CPU-only arm64 host of its own, for staging only, that exists only
+    once the release pointer names its image. Its template is the GPU host's without a GPU, the coordinator launches it
+    through its own templates only, and the GPU host's boot script is not touched (the image publisher pins its digest)."""
+
+    RELEASE = (ROOT / "fcvm-fleet-ami-release.tf").read_text()
+    PURPOSE = "fcvm-fleet-renders"
+
+    def template(self):
+        return block('resource "aws_launch_template" "renders"', MOD)
+
+    @staticmethod
+    def renders_type():
+        return re.search(r'\n  fcvm_fleet_renders_type\s+= "([^"]+)"\n', TF)[1]
+
+    def policy(self):
+        return block('resource "aws_iam_policy" "fcvm_fleet_coordinator_renders"')
+
+    def stmt(self, sid):
+        parts = re.split(r'Sid +="%s"' % sid, self.policy().replace('= "', '="'), maxsplit=1)
+        self.assertEqual(len(parts), 2, sid)
+        return parts[1].split("\n      },", 1)[0].replace('="', '= "')
+
+    @staticmethod
+    def heredoc(name):
+        return MOD.split("\n  %s = base64encode(<<-EOT\n" % name, 1)[1].split("\n  EOT\n", 1)[0]
+
+    @staticmethod
+    def args(name, text=TF):
+        return re.findall(r'^    "(--[^"]+)",$', text.split("%s = join(" % name, 1)[1].split("\n  ]", 1)[0], re.M)
+
+    # ------------------------------------------------------------------------------------------- the module
+    def test_the_class_is_off_unless_an_arm64_image_is_named(self):
+        amis = block('variable "renders_amis"', MOD)
+        self.assertRegex(amis, r"default\s+= \{\}\n")
+        self.assertIn('arch == "arm64" && (ami == "" || can(regex("^ami-[0-9a-f]{17}$", ami)))', amis)
+        self.assertRegex(block('variable "renders_agent_args"', MOD), r'default\s+= ""\n')
+        self.assertRegex(block('variable "renders_instance_type"', MOD), r'default\s+= "m8gd.metal-24xl"\n')
+        self.assertIn("renders_types   = { arm64 = var.renders_instance_type }", MOD)
+        self.assertIn('renders_archs   = [for a in sort(keys(local.renders_types)) : a if try(var.renders_amis[a], "") != ""]', MOD)
+        self.assertRegex(self.template(), r"\n  for_each\s+= toset\(local\.renders_archs\)\n")
+        # Behind the GPU hosts' gate too, for what the coordinator and its role are given.
+        self.assertIn("renders_on      = var.hosts_enabled && length(local.renders_archs) > 0", MOD)
+        for output, value in (("renders_template_names", "[for a in local.renders_archs : aws_launch_template.renders[a].name]"),
+                              ("renders_template_arns", "[for t in aws_launch_template.renders : t.arn]"),
+                              ("renders_types", "[for a in local.renders_archs : local.renders_types[a]]")):
+            self.assertIn("value = local.renders_on ? %s : []" % value, block('output "%s"' % output, MOD), output)
+
+    def test_the_template_is_the_gpu_hosts_without_a_gpu(self):
+        lt, host = self.template(), block('resource "aws_launch_template" "host"', MOD)
+        self.assertRegex(lt, r'\n  name\s+= "\$\{var\.name_prefix\}-renders-\$\{each\.key\}"\n')
+        self.assertRegex(lt, r"\n  image_id\s+= var\.renders_amis\[each\.key\]\n")
+        self.assertRegex(lt, r"\n  instance_type\s+= local\.renders_types\[each\.key\]\n")
+        self.assertRegex(lt, r"\n  user_data\s+= local\.renders_user_data\n")
+        # What it shares with the GPU host's template, line for line.
+        for line in ("    associate_public_ip_address = true\n", "    ipv6_prefix_count           = 1\n",
+                     '    http_tokens                 = "required"\n', "    http_put_response_hop_limit = 1\n",
+                     "  update_default_version = true\n"):
+            self.assertIn(line, lt, line)
+            self.assertIn(line, host, line)
+        # Its own: the profile, the group, and the pointer whose apply-time guard it awaits (the renders pointer's,
+        # not the pair's).
+        self.assertIn("    name = var.renders_profile_name\n", lt)
+        self.assertIn("    security_groups             = [aws_security_group.renders[0].id]\n", lt)
+        self.assertIn("  depends_on             = [var.renders_release_parameter_version]\n", lt)
+        self.assertNotIn("host_profile_name", lt)
+        self.assertNotIn("aws_security_group.fleet", lt)
+        self.assertNotIn("ami_release_parameter_version", lt)
+        self.assertRegex(block('variable "renders_release_parameter_version"', MOD), r"ephemeral\s+= true")
+        self.assertNotIn("ipv6_address_count", lt)  # EC2 refuses a prefix count and an address count together
+        # No Minecraft group, no spot market in the template (the coordinator's fleet request chooses the market, as
+        # for a GPU host), no block device override (the image's 128 GiB root).
+        self.assertNotIn("minecraft", lt)
+        self.assertNotIn("instance_market_options", lt)
+        self.assertNotIn("block_device_mappings", lt)
+        self.assertIn("length(local.renders_user_data) * 3 / 4 - length(regex(\"=*$\", local.renders_user_data)) <= 16384", lt)
+
+    def test_its_group_admits_443_over_both_families_and_nothing_else(self):
+        # Viewers reach the frame socket on 443 over IPv6 (<prefix>::1) and IPv4 (the agent's front). The GPU slots'
+        # per-place IPv4 ports, which the fleet's group admits, and the frame socket's own port behind the front stay
+        # closed on this class.
+        sg = block('resource "aws_security_group" "renders"', MOD)
+        self.assertRegex(sg, r"\n  count\s+= length\(local\.renders_archs\) > 0 \? 1 : 0\n")
+        self.assertIn("depends_on  = [data.aws_ami.guarded]", sg)
+        rules = re.findall(r"  ingress \{\n(.*?)\n  \}", sg, re.S)
+        self.assertEqual(len(rules), 1, rules)
+        for line in ("from_port        = 443", "to_port          = 443", 'protocol         = "tcp"',
+                     'cidr_blocks      = ["0.0.0.0/0"]', 'ipv6_cidr_blocks = ["::/0"]'):
+            self.assertIn(line, rules[0])
+        self.assertNotIn("slot_tls_ports", sg)
+        self.assertIn("value = [for g in aws_security_group.renders : g.id]", block('output "renders_security_group_ids"', MOD))
+
+    def test_its_instances_carry_their_own_purpose_and_the_stacks_fleet_tag(self):
+        lt = self.template()
+        specs = re.findall(r"  tag_specifications \{\n(.*?)\n  \}", lt, re.S)
+        self.assertEqual(len(specs), 1)
+        self.assertIn('resource_type = "instance"', specs[0])
+        self.assertIn('tags          = { Name = "fcvm-fleet-renders", Purpose = "%s", Fleet = var.fleet }' % self.PURPOSE, specs[0])
+        self.assertIn('tags = { Name = "${var.name_prefix}-renders-${each.key}", Fleet = var.fleet }', lt)
+        # Apart from the GPU hosts and the tiles: no other template uses this Purpose, and this one uses no other.
+        self.assertEqual(MOD.count('Purpose = "%s"' % self.PURPOSE), 1)
+        self.assertNotRegex(lt, r'Purpose = "fcvm-fleet-(host|tile)"')
+
+    def test_boot_starts_the_images_renders_unit_with_agent_env_only(self):
+        host, renders = self.heredoc("user_data"), self.heredoc("renders_user_data")
+        # The image's own unit (ejc3/fcvm fleet/ami/renders/fcvm-fleet-renders-agent.service): it reads agent.env, then
+        # the image's renders.env, which sets RENDERS_AGENT_ARGS and RENDERS_FRAME_ARGS itself. The boot writes the
+        # host's FLEET_AGENT_ARGS and starts the unit, which a first boot skips before user data has run.
+        tail = renders.split("    agent_args='${var.renders_agent_args}'\n", 1)[1].split("    %{endif~}", 1)[0]
+        self.assertEqual(tail, "    printf 'FLEET_AGENT_ARGS=%s\\n' \"$agent_args\" > /etc/fcvm-fleet/agent.env\n"
+                               "    systemctl start --no-block fcvm-fleet-renders-agent.service\n")
+        self.assertNotIn("fcvm-fleet-agent.service", renders)  # the image has no such unit
+        for image_owned in ("RENDERS_AGENT_ARGS", "RENDERS_FRAME_ARGS", "renders.env"):
+            self.assertNotIn(image_owned, renders)
+        self.assertTrue(renders.startswith("    #!/bin/bash\n    set -eu\n    ${var.ip_options_bootstrap}\n"), renders)
+        self.assertIn('    %{if var.renders_agent_args != ""~}\n    install -d -m 0755 /etc/fcvm-fleet\n'
+                      "    agent_args='${var.renders_agent_args}'\n", renders)
+        # The arguments are written inside single quotes, so the variable takes nothing that could close them.
+        self.assertIn('can(regex("^[A-Za-z0-9 ._:/=,@+-]*$", var.renders_agent_args))', block('variable "renders_agent_args"', MOD))
+        # None of the GPU host's modes.
+        for gpu_only in ("potato", "windows", "minecraft", "podman", "imds"):
+            self.assertNotIn(gpu_only, renders)
+        self.assertEqual(set(re.findall(r"\bvar\.(\w+)", renders)), {"ip_options_bootstrap", "renders_agent_args"})
+        # The publisher pins the digest of the GPU host's script (HOST_FIX_BOOT_SHA): that script reads no input of
+        # this class and the digest is still its own.
+        self.assertFalse([v for v in re.findall(r"\b(?:var|local)\.(\w+)", host) if "renders" in v])
+        self.assertNotIn("renders", host)
+        self.assertIn("value       = sha256(local.user_data)", block('output "host_user_data_sha256"', MOD))
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertIn("HOST_FIX_BOOT_SHA = module.fcvm_fleet_east1.host_user_data_sha256", pipeline)
+
+    def test_it_launches_only_where_its_type_is_offered(self):
+        offerings = block('data "aws_ec2_instance_type_offerings" "renders"', MOD)
+        self.assertRegex(offerings, r"for_each\s+= toset\(local\.renders_archs\)\n")
+        self.assertIn('location_type = "availability-zone"', offerings)
+        self.assertIn("values = [local.renders_types[each.key]]", offerings)
+        self.assertIn("renders_azs     = sort(distinct(flatten([for o in data.aws_ec2_instance_type_offerings.renders : o.locations])))", MOD)
+        self.assertIn("renders_subnets = [for az in local.renders_azs : aws_subnet.public[az].id if contains(local.azs, az)]", MOD)
+        self.assertIn("value = local.renders_subnets", block('output "renders_subnet_ids"', MOD))
+
+    def test_the_image_publishers_renders_track_is_given_the_template_and_the_pair_is_not(self):
+        # publish.py's pair requires exactly four templates, a host and three tiles, all x86_64: the renders template is
+        # not in image_templates. The renders track (RENDERS_JSON, RENDERS_TRACK) gets it from its own output.
+        self.assertNotIn("renders", block('output "image_templates"', MOD))
+        self.assertIn("fcvm_ami_compute_templates = module.fcvm_fleet_east1.image_templates", self.RELEASE)
+        self.assertIn('{ region = local.region, id = template.id, kind = "renders", arch = arch }',
+                      block('output "renders_image_templates"', MOD))
+        pipeline = (ROOT / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertIn("fcvm_ami_renders_templates = module.fcvm_fleet_east1.renders_image_templates", pipeline)
+        publish = (ROOT / "fcvm-fleet-ami-pipeline" / "publish.py").read_text()
+        self.assertIn("len(self.templates) == 4", publish)
+
+    # ------------------------------------------------------------------------------------------- staging
+    def test_staging_alone_has_the_class_and_only_in_us_east_1(self):
+        east = block('module "fcvm_fleet_east1"')
+        self.assertRegex(east, r'\n  renders_amis\s+= lookup\(local\.fcvm_active_renders_amis, "us-east-1", \{\}\)\n')
+        self.assertRegex(east, r"\n  renders_agent_args\s+= local\.fcvm_fleet_renders_agent_args\n")
+        self.assertRegex(east, r"\n  renders_instance_type\s+= local\.fcvm_fleet_renders_type\n")
+        self.assertRegex(east, r"\n  renders_profile_name\s+= one\(aws_iam_instance_profile\.fcvm_fleet_renders\[\*\]\.name\)\n")
+        self.assertRegex(east, r"\n  renders_release_parameter_version = one\(ephemeral\.aws_ssm_parameter\.fcvm_ami_renders_release_guard\[\*\]\.version\)\n")
+        self.assertRegex(TF, r'\n  fcvm_fleet_renders_type\s+= "m8gd.metal-24xl"\n')
+        for region in ("east2", "west2"):
+            self.assertNotIn("renders", block('module "fcvm_fleet_%s"' % region), region)
+        # Production adopts it later by passing the same inputs: until then nothing of it is in the prod files.
+        for name in ("fcvm-fleet-prod.tf", "fcvm-fleet-prod-dns.tf", "fcvm-fleet-prod-broadcast.tf", "fcvm-fleet-prod-ci.tf",
+                     "fcvm-fleet-prod-alarms.tf", "fcvm-fleet-prod-drills.tf", "fcvm-dev-prod.tf"):
+            self.assertNotRegex(tf_code((ROOT / name).read_text()), r"renders_|fcvm-fleet-renders|FLEET_RENDERS|" + re.escape(self.renders_type()), name)
+
+    def test_the_image_is_the_renders_pointers_and_an_empty_pointer_means_no_class(self):
+        # The renders track's own pointer, never the pair's: a renders publication writes only it.
+        data = block('data "aws_ssm_parameter" "fcvm_ami_renders_release"', self.RELEASE)
+        for line in ("count           = var.fcvm_ami_pipeline_enabled ? 1 : 0",
+                     "name            = aws_ssm_parameter.fcvm_ami_renders_release.name",
+                     'try(jsondecode(self.value).track, "") == "renders"', "try(jsondecode(self.value).version, 0) == 1",
+                     '(try(length(jsondecode(self.value).renders_amis), 1) == 0 ||\n        try(jsondecode(self.value).guard_sha256, "") == filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py"))',
+                     'contains(local.fcvm_fleet_regions, region) && length(arches) == 1 && contains(keys(arches), "arm64")',
+                     'can(regex("^ami-[0-9a-f]{17}$", image))'):
+            self.assertIn(line, data, line)
+        guard = block('ephemeral "aws_ssm_parameter" "fcvm_ami_renders_release_guard"', self.RELEASE)
+        self.assertIn("arn             = aws_ssm_parameter.fcvm_ami_renders_release.arn", guard)
+        self.assertIn("condition     = self.version == data.aws_ssm_parameter.fcvm_ami_renders_release[0].version", guard)
+        self.assertIn("fcvm_active_renders_amis = var.fcvm_ami_pipeline_enabled ? "
+                      "nonsensitive(jsondecode(data.aws_ssm_parameter.fcvm_ami_renders_release[0].value).renders_amis) : {}", self.RELEASE)
+        self.assertNotIn("data.aws_ssm_parameter.fcvm_ami_release[0].value).renders_amis", self.RELEASE)
+        # The pointer starts empty, so the class exists only after the renders track's first publication.
+        self.assertIn("renders_amis = {}", block('resource "aws_ssm_parameter" "fcvm_ami_renders_release"', self.RELEASE))
+        # No image id for this class is written in the repository.
+        self.assertNotIn("renders", block('resource "aws_ssm_parameter" "fcvm_ami_release"', self.RELEASE))
+        self.assertNotRegex(TF, r"renders[^\n]*ami-[0-9a-f]{17}")
+        # The image passes the same admission as a host's or tile's (NetworkTests) before the template can use it.
+        self.assertIn("values(var.renders_amis)", block('data "aws_ami" "guarded"', MOD))
+
+    def test_the_agent_gets_only_the_hosts_own_arguments(self):
+        host, renders = self.args("fcvm_fleet_host_agent_args"), self.args("fcvm_fleet_renders_agent_args")
+        flag = lambda a: a.split(" ", 1)[0]
+        # Only what names the stack, each spelled exactly as the GPU host's, in the GPU host's order.
+        self.assertEqual(renders, [a for a in host if a in renders])
+        self.assertEqual([flag(a) for a in renders],
+                         ["--dial", "--access-secret", "--tls-secret", "--secret-region", "--spot-notice-url", "--store-ready-file"])
+        # The image owns the rest: its renders.env gives the mode's options and every frame-socket option that is the
+        # same on every renders host, and the agent refuses an option given twice.
+        for image_owned in ("--renders", "--image", "--base-port", "--host-from-imds", "--renders-arg", "--publish-ip",
+                            "--tls-publish-base", "--public-ipv4-from-imds", "--tls-dir", "--ipv6-prefix-from-imds",
+                            "--frame-zone"):
+            self.assertNotIn(image_owned, map(flag, renders))
+        definition = TF.split("fcvm_fleet_renders_agent_args = join(", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("PLACEHOLDER", TF)
+        self.assertNotIn("fcvm_fleet_renders_mode_args", TF)
+        for gpu_only in ("aggregate", "fcvm-renderer", "phone"):
+            self.assertNotIn(gpu_only, definition)
+
+    def test_the_coordinator_gets_the_class_in_its_environment_only_once_it_exists(self):
+        self.assertIn('fcvm_fleet_renders_templates = flatten([for r, m in local.fcvm_fleet_regional : [for t in m.renders_template_names : "${r}:${t}"]])', TF)
+        subnets = TF.split("fcvm_fleet_renders_subnets = flatten(", 1)[1].split("\n\n", 1)[0]
+        self.assertIn('[for s in m.renders_subnet_ids : "${r}:${s}"]', subnets)
+        self.assertIn("if length(m.renders_template_names) > 0", subnets)
+        td = block('resource "aws_ecs_task_definition" "fcvm_fleet_coordinator"')
+        added = td.split("], [for v in [\n", 1)[1].split("\n      ])\n", 1)[0]
+        self.assertEqual([l.strip() for l in added.splitlines()], [
+            '{ name = "FLEET_RENDERS_TEMPLATES", value = join(",", local.fcvm_fleet_renders_templates) },',
+            '{ name = "FLEET_RENDERS_SUBNETS", value = join(",", local.fcvm_fleet_renders_subnets) },',
+            # Absent, not empty, without a template: the task definition, and so the running coordinator, is not
+            # replaced by an apply that creates no renders host.
+            '] : v if v.value != ""'])
+        # Environment, not arguments: an older coordinator image refuses an unknown argument and does not start.
+        self.assertNotIn("renders", command(TF, "fcvm_fleet_coordinator_command").lower())
+
+    # ------------------------------------------------------------------------------------------- the task role
+    def test_the_class_has_its_own_policy_only_once_a_template_exists(self):
+        pol = self.policy()
+        self.assertRegex(pol, r"\n  count\s+= length\(local\.fcvm_fleet_renders_templates\) > 0 \? 1 : 0\n")
+        self.assertRegex(pol, r"\n  provider\s+= aws\.fcvm_fleet\n")
+        att = block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_coordinator_renders"')
+        self.assertRegex(att, r"\n  count\s+= length\(aws_iam_policy\.fcvm_fleet_coordinator_renders\)\n")
+        self.assertRegex(att, r"\n  role\s+= aws_iam_role\.fcvm_fleet_coordinator_task\.name\n")
+        self.assertRegex(att, r"\n  policy_arn\s+= aws_iam_policy\.fcvm_fleet_coordinator_renders\[count\.index\]\.arn\n")
+        # The staging role only, and nothing of it in the inline policy, which is at its size limit, beyond the two
+        # lists below.
+        self.assertEqual(TF.count("aws_iam_policy.fcvm_fleet_coordinator_renders"), 2)
+        inline = block('resource "aws_iam_role_policy" "fcvm_fleet_coordinator_task"')
+        self.assertEqual(sorted(set(re.findall(r"local\.fcvm_fleet_renders_\w+", tf_code(inline)))),
+                         ["local.fcvm_fleet_renders_purposes", "local.fcvm_fleet_renders_types"])
+        self.assertNotIn(self.PURPOSE, tf_code(inline))
+        self.assertEqual(re.findall(r'Sid\s+= "(\w+)"', pol), [
+            "LaunchRendersFromTheirTemplates", "LaunchRendersWithTheirOwnResources", "ValidatedRendersImagesOnly",
+            "RendersTemplatesLaunchRendersTypesOnly", "RendersTemplatesAreTaggedRendersOnly", "PassTheRendersRoleOnly",
+            "TerminateRendersInstancesOnly"])
+        self.assertNotRegex(pol, r'Resource\s*=\s*"\*"')
+        self.assertNotRegex(pol, r'Action\s*=\s*"(ec2|iam):\*"')
+
+    def test_the_coordinator_launches_the_class_through_its_templates_with_its_own_resources(self):
+        created = self.stmt("LaunchRendersFromTheirTemplates")
+        self.assertIn('Effect    = "Allow"', created)
+        self.assertIn('Action    = "ec2:RunInstances"', created)
+        self.assertIn("Resource  = local.fcvm_fleet_tile_created_arns", created)
+        self.assertIn('Condition = { ArnLike = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns } }', created)
+        referenced = self.stmt("LaunchRendersWithTheirOwnResources")
+        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', referenced)
+        self.assertIn("Resource  = local.fcvm_fleet_renders_referenced_arns", referenced)
+        self.assertIn('Condition = { ArnLikeIfExists = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns } }', referenced)
+        # The same shape as the GPU hosts' two statements.
+        gpu = CoordinatorLaunchSplit.stmt(CoordinatorLaunchSplit, "LaunchHostsWithTheirOwnResources")
+        self.assertIn('Action    = ["ec2:RunInstances", "ec2:CreateFleet"]', gpu)
+        self.assertIn("ArnLikeIfExists", gpu)
+        self.assertIn("fcvm_fleet_renders_template_arns = flatten([for m in values(local.fcvm_fleet_regional) : m.renders_template_arns])", TF)
+        refs = TF.split("fcvm_fleet_renders_referenced_arns = concat(", 1)[1].split("\n  )\n", 1)[0]
+        self.assertEqual(refs.count("if length(m.renders_template_names) > 0"), 2)
+        self.assertIn(':subnet/${s}"] if length(m.renders_template_names) > 0', refs)
+        self.assertIn("for s in m.renders_subnet_ids", refs)
+        self.assertIn('[for g in m.renders_security_group_ids : "arn:aws:ec2:${r}:${local.fcvm_fleet_account_id}:security-group/${g}"] if length(m.renders_template_names) > 0', refs)
+        self.assertNotIn("m.security_group_id", refs)  # never the GPU hosts' group
+        self.assertIn("local.fcvm_fleet_renders_template_arns,", refs)
+        self.assertNotIn("image/", refs)  # its image is admitted by kind, never by a wildcard here
+        self.assertNotIn("host_subnet_ids", refs)
+
+    def test_a_renders_template_launches_only_a_validated_renders_image(self):
+        image = self.stmt("ValidatedRendersImagesOnly")
+        self.assertIn('Effect   = "Allow"', image)
+        self.assertIn('Resource = [for region in local.fcvm_fleet_regions : "arn:aws:ec2:${region}::image/*"]', image)
+        for key, value in (("ec2:Owner", "local.fcvm_fleet_account_id"), ("ec2:ResourceTag/Purpose", '"fcvm-fleet"'),
+                           ("ec2:ResourceTag/FleetImageKind", '"renders"'), ("ec2:ResourceTag/FleetImageValidated", '"true"'),
+                           ("ec2:ResourceTag/GuardHelperSHA256", 'filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")')):
+            self.assertRegex(image, r'"%s"\s+= %s\n' % (re.escape(key), re.escape(value)), key)
+        self.assertRegex(image, r'Bool\s+= \{ "ec2:Public" = "false" \}')
+        self.assertRegex(image, r'ArnLikeIfExists = \{ "ec2:LaunchTemplate" = local\.fcvm_fleet_renders_template_arns \}')
+        # The host and tile statements still admit their own kind only, through their own templates.
+        kinds = self.RELEASE.split('resource "aws_iam_policy" "fcvm_ami_validated_images"', 1)[1]
+        self.assertEqual(re.findall(r'"ec2:ResourceTag/FleetImageKind"\s+= "(\w+)"', kinds), ["tile", "host"])
+
+    def test_each_template_launches_its_own_type_and_purpose_and_no_other_classes(self):
+        types = self.stmt("RendersTemplatesLaunchRendersTypesOnly")
+        tagged = self.stmt("RendersTemplatesAreTaggedRendersOnly")
+        for deny in (types, tagged):
+            self.assertIn('Effect   = "Deny"', deny)
+            self.assertIn('Action   = "ec2:RunInstances"', deny)
+            self.assertIn('Resource = "arn:aws:ec2:*:*:instance/*"', deny)
+            self.assertIn('ArnLike         = { "ec2:LaunchTemplate" = local.fcvm_fleet_renders_template_arns }', deny)
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_renders_types }', types)
+        self.assertIn('StringNotEquals = { "aws:RequestTag/Purpose" = "%s" }' % self.PURPOSE, tagged)
+        # The reverse: a GPU host or tile template still launches its own types and Purpose only, so neither reaches
+        # the CPU type or this Purpose through the two wider lists below.
+        inline = CoordinatorLaunchSplit.stmt
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_host_types }',
+                      inline(CoordinatorLaunchSplit, "HostTemplatesLaunchHostTypesOnly"))
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = local.fcvm_fleet_tile_types }',
+                      inline(CoordinatorLaunchSplit, "TileTemplatesLaunchTileTypesOnly"))
+        self.assertIn('StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-host" }',
+                      inline(CoordinatorLaunchSplit, "HostTemplatesAreTaggedHostsOnly"))
+        self.assertIn('StringNotEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet-tile" }',
+                      inline(CoordinatorLaunchSplit, "TileTemplatesAreTaggedTilesOnly"))
+        for types_list in ("fcvm_fleet_host_types", "fcvm_fleet_tile_types"):
+            self.assertNotIn(self.renders_type(), re.search(r"\n  %s\s+= (\[[^\n]*\])\n" % types_list, TF).group(1))
+
+    def test_the_existing_denies_admit_the_class_only_while_it_has_a_template(self):
+        # An explicit deny wins over the class's allows, so the two fleet-wide denies must name its type and Purpose;
+        # both lists are empty without a template, and the inline policy then renders as it did.
+        inline = CoordinatorLaunchSplit.stmt
+        self.assertIn('StringNotEquals = { "ec2:InstanceType" = concat(local.fcvm_fleet_tile_types, local.fcvm_fleet_host_types, local.fcvm_fleet_renders_types) }',
+                      inline(CoordinatorLaunchSplit, "FleetTypesOnly"))
+        self.assertIn('StringNotEquals = { "aws:RequestTag/Purpose" = concat(["fcvm-fleet-tile", "fcvm-fleet-host"], local.fcvm_fleet_renders_purposes) }',
+                      inline(CoordinatorLaunchSplit, "FleetInstancesAreTagged"))
+        self.assertRegex(TF, r"\n  fcvm_fleet_renders_types\s+= distinct\(flatten\(\[for m in values\(local\.fcvm_fleet_regional\) : m\.renders_types\]\)\)\n")
+        self.assertRegex(TF, r'\n  fcvm_fleet_renders_purposes\s+= length\(local\.fcvm_fleet_renders_templates\) > 0 \? \["%s"\] : \[\]\n' % self.PURPOSE)
+
+    def test_the_coordinator_terminates_the_class_by_its_purpose_within_its_stack(self):
+        end = self.stmt("TerminateRendersInstancesOnly")
+        self.assertIn('Effect    = "Allow"', end)
+        self.assertIn('Action    = "ec2:TerminateInstances"', end)
+        self.assertIn('Resource  = "arn:aws:ec2:*:*:instance/*"', end)
+        self.assertIn('Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "%s", "aws:RequestedRegion" = local.fcvm_fleet_regions } }' % self.PURPOSE, end)
+        # No start, stop, retag or spot-request grant for it: those are the tile pool's.
+        self.assertEqual(self.policy().count('"ec2:TerminateInstances"'), 1)
+        for action in ("StartInstances", "StopInstances", "CreateTags", "DeleteTags", "CancelSpotInstanceRequests"):
+            self.assertNotIn(action, self.policy(), action)
+        # The Fleet tag comes from the stack's scope policy, which denies launching or terminating anything not
+        # tagged for the stack, whatever its Purpose (StackScopeTests).
+        scope = block('resource "aws_iam_policy" "fcvm_fleet_stack_scope"')
+        self.assertIn('Condition = { StringNotEquals = { "aws:RequestTag/Fleet" = each.value.fleet } }', scope)
+        self.assertIn('Condition = { StringNotEquals = { "ec2:ResourceTag/Fleet" = each.value.fleet } }', scope)
+        # It passes the class's own role, whose profile the template uses, and no other.
+        self.assertIn("name = var.renders_profile_name", self.template())
+        passing = self.stmt("PassTheRendersRoleOnly")
+        self.assertIn('Action    = "iam:PassRole"', passing)
+        self.assertIn("Resource  = aws_iam_role.fcvm_fleet_renders[*].arn", passing)
+        self.assertIn('Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } }', passing)
+        self.assertEqual(self.policy().count("iam:PassRole"), 1)
+
+    def test_its_role_reads_the_certificate_the_agent_token_and_its_store_and_nothing_else(self):
+        gated = "local.fcvm_fleet_renders_enabled ? 1 : 0"
+        self.assertIn('fcvm_fleet_renders_enabled = length(lookup(local.fcvm_active_renders_amis, "us-east-1", {})) > 0', TF)
+        role = block('resource "aws_iam_role" "fcvm_fleet_renders"')
+        self.assertIn("count    = " + gated, role)
+        self.assertIn('name     = "fcvm-fleet-renders"', role)
+        self.assertIn('Principal = { Service = "ec2.amazonaws.com" }', role)
+        for name in ('resource "aws_iam_role_policy" "fcvm_fleet_renders"', 'resource "aws_iam_role_policy_attachment" "fcvm_fleet_renders_ssm"',
+                     'resource "aws_iam_instance_profile" "fcvm_fleet_renders"'):
+            self.assertIn("count", block(name))
+            self.assertIn("length(aws_iam_role.fcvm_fleet_renders)", block(name))
+        policy = block('resource "aws_iam_role_policy" "fcvm_fleet_renders"')
+        self.assertEqual(re.findall(r'Sid\s+= "(\w+)"', policy), ["ReadTheCertificateAndTheAgentToken", "ReadTheRendersStore"])
+        self.assertIn('Resource = [local.fcvm_fleet_secret_arn["tls"], local.fcvm_fleet_secret_arn["agent-access-token"]]', policy)
+        self.assertIn('Action   = "s3:GetObject"', policy)
+        self.assertIn('Resource = "${aws_s3_bucket.fcvm_fleet_assets.arn}/factory/*/renders/store/*"', policy)
+        self.assertNotIn("ListBucket", policy)
+        self.assertIn('policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"',
+                      block('resource "aws_iam_role_policy_attachment" "fcvm_fleet_renders_ssm"'))
+        # The class is built in us-east-1 only; a plan that drops us-east-1 from the coordinator's regions refuses.
+        self.assertIn('condition     = contains(local.fcvm_fleet_coordinator_host_regions.stage, "us-east-1")', role)
+        # The GPU host's role is not widened for this class.
+        self.assertNotIn("renders", block('resource "aws_iam_role_policy" "fcvm_fleet_host"'))
+
+    def test_no_per_place_ipv4_port_opens_for_the_renders_frame_socket(self):
+        # When ejc3/fcvm's declaration gains the renders range (offset 17, one port), the us-east-1 range still ends at
+        # the last place's port, the aggregator's while aggregated streaming is off: the frame socket is reached through
+        # the front on 443 only.
+        decl = json.loads((ROOT / "fcvm-fleet-published-ports.json").read_text())
+        ranges = {r["mode"]: r for r in decl["gpu_host_ipv4"]["ranges"]}
+        ranges.setdefault("renders", {"mode": "renders", "offset": 17, "count": 1})
+        aggregated = re.search(r"fcvm_fleet_aggregated = (true|false)\n", TF).group(1) == "true"
+        modes = [m for m in ranges if (m != "aggregate" or aggregated) and m != "renders"]
+        base = decl["gpu_host_ipv4"]["base"]
+        top = base + max(ranges[m]["offset"] + ranges[m]["count"] for m in modes) - 1
+        self.assertLess(top, base + ranges["renders"]["offset"])
+        self.assertIn('m if(m != "aggregate" || local.fcvm_fleet_aggregated) && m != "renders"', TF)
+
+    # ------------------------------------------------------------------------------------------- what follows a new Purpose
+    def test_the_spend_backstop_and_the_boot_guard_cover_the_new_purpose(self):
+        # A distinct Purpose would otherwise put this class outside the $750 a day budget and outside the fleet
+        # account's 30-minute guard association, both of which select instances by Purpose.
+        self.assertIn('"%s"]' % self.PURPOSE, re.search(r"fcvm_fleet_budget_purposes\s+= (\[[^\n]*\])", BUDGET).group(1))
+        guard = (ROOT / "linux-ip-options.tf").read_text()
+        fleet = re.findall(r'resource "aws_ssm_association" "linux_ip_options_fleet_(\w+)" \{(.*?)\n\}', guard, re.S)
+        self.assertEqual([name for name, _ in fleet], ["east2", "west2", "east1"])
+        for name, body in fleet:
+            values = re.search(r'key    = "tag:Purpose"\n    values = \[([^\]]*)\]', body).group(1)
+            self.assertIn('"%s"' % self.PURPOSE, values, name)
+            self.assertLessEqual(values.count('"fcvm-'), 5, name)  # State Manager takes five values per target
 
 
 if __name__ == "__main__":
