@@ -13,7 +13,7 @@
 #                  scripts/workers-stage-secrets.sh loads alongside the inventory bindings from browserbase/credentials.
 #
 # The container holds LIGHTS_AWS_ACCESS_KEY_ID, LIGHTS_AWS_SECRET_ACCESS_KEY, LIGHTS_BEDROCK_REGION and
-# LIGHTS_BEDROCK_MODEL. The key is in Terraform state, as the moderation Workers' keys are.
+# LIGHTS_BEDROCK_MODEL, and the phone's sign-in settings (lights-signin.tf). The key is in Terraform state, as the moderation Workers' keys are.
 #   Rotate: terraform apply -replace='aws_iam_access_key.lights_vision_worker', then scripts/workers-stage-secrets.sh
 #   lights, after a deploy has finished.
 #
@@ -73,6 +73,11 @@ resource "aws_secretsmanager_secret_version" "lights_vision_worker" {
     LIGHTS_AWS_SECRET_ACCESS_KEY = aws_iam_access_key.lights_vision_worker.secret
     LIGHTS_BEDROCK_REGION        = local.bedrock_haiku_region
     LIGHTS_BEDROCK_MODEL         = local.bedrock_haiku_profile
+    # The phone's sign-in (lights-signin.tf): the token key, and the Access team and audience whose JWT
+    # /native/login checks (the lights-stage hostname application's, constellation-stage-smoke.tf).
+    LIGHTS_TOKEN_KEY   = random_bytes.lights_token_key.hex
+    ACCESS_TEAM_DOMAIN = local.browser_manager_issuer
+    ACCESS_AUD         = cloudflare_zero_trust_access_application.lights_stage_smoke.aud
   })
 
   lifecycle {
