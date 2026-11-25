@@ -3162,6 +3162,27 @@ only. It applies to `ubuntu` on the metal boxes and admin boxes and to every acc
 its setup script is re-run. Once a box has the script, an account can also seed itself by
 running `user-agents-seed`.
 
+## Where alerts go
+
+Every alarm and alert in this account publishes to one SNS topic, `cost-alerts` (`cost-alerts.tf`). It is emailed
+to the owner, and `alert-telegram.tf` also sends it to Telegram as short readable lines:
+
+- an alarm entering ALARM is "🔴 name: the first sentence of its description";
+- "✅ name recovered after N min" follows only an ALARM that was sent;
+- an alarm that fires more than 3 times in 6 hours sends one "🔁 … is flapping" and is muted for 6 hours;
+- anything else (budgets, the security digest, auto-reboot) is its subject and the start of its body.
+
+The bot is set up once by the owner: create it with @BotFather (`/newbot`) and send it any message. The chat id is
+`message.chat.id` in `https://api.telegram.org/bot<token>/getUpdates`. Then, from a 0600 file holding
+`{"bot_token": "...", "chat_id": "..."}`:
+
+```bash
+aws secretsmanager put-secret-value --region us-west-1 --secret-id alerts/telegram --secret-string file://<file>
+```
+
+Until the secret has a value, the function does nothing. Its own failures (`alert-telegram-errors`) still reach the
+email.
+
 ## Backups, safety, and cost controls
 
 A one-shot offline comparison of two restored, detached encrypted gp3 volumes is available
