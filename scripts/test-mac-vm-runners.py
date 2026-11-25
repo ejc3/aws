@@ -24,7 +24,7 @@ if Path(sys.argv[0]).name == "ssh":
     if "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
             assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
-                                                         "install-ci-sim-slots.sh"}
+                                                         "ci/ci-coreaudio-check", "install-ci-sim-slots.sh"}
         print("test: installed CI test slots")
     elif "Print :CFBundleShortVersionString" in cmd:
         print("27.0\n27A123")
@@ -64,15 +64,34 @@ args = sys.argv[1:]
 history = open(calls).read().splitlines() if os.path.exists(calls) else []
 with open(calls, "a") as f:
     print(*args, file=f)
-loaded, lingering = False, 0
+
+
+def job(words):
+    # The job a call names, as domain/label: bootstrap names its plist; bootout and print name the job itself
+    # (system/LABEL or gui/UID/LABEL). A domain alone (gui/UID) names no job.
+    if words[0] == "bootstrap":
+        return words[1] + "/" + os.path.basename(words[2]).removesuffix(".plist")
+    if words[0] in ("bootout", "print") and (words[1].startswith("system/") or words[1].count("/") == 2):
+        return words[1]
+    return None
+
+
+jobs = {}  # job -> (loaded, prints for which a booted-out instance still lingers)
 for call in history:
-    if call.startswith("bootstrap"):
-        loaded, lingering = True, 0
-    elif call.startswith("bootout"):
-        lingering, loaded = (2 if loaded else 0), False
-    elif call.startswith("print") and call.count("/") == 2 and lingering:
-        lingering -= 1
-if args[0] == "print" and args[1].count("/") == 2:
+    words = call.split()
+    name = job(words)
+    if name is None:
+        continue
+    loaded, lingering = jobs.get(name, (False, 0))
+    if words[0] == "bootstrap":
+        jobs[name] = (True, 0)
+    elif words[0] == "bootout":
+        jobs[name] = (False, 2 if loaded else 0)
+    elif lingering:
+        jobs[name] = (loaded, lingering - 1)
+name = job(args)
+loaded, lingering = jobs.get(name, (False, 0))
+if args[0] == "print" and name is not None:
     sys.exit(0 if loaded or lingering else 1)
 if args[0] == "bootstrap" and (loaded or lingering):
     print("Bootstrap failed: 5: Input/output error", file=sys.stderr)
@@ -161,7 +180,9 @@ class SimulatorSlots(unittest.TestCase):
         launchctl = self.root / "launchctl"
         launchctl.write_text(LAUNCHCTL)
         launchctl.chmod(0o755)
-        self.install_env = dict(os.environ, CI_LAUNCH_AGENTS=str(self.agents), LAUNCHCTL=str(launchctl),
+        self.daemons = self.root / "LaunchDaemons"
+        self.install_env = dict(os.environ, CI_LAUNCH_AGENTS=str(self.agents), CI_LAUNCH_DAEMONS=str(self.daemons),
+                                LAUNCHCTL=str(launchctl),
                                 CI_CLEAN_USER=pwd.getpwuid(os.getuid()).pw_name,
                                 FAKE_LAUNCHCTL_CALLS=str(self.launchctl_calls))
 
@@ -186,18 +207,42 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual((agent["Nice"], agent["ProcessType"], agent["LowPriorityIO"]), (20, "Background", True))
         self.assertEqual(agent["LimitLoadToSessionType"], "Aqua")
         uid = os.getuid()
+        audio = self.daemons / "com.ejcampbell.ci-coreaudio-check.plist"
+        with audio.open("rb") as f:
+            daemon = plistlib.load(f)
+        check = self.mac_build.with_name("ci-coreaudio-check")
+        self.assertTrue(os.access(check, os.X_OK))
+        self.assertEqual(daemon["Label"], "com.ejcampbell.ci-coreaudio-check")
+        self.assertEqual(daemon["ProgramArguments"], [str(check)])
+        self.assertEqual((daemon["StartInterval"], daemon["RunAtLoad"], daemon["ProcessType"]), (300, True, "Standard"))
+        self.assertNotIn("UserName", daemon)  # root: restarting coreaudiod needs it
         self.assertEqual([c for c in self.launchctl() if not c.startswith("print")],
-                         [f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
+                         ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}",
+                          f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
         # Unchanged and loaded: nothing is reloaded.
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("unchanged and loaded", result.stdout)
-        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 1)
+        self.assertIn("Disk cleaner unchanged and loaded", result.stdout)
+        self.assertIn("coreaudiod check unchanged and loaded", result.stdout)
+        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
         # A changed plist is replaced and reloaded once more, after the old instance has finished exiting.
         plist.write_text(plist.read_text().replace("3600", "60"))
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
+        self.assertEqual(sum(c.startswith("bootstrap gui") for c in self.launchctl()), 2)
+        self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 1)
+        # A changed daemon plist is replaced and reloaded too, after its old instance has gone.
+        audio.write_text(audio.read_text().replace("300", "60"))
+        before = len(self.launchctl())
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("coreaudiod check loaded", result.stdout)
+        calls = self.launchctl()[before:]
+        self.assertEqual([c for c in calls if not c.startswith("print")][:2],
+                         ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}"])
+        self.assertGreaterEqual(sum(c == "print system/com.ejcampbell.ci-coreaudio-check" for c in calls), 3)
+        with audio.open("rb") as f:
+            self.assertEqual(plistlib.load(f)["StartInterval"], 300)
         with plist.open("rb") as f:
             self.assertEqual(plistlib.load(f)["StartInterval"], 3600)
 
