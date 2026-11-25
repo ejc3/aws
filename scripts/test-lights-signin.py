@@ -34,9 +34,10 @@ class AccessTests(unittest.TestCase):
 
 
 class OrderTests(unittest.TestCase):
-    def test_the_bypass_waits_for_the_workers_access_check(self):
-        # Step 1 of lights-signin.tf's ORDER: nothing skips Access until the Worker verifies it.
-        self.assertRegex(TF, r"(?m)^  lights_phone_bypass\s*= false$")
+    def test_the_bypass_is_on_only_through_its_switch(self):
+        # Step 2 of lights-signin.tf's ORDER, taken once lights-stage's /api/health reported
+        # accessCheck: verified and phoneSignIn: on (2026-11-25).
+        self.assertRegex(TF, r"(?m)^  lights_phone_bypass\s*= true$")
         for kind in ("cloudflare_zero_trust_access_policy", "cloudflare_zero_trust_access_application"):
             self.assertIn("count      = local.lights_phone_bypass ? 1 : 0".replace("      ", " " * (6 if kind.endswith("policy") else 8)),
                           block(TF, kind, "lights_stage_bearer_paths"))
