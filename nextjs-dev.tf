@@ -31,7 +31,7 @@ variable "enable_nextjs_dev" {
 }
 
 variable "nextjs_instance_type" {
-  description = "Next.js shared dev host size. The t4g.2xlarge default provides 8 vCPU and 32 GiB of memory."
+  description = "Next.js shared dev host size. The m7g.2xlarge default provides 8 vCPU and 32 GiB of memory, not burstable."
   type        = string
   # 8GB, raised from t4g.medium (4GB) on 2026-08-16. At 4GB the kernel paged to /swapfile,
   # swap-in reads pinned the root volume at its 125MB/s ceiling, and with the disk saturated
@@ -40,7 +40,11 @@ variable "nextjs_instance_type" {
   # 16GB, raised from t4g.large on 2026-09-15 at the owner's request. All four accounts were
   # running Claude and `next dev`, three of them Codex too, with 1.15GB of the swapfile in use.
   # 32 GiB and 8 vCPU, doubled from t4g.xlarge on 2026-11-05 at the owner's request.
-  default = "t4g.2xlarge"
+  # m7g.2xlarge from 2026-11-25 at the owner's request (#1057): the t4g.2xlarge had had no CPU credits since
+  # 2026-11-06, ran 45-96% of 8 vCPUs around the clock and was billed 4,000-5,500 vCPU-minutes of surplus
+  # credits a day. The same size fixed-performance (about $278 a month in us-west-1) costs less than the t4g plus
+  # its surplus (about $335-360) and is never throttled.
+  default = "m7g.2xlarge"
 }
 
 variable "nextjs_dolphin_gdocs_access_enabled" {
