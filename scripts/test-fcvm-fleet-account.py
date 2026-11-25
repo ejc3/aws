@@ -615,6 +615,19 @@ class QuotaTests(unittest.TestCase):
             " ".join(quota.split()),
         )
 
+    def test_the_renders_builder_has_standard_on_demand_in_the_build_region(self):
+        # One m8gd.metal-24xl (96 vCPUs) at a time: the renders validator launches after the builder has terminated.
+        self.assertIn("fcvm_fleet_factory_standard_vcpus = 96", TF)
+        source = block('data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2"')
+        quota = block('resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2"')
+        for section in (source, quota):
+            self.assertIn("provider     = aws.fcvm_fleet_west2", section)
+            self.assertIn('quota_code   = "L-1216C47A"', section)
+        self.assertIn("max(local.fcvm_fleet_factory_standard_vcpus, "
+                      "data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_standard_west2.value)", quota)
+        pipeline = (Path(__file__).resolve().parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        self.assertIn("fcvm_ami_build_region   = \"us-west-2\"", pipeline)
+
     def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
         # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
         self.assertIn("fcvm_fleet_spot_g_vcpus = 480", TF)

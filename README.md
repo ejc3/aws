@@ -598,6 +598,21 @@ call tagged them at creation; older unmarked snapshots remain for separate revie
 release configuration (templates and reviewed pairs) ships in its code bundle as
 `publisher-config.json`, not in its environment.
 
+Pages mode's arm64 host image (ejc3/fcvm `fleet/ami/README.md`, "The renders track") is built
+on a factory track of its own: the CodeBuild project `fcvm-fleet-image-factory-renders` (the same
+buildspec, with `FLEET_AMI_TRACK=renders` set on the project), its own queue under
+`/fcvm-fleet/ami-pipeline/renders/`, two slots (`renders-build`, `renders-verify`) on one
+m8gd.metal-24xl at a time with a 128 GiB root, a 360-minute lease, and the arm64 Canonical image
+or the released renders image as its base. Every request the pair admits is queued there too,
+with the same id, source, priority and daily window. Its failures go to
+`/fcvm-fleet/ami-factory-failure-renders` in us-east-1, never to the pair's record. Neither track's
+queue, slots, worker session, expiry sweep or image cleanup reads or changes the other's, and a
+renders build's worker session has no Secrets Manager action, so it cannot touch the pair's TLS
+canaries. The builder uses the Standard on-demand quota in us-west-2 (96 vCPUs,
+`fcvm-fleet-account.tf`). `fcvm_ami_renders_track_enabled` keeps the track off until ejc3/fcvm's
+executor has it on main: an older executor ignores the track and the broker refuses its first
+launch.
+
 The first production AMI seed runs under Terraform's backend lock. Before writing the pointer,
 the enabling apply rechecks the planned staging release version and describes the current and
 rollback AMIs, including their linked regional copies, using AWS CLI v2 on the jumpbox. If staging

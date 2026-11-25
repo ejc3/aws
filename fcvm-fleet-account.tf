@@ -17,6 +17,7 @@
 #   neither has Terraform-state or reusable-credential access.
 # - Quotas (ejc3/aws#605, #913): 480 vCPU of G spot in us-east-1 (production's two hosts and a replacement, staging's
 #   host and an image-factory build host); one region is enough.
+#   96 vCPU of Standard on demand in us-west-2 for the image factory's renders builder (fcvm-fleet-ami-pipeline.tf).
 #
 # First apply: the provider aliases need the account id, so apply the account first
 # (-target=aws_organizations_account.fcvm_fleet), then everything.
@@ -38,6 +39,10 @@ locals {
   # whose Managed Instances are on-demand g4dn.xlarge in this account (fcvm-fleet-lambda.tf, 48 vCPUs a stack).
   fcvm_fleet_on_demand_g_base_vcpus = 768
   fcvm_fleet_on_demand_g_vcpus      = local.fcvm_fleet_on_demand_g_base_vcpus + 2 * local.fcvm_lambda_max_vcpus
+  # Standard on-demand vCPUs in us-west-2 for the image factory's renders track (fcvm-fleet-ami-pipeline.tf): one
+  # m8gd.metal-24xl (96 vCPUs) at a time, since the renders validator launches only after the renders builder has
+  # terminated, and the renders project runs one build at a time. The pair's builders are G and do not draw on it.
+  fcvm_fleet_factory_standard_vcpus = 96
 }
 
 resource "aws_organizations_organizational_unit" "fcvm_fleet" {
@@ -668,6 +673,23 @@ resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
     ? local.fcvm_fleet_on_demand_g_base_vcpus
     : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted)
   )
+}
+
+# The renders track's builder quota (local.fcvm_fleet_factory_standard_vcpus): "Running On-Demand Standard (A, C, D, H, I,
+# M, R, T, Z) instances" (L-1216C47A) in the build region. Where the account's value is below 96 the apply files an
+# increase request, which AWS grants, partly grants or denies in its own time; the data source is the effective quota,
+# and a larger value is never lowered.
+data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2" {
+  provider     = aws.fcvm_fleet_west2
+  service_code = "ec2"
+  quota_code   = "L-1216C47A"
+}
+
+resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_standard_west2" {
+  provider     = aws.fcvm_fleet_west2
+  service_code = "ec2"
+  quota_code   = "L-1216C47A"
+  value        = max(local.fcvm_fleet_factory_standard_vcpus, data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_standard_west2.value)
 }
 
 output "fcvm_fleet" {

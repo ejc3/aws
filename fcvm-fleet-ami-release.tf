@@ -22,6 +22,33 @@ resource "aws_ssm_parameter" "fcvm_ami_release" {
   }
 }
 
+# The renders host image's release pointer (fcvm-fleet-ami-pipeline.tf, the renders track): only the renders publication
+# writes it, and the pair's never reads or writes it. renders_amis names the build region's original (the next renders
+# build's base) and the release region's copy (the renders host template's image): { region = { arm64 = "ami-..." } }.
+# Empty until the first renders publication; the renders host class exists only once it names an image.
+resource "aws_ssm_parameter" "fcvm_ami_renders_release" {
+  provider    = aws.fcvm_fleet_east1
+  name        = "/fcvm-fleet/ami-release-renders"
+  description = "Validated Fleet renders host AMI and previous release; the image-only publisher owns the value"
+  type        = "String"
+  value = jsonencode({
+    version      = 1
+    track        = "renders"
+    generation   = 0
+    source_sha   = ""
+    build_id     = ""
+    guard_sha256 = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")
+    renders_amis = {}
+    versions     = {}
+    build        = null
+    previous     = null
+  })
+  lifecycle {
+    ignore_changes  = [value]
+    prevent_destroy = true
+  }
+}
+
 # Every published host and tile image is also copied into these regions: the fixed ones, so
 # agents' GPU boxes and other work can run outside the staging fleet's region and quotas, and
 # every other region staging lists for its GPU hosts (fcvm-fleet.tf, local.fcvm_fleet_host_regions),
