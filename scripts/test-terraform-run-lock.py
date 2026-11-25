@@ -310,6 +310,11 @@ class WiringTests(unittest.TestCase):
         self.assertIn("printf 'main=%s checked_at=%s terraform_exit=%s\\n'", (ROOT / "scripts/publish-applied-status.sh").read_text())
         self.assertIn("s/^main=([0-9a-f]{40}) checked_at=([0-9TZ:-]+) terraform_exit=([0-9]+)$/", HOOK)
 
+    def test_the_full_check_plans_at_low_parallelism(self):
+        # At the default 10 the full plan's providers outgrew the 8 GB jumpbox and the check was killed (2026-11-25).
+        script = (ROOT / "scripts/publish-applied-status.sh").read_text()
+        self.assertIn('"$terraform" plan -parallelism=2 -detailed-exitcode', script)
+
     def test_the_association_runs_daily_on_every_admin_box(self):
         self.assertIn('schedule_expression = "rate(1 day)"', TF)
         self.assertIn("values = values(local.admin_tmux_boxes)", TF)

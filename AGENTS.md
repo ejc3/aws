@@ -295,9 +295,17 @@ runner security groups, VPC flow logs to the audit bucket, and `ami-replicator`,
 AMIs of each architecture to Ohio every hour (the launcher picks its AMI by tag in its own region, and fcvm publishes
 only in us-west-1). Nothing there bills while idle: no Elastic IP, NAT, instance or endpoint (a test enforces it). The
 cutover is a separate act the owner schedules. The fcvm metal runners are region-aware: `local.runner_regions` in
-`runner-vpc.tf` (primary first; now `["us-east-2"]`: the move is finished and us-west-1 holds no runners; `["us-east-2", "us-west-1"]` was the draining step) drives the launcher, reuse and cleanup Lambdas, the IAM ARNs and the
-subnet and security-group choice. A move is two applies: `["us-east-2", "us-west-1"]` (new runners in Ohio, old ones still
-counted, reused and reaped while they drain), then `["us-east-2"]`. The control plane (SSM, DynamoDB, the Lambdas) stays in
+`runner-vpc.tf` is their launch order, primary first, now `["us-east-2", "us-west-1"]` (owner, 2026-11-24: "Make sure CI
+spreads out across regions"). A launch tries every subnet and instance type in Ohio and, once every pool there has refused
+(any refusal for spot; only capacity or quota for on-demand), those of us-west-1, each region with its own AMI (a region
+with none is skipped), subnets and security group (the webhook's `LAUNCH_NETWORKS`), and starts a call only while the
+webhook's invocation has time for it. A capacity or quota refusal is remembered for 10 minutes (a `refused-pools#` row in
+the registration table), so the next launches skip to pools that have not just refused instead of spending the invocation
+on Ohio again; a walk that runs out of time is retried by the next poll. Every listed region is read on every launch
+decision, and a failed read in either fails the launch. A runner in us-west-1 costs about three times Ohio's, and a full
+fallback there meets its 1,148 vCPU spot quota, shared with the app runners. Every listed region is counted, reused and reaped, and the launch IAM allows exactly the
+listed regions' subnets, security groups and runner AMIs. A region left out of the list is no longer reaped: drop one only
+once no runner is left there. The control plane (SSM, DynamoDB, the Lambdas) stays in
 us-west-1; an instance uses `CONTROL_REGION` for those and its own region for EC2. The app runners (runner-app.tf) have not
 moved. **The parallel boxes** live in Ohio (`ohio-pbox.tf`): their own VPC, security group, key pair, launch templates and
 idle watchdog, and a peering route to the I/O box's one subnet for the NFS scratch. They moved from us-west-2 on 2026-10-05
@@ -559,7 +567,7 @@ The long-lived development and administration instances are:
 | jumpbox-2 | t4g.micro (2 vCPU / 1GB) | on-demand | Independent recovery admin host | jumpbox2.tf |
 | fcvm-metal-arm | r8gd.metal-24xl (96 vCPU / 768GB, Graviton4) | spot | Firecracker/KVM on ARM64 | firecracker-dev.tf |
 | fcvm-metal-x86 | c5d.metal | spot | Firecracker/KVM on x86 | x86-dev.tf |
-| nextjs-dev | t4g.2xlarge (8 vCPU / 32 GiB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-ct.tf / nextjs-dev.tf |
+| nextjs-dev | m7g.2xlarge (8 vCPU / 32 GiB) | **on-demand** | Kids' Next.js games behind Cloudflare Access | nextjs-ct.tf / nextjs-dev.tf |
 | io-box | i8ge.large | persistent spot | Private ephemeral NFS scratch | io-box.tf |
 | wbox | g4dn.xlarge, Windows Server 2025 | on-demand, stopped when idle 1h | Windows game playtesting; RDP/DCV from dev boxes only; `wbox up/down/run/launch` | wbox.tf |
 | wbox-, pbox-, gbox-`<member>` | per member (colton, connor, colin, skevh): a Windows g4dn spot box in us-west-1a, a Graviton spot box in us-east-2c, a small NVIDIA box in us-west-2a | launched and terminated on demand; idle and lifetime reaped | Each member's own boxes, each with a fixed private IP; the wbox and pbox keep a persistent disk per person. The same `wbox` / `pbox` / `gbox` commands, run from the member's account, act on them (`member-boxes.tf`) | member-wbox.tf, member-pbox.tf, member-gbox.tf |
@@ -848,6 +856,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   is used once: a revoked login is replaced under a new name. Add the name to `local.claw_master_profiles` only to change
   its place in the order; a login that exists only on the server stays out of fcvm's default list in the login script
   (refreshing one login on two boxes revokes the other copy).
+- **Claiming a banked limit reset** (claude.ai's "Reset for free") without signing in to that account:
+  `sudo claw-master-reset claude-NAME [fable|weekly]` over SSM shows what the reset would clear and whether Anthropic
+  allows it now. Add `--claim` to spend it; it cannot be undone. A Fable reset clears Fable and gives the week back
+  Fable's share. A weekly reset clears the week. Neither moves the reset time. Needs claw-master with `reset`
+  (ejc3/CLIProxyAPI #48).
 - **Restarts nobody notices: Envoy and blue/green** (`claw-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
   version and sha256) listens on the client address and the tunnel's loopback port and passes TCP through,
   unchanged, to one of two servers on the box, `claude-master-server@blue` or `@green`, each on its own port of
@@ -1501,6 +1514,29 @@ Available if a task needs them; neither needs a key on disk.
   Terraform owns only the container and grants. Pricing and capabilities must come from
   the current official API documentation; the web subscription and API credits differ.
 
+- **run.cloud** (cloud iOS simulators: create one, install a simulator build, tap, type,
+  screenshot, read the pasteboard). The fallback when every Mac simulator is busy.
+  `run-cloud/api-key` in us-west-1, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same
+  admin/dev-role read boundary as ElevenLabs plus the reaper's role (next bullet). Fetch it at use time as `RUN_CLOUD_API_KEY`
+  (with `RUN_CLOUD_API_URL=https://api.run.cloud`) for the `runcloud` CLI or `@run-cloud/sdk`.
+  Billed per active simulator minute: give each session an inactivity and a hard timeout,
+  and delete it when done. Terraform owns only the container and grants.
+- **The run.cloud reaper** (`run-cloud-reaper.tf`, `scripts/run-cloud-reaper.py`): the Lambda `run-cloud-reaper` runs every 5
+  minutes, reads that key, lists the account's active iOS and Android sessions, sandboxes and boxes, and deletes an active
+  session or a running, non-persistent sandbox that has no inactivity and no hard timeout or one over its cap (once it is 5 minutes
+  old), that has been idle 10 minutes, or that is older than 60 minutes (a sandbox: its current run) whatever its timeouts. The
+  caps are those same 10 minutes (inactivity timeout, a sandbox's idle pause) and 60 minutes (hard timeout, a sandbox's lifetime);
+  all three numbers are Terraform variables (`run_cloud_reaper_*`). Only sandboxes report last activity: a simulator session does
+  not, so for simulators the idle rule is age (run.cloud's own inactivity timer, which the cap keeps at 10 minutes or less, plus the
+  60-minute rule). It never deletes a session or sandbox with the run.cloud tag `keep=true` (`tags` on create in the SDK;
+  `runcloud sandbox create --tag keep=true`), a persistent sandbox (idle pause 0
+  or no lifetime limit: `--persistent`, `--expose`), one behind a box, or a sandbox that is not running; persistent ones and boxes
+  are logged on every run. Each run logs one JSON line per session (log group `/aws/lambda/run-cloud-reaper`) and publishes
+  `SessionsReaped` and `ActiveSessions` in namespace `RunCloud`; a failed delete is retried by the next run. Its role reads that one
+  secret, writes its own log group and publishes its own namespace, nothing else. Alarms (cost-alerts): two failed runs in 15
+  minutes, or no run for 15. `aws lambda invoke --function-name run-cloud-reaper --payload '{"dry_run": true}'
+  --cli-binary-format raw-in-base64-out /dev/stdout` shows the decisions without deleting anything.
+
 - **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
   uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
   SUNO_COOKIE at use time only. It is a full website session: never in files, command
@@ -1914,6 +1950,22 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
   `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
   notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
+- **Host regions** (`local.fcvm_fleet_host_regions` in `fcvm-fleet.tf`; owner, 2026-11-24): one ordered list per stack
+  decides where its GPU hosts run (staging `["us-east-1", "us-west-2"]`, prod `["us-east-1"]`; prod refuses a region it
+  has no module in). Every listed region other than the publisher's compute region (us-east-1) is a copy region
+  (`fcvm-fleet-ami-release.tf`), so each build is copied there with no hand step, and gets a host template booting its
+  host copy from `/fcvm-fleet/ami-release-copies` (read with a schema postcondition and an apply-time guard, as the
+  pointer is). After each replication the publisher moves those templates onto the new copy, and back on a rollback
+  (`publish.py` `follow_copies`): an image-only version labelled for replay, outside the release's transaction; its role
+  may create versions and set defaults on exactly those templates. The coordinator is given the FIRST listed region only
+  (`local.fcvm_fleet_coordinator_host_regions`): it runs its awake hosts in every region it is given, in name order, with
+  no fallback (ejc3/fcvm#2114), so reordering the list moves the hosts; once it falls back in list order that local
+  becomes the whole list. Staging's task definition keeps that region us-east-1 until the release gate and critical
+  retirement cover another region. A newly listed region gets its template at the apply after the publisher's next replication
+  (or `replicate-active-release`); a `check` warns until then, and the coordinator's task definition refuses a first
+  region without one. Only us-east-1 yet: the release gate's placement and a critical release's retirement of old-image
+  hosts, and Windows, Minecraft and potato modes (a copy region's bootstrap and IPv4 ports serve the GPU slots and
+  phones). Prod's image release refuses copy regions until it has a copy step of its own.
 - **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `m8gd.metal-24xl`
   per stack while the fleet is awake, launched by the coordinator as a GPU host is (`FLEET_RENDERS_TEMPLATES`,
   `FLEET_RENDERS_SUBNETS`). Its template (`fcvm-fleet-renders-arm64`, instances tagged `Purpose=fcvm-fleet-renders`),

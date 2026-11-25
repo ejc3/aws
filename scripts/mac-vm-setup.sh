@@ -70,9 +70,10 @@ esac
 on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "$@"; }
 
 # Existing listeners already search /usr/local/bin. Updating the tools there also works during a job.
-# The same install loads (or reloads, when it changed) the admin's hourly disk cleaner LaunchAgent.
+# The same install loads (or reloads, when it changed) the admin's hourly disk cleaner LaunchAgent and the
+# root coreaudiod check LaunchDaemon.
 install_sim_slots() {
-  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim ci/ci-disk-clean install-ci-sim-slots.sh |
+  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim ci/ci-disk-clean ci/ci-coreaudio-check install-ci-sim-slots.sh |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' '
       set -e
       d=$(mktemp -d)

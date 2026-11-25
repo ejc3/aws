@@ -35,3 +35,22 @@ When something fails, read its actual error before you say why:
 
 "X was blocking it" is a claim. Make it only when you saw X refuse. If you changed two things and it worked, say you
 are not sure which one mattered.
+
+## iOS Simulators: run.cloud
+
+When a job needs an iOS Simulator and you have no Mac simulator free, use run.cloud: cloud iOS
+simulators that take a simulator build (`.app`, `.zip`, `.tar.gz`), with tap, type, screenshot,
+pasteboard, open-URL and accessibility-tree calls, from the `runcloud` CLI or `@run-cloud/sdk`.
+
+- The key is the Secrets Manager secret `run-cloud/api-key` (us-west-1), JSON `{"RUN_CLOUD_API_KEY": ...}`.
+  Read it into the environment when you use it, never onto a command line or into a file:
+  `export RUN_CLOUD_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id run-cloud/api-key --query SecretString --output text | jq -r .RUN_CLOUD_API_KEY)`
+  and `export RUN_CLOUD_API_URL=https://api.run.cloud`.
+- It is billed per active simulator minute against a small shared balance. Give every session an
+  inactivity timeout and a hard timeout (`runcloud ios create --inactivity-timeout 2m --hard-timeout 30m`),
+  delete it when you are done (`runcloud ios delete <id>`), and never touch a session you did not
+  start (`runcloud ios list` shows everyone's).
+- Simulator builds only: never sign or ship an app from it.
+- A reaper deletes any session older than 60 minutes, any with no timeouts (or timeouts over 10 minutes idle /
+  60 minutes total) once it is 5 minutes old, and sandboxes idle 10 minutes. Tag a session `keep=true` only when
+  you must keep it longer, and delete it yourself when done.

@@ -280,7 +280,8 @@ class SecurityHubAutomation(unittest.TestCase):
         self.assertEqual(got, {
             "dolphin-inspector-ecr-lambda-code-off-by-design": (["Inspector.2", "Inspector.3"], "", [], [], 8),
             "dolphin-redis-public-ip-by-design": (["ECS.2"], "EQUALS",
-                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN], [], 9),
+                                                  ['"arn:aws:ecs:us-west-1:${%s}:service/dolphin/redis"' % DOLPHIN,
+                                                   '"arn:aws:ecs:us-west-1:${%s}:service/dolphin/rundown-collector"' % DOLPHIN], [], 9),
             "dolphin-config-custom-recorder-role-by-design": (["Config.1"], "", [], [], 10),
             WHISPER_RULE: (["EC2.9"], "", [], WHISPER_TAGS, 11),
         })

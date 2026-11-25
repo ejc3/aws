@@ -17,9 +17,13 @@
 #                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on.
 #                     A GPU flavor implies --fallback: home first, then every fallback region that offers
 #                     the type (owner, 2026-10-22: the region does not matter for these).
-#   pbox up [N] kvm-96 --local-nvme
+#   pbox up [N] kvm-96|kvm-192 --local-nvme
 #                     try only the KVM types with disposable instance-store NVMe. A slot already occupied
 #                     by a different type is left alone; choose a free or compatible slot.
+#   pbox up [N] kvm-96|kvm-192 --local-nvme --min-memory GIB
+#                     of those, try only the types with at least GIB of memory (kvm-96: 192 or 384;
+#                     kvm-192: 384 or 768). For a job whose measured peak does not fit the smallest type
+#                     of the flavor. `pbox capacity` takes it too.
 #   pbox up [N] FLAVOR --fallback
 #                     home AZ first; if it has no capacity, every other US AZ that has a
 #                     fallback site (pbox-fallback.tf), best spot placement score first.
@@ -62,7 +66,7 @@
 #                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
-#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96.
+#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96 and kvm-192.
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
 #   "launched box=N region=R az=Z type=T ip=IP id=i-... work=persistent|fresh", or "running ..." when it already was,
@@ -166,8 +170,18 @@ flavor_lines() {
 }
 
 flavor_types() { flavor_lines | awk -v f="$1" '$1 == f { for (i = 6; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") }'; }
-has_kvm96_local_nvme() {
-  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl) return 0 ;; *) return 1 ;; esac
+# The KVM types with instance-store NVMe, which --local-nvme limits kvm-96 and kvm-192 to.
+has_kvm_local_nvme() {
+  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl|c8gd.metal-48xl|c9gd.metal-48xl|m8gd.metal-48xl) return 0 ;; *) return 1 ;; esac
+}
+# The memory of each of those types, in GiB, which --min-memory compares (c: 2 GiB per vCPU, m: 4).
+kvm_local_nvme_memory_gib() {
+  case "$1" in
+    c8gd.metal-24xl) echo 192 ;;
+    m8gd.metal-24xl|c8gd.metal-48xl|c9gd.metal-48xl) echo 384 ;;
+    m8gd.metal-48xl) echo 768 ;;
+    *) echo 0 ;;
+  esac
 }
 
 # The flavor an instance type belongs to (each type is in exactly one), or nothing.
@@ -252,6 +266,7 @@ BOX=""
 MODE=""
 FLAVOR=""
 LOCAL_NVME=""
+MIN_MEMORY=""
 FALLBACK=""
 ONLY_REGIONS=""
 OPEN=""
@@ -269,6 +284,13 @@ while [ $# -gt 0 ]; do
       FLAVOR="$1" ;;
     --flavor=*) FLAVOR="${1#--flavor=}" ;;
     --local-nvme) LOCAL_NVME=1 ;;
+    --min-memory)
+      shift
+      MIN_MEMORY="${1:-}"
+      [[ "$MIN_MEMORY" =~ ^[1-9][0-9]{0,4}$ ]] || { say "--min-memory needs a whole number of GiB (384)"; exit 2; } ;;
+    --min-memory=*)
+      MIN_MEMORY="${1#--min-memory=}"
+      [[ "$MIN_MEMORY" =~ ^[1-9][0-9]{0,4}$ ]] || { say "--min-memory needs a whole number of GiB (384)"; exit 2; } ;;
     --fallback) FALLBACK=1 ;;
     --open) OPEN=1 ;;
     --on-demand) ONDEMAND=1 ;;
@@ -296,7 +318,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --min-memory GIB, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
   esac
   shift
 done
@@ -385,9 +407,12 @@ if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
 if [ -n "$LOCAL_NVME" ]; then
-  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || [ "$FLAVOR" != "kvm-96" ]; then
-    say "--local-nvme only applies to 'up kvm-96' and 'capacity kvm-96'"; exit 2
+  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || { [ "$FLAVOR" != "kvm-96" ] && [ "$FLAVOR" != "kvm-192" ]; }; then
+    say "--local-nvme only applies to 'up' and 'capacity' with kvm-96 or kvm-192"; exit 2
   fi
+fi
+if [ -n "$MIN_MEMORY" ] && [ -z "$LOCAL_NVME" ]; then
+  say "--min-memory only applies with --local-nvme ('up' and 'capacity' with kvm-96 or kvm-192)"; exit 2
 fi
 
 if [ "$CMD" = "flavors" ]; then
@@ -416,14 +441,24 @@ if [ "$CMD" = "up" ] || [ "$CMD" = "capacity" ]; then
   if [ -n "$LOCAL_NVME" ]; then
     NVME_TYPES=()
     for T in $TYPES; do
-      if has_kvm96_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
+      if has_kvm_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
     done
     if [ "${#NVME_TYPES[@]}" -eq 0 ]; then
       say "No local NVMe types are configured for $FLAVOR; nothing was launched."; exit 2
     fi
     TYPES="${NVME_TYPES[*]}"
   fi
-  FLAVOR_HINT="$FLAVOR${LOCAL_NVME:+ --local-nvme}"
+  if [ -n "$MIN_MEMORY" ]; then
+    MEMORY_TYPES=()
+    for T in $TYPES; do
+      if [ "$(kvm_local_nvme_memory_gib "$T")" -ge "$MIN_MEMORY" ]; then MEMORY_TYPES+=("$T"); fi
+    done
+    if [ "${#MEMORY_TYPES[@]}" -eq 0 ]; then
+      say "No local NVMe type of $FLAVOR has $MIN_MEMORY GiB of memory; nothing was launched."; exit 2
+    fi
+    TYPES="${MEMORY_TYPES[*]}"
+  fi
+  FLAVOR_HINT="$FLAVOR${LOCAL_NVME:+ --local-nvme}${MIN_MEMORY:+ --min-memory $MIN_MEMORY}"
   case "$FLAVOR" in kvm-*) MODE="kvm" ;; esac
 fi
 

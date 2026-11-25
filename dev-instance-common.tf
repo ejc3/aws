@@ -70,6 +70,15 @@ resource "aws_iam_policy" "dev_server_service_quotas_read" {
         Action   = ["logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"]
         Resource = "${aws_cloudwatch_log_group.runner_loss.arn}:*"
       },
+      # The runner image builder (github-ami-builder.tf) reports a failure only through its
+      # serial console; its user data carries no credential. Its own instances only.
+      {
+        Sid       = "ReadRunnerImageBuilderConsoles"
+        Effect    = "Allow"
+        Action    = "ec2:GetConsoleOutput"
+        Resource  = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = { StringEquals = { "aws:ResourceTag/Name" = "ami-builder-temp" } }
+      },
     ]
   })
 }

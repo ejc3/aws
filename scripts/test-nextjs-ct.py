@@ -86,7 +86,7 @@ class CutoverSwitchTests(unittest.TestCase):
         self.assertIn("volume/${local.nextjs_live_instance.root_block_device[0].volume_id}", NEXTJS_DEV_TF)
         alarms = (ROOT / "nextjs-alarms.tf").read_text()
         self.assertNotIn("aws_instance.nextjs_dev", alarms)
-        self.assertEqual(alarms.count("local.nextjs_live_instance"), 6)
+        self.assertEqual(alarms.count("local.nextjs_live_instance"), 5)  # no CPU-credit alarm since m7g (2026-11-25)
         self.assertIn("[local.nextjs_live_instance.id]", (ROOT / "agents-md.tf").read_text())
         self.assertIn('Name    = local.nextjs_ct_serving ? "nextjs-dev-retired" : "nextjs-dev"', NEXTJS_DEV_TF)
 
@@ -399,6 +399,12 @@ class BoxAgentNotesTests(unittest.TestCase):
         notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
         for phrase in ("`HTTPS_PROXY` is not a firewall", "127.0.0.1", "Do not unset it",
                        "nothing you run inside can change them", "Name a cause only after you have seen it"):
+            self.assertIn(phrase, notes)
+
+    def test_the_notes_say_how_to_use_run_cloud_without_leaking_or_overspending(self):
+        notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
+        for phrase in ("`run-cloud/api-key`", "--inactivity-timeout", "--hard-timeout", "runcloud ios delete",
+                       "never touch a session you did not", "never onto a command line"):
             self.assertIn(phrase, notes)
 
 

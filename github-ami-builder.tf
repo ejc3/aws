@@ -183,6 +183,16 @@ resource "aws_iam_role_policy" "github_actions_ami_builder" {
         Condition = { StringEquals = { "ec2:ResourceTag/Name" = "ami-builder-temp" } }
       },
       {
+        # A builder that stops before it can tag itself says why only on its serial console. The build script
+        # prints the console's cloud-init lines in the job log when a leg fails. Its own builders only; the
+        # user data carries no credential, and the script masks host names and addresses before printing.
+        Sid       = "ReadBuilderConsole"
+        Effect    = "Allow"
+        Action    = "ec2:GetConsoleOutput"
+        Resource  = "arn:aws:ec2:us-west-1:${data.aws_caller_identity.current.account_id}:instance/*"
+        Condition = { StringEquals = { "ec2:ResourceTag/Name" = "ami-builder-temp" } }
+      },
+      {
         # An image is created as a candidate, which no launcher selects, and published by the statement below
         # once it has booted. "github-runner" at creation stays allowed for the build script on fcvm's main
         # until the two-step one lands, and for the image's snapshot.

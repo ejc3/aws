@@ -1,0 +1,199 @@
+#!/usr/bin/python3
+"""Restart the CI VM's coreaudiod when it stops answering (ejc3/aws#1068).
+
+Runs every 5 minutes as root from the LaunchDaemon com.ejcampbell.ci-coreaudio-check, which
+scripts/mac/install-ci-sim-slots.sh installs. On 2026-11-25 the VM's coreaudiod hung at 06:01 UTC and stayed hung:
+from then on every process that touched CoreAudio blocked for good (WebKit's GPU process, AVPlayer, CoreSimulator's
+device I/O), and every dolphin-labs native test run failed. Each run:
+
+  1. asks CoreAudio for the default output device in a child process (this file with --probe). The child says
+     "ready" once CoreAudio is loaded (it has 60 seconds for that), and only the request itself is then timed, at 10
+     seconds (a real hang lasts for good). Any answer, an error status included, is alive. A probe that cannot start
+     or exits without answering says nothing about coreaudiod: it never causes a restart, and is logged once;
+  2. when it does not answer, kills coreaudiod (launchd starts it again on the next request) once no runner has a
+     job (no Runner.Worker process; an unreadable process list counts as a job), or after 30 minutes of no answer
+     even with a job running: a job that touches audio is already stuck, and under steady CI an idle moment may
+     not come (the disk cleaner's lesson, #1033);
+  3. restarts at most once in 15 minutes, then asks again and logs whether it answers.
+
+The log carries outcomes and minutes only. Python 3.9 (Xcode's /usr/bin/python3).
+"""
+
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+import time
+
+PROBE_TIMEOUT = 10
+LOAD_TIMEOUT = 60
+RESTART_GAP = 15 * 60
+MAX_WAIT = 30 * 60
+SETTLE = 3
+STATE = Path("/var/db/ci-coreaudio-check")
+PS = "/bin/ps"
+KILLALL = "/usr/bin/killall"
+PROBE = [sys.executable, os.path.abspath(__file__), "--probe"]
+
+
+def probe():
+    """One CoreAudio request: the default output device. Returns when coreaudiod answers, with any status."""
+    import ctypes
+
+    audio = ctypes.CDLL("/System/Library/Frameworks/CoreAudio.framework/CoreAudio")
+
+    class Address(ctypes.Structure):
+        _fields_ = [("selector", ctypes.c_uint32), ("scope", ctypes.c_uint32), ("element", ctypes.c_uint32)]
+
+    def code(text):
+        return int.from_bytes(text.encode(), "big")
+
+    # kAudioObjectSystemObject (1), kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal.
+    address = Address(code("dOut"), code("glob"), 0)
+    device, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    audio.AudioObjectGetPropertyData(1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
+    return 0
+
+
+def ask():
+    """"answers"; "no answer" (ready, then nothing within PROBE_TIMEOUT, or still loading after LOAD_TIMEOUT); or
+    "no probe" (it could not start, or exited without answering). The child stays in this job's process group, so
+    launchd ends it with the job."""
+    try:
+        child = subprocess.Popen(PROBE, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except OSError:
+        return "no probe"
+    try:
+        if not select.select([child.stdout], [], [], LOAD_TIMEOUT)[0]:
+            return "no answer"
+        if child.stdout.readline() != b"ready\n":
+            return "no probe"
+        try:
+            code = child.wait(timeout=PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return "no answer"
+        return "answers" if code == 0 else "no probe"
+    finally:
+        if child.poll() is None:
+            child.kill()  # a thread waiting for a Mach reply still dies on SIGKILL
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        child.stdout.close()
+
+
+def job_running():
+    try:
+        out = subprocess.run([PS, "-axww", "-o", "command="], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if out.returncode != 0 or not out.stdout.strip():
+        return True
+    return any("Runner.Worker" in line for line in out.stdout.splitlines())
+
+
+def restart():
+    """SIGKILL, not SIGTERM: a hung daemon may never run its TERM handler. launchd relaunches it on demand."""
+    try:
+        return subprocess.run([KILLALL, "-KILL", "coreaudiod"], stdin=subprocess.DEVNULL, capture_output=True,
+                              timeout=30).returncode
+    except (OSError, subprocess.SubprocessError):
+        return -1
+
+
+def minutes(seconds):
+    return int(max(0, seconds) // 60)
+
+
+def check(state, now):
+    """One pass. Updates state in place; returns the line to log, or None when there is nothing to say."""
+    result = ask()
+    if result == "no probe":
+        if state.get("probe_failed"):
+            return None
+        state["probe_failed"] = True
+        return "the probe fails, so coreaudiod is not being checked"
+    state.pop("probe_failed", None)
+    if result == "answers":
+        if state.get("hung_since") is None:
+            return None
+        hung = minutes(now - state["hung_since"])
+        state["hung_since"] = None
+        return f"coreaudiod answers again after {hung} min"
+    if state.get("hung_since") is None or state["hung_since"] > now:  # a clock set back counts from now
+        state["hung_since"] = now
+    hung = now - state["hung_since"]
+    since_restart = now - state.get("restarted_at", float("-inf"))
+    if 0 <= since_restart < RESTART_GAP:
+        return (f"coreaudiod has not answered for {minutes(hung)} min; restarted {minutes(since_restart)} min ago, "
+                "the next restart waits")
+    if hung < MAX_WAIT and job_running():
+        return f"coreaudiod has not answered for {minutes(hung)} min; a job is running, the restart waits"
+    status = restart()
+    state["restarted_at"] = now
+    time.sleep(SETTLE)
+    if ask() == "answers":
+        state["hung_since"] = None
+        return f"restarted coreaudiod after {minutes(hung)} min without an answer; it answers"
+    return (f"restarted coreaudiod after {minutes(hung)} min without an answer (killall {status}); "
+            "it still does not answer")
+
+
+def load(path):
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(state, dict):
+        return {}
+    kept = {key: state[key] for key in ("hung_since", "restarted_at")
+            if isinstance(state.get(key), (int, float)) and not isinstance(state.get(key), bool)}
+    if state.get("probe_failed") is True:
+        kept["probe_failed"] = True
+    return kept
+
+
+def save(path, state):
+    temp = path.with_name(path.name + ".new")
+    temp.write_text(json.dumps(state))
+    os.replace(temp, path)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.probe:
+        return probe()
+    os.umask(0o077)
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return 0
+        try:
+            state = load(STATE / "state.json")
+            line = check(state, time.time())
+            save(STATE / "state.json", state)
+        except (OSError, ValueError) as error:
+            print(f"ci-coreaudio-check: failed: {type(error).__name__} {getattr(error, 'errno', '') or ''}".rstrip(),
+                  file=sys.stderr, flush=True)
+            return 1
+    if line:
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(f"{stamp} ci-coreaudio-check: {line}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

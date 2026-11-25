@@ -97,7 +97,7 @@ TF_RUN_LOCK_WAIT=86400 TF_CLI_ARGS='-refresh=false' TF_CLI_ARGS_plan='-target=aw
 [ "$(field pending_count)" = 0 ] || fail "clean plan has pending items"
 [ "$(field main)" = "$(git rev-parse HEAD)" ] || fail "wrong main sha"
 [ "$(field subject)" = "Merge the thing (#42)" ] || fail "wrong subject"
-[ "$(cat "$FAKE_PLAN_CALL")" = 'idle= host_wait=120 workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=10m -input=false -no-color' ] ||
+[ "$(cat "$FAKE_PLAN_CALL")" = 'idle= host_wait=120 workspace=default global= per_command= args=plan -parallelism=2 -detailed-exitcode -lock=true -lock-timeout=10m -input=false -no-color' ] ||
   fail "explicit plan did not lock and refresh the entire default workspace"
 [ "$(stat -c %a "$diagnostic")" = 600 ] || fail "diagnostic is not private"
 
@@ -120,7 +120,7 @@ LOG
 run 2 2 "$tmp/pending.log" --if-idle
 [ "$(field plan)" = pending ] || fail "pending plan not published as pending"
 [ "$(field pending_count)" = 4 ] || fail "expected four managed-resource actions"
-[ "$(cat "$FAKE_PLAN_CALL")" = 'idle=1 host_wait=120 workspace=default global= per_command= args=plan -detailed-exitcode -lock=true -lock-timeout=0s -input=false -no-color' ] ||
+[ "$(cat "$FAKE_PLAN_CALL")" = 'idle=1 host_wait=120 workspace=default global= per_command= args=plan -parallelism=2 -detailed-exitcode -lock=true -lock-timeout=0s -input=false -no-color' ] ||
   fail "Stop hook would wait instead of using both nonblocking locks"
 python3 - "$FAKE_AWS_OUT" <<'PY' || fail "pending list is wrong"
 import json, sys

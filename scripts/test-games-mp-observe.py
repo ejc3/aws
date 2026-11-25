@@ -18,8 +18,8 @@ ALLOWED = {
     "ecs:DescribeTaskDefinition", "ecs:ListTaskDefinitions", "ecs:ListTaskDefinitionFamilies",
     "ecs:ListTasks", "ecs:ListServices", "ecs:DescribeTasks", "ecs:DescribeServices",
     "dynamodb:GetItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:DescribeTable",
-    "cloudwatch:DescribeAlarms", "cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics",
-    "cloudwatch:ListMetrics",
+    "cloudwatch:DescribeAlarms", "cloudwatch:DescribeAlarmHistory", "cloudwatch:DescribeAlarmsForMetric",
+    "cloudwatch:GetMetricData", "cloudwatch:GetMetricStatistics", "cloudwatch:ListMetrics",
     "secretsmanager:GetSecretValue",   # ReadMpTestKey only (see the test below)
 }
 # Statements that may use resources = ["*"]: the services give these no resource-level
@@ -154,6 +154,14 @@ class ObserveGrantTests(unittest.TestCase):
                 continue   # public keys, and the verifier's scheme marker (ed25519-v2)
             self.assertNotRegex(var, r"SECRET|TOKEN|PASSWORD|PRIVATE|CREDENTIAL|_KEY$|_KEYS$", var)
 
+
+class AlarmReadTests(unittest.TestCase):
+    def test_alarms_are_read_only_in_this_account(self):
+        body = statements()["ReadAlarms"]
+        self.assertEqual(sorted(actions(body)), ["cloudwatch:DescribeAlarmHistory", "cloudwatch:DescribeAlarms"])
+        self.assertIn('"arn:aws:cloudwatch:*:${data.aws_caller_identity.current.account_id}:alarm:*"', body)
+        for verb in ("PutMetricAlarm", "DeleteAlarms", "SetAlarmState", "DisableAlarmActions", "EnableAlarmActions"):
+            self.assertNotIn(verb, policy_document())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
