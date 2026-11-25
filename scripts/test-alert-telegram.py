@@ -280,6 +280,17 @@ class AlertTelegram(unittest.TestCase):
         self.assertNotIn("muted_until", self.table.items[key("calm")])
         self.assertIn("muted_until", self.table.items[key("busy")])
 
+    def test_an_alarm_sent_after_its_mute_is_not_reported_again_by_the_sweep(self):
+        self.mute("back")
+        self.clock = NOW + 6 * 3600 + 1200
+        self.run_records(alarm("back", "OK", NOW + 6 * 3600 + 400))
+        self.run_records(alarm("back", "ALARM", NOW + 6 * 3600 + 600))  # comes back just after the mute: sent as usual
+        self.assertTrue(self.texts()[-1].startswith("🔴 back"))
+        self.cw.alarms["back"] = ("ALARM", 3 * 3600)
+        before = len(self.texts())
+        self.sweep()
+        self.assertEqual(len(self.texts()), before)  # no second 🔴 for the same alarm
+
     def test_the_sweep_leaves_a_mute_that_has_not_ended(self):
         self.mute("m")
         self.clock = NOW + 3600
@@ -342,6 +353,15 @@ class AlertTelegram(unittest.TestCase):
                      "Timestamp": iso(NOW)}})
         self.assertEqual(self.texts(), ["ℹ️ Security alerts: 3 Inspector, 1 GuardDuty", "ℹ️ Security alert: GuardDuty: Recon",
                                         "ℹ️ Access audit: jumpbox: credentials opened by python3"])
+
+
+    def test_cloudtrails_access_audit_notice_sends_its_first_sentence_only(self):
+        body = json.dumps("ACCESS AUDIT: registered principal used. arn:aws:iam::123456789012:user/someone (key AKIAEXAMPLE) "
+                          "called iam CreateUser from 203.0.113.9 in us-west-1 at 2026-11-25. Result: none. User agent: curl.")
+        self.run_records({"Sns": {"Message": body, "Timestamp": iso(NOW)}})
+        self.assertEqual(self.texts(), ["ℹ️ Access audit: registered principal used"])
+        for leak in ("AKIAEXAMPLE", "203.0.113.9", "someone", "curl"):
+            self.assertNotIn(leak, self.texts()[0])
 
 
 class Terraform(unittest.TestCase):

@@ -188,6 +188,8 @@ def handle_alarm(alarm, when, table, token, chat):
     item["region"] = parts[3] if len(parts) > 4 else HOME_REGION
     item["account"] = str(alarm.get("AWSAccountId") or "")
     muted = float(item.get("muted_until", 0) or 0) > when
+    if not muted:
+        item.pop("muted_until", None)  # an ended mute is handled here, so the sweep does not report it again
     fired = [float(t) for t in item.get("fired", []) if when - float(t) < FLAP_WINDOW]
     if state == "ALARM":
         fired.append(when)
@@ -241,7 +243,7 @@ def sweep(table, token, chat, now):
             found = cloudwatch(item.get("region") or HOME_REGION).describe_alarms(AlarmNames=[name])
             alarms = found.get("MetricAlarms", []) + found.get("CompositeAlarms", [])
             current = alarms[0] if alarms else {}
-            since = current.get("StateUpdatedTimestamp")
+            since = current.get("StateTransitionedTimestamp") or current.get("StateUpdatedTimestamp")
             since = since.timestamp() if hasattr(since, "timestamp") else parse_time(since, now)
             if current.get("StateValue") == "ALARM":
                 if now - since < SETTLED:
@@ -321,7 +323,11 @@ def lambda_handler(event, context=None):
             outcome = handle_alarm(alarm, parse_time(alarm.get("StateChangeTime"), when), table, token, chat)
         else:
             subject = " ".join(str(sns.get("Subject") or "Alert").split())
-            text = "" if subject.startswith(SUBJECT_ONLY) else readable(message)
+            if str(message).lstrip('"').startswith("ACCESS AUDIT:"):
+                # CloudTrail's access-audit notice (access-audit.tf) has no Subject: its first sentence only.
+                subject, text = "Access audit: " + str(message).lstrip('"')[len("ACCESS AUDIT:"):].split(".")[0].strip(), ""
+            else:
+                text = "" if subject.startswith(SUBJECT_ONLY) else readable(message)
             send(token, chat, f"ℹ️ {subject}" + (f"\n{text}" if text else ""))
             outcome = "message"
         counts[outcome] = counts.get(outcome, 0) + 1
