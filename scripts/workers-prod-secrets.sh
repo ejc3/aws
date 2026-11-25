@@ -50,6 +50,8 @@ case "$SITE" in
     OUT_OF_BAND_NAMES+=" GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET LEDGER_AUTH_TOKEN LEDGER_DATABASE_URL TURSO_AUTH_TOKEN TURSO_DATABASE_URL"
     # The arrival page's place lookups (dolphin-maps /api/place, server-side only): the fetch services Dolphin licenses.
     OUT_OF_BAND_NAMES+=" BROWSERBASE_API_KEY BROWSERBASE_PROJECT_ID EXA_API_KEY SCRAPINGDOG_API_KEY"
+    # The trivia queue's bearer token (dolphin-maps#2050, ejc3/aws#1054): random, its own value per environment.
+    OUT_OF_BAND_NAMES+=" TRIVIA_QUEUE_TOKEN"
     ;;
   *) echo "no production Worker secrets are defined for $SITE (workers-prod-secrets.tf)" >&2; exit 2 ;;
 esac

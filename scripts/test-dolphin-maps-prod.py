@@ -18,11 +18,11 @@ ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "dolphin-labs-zone.tf").read_text()
 SCRIPT = ROOT / "scripts" / "workers-prod-secrets.sh"
 DOLPHIN_ROLE = "arn:aws:iam::484888470752:role/OrganizationAccountAccessRole"
-# The names dolphin-maps-prod reads (issue #529 and the arrival page's server-side place lookups).
+# The names dolphin-maps-prod reads (issue #529, the arrival page's server-side place lookups and the trivia queue).
 # APP_ORIGIN is a wrangler.jsonc var, not a secret.
 NAMES = ["ACCOUNT_TOKEN_KEY", "APPLE_BUNDLE_ID", "APPLE_KEY_ID", "APPLE_PRIVATE_KEY", "APPLE_SERVICES_ID", "APPLE_TEAM_ID",
          "BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID", "EXA_API_KEY", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET",
-         "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "SCRAPINGDOG_API_KEY", "TURSO_AUTH_TOKEN",
+         "LEDGER_AUTH_TOKEN", "LEDGER_DATABASE_URL", "SCRAPINGDOG_API_KEY", "TRIVIA_QUEUE_TOKEN", "TURSO_AUTH_TOKEN",
          "TURSO_DATABASE_URL"]
 # What Terraform writes into workers-prod/dolphin-maps/terraform (dolphin-maps-moderation.tf).
 MANAGED_NAMES = ["MODERATION_AWS_ACCESS_KEY_ID", "MODERATION_AWS_REGION", "MODERATION_AWS_SECRET_ACCESS_KEY",
