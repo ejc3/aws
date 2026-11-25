@@ -1202,7 +1202,8 @@ class ResetHelperTests(unittest.TestCase):
             self.assertEqual((out.returncode, out.stdout), (0, want), (args, out.stderr))
 
     def test_anything_else_is_refused_unsent(self):
-        for args in ((), ("claude-a", "monthly"), ("claude-a", "--claim=yes"), ("claude-a", "fable", "--claim", "extra")):
+        for args in ((), ("claude-a", "monthly"), ("claude-a", "--claim=yes"), ("claude-a", "fable", "--claim", "extra"),
+                     ("--claim",), ("--claim", "weekly"), ("-x",), ("claude a",), ("../claude-a",)):
             out = self.run_helper(*args)
             self.assertEqual((out.returncode, out.stdout), (2, ""), args)
             self.assertIn("usage: claw-master-reset", out.stderr)

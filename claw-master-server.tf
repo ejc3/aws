@@ -876,6 +876,7 @@ cat > /usr/local/bin/claw-master-reset <<'EOF'
 usage() { echo "usage: claw-master-reset PROFILE [fable|weekly] [--claim]  (without --claim it only reads)" >&2; exit 2; }
 [ $# -ge 1 ] && [ $# -le 3 ] || usage
 profile=$1; shift
+[[ $profile =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || usage  # the add-start rule: a name, never a flag
 kind=fable; claim=()
 for a in "$@"; do
   case $a in
