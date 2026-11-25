@@ -361,8 +361,10 @@ ATUINHOOKS
 [ -d ~/.zsh/zsh-syntax-highlighting ] || git clone https://github.com/zsh-users/zsh-syntax-highlighting ~/.zsh/zsh-syntax-highlighting
 cat > ~/.zshrc << 'ZSH'
 export PATH="$HOME/.local/bin:$HOME/.atuin/bin:$HOME/.cargo/bin:$HOME/.opencode/bin:$PATH"
-# Use NVMe for cargo builds if available
-[ -d /mnt/fcvm-btrfs/cargo-target ] && export CARGO_TARGET_DIR=/mnt/fcvm-btrfs/cargo-target
+# No CARGO_TARGET_DIR here. One target directory shared by every checkout lets cargo take a
+# sibling worktree's test binary for fresh and run code from the wrong checkout (ejc3/fcvm
+# CLAUDE.md, "Never share CARGO_TARGET_DIR across worktrees"). Each repository routes its own
+# target directory (fcvm's Makefile maps `target` to a per-worktree directory on the NVMe).
 HISTFILE=~/.zsh_history; HISTSIZE=100000; SAVEHIST=100000
 setopt SHARE_HISTORY HIST_IGNORE_DUPS HIST_IGNORE_SPACE
 autoload -Uz compinit && compinit
