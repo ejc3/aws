@@ -8,8 +8,11 @@
 # WHAT: scripts/alert-telegram.py, subscribed to cost-alerts beside the email (which is unchanged). An alarm entering
 # ALARM is one line: its name and the first sentence of its description. OK is a "recovered after N min" line, only
 # for an ALARM it sent. An alarm that fires more than 3 times in 6 hours sends one "flapping" line and is muted for 6
-# hours. Other messages (budgets, the security digest, auto-reboot) are their subject and the start of the body.
-# Plain text, no formatting interpreted. State is one item per alarm in alert-telegram-state.
+# hours; a sweep every 15 minutes reports, once, an alarm still in ALARM when its mute ends. An event older than the
+# newest already seen for its alarm is dropped (Lambda's async queue is not FIFO). The watchdog relay's raw EventBridge
+# alarm events are read as alarms. Other messages are their subject and the start of the body, except the security
+# digest and the access-audit notices, which send their subject alone (their bodies stay in the email). Plain text,
+# no formatting interpreted. State is one item per alarm in alert-telegram-state.
 #
 # SETUP (once, by the owner): make a bot with @BotFather (/newbot), send it any message, and read the chat id from
 # https://api.telegram.org/bot<token>/getUpdates (message.chat.id). Then, from a 0600 file holding
@@ -17,7 +20,8 @@
 #   aws secretsmanager put-secret-value --region us-west-1 --secret-id alerts/telegram --secret-string file://<file>
 # Until the secret has a value, the function logs "not configured" and does nothing. No Terraform change is needed.
 #
-# The role reads that one secret and the one table, and writes its own log group: nothing else. The secret's resource
+# The role reads that one secret, reads and writes the one table, reads this account's alarm states (the sweep), and
+# writes its own log group: nothing else. The secret's resource
 # policy admits administration and this role alone.
 
 resource "aws_secretsmanager_secret" "alert_telegram" {
@@ -98,8 +102,15 @@ resource "aws_iam_role_policy" "alert_telegram" {
       {
         Sid      = "KeepItsOwnState"
         Effect   = "Allow"
-        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"]
+        Action   = ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:Scan"]
         Resource = aws_dynamodb_table.alert_telegram.arn
+      },
+      {
+        # The sweep asks whether an alarm whose mute ended is still in ALARM. Read-only, this account's alarms.
+        Sid      = "ReadAlarmStates"
+        Effect   = "Allow"
+        Action   = "cloudwatch:DescribeAlarms"
+        Resource = "arn:aws:cloudwatch:*:${data.aws_caller_identity.current.account_id}:alarm:*"
       },
       {
         Sid      = "WriteItsOwnLogs"
@@ -126,8 +137,9 @@ resource "aws_lambda_function" "alert_telegram" {
   memory_size      = 128
   filename         = data.archive_file.alert_telegram.output_path
   source_code_hash = data.archive_file.alert_telegram.output_base64sha256
-  # One at a time: each alarm's flap and mute state is read and written per message. SNS retries a throttled
-  # delivery, so a burst queues rather than racing.
+  # One at a time: each alarm's flap and mute state is read and written per message. SNS hands each message to
+  # Lambda's async queue, which holds a throttled or failed invocation and retries it (for up to 6 hours, then drops
+  # it), so a burst queues rather than racing.
   reserved_concurrent_executions = 1
 
   environment {
@@ -164,6 +176,26 @@ resource "aws_lambda_permission" "alert_telegram" {
   function_name = aws_lambda_function.alert_telegram.function_name
   principal     = "sns.amazonaws.com"
   source_arn    = aws_sns_topic.cost_alerts.arn
+}
+
+# The sweep: every 15 minutes, the mutes that have ended (scripts/alert-telegram.py, sweep()).
+resource "aws_cloudwatch_event_rule" "alert_telegram_sweep" {
+  name                = "alert-telegram-sweep"
+  description         = "Report alarms still in ALARM when their Telegram flapping mute ends"
+  schedule_expression = "rate(15 minutes)"
+}
+
+resource "aws_cloudwatch_event_target" "alert_telegram_sweep" {
+  rule = aws_cloudwatch_event_rule.alert_telegram_sweep.name
+  arn  = aws_lambda_function.alert_telegram.arn
+}
+
+resource "aws_lambda_permission" "alert_telegram_sweep" {
+  statement_id  = "AllowEventBridgeSweep"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.alert_telegram.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.alert_telegram_sweep.arn
 }
 
 # Its own failures still reach the email: a send that keeps failing (a revoked token, Telegram down) fails every
