@@ -364,6 +364,9 @@ class SimulatorSlots(unittest.TestCase):
         shim = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="60", FAKE_SWIFT_PID=str(pid_file)),
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
         self.assertIn('"1"', shim.stdout.readline())  # the real swift is running in the slot
+        deadline = time.monotonic() + 5
+        while not (pid_file.exists() and pid_file.read_text().strip()) and time.monotonic() < deadline:
+            time.sleep(0.05)
         real = int(pid_file.read_text())
         shim.send_signal(signal.SIGTERM)
         self.assertEqual(shim.wait(timeout=10), -signal.SIGTERM)
