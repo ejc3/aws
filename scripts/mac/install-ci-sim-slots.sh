@@ -45,8 +45,10 @@ if [ ! -L "$swift_link" ]; then
   ln -s "$swift_target" "$swift_link" || [ "$(readlink "$swift_link")" = "$swift_target" ]
 fi
 # The slot's lock file lives in one directory for the whole VM, whatever a job sets HOME to, owned by the CI user.
+# /Users/Shared is writable by everyone, so a link planted there is refused rather than followed.
+[ ! -L "$swift_dir" ] || { echo "Refusing the symlink at $swift_dir" >&2; exit 1; }
 [ -d "$swift_dir" ] || install -d -m 700 "$swift_dir"
-chown "$user" "$swift_dir"
+chown -h "$user" "$swift_dir"
 chmod 700 "$swift_dir"
 echo "Installed the swift test slot at $swift_link ($swift_dir)"
 

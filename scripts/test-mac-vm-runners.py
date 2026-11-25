@@ -391,6 +391,32 @@ class SimulatorSlots(unittest.TestCase):
         self.assertIn("waiting for the VM's test slot", waiter.stderr)
         holder.wait(timeout=30)
 
+    def test_a_slot_file_that_cannot_be_opened_runs_the_test_without_a_slot(self):
+        # As after a `sudo swift test` left a root-owned slot file: the test still runs, and says why it has no slot.
+        self.assertEqual(self.install().returncode, 0)
+        self.swift_dir.mkdir(parents=True, exist_ok=True)
+        locked = self.swift_dir / "slot.1"
+        locked.write_text("")
+        locked.chmod(0)
+        self.addCleanup(locked.chmod, 0o600)
+        out = subprocess.run([self.prefix / "bin/swift", "test"], env=self.swift_env(FAKE_SWIFT_RC="3"),
+                             capture_output=True, text=True, timeout=10)
+        self.assertEqual(out.returncode, 3, out.stderr)  # the test ran, and its own exit code came back
+        self.assertEqual(json.loads(out.stdout), [None, ["test"]])
+        self.assertIn("running without the VM's test slot", out.stderr)
+
+    def test_a_symlink_at_the_shared_slot_directory_is_refused(self):
+        # /Users/Shared is writable by everyone: a planted link is not followed by the installer's chown and chmod.
+        target = self.root / "elsewhere"
+        target.mkdir()
+        target.chmod(0o755)
+        self.swift_dir.parent.mkdir(parents=True, exist_ok=True)
+        self.swift_dir.symlink_to(target)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing the symlink", result.stderr)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+
     def test_an_unmanaged_swift_is_refused_and_left_alone(self):
         swift = self.prefix / "bin/swift"
         swift.parent.mkdir(parents=True)

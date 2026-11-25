@@ -34,17 +34,24 @@ unless (-d $dir || eval { make_path($dir, { mode => 0700 }); 1 }) {
 }
 my $slots = ($ENV{SWIFT_TEST_SLOTS} // '1') =~ /^([1-9]\d*)$/ ? $1 : 1;
 
+# A lock that cannot be opened (a slot file root left behind after `sudo swift test`, another account's directory)
+# must never fail the test: say so once and run it without a slot.
+sub unslotted {
+    print STDERR "swift test: $_[0]: $!; running without the VM's test slot\n";
+    exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; exit 127 };
+}
+
 my ($held, $slot);
 for my $n (1 .. $slots) {
-    sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$n: $!\n";
+    sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or unslotted("$dir/slot.$n");
     if (flock($fh, LOCK_EX | LOCK_NB)) { ($held, $slot) = ($fh, $n); last }
     close $fh;
 }
 unless ($held) {
     print STDERR "swift test: waiting for the VM's test slot (cat $dir/slot.* shows who holds it)\n";
     $slot = 1 + $$ % $slots;
-    sysopen($held, "$dir/slot.$slot", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$slot: $!\n";
-    flock($held, LOCK_EX) or die "swift: lock $dir/slot.$slot: $!\n";
+    sysopen($held, "$dir/slot.$slot", O_RDWR | O_CREAT, 0600) or unslotted("$dir/slot.$slot");
+    flock($held, LOCK_EX) or unslotted("lock $dir/slot.$slot");
 }
 truncate($held, 0); seek($held, 0, 0);
 syswrite($held, sprintf("pid %d since %s: swift %s (in %s)\n", $$, scalar localtime,
