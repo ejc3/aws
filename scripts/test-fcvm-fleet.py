@@ -2156,7 +2156,7 @@ class RendersHostTests(unittest.TestCase):
         self.assertRegex(amis, r"default\s+= \{\}\n")
         self.assertIn('arch == "arm64" && (ami == "" || can(regex("^ami-[0-9a-f]{17}$", ami)))', amis)
         self.assertRegex(block('variable "renders_agent_args"', MOD), r'default\s+= ""\n')
-        self.assertRegex(block('variable "renders_instance_type"', MOD), r'default\s+= "c8g.metal-24xl"\n')
+        self.assertRegex(block('variable "renders_instance_type"', MOD), r'default\s+= "m8gd.metal-24xl"\n')
         self.assertIn("renders_types   = { arm64 = var.renders_instance_type }", MOD)
         self.assertIn('renders_archs   = [for a in sort(keys(local.renders_types)) : a if try(var.renders_amis[a], "") != ""]', MOD)
         self.assertRegex(self.template(), r"\n  for_each\s+= toset\(local\.renders_archs\)\n")
@@ -2247,7 +2247,7 @@ class RendersHostTests(unittest.TestCase):
         self.assertRegex(east, r'\n  renders_amis\s+= lookup\(local\.fcvm_active_renders_amis, "us-east-1", \{\}\)\n')
         self.assertRegex(east, r"\n  renders_agent_args\s+= local\.fcvm_fleet_renders_agent_args\n")
         self.assertRegex(east, r"\n  renders_instance_type\s+= local\.fcvm_fleet_renders_type\n")
-        self.assertIn('fcvm_fleet_renders_type = "c8g.metal-24xl"', TF)
+        self.assertIn('fcvm_fleet_renders_type = "m8gd.metal-24xl"', TF)
         for region in ("east2", "west2"):
             self.assertNotIn("renders", block('module "fcvm_fleet_%s"' % region), region)
         # Production adopts it later by passing the same inputs: until then nothing of it is in the prod files.

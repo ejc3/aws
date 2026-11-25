@@ -630,11 +630,11 @@ class QuotaTests(unittest.TestCase):
         self.assertEqual(TF.count("destroy = false"), 2)
 
     def test_standard_quotas_hold_the_renders_hosts_in_us_east_1_and_are_never_lowered(self):
-        # The renders host class (fcvm-fleet.tf) is a c8g.metal-24xl, 96 vCPUs of the Standard families, not G: one host
+        # The renders host class (fcvm-fleet.tf) is a m8gd.metal-24xl, 96 vCPUs of the Standard families, not G: one host
         # per stack awake (2 x 96) and per stack the replacement that overlaps it during a spot interruption (2 x 96).
         self.assertRegex(TF, r"\n  fcvm_fleet_standard_vcpus = 384\n")
         comment = TF.split("  fcvm_fleet_standard_vcpus = 384\n", 1)[0].rsplit("fcvm_fleet_on_demand_g_vcpus", 1)[1]
-        for part in ("c8g.metal-24xl", "2 x 96 = 192", "spot first", "us-west-2"):
+        for part in ("m8gd.metal-24xl", "2 x 96 = 192", "spot first", "us-west-2"):
             self.assertIn(part, " ".join(comment.replace("#", " ").split()), part)
         # Spot first, on demand when spot is refused: the same number in both markets' quotas.
         for name, code in (("spot_standard", "L-34B43A08"), ("on_demand_standard", "L-1216C47A")):

@@ -1914,7 +1914,7 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   launches (including recovered idempotent responses) increment `FCVM/Fleet:OnDemandHostLaunches`; the coordinator's
   `fcvm-fleet-on-demand-host-launches` alarm notifies the existing `fcvm-fleet-alerts` subscribers. This is a launch-event
   notification: its return to OK does not mean running hosts stopped, so it sends no OK notification.
-- **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `c8g.metal-24xl`
+- **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `m8gd.metal-24xl`
   per stack while the fleet is awake, launched by the coordinator as a GPU host is (`FLEET_RENDERS_TEMPLATES`,
   `FLEET_RENDERS_SUBNETS`). Its template (`fcvm-fleet-renders-arm64`, instances tagged `Purpose=fcvm-fleet-renders`),
   its policy (`fcvm-fleet-coordinator-renders`) and those variables exist only once the release pointer has a

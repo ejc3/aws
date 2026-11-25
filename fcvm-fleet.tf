@@ -28,7 +28,7 @@
 #   first and on demand when spot is refused, in us-east-1. Staging only. Nothing of it exists until the release pointer
 #   names a renders image (local.fcvm_active_renders_amis, fcvm-fleet-ami-release.tf): no launch template, no
 #   fcvm-fleet-coordinator-renders policy, no FLEET_RENDERS_* variables, and the task role's type and Purpose lists as
-#   they were. A c8g.metal-24xl is $3.82848 an hour on demand in us-east-1 (AWS Price List, 2026-11-24).
+#   they were. An m8gd.metal-24xl is $5.53536 an hour on demand in us-east-1 (AWS Price List, 2026-11-25).
 # - local.fcvm_fleet_coordinator_enabled: the coordinator service (one Fargate task, 0.5 vCPU and 1 GB ARM64, about $15 a
 #   month; 4 vCPU and 8 GB, about $115, with the broadcast, fcvm-fleet-broadcast.tf). Its initial image is fcvm-fleet/coordinator:<local.fcvm_fleet_coordinator_tag>;
 #   main-only CI releases immutable digests through fcvm-fleet-ci.tf.
@@ -220,7 +220,7 @@ locals {
   # image (--image), no phones, no aggregator. Viewers connect to one WebSocket per host on 443: over IPv6 at an
   # address of the host's delegated /80, over IPv4 through the agent's front on the host's public address
   # (--publish-ip, --tls-publish-base, --public-ipv4-from-imds).
-  fcvm_fleet_renders_type = "c8g.metal-24xl"
+  fcvm_fleet_renders_type = "m8gd.metal-24xl"
   # PLACEHOLDER. --renders is the working name of the mode's own arguments, which ejc3/fcvm's agent module defines; no
   # released agent has it. Set this list when that module lands, before the first renders image is published. Today's
   # agent also requires --image and --base-port (src/cli/args.rs, FleetAgentArgs): that module either lifts the two for

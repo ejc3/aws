@@ -39,7 +39,7 @@ locals {
   # whose Managed Instances are on-demand g4dn.xlarge in this account (fcvm-fleet-lambda.tf, 48 vCPUs a stack).
   fcvm_fleet_on_demand_g_base_vcpus = 768
   fcvm_fleet_on_demand_g_vcpus      = local.fcvm_fleet_on_demand_g_base_vcpus + 2 * local.fcvm_lambda_max_vcpus
-  # Standard (A, C, D, H, I, M, R, T, Z) vCPUs in us-east-1 for the renders host class (fcvm-fleet.tf, c8g.metal-24xl,
+  # Standard (A, C, D, H, I, M, R, T, Z) vCPUs in us-east-1 for the renders host class (fcvm-fleet.tf, m8gd.metal-24xl,
   # 96 vCPUs): one host per stack while its fleet is awake (staging and production, 2 x 96 = 192), and per stack the
   # replacement that overlaps a host while a spot interruption drains it (2 x 96 = 192). 384, for each market: the
   # coordinator tries spot first and takes the host or its replacement on demand when spot is refused, so either quota

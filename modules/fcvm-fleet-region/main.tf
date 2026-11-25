@@ -153,7 +153,7 @@ variable "renders_agent_args" {
 variable "renders_instance_type" {
   description = "The renders host's instance type: arm64 metal without a GPU"
   type        = string
-  default     = "c8g.metal-24xl"
+  default     = "m8gd.metal-24xl"
 }
 
 variable "potato_host_amis" {
