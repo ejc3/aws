@@ -313,6 +313,41 @@ resource "aws_iam_instance_profile" "fcvm_ami_builder" {
   role     = aws_iam_role.fcvm_ami_builder.name
 }
 
+# The renders track's builders and validators: a role and profile of their own, which reach their own instance's export
+# prefix and Session Manager like the pair's builders, and none of the pair's TLS canary secrets (the renders executor
+# makes no certificate, and those secrets' policy admits only the pair's builder and worker roles).
+resource "aws_iam_role" "fcvm_ami_renders_builder" {
+  provider = aws.fcvm_fleet_east1
+  name     = "fcvm-fleet-ami-renders-builder"
+  assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
+    Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" }, Action = "sts:AssumeRole"
+  }] })
+}
+
+resource "aws_iam_instance_profile" "fcvm_ami_renders_builder" {
+  provider = aws.fcvm_fleet_east1
+  name     = "fcvm-fleet-ami-renders-builder"
+  role     = aws_iam_role.fcvm_ami_renders_builder.name
+}
+
+resource "aws_iam_role_policy" "fcvm_ami_renders_builder_ssm" {
+  provider = aws.fcvm_fleet_east1
+  name     = "managed-instance-without-parameters"
+  role     = aws_iam_role.fcvm_ami_renders_builder.id
+  policy   = aws_iam_policy.ssm_managed_instance.policy
+}
+
+resource "aws_iam_role_policy" "fcvm_ami_renders_builder_data" {
+  provider = aws.fcvm_fleet_east1
+  name     = "own-instance-artifacts-only"
+  role     = aws_iam_role.fcvm_ami_renders_builder.id
+  policy = jsonencode({ Version = "2012-10-17", Statement = [
+    { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/$${ec2:SourceInstanceARN}/*" },
+    { Effect = "Deny", Action = ["s3:DeleteObject", "s3:DeleteObjectVersion", "iam:*", "sts:AssumeRole*", "ssm:GetParameter*", "secretsmanager:*"], Resource = "*" },
+    { Effect = "Deny", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], NotResource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/$${ec2:SourceInstanceARN}/*" }
+  ] })
+}
+
 resource "aws_iam_role" "fcvm_ami_dispatch" {
   name = "fcvm-fleet-ami-dispatch"
   assume_role_policy = jsonencode({ Version = "2012-10-17", Statement = [{
@@ -465,6 +500,7 @@ resource "aws_lambda_function" "fcvm_ami_dispatch" {
         release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name
         failure_parameter = aws_ssm_parameter.fcvm_ami_renders_failure.name
         canonical_ami     = data.aws_ami.fcvm_ami_canonical_arm64.id
+        builder_profile   = aws_iam_instance_profile.fcvm_ami_renders_builder.arn
         templates         = local.fcvm_ami_renders_templates
       })
     }
@@ -683,7 +719,7 @@ resource "aws_s3_bucket_policy" "fcvm_ami_pipeline" {
   bucket   = aws_s3_bucket.fcvm_ami_pipeline.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Sid = "TLSOnly", Effect = "Deny", Principal = "*", Action = "s3:*", Resource = [aws_s3_bucket.fcvm_ami_pipeline.arn, "${aws_s3_bucket.fcvm_ami_pipeline.arn}/*"], Condition = { Bool = { "aws:SecureTransport" = "false" } } },
-    { Sid = "FleetWorkers", Effect = "Allow", Principal = { AWS = [aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_worker_fleet.arn, aws_iam_role.fcvm_ami_publish_fleet.arn] },
+    { Sid = "FleetWorkers", Effect = "Allow", Principal = { AWS = [aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_renders_builder.arn, aws_iam_role.fcvm_ami_worker_fleet.arn, aws_iam_role.fcvm_ami_publish_fleet.arn] },
     Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:PutObject"], Resource = ["${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*", "${aws_s3_bucket.fcvm_ami_pipeline.arn}/builders/*"] }
   ] })
 }
@@ -718,7 +754,7 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     # volume's size to the instance type of the same launch, so both are tied to the FactorySlot tag the broker puts on
     # the instance and its volume; FixedInstance and FixedRoot above stay the pair's and admit neither.
     { Sid = "RendersInstance", Effect = "Allow", Action = "ec2:RunInstances", Resource = local.fcvm_ami_instance_arn,
-    Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots, "ec2:InstanceType" = local.fcvm_ami_renders_type, "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
+    Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots, "ec2:InstanceType" = local.fcvm_ami_renders_type, "ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_renders_builder.arn, "ec2:MetadataHttpTokens" = "required" }, NumericEquals = { "ec2:MetadataHttpPutResponseHopLimit" = 1 } } },
     { Sid = "RendersRoot", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:volume/*",
     Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag, "aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots, "ec2:VolumeType" = "gp3" }, Bool = { "ec2:Encrypted" = "true" }, NumericLessThanEquals = { "ec2:VolumeSize" = local.fcvm_ami_renders_root } } },
     { Sid = "TaggedInterface", Effect = "Allow", Action = "ec2:RunInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_build_region}:${local.fcvm_fleet_account_id}:network-interface/*", Condition = { StringEquals = { "aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag } } },
@@ -729,10 +765,10 @@ resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" {
     { Sid = "CreateCandidate", Effect = "Allow", Action = "ec2:CreateImage", Resource = local.fcvm_ami_image_arns, Condition = { StringEquals = { "aws:RequestTag/Purpose" = "fcvm-fleet" } } },
     { Sid = "TagCandidateAtCreation", Effect = "Allow", Action = "ec2:CreateTags", Resource = local.fcvm_ami_image_arns,
     Condition = { StringEquals = { "ec2:CreateAction" = "CreateImage" }, "ForAllValues:StringEquals" = { "aws:TagKeys" = ["Purpose", "PipelineBuildId", "FleetImageKind", "PipelineSanitized", "SourceCommit", "InputSHA256", "GuardHelperSHA256"] } } },
-    { Sid = "OnlyBuilderProfile", Effect = "Allow", Action = "iam:PassRole", Resource = aws_iam_role.fcvm_ami_builder.arn, Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } } },
+    { Sid = "OnlyBuilderProfile", Effect = "Allow", Action = "iam:PassRole", Resource = [aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_renders_builder.arn], Condition = { StringEquals = { "iam:PassedToService" = "ec2.amazonaws.com" } } },
     { Sid = "FactoryImageRetention", Effect = "Allow", Action = ["ec2:DeregisterImage", "ec2:DeleteSnapshot"], Resource = local.fcvm_ami_image_arns,
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet", "ec2:ResourceTag/PipelineSanitized" = "true" } } },
-    { Sid = "NoOtherProfile", Effect = "Deny", Action = "iam:PassRole", NotResource = aws_iam_role.fcvm_ami_builder.arn },
+    { Sid = "NoOtherProfile", Effect = "Deny", Action = "iam:PassRole", NotResource = [aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_renders_builder.arn] },
     # The fixed broker pins InstanceId from an immutable slot; workers never get this unscoped read.
     { Sid = "OwnCommandStatusBroker", Effect = "Allow", Action = "ssm:GetCommandInvocation", Resource = "*", Condition = { StringEquals = { "aws:RequestedRegion" = local.fcvm_ami_build_region } } },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn,

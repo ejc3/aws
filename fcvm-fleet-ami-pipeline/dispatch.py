@@ -209,7 +209,7 @@ def renders_config(raw):
     if not raw:
         return None
     value = json.loads(raw)
-    names = ("project", "release_parameter", "failure_parameter", "canonical_ami")
+    names = ("project", "release_parameter", "failure_parameter", "canonical_ami", "builder_profile")
     if not (isinstance(value, dict) and set(value) == {"enabled", "templates", *names} and type(value["enabled"]) is bool
             and all(isinstance(value[name], str) and value[name] for name in names)
             and isinstance(value["templates"], list) and len(value["templates"]) <= 4
@@ -231,8 +231,16 @@ class Factory:
         self.clients = clients or {}
         self.prefix = self.env["STATE_PREFIX"]
         self.project = self.env["PROJECT_NAME"]
-        self.renders = renders_config(self.env.get("RENDERS_TRACK"))
         self.failures = []
+        # Renders-track steps that failed in this invocation (renders_step); tick raises once the pair's work is done.
+        self.renders_errors = []
+        try:
+            self.renders = renders_config(self.env.get("RENDERS_TRACK"))
+        except (Refused, ValueError, TypeError) as error:
+            # A bad configuration turns the renders track off; the pair's queue, broker and cleanup run as without it.
+            self.renders = None
+            self.renders_errors.append("configuration")
+            print(json.dumps({"renders_track_error": "configuration", "message": str(error) if isinstance(error, Refused) else type(error).__name__}))
 
     def track_of(self, build_id):
         """A build's track is its project's: the build id names it, and no caller can choose it."""
@@ -252,6 +260,10 @@ class Factory:
 
     def release_parameter(self, track):
         return self.renders["release_parameter"] if track == "renders" else self.env["RELEASE_PARAMETER"]
+
+    def builder_profile(self, track):
+        """The renders builders run with an instance profile of their own, which cannot read the pair's TLS canaries."""
+        return self.renders["builder_profile"] if track == "renders" else self.env["BUILDER_PROFILE"]
 
     def failure_parameter(self, track):
         if track == "renders":
@@ -355,10 +367,11 @@ class Factory:
         reported = [i for r in reservations for i in r["Instances"]]
         # EC2 may omit the profile after termination. Only an already recorded
         # instance can supply that terminal receipt without the profile proof.
+        profile = self.builder_profile(self.track_of(journal["build_id"]))
         rows = [i for i in reported if all({t["Key"]: t["Value"] for t in i.get("Tags", [])}.get(key) == value
                 for key, value in (("Purpose", GUARD_PURPOSE), ("FactoryBuild", digest(journal["build_id"])), ("FactorySlot", slot)))
             and i.get("InstanceType") == ALL_TYPES[slot.split("-", 1)[0]] and (
-            i.get("IamInstanceProfile", {}).get("Arn") == self.env["BUILDER_PROFILE"] or (
+            i.get("IamInstanceProfile", {}).get("Arn") == profile or (
                 "IamInstanceProfile" not in i and i["State"]["Name"] == "terminated"
                 and recorded.get("instance_id") == i["InstanceId"]))]
         if recorded.get("terminated_seen") is True and reported and (
@@ -418,7 +431,11 @@ class Factory:
         image_id = self.renders["canonical_ami"]
         try:
             pointer = json.loads(self.release_ssm().get_parameter(Name=self.renders["release_parameter"], WithDecryption=False)["Parameter"]["Value"])
-            candidate = pointer["renders_amis"].get(self.env["COMPUTE_REGION"], {}).get("arm64")
+            amis = pointer.get("renders_amis") if isinstance(pointer, dict) else None
+            here = amis.get(self.env["COMPUTE_REGION"], {}) if isinstance(amis, dict) else None
+            if not isinstance(here, dict) or not set(here) <= {"arm64"}:
+                raise Refused("the renders release pointer is malformed; no renders build starts from it")
+            candidate = here.get("arm64")
             if candidate is not None:
                 try:
                     rows = self.client("ec2", True).describe_images(ImageIds=[candidate])["Images"]
@@ -434,7 +451,7 @@ class Factory:
                             and tags.get("FleetImageValidated") == "true" and tags.get("FleetImageKind") == "renders"
                             and tags.get("GuardHelperSHA256") == self.env["GUARD_SHA256"]):
                         image_id = candidate
-        except (KeyError, AttributeError, self.release_ssm().exceptions.ParameterNotFound):
+        except self.release_ssm().exceptions.ParameterNotFound:
             pass
         images = self.client("ec2", True).describe_images(ImageIds=[image_id])["Images"]
         if len(images) != 1 or images[0].get("State") != "available" or images[0].get("Architecture") != "arm64":
@@ -472,7 +489,7 @@ class Factory:
         user_data = "#!/bin/bash\nset -eu\ncommand -v nft >/dev/null || { apt-get update -qq; apt-get install -y nftables; }\nprintf '%s' '" + guard + "' | base64 -d >/run/factory-guard.py\npython3 /run/factory-guard.py --apply\nrm -f /run/factory-guard.py\n"
         try:
             response = self.client("ec2", True).run_instances(ImageId=image_id, InstanceType=ALL_TYPES[kind], MinCount=1, MaxCount=1,
-            ClientToken=digest(journal["build_id"] + "/" + slot), IamInstanceProfile={"Arn": self.env["BUILDER_PROFILE"]},
+            ClientToken=digest(journal["build_id"] + "/" + slot), IamInstanceProfile={"Arn": self.builder_profile(self.track_of(journal["build_id"]))},
             MetadataOptions={"HttpEndpoint": "enabled", "HttpTokens": "required", "HttpPutResponseHopLimit": 1},
             NetworkInterfaces=[{"DeviceIndex": 0, "SubnetId": self.env["SUBNET_ID"], "Groups": [self.env["SECURITY_GROUP"]], "AssociatePublicIpAddress": True, "DeleteOnTermination": True, "Ipv6PrefixCount": 1}],
             BlockDeviceMappings=[{"DeviceName": image["RootDeviceName"], "Ebs": {"VolumeSize": ALL_VOLUMES[kind], "VolumeType": "gp3", "Encrypted": True, "DeleteOnTermination": True}}],
@@ -656,21 +673,25 @@ class Factory:
         self.renders_step(self.mirror_renders, admitted)
         return public_record(admitted)
 
-    @staticmethod
-    def renders_step(step, *arguments):
+    def renders_step(self, step, *arguments):
         """Run one renders-track step where the pair's work goes on regardless: a failure is logged by
-        its type, and the pair's answer, queue and cleanup are what they would be without the track."""
+        its type and recorded, so the pair's answer, queue and cleanup are what they would be without the
+        track, and tick() then fails the invocation (a Lambda error) once both tracks have run."""
         try:
             step(*arguments)
         except Exception as error:
+            self.renders_errors.append(type(error).__name__)
             print(json.dumps({"renders_track_error": type(error).__name__}))
 
     def mirror_renders(self, record):
         """Queue the renders build of a request the pair admitted: the same id, source, priority and CI
         receipt, so the source fences and the daily window are the pair's. The renders queue then runs
         on its own (its control, its records, its project); a newer request supersedes a queued older
-        one there as it does in the pair's queue."""
-        if not self.enabled("renders") or record.get("status") in ("superseded", "failed", "disabled"):
+        one there as it does in the pair's queue. Only a live pair request (queued, building or awaiting
+        publication) creates a renders record: a request repeated after its pair build ended can only
+        raise an existing renders record's priority, never queue an older source over a newer one.
+        This writes records only; the next tick starts the build."""
+        if not self.enabled("renders"):
             return
         requests, control_key = RENDERS_STATE + "/requests/", RENDERS_STATE + "/control"
         request_id = record["request_id"]
@@ -679,7 +700,8 @@ class Factory:
             if record["priority"] == "critical" and existing["priority"] == "normal" and existing["status"] in ("queued", "building", "awaiting-publish"):
                 existing.update(priority="critical", not_before=int(self.now()))
                 self.save(requests + request_id, existing)
-                self.reconcile(track="renders")
+            return
+        if record.get("status") not in ("queued", "building", "awaiting-publish"):
             return
         mirrored = {key: record[key] for key in ("source_sha", "priority", "not_before", "ci_head_sha", "ci_run_id") if key in record}
         mirrored.update(request_id=request_id, input_sha256=request_id, track="renders", status="queued", build_id=None,
@@ -697,7 +719,6 @@ class Factory:
                 self.save(requests + previous["request_id"], previous)
         control["pending"] = request_id
         self.save(control_key, control)
-        self.reconcile(track="renders")
 
     @contextmanager
     def control_lock(self):
@@ -886,6 +907,8 @@ class Factory:
                     self.save(control_key, control)
                     start_record = None
             elif active:
+                if self.track_of(active) != track:
+                    raise Refused("the control names another track's build")
                 suffix, journal = self.journal(active, active=False)
                 build = self.actual_build(active, active=False)
                 record = self.request_record(journal["request_id"], track)
@@ -1006,8 +1029,11 @@ class Factory:
             try:
                 minutes = (EXTENDED_TIMEOUT_MINUTES if start_record.get("build_timeout_minutes") == EXTENDED_TIMEOUT_MINUTES
                            else LEGACY_TIMEOUT_MINUTES)
+                # The renders build shares its request id with the pair's: its token is its own, so CodeBuild can
+                # neither refuse it as a repeat nor answer with the pair's build.
+                token = start_record["request_id"] if track == "pair" else digest("renders/" + start_record["request_id"])
                 build = self.client("codebuild").start_build(projectName=project, sourceVersion=start_record["source_sha"],
-                    idempotencyToken=start_record["request_id"], timeoutInMinutesOverride=minutes, environmentVariablesOverride=[
+                    idempotencyToken=token, timeoutInMinutesOverride=minutes, environmentVariablesOverride=[
                         {"name": "SOURCE_SHA", "value": start_record["source_sha"], "type": "PLAINTEXT"},
                         {"name": "INPUT_SHA256", "value": start_record["request_id"], "type": "PLAINTEXT"},
                         {"name": "FLEET_AMI_CAPABILITY", "value": secrets.token_urlsafe(32), "type": "PLAINTEXT"}])["build"]
@@ -1038,6 +1064,9 @@ class Factory:
                 # Retain the intent fence. Ambiguity must never permit a replacement build.
                 return
             build = matches[0]
+        if self.track_of(build.get("id")) != track or build.get("projectName") != project:
+            # Keep the intent fence: a build of the other track is never bound to this queue.
+            raise Refused("CodeBuild answered with another track's build")
         with self.control_lock() as acquired:
             if not acquired:
                 return
@@ -1060,36 +1089,49 @@ class Factory:
         rows = [i for r in self.client("ec2", True).describe_instances(Filters=[
             {"Name": "tag:Purpose", "Values": [GUARD_PURPOSE]},
             {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]}])["Reservations"] for i in r["Instances"]]
-        for instance in rows:
-            tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
-            build_hash = tags.get("FactoryBuild", "")
-            if self.renders is not None and tags.get("FactorySlot") in RENDERS_SLOTS:
-                # A renders builder: its own slots and type, never the pair's.
-                if not INPUT.fullmatch(build_hash) or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") != RENDERS_TYPES["renders"]:
-                    continue
-            elif not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
-                continue
-            journal = self.load("/builds/" + build_hash)
-            if journal is not None:
-                build = self.actual_build(journal["build_id"], active=False)
-                deadline = execution_deadline(build)
-                expired = deadline is None or self.now() >= min(deadline, journal["deadline_unix"])
-                terminal = build["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
-            else:
-                # A real launch has a durable journal before RunInstances; a lost journal cannot extend compute.
-                expired = self.now() - instance["LaunchTime"].timestamp() >= LEGACY_TIMEOUT_MINUTES * 60
-                terminal = False
-            if expired or terminal:
-                self.client("ec2", True).terminate_instances(InstanceIds=[instance["InstanceId"]])
         try:
+            for instance in rows:
+                tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+                build_hash = tags.get("FactoryBuild", "")
+                if not INPUT.fullmatch(build_hash) or tags.get("FactorySlot") not in SLOTS or instance.get("IamInstanceProfile", {}).get("Arn") != self.env["BUILDER_PROFILE"] or instance.get("InstanceType") not in TYPES.values():
+                    continue
+                self.reap(instance, build_hash)
             self.reconcile()
             self.collect_images()
         finally:
-            # The renders track's queue and images, whether or not the pair's raised.
+            # The renders track's builders, queue and images, after the pair's work and whether or not it raised.
             if self.renders is not None:
+                self.renders_step(self.reap_renders, rows)
                 self.renders_step(self.reconcile, None, "renders")
                 self.renders_step(self.collect_renders_images)
+        if self.renders_errors:
+            raise RuntimeError("renders track steps failed: " + ",".join(self.renders_errors))
         return {"status": "checked"}
+
+    def reap_renders(self, rows):
+        """The renders builders: their own slots, type and profile, never the pair's."""
+        for instance in rows:
+            tags = {t["Key"]: t["Value"] for t in instance.get("Tags", [])}
+            build_hash = tags.get("FactoryBuild", "")
+            if (tags.get("FactorySlot") in RENDERS_SLOTS and INPUT.fullmatch(build_hash)
+                    and instance.get("IamInstanceProfile", {}).get("Arn") == self.renders["builder_profile"]
+                    and instance.get("InstanceType") == RENDERS_TYPES["renders"]):
+                self.reap(instance, build_hash)
+
+    def reap(self, instance, build_hash):
+        """Terminate one owned builder whose build has ended or whose lease has run out."""
+        journal = self.load("/builds/" + build_hash)
+        if journal is not None:
+            build = self.actual_build(journal["build_id"], active=False)
+            deadline = execution_deadline(build)
+            expired = deadline is None or self.now() >= min(deadline, journal["deadline_unix"])
+            terminal = build["buildStatus"] not in ("IN_PROGRESS", "QUEUED")
+        else:
+            # A real launch has a durable journal before RunInstances; a lost journal cannot extend compute.
+            expired = self.now() - instance["LaunchTime"].timestamp() >= LEGACY_TIMEOUT_MINUTES * 60
+            terminal = False
+        if expired or terminal:
+            self.client("ec2", True).terminate_instances(InstanceIds=[instance["InstanceId"]])
 
     def prod_factory_images(self, owned):
         """Protect production's active and rollback releases and both ends of their build-region copy links."""
