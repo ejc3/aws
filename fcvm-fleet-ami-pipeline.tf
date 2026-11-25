@@ -432,6 +432,14 @@ data "archive_file" "fcvm_ami_publish" {
       # Prod's image pointer (fcvm-fleet-prod-ci.tf): retention keeps its images and its previous ones. Absent while
       # the prod stack is off, which retention reads as no prod release.
       PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
+      # The renders track's publication (publish.py run_renders): its project, its pointer and its templates.
+      RENDERS_JSON = jsonencode({
+        enabled           = var.fcvm_ami_renders_track_enabled
+        project           = local.fcvm_ami_renders_project
+        builder_profile   = aws_iam_instance_profile.fcvm_ami_renders_builder.arn
+        release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name
+        templates         = local.fcvm_ami_renders_templates
+      })
     })
     filename = "publisher-config.json"
   }
@@ -893,6 +901,8 @@ resource "aws_iam_role_policy" "fcvm_ami_publish" {
   role = aws_iam_role.fcvm_ami_publish.id
   policy = jsonencode({ Version = "2012-10-17", Statement = [
     { Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami.arn },
+    { Sid = "RendersProjectBuilds", Effect = "Allow", Action = "codebuild:BatchGetBuilds", Resource = aws_codebuild_project.fcvm_ami_renders.arn },
+    { Sid = "RendersRequests", Effect = "Allow", Action = "ssm:PutParameter", Resource = "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/renders/requests/*" },
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = local.fcvm_ami_state_arn },
     { Effect = "Allow", Action = "ssm:PutParameter", Resource = ["arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/requests/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/publications/*", "arn:aws:ssm:${var.aws_region}:${data.aws_caller_identity.current.account_id}:parameter${local.fcvm_ami_state_prefix}/gate"] },
     { Effect = "Allow", Action = ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"], Resource = "${aws_s3_bucket.fcvm_ami_pipeline.arn}/runs/*" },
@@ -924,6 +934,13 @@ resource "aws_iam_role_policy" "fcvm_ami_publish_fleet" {
       Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:spot-instances-request/*",
     Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-tile", "aws:RequestedRegion" = local.fcvm_ami_region } } },
     { Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = [aws_ssm_parameter.fcvm_ami_release.arn, aws_ssm_parameter.fcvm_ami_copies.arn] },
+    # The renders track's publication: its pointer, the renders host template (none until the class exists), and on a
+    # critical release the renders hosts on an older image (publish.py retire_renders).
+    { Sid = "RendersRelease", Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], Resource = aws_ssm_parameter.fcvm_ami_renders_release.arn },
+    { Sid = "RendersTemplates", Effect = "Allow", Action = ["ec2:CreateLaunchTemplateVersion", "ec2:ModifyLaunchTemplate", "ec2:DeleteLaunchTemplateVersions"],
+    Resource = length(local.fcvm_ami_renders_templates) > 0 ? [for template in local.fcvm_ami_renders_templates : "arn:aws:ec2:${template.region}:${local.fcvm_fleet_account_id}:launch-template/${template.id}"] : ["arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:launch-template/none"] },
+    { Sid = "RetireOldRendersHosts", Effect = "Allow", Action = "ec2:TerminateInstances", Resource = "arn:aws:ec2:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:instance/*",
+    Condition = { StringEquals = { "ec2:ResourceTag/Purpose" = "fcvm-fleet-renders", "ec2:InstanceType" = local.fcvm_ami_renders_type, "aws:RequestedRegion" = local.fcvm_ami_region } } },
     # Read only: retention keeps prod's images (fcvm-fleet-prod-ci.tf). Only the prod release function writes it.
     { Effect = "Allow", Action = "ssm:GetParameter", Resource = "arn:aws:ssm:${local.fcvm_ami_region}:${local.fcvm_fleet_account_id}:parameter${local.fcvm_prod_ami_release_parameter}" },
     { Sid      = "CopyPublishedImagesOnly", Effect = "Allow", Action = "ec2:CopyImage",
@@ -1037,4 +1054,28 @@ resource "aws_lambda_permission" "fcvm_ami_success" {
   function_name = aws_lambda_function.fcvm_ami_publish.function_name
   principal     = "events.amazonaws.com"
   source_arn    = aws_cloudwatch_event_rule.fcvm_ami_success.arn
+}
+
+# The renders track's successful builds, to the same publisher, which sends them to their own publication by project.
+resource "aws_cloudwatch_event_rule" "fcvm_ami_renders_success" {
+  name = "fcvm-fleet-image-factory-renders-success"
+  event_pattern = jsonencode({ source = ["aws.codebuild"], "detail-type" = ["CodeBuild Build State Change"],
+  account = [data.aws_caller_identity.current.account_id], detail = { "build-status" = ["SUCCEEDED"], "project-name" = [local.fcvm_ami_renders_project] } })
+}
+
+resource "aws_cloudwatch_event_target" "fcvm_ami_renders_success" {
+  rule = aws_cloudwatch_event_rule.fcvm_ami_renders_success.name
+  arn  = aws_lambda_function.fcvm_ami_publish.arn
+  retry_policy {
+    maximum_event_age_in_seconds = 86400
+    maximum_retry_attempts       = 185
+  }
+}
+
+resource "aws_lambda_permission" "fcvm_ami_renders_success" {
+  statement_id  = "OnlyFactorySuccessfulRendersBuilds"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.fcvm_ami_publish.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.fcvm_ami_renders_success.arn
 }

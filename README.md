@@ -616,7 +616,19 @@ on-demand quota in us-west-2 (96 vCPUs, `fcvm-fleet-account.tf`). `fcvm_ami_rend
 keeps the track off until ejc3/fcvm's executor has it on main: an older executor ignores the track
 and the broker refuses its first launch. With it off these exist and do nothing: the renders
 project, the renders builders' role and profile, `/fcvm-fleet/ami-release-renders` (empty), the
-renders failure record, the broker and dispatcher grants for the track, and the quota request.
+renders failure record, the broker, dispatcher and publisher grants for the track, the renders
+success rule (the publisher refuses a renders build while the flag is off), and the quota request.
+A successful renders build reaches the publisher through a rule of its own. The publisher checks
+its journal, its two terminated m8gd.metal-24xl builders and its manifest (`"track": "renders"`,
+one arm64 image, the build record and every boot proof), copies its store to
+`factory/<input>/renders/store/` and its image to us-east-1, then moves
+`/fcvm-fleet/ami-release-renders` (`renders_amis` names the us-west-2 original and the us-east-1
+copy) and, once the renders host class exists, that class's launch template, under the same lock
+and image-only template transaction as the pair. It never reads or writes the pair's pointer, copy
+record or templates, and the pair's publication never touches the renders track's. A critical
+renders release terminates renders hosts on an older image. Retention removes only the track's own
+copies and keeps its active and previous release and its template's image. A failed renders
+publication rolls its template back and leaves the previous renders image live.
 
 The first production AMI seed runs under Terraform's backend lock. Before writing the pointer,
 the enabling apply rechecks the planned staging release version and describes the current and

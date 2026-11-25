@@ -3,6 +3,10 @@
 Factory publication requires a successful fixed-project CodeBuild event.
 Reviewed, configuration-pinned transitions use the same image transaction.
 Every new template version differs solely in ImageId.
+
+The renders track (RENDERS_JSON in the bundle) publishes pages mode's arm64 host image from its
+own project's builds to its own pointer and template, under the same lock and transaction, and
+retires and retains only its own images; the pair's publication never reads or writes any of it.
 """
 import base64
 import copy
@@ -36,6 +40,14 @@ COPY_SNAPSHOT_TAG = "FleetPublisherCopy"
 NAME = {kind: re.compile(r"(fcvm-factory-[0-9a-f]{24}-" + kind + r"|fcvm-fleet-" + kind + r"-x86_64-[0-9a-f]{8}-[0-9]{12})\Z")
         for kind in ("host", "tile")}
 SLOTS = {"host-build", "tile-build", "host-verify", "tile-verify"}
+# The renders track (dispatch.py RENDERS_SLOTS, RENDERS_TYPES; ejc3/fcvm fleet/ami/pipeline.py run_renders).
+RENDERS_SLOTS = {"renders-build", "renders-verify"}
+RENDERS_TYPE = "m8gd.metal-24xl"
+RENDERS_NAME = re.compile(r"fcvm-factory-[0-9a-f]{24}-renders\Z")
+# The build record's fields (ejc3/fcvm fleet/ami/renders/host-check.py RECORD_FIELDS, RELEASE).
+RENDERS_RECORD = {"fcvm_commit", "kitesurf_commit", "bundle_sha256", "kernel_release", "boot_params", "hugepages"}
+KERNEL_RELEASE = re.compile(r"[0-9]+\.[0-9]+(\.[0-9]+)?-fcvm-[0-9a-f]{12}\Z")
+UUID = re.compile(r"[0-9a-f-]{36}\Z")
 ARCHIVES = {f"part-{index:02d}.tar.zst" for index in range(16)} | {"dirs.tar.zst"}
 STORE_FILES = ARCHIVES | {"parts", "sha256.json"}
 EXECUTION_TIMEOUT_MINUTES = (240, 360)
@@ -123,7 +135,7 @@ def copy_sdk_status():
 # not in the Lambda environment, which is limited to 4 KB.
 BUNDLED_CONFIG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "publisher-config.json")
 BUNDLED_KEYS = {"TEMPLATES_JSON", "SEED_RELEASE_JSON", "PHONE_AMI_JSON", "RENDERER_AMI_JSON",
-                "POTATO_AMI_JSON", "HOST_FIX_AMI_JSON", "PROD_RELEASE_PARAMETER"}
+                "POTATO_AMI_JSON", "HOST_FIX_AMI_JSON", "PROD_RELEASE_PARAMETER", "RENDERS_JSON"}
 
 
 def bundled_config(path):
@@ -181,11 +193,40 @@ class Publisher:
         # COMPUTE_REGION; a candidate built elsewhere is copied there before it is promoted.
         self.build_region = self.env["BUILD_REGION"]
         need(COPY_REGION.fullmatch(self.build_region), "image build region is outside its fixed scope")
+        try:
+            self.renders = self.renders_config(self.env.get("RENDERS_JSON"))
+        except (Refused, ValueError, TypeError) as error:
+            # A bad renders configuration turns the renders publication off; the pair's runs as without it.
+            self.renders = None
+            print(json.dumps({"renders_track_error": "configuration", "message": str(error) if isinstance(error, Refused) else type(error).__name__}))
         self.build_id = None
         self.lock_info = None
         self.transaction = None
         self.committed = False
         self.recovery_failed = False
+
+    def renders_config(self, raw):
+        """The renders track: whether it is on, its project, its builders' instance profile, its pointer and
+        its templates (none until the renders host class exists), each in the compute region. Absent, the
+        publisher has no renders track."""
+        if not raw:
+            return None
+        value = json.loads(raw)
+        need(isinstance(value, dict) and set(value) == {"enabled", "project", "builder_profile", "release_parameter", "templates"}
+             and type(value["enabled"]) is bool
+             and isinstance(value["builder_profile"], str) and value["builder_profile"].startswith("arn:aws:iam::")
+             and value["builder_profile"] != self.env["BUILDER_PROFILE"]
+             and isinstance(value["project"], str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value["project"])
+             and value["project"] != self.env["PROJECT_NAME"]
+             and isinstance(value["release_parameter"], str) and value["release_parameter"].startswith("/")
+             and value["release_parameter"] != self.env["RELEASE_PARAMETER"]
+             and isinstance(value["templates"], list) and len(value["templates"]) <= 1
+             and all(isinstance(t, dict) and set(t) == {"region", "id", "kind", "arch"} and t["kind"] == "renders"
+                     and t["arch"] == "arm64" and t["region"] == self.env["COMPUTE_REGION"]
+                     and re.fullmatch(r"lt-[0-9a-f]{17}", str(t["id"])) for t in value["templates"])
+             and not {t["id"] for t in value["templates"]} & {t["id"] for t in self.templates + self.copy_templates},
+             "renders track configuration is outside its fixed scope")
+        return value
 
     def request(self, source, input_sha):
         name = self.env["STATE_PREFIX"] + "/requests/" + input_sha
@@ -1205,24 +1246,25 @@ class Publisher:
             self.retain(result, self.spread(result))
             return {"status": "promoted", "generation": result["generation"]}
 
-    def event(self, event):
+    def event(self, event, project=None):
+        project = self.env["PROJECT_NAME"] if project is None else project
         need(isinstance(event, dict) and event.get("source") == "aws.codebuild"
              and event.get("detail-type") == "CodeBuild Build State Change"
              and event.get("account") == self.env["CONTROL_ACCOUNT"]
              and event.get("region") == self.env["CONTROL_REGION"], "not the configured CodeBuild event")
         detail = event.get("detail", {})
         need(detail.get("build-status") == "SUCCEEDED"
-             and detail.get("project-name") == self.env["PROJECT_NAME"], "only successful factory builds may publish")
+             and detail.get("project-name") == project, "only successful factory builds may publish")
         build_id = detail.get("build-id", "")
         prefix = f"arn:aws:codebuild:{self.env['CONTROL_REGION']}:{self.env['CONTROL_ACCOUNT']}:build/"
         if build_id.startswith(prefix):
             build_id = build_id[len(prefix):]
-        need(re.fullmatch(re.escape(self.env["PROJECT_NAME"]) + r":[0-9a-f-]{36}", build_id), "invalid factory build identity")
+        need(re.fullmatch(re.escape(project) + r":[0-9a-f-]{36}", build_id), "invalid factory build identity")
         self.build_id = build_id
         builds = self.client("codebuild").batch_get_builds(ids=[build_id])["builds"]
         need(len(builds) == 1, "factory build is missing")
         build = builds[0]
-        need(build["id"] == build_id and build["projectName"] == self.env["PROJECT_NAME"]
+        need(build["id"] == build_id and build["projectName"] == project
              and build["buildStatus"] == "SUCCEEDED" and build["buildComplete"] is True,
              "actual CodeBuild result is not successful")
         variables = {item["name"]: item["value"] for item in build["environment"]["environmentVariables"]}
@@ -1332,7 +1374,8 @@ class Publisher:
             resources.extend([image_id, *snapshots])
         return {self.build_region: resources}
 
-    def regional_copy(self, target, region, original, source_region, base, expected, *, reverse=None, factory=False):
+    def regional_copy(self, target, region, original, source_region, base, expected, *, reverse=None, factory=False,
+                      architecture="x86_64"):
         """Retry proven failed copies under deterministic names without deleting their receipts."""
         names = [base] + [f"{base}-copy-{attempt}" for attempt in range(2, COPY_ATTEMPTS + 1)]
         found = target.describe_images(Owners=[self.env["FLEET_ACCOUNT"]],
@@ -1355,8 +1398,8 @@ class Publisher:
                  and (not (factory or state == "failed") or image.get("Description") == description),
                  "a regional copy is outside its private image lineage")
             if state == "available":
-                need(image.get("Architecture") == "x86_64" and image.get("RootDeviceType") == "ebs",
-                     "a regional copy is not an x86_64 EBS image")
+                need(image.get("Architecture") == architecture and image.get("RootDeviceType") == "ebs",
+                     "a regional copy is not an " + architecture + " EBS image")
             else:
                 need(state == "failed", "a regional copy is not pending, available or failed")
             return state
@@ -1420,7 +1463,7 @@ class Publisher:
         need(not pending, "release-region copies are still pending: " + ",".join(pending))
         return ids, list(ids.values())
 
-    def store(self, manifest, input_sha):
+    def store(self, manifest, input_sha, directory="store/"):
         """Copy only immutable, proof-bound source versions into runtime assets.
 
         The backend lock serializes the sole Fleet-prefix writer. CodeBuild and
@@ -1429,7 +1472,7 @@ class Publisher:
         """
         proof = manifest.get("store", {})
         source_prefix = "runs/" + digest(self.build_id) + "/store/"
-        target_prefix = "factory/" + input_sha + "/store/"
+        target_prefix = "factory/" + input_sha + "/" + directory
         destination = {"bucket": self.env["ASSET_BUCKET"], "region": self.env["ASSET_REGION"], "prefix": target_prefix}
         objects = proof.get("objects", {})
         need(proof.get("bucket") == self.env["PIPELINE_BUCKET"]
@@ -1992,6 +2035,13 @@ class Publisher:
         keep.update(self.current(template["id"], template["region"])["LaunchTemplateData"].get("ImageId")
                     for template in self.templates + self.copy_templates)
         regions = sorted({self.env["COMPUTE_REGION"], self.build_region, *self.copy_regions})
+        return self.remove_unneeded(keep, regions, self.retirable)
+
+    def remove_unneeded(self, keep, regions, retirable, sweep=True):
+        """Deregister the images `retirable` admits in `regions` that nothing in `keep` (or an instance, an
+        open Spot request or a copy link to a kept image) needs, at most RETAIN_LIMIT per region and run.
+        `sweep` also deletes snapshots an earlier run marked FleetRetired and could not delete; a mark does
+        not say which track made it, so only the pair's run sweeps, as it did before the renders track."""
         listed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
@@ -2020,9 +2070,9 @@ class Publisher:
         removed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
-            for snapshot in self.copy_snapshots(ec2):
+            for snapshot in (self.copy_snapshots(ec2) if sweep else []):
                 self.delete_retired_snapshot(ec2, snapshot)
-            stale = sorted((image for image in listed[region] if self.retirable(image, region) and image["ImageId"] not in keep),
+            stale = sorted((image for image in listed[region] if retirable(image, region) and image["ImageId"] not in keep),
                            key=lambda image: image["ImageId"])
             removed[region] = []
             for image in stale[:RETAIN_LIMIT]:
@@ -2121,6 +2171,9 @@ class Publisher:
         # (fcvm_ami_factory_paused) still finishes and asks to publish: refuse it. The reviewed
         # actions above are how a release is changed while paused.
         need(self.env.get("FACTORY_PAUSED") != "true", "factory promotion is paused (fcvm_ami_factory_paused)")
+        if (self.renders is not None and isinstance(event, dict) and isinstance(event.get("detail"), dict)
+                and event["detail"].get("project-name") == self.renders["project"]):
+            return self.run_renders(event)
         build, source, input_sha = self.event(event)
         active = self.load(self.env["RELEASE_PARAMETER"], True)
         manifest = None
@@ -2159,6 +2212,301 @@ class Publisher:
             released = {"images": {kind: {"image_id": image} for kind, image in targets.items()}}
             result = self.promote(released, source, input_sha, resources)
             return self.finish(result, source, input_sha)
+
+    # ---------------------------------------------------------------------------------------- renders track
+
+    def renders_request(self, source, input_sha):
+        name = self.env["STATE_PREFIX"] + "/renders/requests/" + input_sha
+        value = self.load(name)
+        need(value.get("request_id") == input_sha and value.get("input_sha256") == input_sha
+             and value.get("source_sha") == source and value.get("build_id") == self.build_id
+             and value.get("track") == "renders" and value.get("priority") in {"normal", "critical"},
+             "accepted request provenance changed")
+        return name, value
+
+    def renders_fence(self, source, input_sha):
+        """The renders queue still names this build, its request is live, and the source does not precede
+        the active renders release's."""
+        need(self.load(self.env["STATE_PREFIX"] + "/renders/control").get("active") == self.build_id,
+             "a superseded build cannot publish")
+        _, request = self.renders_request(source, input_sha)
+        need(request.get("status") not in {"superseded", "failed"}, "a superseded build cannot publish")
+        self.renders_source_fence(source)
+
+    def renders_source_fence(self, source):
+        need(SHA.fullmatch(source), "invalid factory source")
+        active = self.load(self.renders["release_parameter"], True)
+        if active.get("source_sha") and active["source_sha"] != source:
+            need(SHA.fullmatch(active["source_sha"]), "active renders release source is invalid")
+            self.strict_source_edge(active["source_sha"], source)
+
+    def renders_proof(self, build, source, input_sha):
+        """The renders build's journal, its two terminated builders and its manifest, as proof() checks the pair's."""
+        prefix = self.env["STATE_PREFIX"]
+        need(self.load(prefix + "/renders/control").get("active") == self.build_id, "a superseded build cannot publish")
+        journal = self.load(prefix + "/builds/" + digest(self.build_id))
+        need(journal.get("build_id") == self.build_id and journal.get("source_sha") == source
+             and journal.get("input_sha256") == input_sha and journal.get("request_id") == input_sha
+             and set(journal.get("slots", {})) == RENDERS_SLOTS and set(journal.get("candidates", {})) == {"renders"}
+             and journal["deadline_unix"] == int(build["startTime"].timestamp()) + execution_lease_seconds(build)
+             and build["endTime"].timestamp() <= journal["deadline_unix"], "broker proof does not match this completed build")
+        slots = {journal["slots"][slot].get("instance_id", ""): slot for slot in RENDERS_SLOTS}
+        need(len(slots) == 2 and all(re.fullmatch(r"i-[0-9a-f]{17}", item) for item in slots),
+             "broker has no two distinct instance receipts")
+        need(all(entry.get("attempted") is True and entry.get("terminated_seen") is True
+                 and not entry.get("no_instance") and not entry.get("rejected")
+                 for entry in journal["slots"].values()), "broker has no durable termination proof for every slot")
+        reservations = self.client("ec2", True, self.build_region).describe_instances(
+            Filters=[{"Name": "instance-id", "Values": sorted(slots)}])["Reservations"]
+        seen = set()
+        for reservation in reservations:
+            for item in reservation["Instances"]:
+                instance_id = item["InstanceId"]
+                need(instance_id in slots and instance_id not in seen, "unexpected factory instance metadata")
+                seen.add(instance_id)
+                tags = {tag["Key"]: tag["Value"] for tag in item.get("Tags", [])}
+                need(reservation.get("OwnerId") == self.env["FLEET_ACCOUNT"] and item["State"]["Name"] == "terminated"
+                     and item.get("InstanceType") == RENDERS_TYPE and tags.get("Purpose") == "fcvm-fleet-ami-builder"
+                     and tags.get("FactoryBuild") == digest(self.build_id) and tags.get("FactorySlot") == slots[instance_id]
+                     and ("IamInstanceProfile" not in item or item["IamInstanceProfile"].get("Arn") == self.renders["builder_profile"]),
+                     "instance metadata contradicts its recorded termination")
+        response = self.client("s3").get_object(Bucket=self.env["PIPELINE_BUCKET"], Key="runs/" + digest(self.build_id) + "/manifest.json")
+        raw = response["Body"].read(32769)
+        need(len(raw) <= 32768, "factory manifest exceeds its fixed bound")
+        manifest = json.loads(raw)
+        need(manifest.get("version") == 1 and manifest.get("track") == "renders" and manifest.get("build_id") == self.build_id
+             and manifest.get("source_commit") == source and manifest.get("input_sha256") == input_sha
+             and DIGEST.fullmatch(manifest.get("source_tree_sha256", ""))
+             and manifest.get("guard_sha256") == self.env["GUARD_SHA256"]
+             and manifest.get("deadline_unix") == journal["deadline_unix"]
+             and set(manifest.get("images", {})) == {"renders"} and "tls" not in manifest,
+             "factory manifest provenance does not match")
+        image = manifest["images"]["renders"]
+        record, validation = image.get("build"), image.get("validation", {})
+        need(isinstance(record, dict) and set(record) == RENDERS_RECORD and record["fcvm_commit"] == source
+             and SHA.fullmatch(str(record["kitesurf_commit"])) and DIGEST.fullmatch(str(record["bundle_sha256"]))
+             and KERNEL_RELEASE.fullmatch(str(record["kernel_release"]))
+             and isinstance(record["boot_params"], str) and 0 < len(record["boot_params"]) <= 512
+             and type(record["hugepages"]) is int and record["hugepages"] > 0,
+             "the renders build record does not name this build's commit and an fcvm kernel")
+        boots = validation.get("boot_ids", [])
+        need(image.get("image_id") == journal["candidates"]["renders"] and IMAGE.fullmatch(image["image_id"])
+             and image.get("architecture") == "arm64"
+             and all(validation.get(field) is True for field in
+                     ("guard", "sanitized", "launch_path", "renders_host", "renders_agent", "renders_unit"))
+             and validation.get("renders_host_problem_count") == 0
+             and validation.get("kernel_release") == record["kernel_release"]
+             and len(boots) == len(set(boots)) == 3 and all(UUID.fullmatch(str(value)) for value in boots),
+             "candidate lacks the full boot/security proof")
+        return manifest
+
+    def renders_resources(self, manifest, source, input_sha):
+        """The candidate and its snapshots in the build region, which promotion marks validated."""
+        ec2 = self.client("ec2", True, self.build_region)
+        image_id = manifest["images"]["renders"]["image_id"]
+        rows = ec2.describe_images(ImageIds=[image_id])["Images"]
+        need(len(rows) == 1, "candidate image is missing")
+        image = rows[0]
+        expected = {"Purpose": "fcvm-fleet", "FleetImageKind": "renders", "GuardHelperSHA256": self.env["GUARD_SHA256"],
+                    "SourceCommit": source, "InputSHA256": input_sha, "PipelineBuildId": self.build_id, "PipelineSanitized": "true"}
+        tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+        need(image["OwnerId"] == self.env["FLEET_ACCOUNT"] and image.get("Public") is False
+             and image.get("State") == "available" and image.get("Architecture") == "arm64"
+             and image.get("RootDeviceType") == "ebs" and RENDERS_NAME.fullmatch(image.get("Name", ""))
+             and all(tags.get(key) == value for key, value in expected.items()),
+             "candidate image is outside the private validated factory lineage")
+        snapshots = [item["Ebs"]["SnapshotId"] for item in image.get("BlockDeviceMappings", []) if item.get("Ebs", {}).get("SnapshotId")]
+        need(0 < len(snapshots) <= 4, "candidate has no bounded EBS snapshot set")
+        found = ec2.describe_snapshots(SnapshotIds=snapshots)["Snapshots"]
+        need({item["SnapshotId"] for item in found} == set(snapshots), "candidate snapshot is missing")
+        for snapshot in found:
+            tags = {item["Key"]: item["Value"] for item in snapshot.get("Tags", [])}
+            need(snapshot["OwnerId"] == self.env["FLEET_ACCOUNT"] and snapshot.get("State") == "completed"
+                 and snapshot.get("Encrypted") is True and all(tags.get(key) == value for key, value in expected.items()),
+                 "candidate snapshot provenance does not match")
+        return {self.build_region: [image_id, *snapshots]}, image["Name"], expected
+
+    def renders_release_copy(self, manifest, name, expected):
+        """The candidate in the release region: itself when built there, else its copy (pending refuses)."""
+        compute = self.env["COMPUTE_REGION"]
+        original = manifest["images"]["renders"]["image_id"]
+        if self.build_region == compute:
+            return original, []
+        copied = self.regional_copy(self.client("ec2", True, compute), compute, original, self.build_region, name,
+                                    expected, factory=True, architecture="arm64")
+        need(copied is not None, "release-region copies are still pending: renders")
+        return copied, [copied]
+
+    def promote_renders(self, manifest, target, source, input_sha, resources):
+        """The renders pointer and, where the renders host class exists, its template: one transaction,
+        each new version differing from the current default only in ImageId."""
+        name = self.renders["release_parameter"]
+        before = self.load(name, True)
+        need(before.get("version") == 1 and before.get("track") == "renders" and before.get("guard_sha256") == self.env["GUARD_SHA256"]
+             and type(before.get("generation")) is int and before["generation"] >= 0, "active renders release schema is incompatible")
+        if before.get("build_id") == self.build_id:
+            return before
+        compute = self.env["COMPUTE_REGION"]
+        self.transaction = {"status": "preparing", "build_id": self.build_id, "entries": {}, "before": before}
+        self.record()
+        versions = {}
+        for template in self.renders["templates"]:
+            current = self.current(template["id"])
+            old_image = ((before.get("renders_amis") or {}).get(template["region"]) or {}).get("arm64")
+            need(current["LaunchTemplateData"].get("ImageId") == old_image, "renders release pointer and template default disagree")
+            entry = {"old_image": old_image, "old_version": current["VersionNumber"]}
+            self.transaction["entries"][template["id"]] = entry
+            self.record()
+            entry["candidate"] = self.version(template["id"], current, target, "candidate", entry)
+            versions[template["region"] + "/" + template["id"]] = entry["candidate"]
+            self.record()
+        for region, names in sorted(resources.items()):
+            if names:
+                self.client("ec2", True, region).create_tags(Resources=names, Tags=[{"Key": "FleetImageValidated", "Value": "true"}])
+        for template, entry in self.transaction["entries"].items():
+            need(self.current(template)["VersionNumber"] == entry["old_version"], "template default changed during publication")
+            self.select(template, entry["candidate"])
+        amis = {self.build_region: {"arm64": manifest["images"]["renders"]["image_id"]}, compute: {"arm64": target}}
+        after = {"version": 1, "track": "renders", "generation": before["generation"] + 1, "source_sha": source,
+                 "build_id": self.build_id, "guard_sha256": self.env["GUARD_SHA256"], "renders_amis": amis,
+                 "versions": versions, "build": manifest["images"]["renders"]["build"],
+                 "previous": {key: value for key, value in before.items() if key not in ("previous", "build")}}
+        self.renders_fence(source, input_sha)
+        try:
+            self.save(name, after, True)
+        except Exception:
+            need(self.load(name, True) == after, "release pointer update was not confirmed")
+        need(self.load(name, True) == after, "release pointer update was not confirmed")
+        self.committed = True
+        self.transaction["status"] = "committed"
+        self.record()
+        return after
+
+    def retire_renders(self, release):
+        """Critical only, after the release is committed: terminate renders hosts launched from a renders
+        template on another image. A failure keeps the release and is retried, as retire() does."""
+        templates = {item["id"] for item in self.renders["templates"]}
+        current = release["renders_amis"][self.env["COMPUTE_REGION"]]["arm64"]
+        ec2 = self.client("ec2", True)
+        states = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+        def eligible(instance, owner):
+            tags = {item["Key"]: item["Value"] for item in instance.get("Tags", [])}
+            return (owner == self.env["FLEET_ACCOUNT"] and tags.get("aws:ec2launchtemplate:id") in templates
+                    and re.fullmatch(r"[1-9][0-9]*", tags.get("aws:ec2launchtemplate:version", "")) is not None
+                    and instance.get("InstanceType") == RENDERS_TYPE and tags.get("Purpose") == "fcvm-fleet-renders"
+                    and IMAGE.fullmatch(instance.get("ImageId", "")) is not None and instance["ImageId"] != current
+                    and instance.get("State", {}).get("Name") in states)
+
+        rows = ec2.describe_instances(Filters=[{"Name": "tag:Purpose", "Values": ["fcvm-fleet-renders"]},
+                                               {"Name": "instance-state-name", "Values": states}])
+        need(not rows.get("NextToken"), "renders inventory exceeds its fixed bound")
+        instances = {item["InstanceId"]: item for reservation in rows["Reservations"] for item in reservation["Instances"]
+                     if eligible(item, reservation.get("OwnerId"))}
+        need(len(instances) <= 8, "renders inventory exceeds its fixed bound")
+        if not instances:
+            return
+        spot = sorted(item["SpotInstanceRequestId"] for item in instances.values() if item.get("SpotInstanceRequestId"))
+        if spot:
+            requests = ec2.describe_spot_instance_requests(SpotInstanceRequestIds=spot)["SpotInstanceRequests"]
+            need({item["SpotInstanceRequestId"] for item in requests} == set(spot)
+                 and all(item.get("Type") == "one-time" for item in requests),
+                 "a renders host's Spot request is not the coordinator's one-time request")
+        live = [i for i, item in instances.items() if item["State"]["Name"] not in {"terminated", "shutting-down"}]
+        if live:
+            ec2.terminate_instances(InstanceIds=sorted(live))
+        for _ in range(12):
+            rows = ec2.describe_instances(InstanceIds=sorted(instances))["Reservations"]
+            found = {item["InstanceId"]: item["State"]["Name"] for reservation in rows for item in reservation["Instances"]}
+            if set(found) == set(instances) and all(value == "terminated" for value in found.values()):
+                return
+            self.sleep(10)
+        raise Refused("critical renders release committed; old renders host reclamation is still pending")
+
+    def retirable_renders(self, image, region):
+        """The renders track's own images that retention may remove: its copies, and its factory candidates
+        outside the build region (dispatch.py collects those inside it). Never a pair image."""
+        tags = {item["Key"]: item["Value"] for item in image.get("Tags", [])}
+        if not (IMAGE.fullmatch(image.get("ImageId", "")) and image.get("OwnerId") == self.env["FLEET_ACCOUNT"]
+                and image.get("Public") is False and tags.get("Purpose") == "fcvm-fleet"
+                and tags.get("FleetImageKind") == "renders" and image.get("State") in {"available", "failed"}):
+            return False
+        try:
+            age = self.clock() - datetime.datetime.fromisoformat(image.get("CreationDate", "").replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return False
+        name = image.get("Name", "")
+        if not RENDERS_NAME.fullmatch(canonical_image_name(name)) or age < RETAIN_MIN_DAYS * 86400:
+            return False
+        described = COPY_DESCRIPTION.fullmatch(image.get("Description", ""))
+        if described:
+            return (image.get("SourceImageId"), image.get("SourceImageRegion")) == described.groups()
+        return (region != self.build_region and tags.get("PipelineSanitized") == "true"
+                and tags.get("PipelineBuildId", "").startswith(self.renders["project"] + ":"))
+
+    def retain_renders(self, release):
+        """Remove the renders images nothing needs: kept are the active and previous renders releases (both
+        regions), every renders template's default image, and what instances and Spot requests use."""
+        keep = set()
+        for bundle in (release, release.get("previous") or {}):
+            for arches in (bundle.get("renders_amis") or {}).values():
+                keep.update(arches.values())
+        keep.update(self.current(template["id"], template["region"])["LaunchTemplateData"].get("ImageId")
+                    for template in self.renders["templates"])
+        return self.remove_unneeded(keep, sorted({self.env["COMPUTE_REGION"], self.build_region}), self.retirable_renders, sweep=False)
+
+    def finish_renders(self, result, source, input_sha):
+        name, request = self.renders_request(source, input_sha)
+        if request["priority"] == "critical":
+            try:
+                self.retire_renders(result)
+            except Exception:
+                request["status"] = "awaiting-publish"
+                self.save(name, request)
+                raise
+        request.update(status="promoted", generation=result["generation"])
+        self.save(name, request)
+        self.retain_renders(result)
+        return {"status": "promoted", "generation": result["generation"]}
+
+    def run_renders(self, event):
+        """Publish a successful renders build: its own proof, store, copy, pointer and template."""
+        need(self.renders["enabled"], "the renders track is off (fcvm_ami_renders_track_enabled)")
+        build, source, input_sha = self.event(event, self.renders["project"])
+        pointer = self.renders["release_parameter"]
+        active = self.load(pointer, True)
+        manifest = None
+        if active.get("build_id") != self.build_id:
+            prior = self.prior_transaction()
+            if prior is not None and prior.get("status") == "committed":
+                return {"status": "superseded", "reason": "committed_release_is_no_longer_live"}
+            if prior and prior.get("status") == "rolled_back":
+                name, request = self.renders_request(source, input_sha)
+                request.update(status="failed", message="publication rolled back; automatic replay refused")
+                self.save(name, request)
+                return {"status": "failed", "reason": "rolled_back"}
+            self.renders_request(source, input_sha)
+            self.renders_source_fence(source)
+            manifest = self.renders_proof(build, source, input_sha)
+            resources, image_name, expected = self.renders_resources(manifest, source, input_sha)
+            # Large content transfers need not hold the infrastructure state lock.
+            self.store(manifest, input_sha, "renders/store/")
+            target, copies = self.renders_release_copy(manifest, image_name, expected)
+            if copies:
+                resources[self.env["COMPUTE_REGION"]] = copies
+        with self.publication_lock():
+            active = self.load(pointer, True)
+            if active.get("build_id") == self.build_id:
+                self.committed = True
+                return self.finish_renders(active, source, input_sha)
+            prior = self.prior_transaction()
+            if manifest is None or (prior is not None and prior.get("status") == "committed"):
+                return {"status": "superseded", "reason": "committed_release_is_no_longer_live"}
+            self.renders_fence(source, input_sha)
+            need(self.renders_proof(build, source, input_sha) == manifest, "factory proof changed before the publication lock")
+            result = self.promote_renders(manifest, target, source, input_sha, resources)
+            return self.finish_renders(result, source, input_sha)
+
 
 
 class ProdPublisher(Publisher):
