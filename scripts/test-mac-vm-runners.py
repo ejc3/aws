@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import pwd
 import select
+import signal
 import subprocess
 import tempfile
 import time
@@ -183,7 +184,9 @@ class SimulatorSlots(unittest.TestCase):
         launchctl.write_text(LAUNCHCTL)
         launchctl.chmod(0o755)
         self.daemons = self.root / "LaunchDaemons"
+        self.swift_dir = self.root / "Shared/swift-test"
         self.install_env = dict(os.environ, CI_LAUNCH_AGENTS=str(self.agents), CI_LAUNCH_DAEMONS=str(self.daemons),
+                                CI_SWIFT_TEST_DIR=str(self.swift_dir),
                                 LAUNCHCTL=str(launchctl),
                                 CI_CLEAN_USER=pwd.getpwuid(os.getuid()).pw_name,
                                 FAKE_LAUNCHCTL_CALLS=str(self.launchctl_calls))
@@ -266,11 +269,19 @@ class SimulatorSlots(unittest.TestCase):
             real.write_text("#!/usr/bin/env python3\n"
                             "import json, os, sys, time\n"
                             "print(json.dumps([os.getenv('SWIFT_TEST_SLOT'), sys.argv[1:]]), flush=True)\n"
+                            "if os.getenv('FAKE_SWIFT_PID'):\n"
+                            "    open(os.environ['FAKE_SWIFT_PID'], 'w').write(str(os.getpid()))\n"
+                            "if os.getenv('FAKE_SWIFT_LINGER'):\n"
+                            "    import subprocess\n"
+                            "    leftover = subprocess.Popen(['sleep', '30'], close_fds=False, stdout=subprocess.DEVNULL,\n"
+                            "                                stderr=subprocess.DEVNULL)  # every other descriptor it inherits\n"
+                            "    open(os.environ['FAKE_SWIFT_LINGER'], 'w').write(str(leftover.pid))\n"
                             "time.sleep(float(os.getenv('FAKE_SWIFT_SLEEP', '0')))\n"
                             "sys.exit(int(os.getenv('FAKE_SWIFT_RC', '0')))\n")
             real.chmod(0o755)
-        env = dict(os.environ, HOME=str(self.root), SWIFT_REAL=str(real), **extra)
-        for key in ("SWIFT_TEST_SLOT", "SWIFT_TEST_SLOTS", "SWIFT_TEST_STATE_DIR"):
+        env = dict(os.environ, HOME=str(self.root), SWIFT_REAL=str(real), SWIFT_TEST_STATE_DIR=str(self.swift_dir))
+        env.update(extra)
+        for key in ("SWIFT_TEST_SLOT", "SWIFT_TEST_SLOTS"):
             if key not in extra:
                 env.pop(key, None)
         return env
@@ -281,7 +292,7 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(swift.resolve(), self.mac_build.with_name("swift-test-shim"))
         for args, slot in ((["build", "-c", "release"], None), (["package", "resolve"], None),
                            (["build", "--product", "test"], None), (["test", "--parallel"], "1"),
-                           (["-v", "test"], "1")):
+                           (["-v", "test"], None), (["-module-name", "test", "x.swift"], None)):
             with self.subTest(args=args):
                 out = subprocess.run([swift, *args], env=self.swift_env(), capture_output=True, text=True, timeout=10)
                 self.assertEqual(out.returncode, 0, out.stderr)
@@ -330,6 +341,52 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(after.returncode, 0)
         self.assertLess(time.monotonic() - started, 1.5)
         self.assertNotIn("waiting", after.stderr)
+
+    def test_a_process_left_behind_by_swift_test_does_not_keep_the_slot(self):
+        self.assertEqual(self.install().returncode, 0)
+        swift = self.prefix / "bin/swift"
+        pid_file = self.root / "leftover.pid"
+        done = subprocess.run([swift, "test"], env=self.swift_env(FAKE_SWIFT_LINGER=str(pid_file)),
+                              capture_output=True, text=True, timeout=10)
+        leftover = int(pid_file.read_text())
+        self.addCleanup(lambda: subprocess.run(["kill", str(leftover)], capture_output=True))
+        self.assertEqual(done.returncode, 0)
+        os.kill(leftover, 0)  # still running, and the slot is free all the same
+        started = time.monotonic()
+        after = subprocess.run([swift, "test"], env=self.swift_env(), capture_output=True, text=True, timeout=10)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertNotIn("waiting", after.stderr)
+
+    def test_a_signal_reaches_swift_test_and_the_shim_ends_the_same_way(self):
+        self.assertEqual(self.install().returncode, 0)
+        swift = self.prefix / "bin/swift"
+        pid_file = self.root / "real.pid"
+        shim = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="60", FAKE_SWIFT_PID=str(pid_file)),
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        self.assertIn('"1"', shim.stdout.readline())  # the real swift is running in the slot
+        real = int(pid_file.read_text())
+        shim.send_signal(signal.SIGTERM)
+        self.assertEqual(shim.wait(timeout=10), -signal.SIGTERM)
+        with self.assertRaises(ProcessLookupError):  # passed on: the real swift test ended too
+            os.kill(real, 0)
+        started = time.monotonic()
+        after = subprocess.run([swift, "test"], env=self.swift_env(), capture_output=True, text=True, timeout=10)
+        self.assertLess(time.monotonic() - started, 1.5)  # the child went with it: nothing holds the slot
+
+    def test_the_slot_is_one_directory_for_the_vm_whatever_home_is(self):
+        self.assertEqual(self.install().returncode, 0)
+        self.assertTrue(self.swift_dir.is_dir())
+        self.assertEqual(oct(self.swift_dir.stat().st_mode & 0o777), "0o700")
+        swift = self.prefix / "bin/swift"
+        holder = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="3", HOME=str(self.root / "a")),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        env = self.swift_env()
+        env.pop("HOME")  # another HOME, or none at all: the same slot
+        waiter = subprocess.run([swift, "test"], env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(waiter.returncode, 0, waiter.stderr)
+        self.assertIn("waiting for the VM's test slot", waiter.stderr)
+        holder.wait(timeout=30)
 
     def test_an_unmanaged_swift_is_refused_and_left_alone(self):
         swift = self.prefix / "bin/swift"

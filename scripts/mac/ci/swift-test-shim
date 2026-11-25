@@ -4,45 +4,72 @@
 # concurrent `swift test` jobs on the VM's 9 vCPUs starved WebKit's GPU process (a WKWebView probe went from 0.1 s to
 # 15-16 s and dolphin-labs' reader tests failed), while one at a time passes.
 #
-# The slot is an flock on ~/.local/state/swift-test/slot.N (SWIFT_TEST_STATE_DIR overrides the directory,
-# SWIFT_TEST_SLOTS the count, default 1). The lock's file descriptor is inherited across exec, so `swift test` itself
-# holds it, and it is released when that process and its children exit, however they exit (a cancelled job included);
-# the kernel holds the lock, so a leftover file never blocks anyone. Waiting is reported once on stderr. A `swift test`
-# started under one that holds the slot (SWIFT_TEST_SLOT set) runs at once in its parent's slot.
+# The slot is an flock on /Users/Shared/swift-test/slot.N, one directory for the whole VM whatever a job sets HOME to
+# (SWIFT_TEST_STATE_DIR overrides it, SWIFT_TEST_SLOTS the count, default 1). This process holds the lock and runs the
+# real swift as its child, so the lock lasts exactly as long as that swift test: the descriptor is close-on-exec, and
+# nothing the test leaves running keeps the slot. INT, TERM, HUP and QUIT are passed on to the child, and this process
+# ends the way the child did (its exit status, or the same signal), so the runner sees no difference. The kernel holds
+# the lock, so a leftover file never blocks anyone. A waiter says so once on stderr and then blocks, waking the moment
+# the slot frees. A `swift test` started under one that holds the slot (SWIFT_TEST_SLOT set) runs at once in its
+# parent's slot. Only `swift test` goes through here: `xcrun swift test` and a direct `swift-test` do not.
 use strict;
 use warnings;
 use Fcntl qw(:flock O_RDWR O_CREAT);
 use File::Path qw(make_path);
+use POSIX qw(:sys_wait_h);
 
 my $real = $ENV{SWIFT_REAL} // '/usr/bin/swift';
 
-# The subcommand is the first argument that is not an option; `swift -v test` is still a test.
-my ($subcommand) = grep { !/^-/ } @ARGV;
-if (!defined $subcommand || $subcommand ne 'test' || defined $ENV{SWIFT_TEST_SLOT}) {
+# The swift driver's subcommand is its first argument; `swift -v test` is the interpreter, not a test run.
+if (!@ARGV || $ARGV[0] ne 'test' || defined $ENV{SWIFT_TEST_SLOT}) {
     exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; exit 127 };
 }
 
-my $dir = $ENV{SWIFT_TEST_STATE_DIR} // "$ENV{HOME}/.local/state/swift-test";
-make_path($dir, { mode => 0700 });
+my $dir = $ENV{SWIFT_TEST_STATE_DIR} // '/Users/Shared/swift-test';
+unless (-d $dir || eval { make_path($dir, { mode => 0700 }); 1 }) {
+    # Without the shared directory (not installed yet, no permission), a per-account one still serializes this user's
+    # jobs, which on the VM are every job.
+    $dir = ((getpwuid $<)[7] // '/tmp') . '/.local/state/swift-test';
+    make_path($dir, { mode => 0700 });
+}
 my $slots = ($ENV{SWIFT_TEST_SLOTS} // '1') =~ /^([1-9]\d*)$/ ? $1 : 1;
 
-$^F = 1023;    # swift test inherits the slot's descriptor across exec
-my ($held, $said);
-until ($held) {
-    for my $n (1 .. $slots) {
-        sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$n: $!\n";
-        if (flock($fh, LOCK_EX | LOCK_NB)) {
-            truncate($fh, 0); seek($fh, 0, 0);
-            my $what = substr(join(' ', @ARGV), 0, 160);
-            syswrite($fh, sprintf("pid %d since %s: swift %s (in %s)\n", $$, scalar localtime, $what, $ENV{PWD} // '?'));
-            $ENV{SWIFT_TEST_SLOT} = $n;
-            $held = $fh;
-            last;
-        }
-        close $fh;
-    }
-    last if $held;
-    print STDERR "swift test: waiting for the VM's test slot (cat $dir/slot.* shows who holds it)\n" unless $said++;
-    sleep 2;
+my ($held, $slot);
+for my $n (1 .. $slots) {
+    sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$n: $!\n";
+    if (flock($fh, LOCK_EX | LOCK_NB)) { ($held, $slot) = ($fh, $n); last }
+    close $fh;
 }
-exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; exit 127 };
+unless ($held) {
+    print STDERR "swift test: waiting for the VM's test slot (cat $dir/slot.* shows who holds it)\n";
+    $slot = 1 + $$ % $slots;
+    sysopen($held, "$dir/slot.$slot", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$slot: $!\n";
+    flock($held, LOCK_EX) or die "swift: lock $dir/slot.$slot: $!\n";
+}
+truncate($held, 0); seek($held, 0, 0);
+syswrite($held, sprintf("pid %d since %s: swift %s (in %s)\n", $$, scalar localtime,
+                        substr(join(' ', @ARGV), 0, 160), $ENV{PWD} // '?'));
+
+my $child = fork;
+defined $child or die "swift: fork: $!\n";
+if (!$child) {
+    $ENV{SWIFT_TEST_SLOT} = $slot;
+    exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; POSIX::_exit(127) };
+}
+for my $sig (qw(INT TERM HUP QUIT)) {
+    $SIG{$sig} = sub { kill $sig, $child };
+}
+my $status;
+while (1) {
+    my $got = waitpid($child, 0);
+    if ($got == $child) { $status = $?; last }
+    die "swift: wait: $!\n" unless $!{EINTR};
+}
+close $held;    # the slot frees here, before this process reports how the test ended
+if (WIFSIGNALED($status)) {
+    my $sig = WTERMSIG($status);
+    $SIG{$_} = 'DEFAULT' for qw(INT TERM HUP QUIT);
+    kill $sig, $$;
+    exit 128 + $sig;
+}
+exit WEXITSTATUS($status);
