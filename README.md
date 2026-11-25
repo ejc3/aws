@@ -2151,6 +2151,7 @@ pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
 pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
 pbox up 3 kvm-192 --local-nvme  # the same on 192 vCPU
+pbox up 3 kvm-96 --local-nvme --min-memory 384  # of those, only the types with at least 384 GiB
 pbox up 3 kvm-192 --open   # the same, open to the internet with a public IPv6 /80 for fcvm VMs (below)
 pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (about 3x the price; below)
 
@@ -2170,6 +2171,11 @@ disks. With kvm-96 the flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; 
 `c9gd.metal-48xl` and `m8gd.metal-48xl` (six, three and six instance-store disks, 11,400 GB in all, made one RAID0 at
 `/mnt/nvme`). It refuses an occupied slot with another instance type and leaves that box alone. `pbox capacity N
 kvm-96 --local-nvme` (or kvm-192) checks those same candidates.
+
+Add `--min-memory GIB` when the job's measured peak does not fit the flavor's smallest type: of the local NVMe types it
+tries only those with at least that much memory (`kvm-96`: `c8gd.metal-24xl` has 192 GiB and `m8gd.metal-24xl` 384;
+`kvm-192`: 384, 384 and 768). `pbox up N kvm-96 --local-nvme --min-memory 384` tries `m8gd.metal-24xl` alone. A floor no
+type meets launches nothing, and an occupied slot with a smaller type is left alone, as above.
 
 `kvm-gpu-64` is a `g5g.metal` (Graviton2, 64 vCPU, 128 GiB, two NVIDIA T4G) for GPU passthrough into fcvm microVMs:
 `/dev/kvm`, the SMMU on, `vfio-pci` loaded at boot, and every NVIDIA function bound to `vfio-pci` by a persistent
