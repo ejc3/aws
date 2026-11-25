@@ -49,6 +49,9 @@ state = open(sp).read().split() if os.path.exists(sp) else []
 here = bool(state) and state[0] == region
 if "get-parameter" in a:
     print(os.environ["FAKE_POINTER"])
+elif "describe-instances" in a and "PboxOwner" in a and "--instance-ids" in a:
+    lt, lease = (os.environ.get("FAKE_LEASE", "2026-10-22T00:00:00+00:00\tNone").split("\t") + ["None"])[:2]
+    print(("None\t%s\tNone\t%s" % (lease, lt)) if here else "None\tNone\tNone\tNone")
 elif "describe-instances" in a and "PboxLeaseUntil" in a:
     print(os.environ.get("FAKE_LEASE", "2026-10-22T00:00:00+00:00\tNone") if here else "None\tNone")
 elif "describe-launch-template-versions" in a:
@@ -109,6 +112,7 @@ class LeaseScript(unittest.TestCase):
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
                    FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER), **extra)
         env.pop("PARALLEL_BOX_REGION", None)
+        env.pop("CLAUDE_CODE_SESSION_ID", None)  # the owner token is the host's alone here, as on CI
         env.setdefault("MEMBER_BOX_USER", "example-owner")
         r = subprocess.run(["bash", str(SCRIPT), *args], capture_output=True, text=True, env=env, timeout=120)
         return r.returncode, r.stdout, r.stderr
@@ -156,7 +160,7 @@ class LeaseScript(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         tags = self.instance_tags(self.runs()[0])
         self.assertNotIn("PboxLeaseUntil", tags)
-        self.assertEqual({k: v for k, v in tags.items() if k != "PboxLaunchedBy"}, {"Name": "parallel-box-3", "DevEBS": "true"})
+        self.assertEqual({k: v for k, v in tags.items() if k not in ("PboxLaunchedBy", "PboxOwner")}, {"Name": "parallel-box-3", "DevEBS": "true"})
         self.assertNotIn("LEASE:", err)
         self.assertNotIn("  lease:", err)
 
@@ -167,7 +171,7 @@ class LeaseScript(unittest.TestCase):
         fb = [r for r in self.runs() if "--subnet-id" in r]
         self.assertEqual(len(fb), 1)
         tags = self.instance_tags(fb[0])
-        self.assertEqual({k: v for k, v in tags.items() if k not in ("PboxLeaseUntil", "PboxLaunchedBy")},
+        self.assertEqual({k: v for k, v in tags.items() if k not in ("PboxLeaseUntil", "PboxLaunchedBy", "PboxOwner")},
                          {"Name": "parallel-box-3", "Fallback": "true", "DevEBS": "true"})
         self.assertTrue(before + 7200 <= int(tags["PboxLeaseUntil"]) <= int(time.time()) + 7200)
         # without --lease the fallback tags are as before
@@ -175,7 +179,7 @@ class LeaseScript(unittest.TestCase):
         (self.tmp / "state").unlink()
         self.pbox("up", "3", "compute-32", "--fallback", FAKE_HOME_FULL="1")
         fb = [r for r in self.runs() if "--subnet-id" in r]
-        self.assertEqual({k: v for k, v in self.instance_tags(fb[0]).items() if k != "PboxLaunchedBy"},
+        self.assertEqual({k: v for k, v in self.instance_tags(fb[0]).items() if k not in ("PboxLaunchedBy", "PboxOwner")},
                          {"Name": "parallel-box-3", "Fallback": "true", "DevEBS": "true"})
 
     def refused(self, *args, member=None):

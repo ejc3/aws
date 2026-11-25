@@ -2181,7 +2181,7 @@ pbox up 3 kvm-gpu-96 --on-demand   # buy this one launch on-demand, not spot (ab
 
 pbox up 3 kvm-gpu-96 --lease 3h   # not terminated for idleness for 3 hours (30m to 12h; below)
 pbox ssh [N]
-pbox down [N]              # terminate compute; keep that box's /mnt/work
+pbox down [N] --instance i-...   # terminate that instance; keep that box's /mnt/work (the id is required)
 ```
 
 `up` needs a flavor (`pbox-flavors.tf`), and with none it prints the menu and launches nothing. A flavor is a shape and
@@ -2250,13 +2250,20 @@ lease's end, and the watchdog does not terminate it for idleness until then; aft
 watchdog ends any lease at 12 hours from launch, whatever the tag says. **A leased box costs money for the whole lease**,
 busy or not: a `kvm-gpu-96` is about $4/hr spot, so a 12-hour lease is about $50. `pbox status` shows
 `lease: until HH:MM UTC (Xh Ym left)` or `lease: ended`. The lease is set at launch only; a running box keeps what it has
-(`pbox down N`, then `up` again with `--lease`). Members' boxes take no lease.
+(`pbox down N --instance ID --force`, then `up` again with `--lease`). Members' boxes take no lease.
 
 Several jobs share the eight slots, and a slot can hold a different instance minutes after a script looked it up. `pbox up`
 ends with `launched box=N ... id=i-...` (with ` failed=<reason>` and exit 1 when the box was launched but did not come up),
 so scripts carry that id and use `pbox ip|ssh|down N --instance i-...`, which refuse when the slot holds another instance;
-they never re-resolve a slot by name. `pbox down N` without `--instance` also refuses a box another caller launched in the
-last hour (its `PboxLaunchedBy` tag, set from `PBOX_CALLER`, by default the host) unless `--force`.
+they never re-resolve a slot by name. `pbox down` requires the id (#1077): `pbox down N` alone prints what the slot holds
+(instance, launch time, `PboxLaunchedBy`, owner, lease) and terminates nothing, because on 2026-11-25 another session's
+`pbox down N` ended a leased, busy box. `down` also refuses a box whose lease has not ended unless `--force`.
+
+Every owner's launch is tagged `PboxOwner`: `--owner TOKEN`, else `PBOX_OWNER`, else the host plus this Claude session
+(`CLAUDE_CODE_SESSION_ID`). `ip`, `ssh`, `down`, and an `up` that finds the slot running, refuse a box another token owns
+unless `--force-other-owner`, so one session's command cannot end, reuse or attach to another's box. A box from before
+the tag is anyone's. To share boxes across sessions (a watcher in another process), set the same `PBOX_OWNER` in each.
+`pbox status` shows the owner beside the lease. A member's box carries no owner tag and a member's `pbox down` needs no id.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this
 lifecycle. Terraform owns the durable half -- work volumes, security groups, key pair and
@@ -2281,7 +2288,7 @@ its last line; `pbox status` shows it while the box runs.
 
 `--open` launches only in the home AZ: the fallback sites' VPCs have no IPv6, so it is refused with `--fallback` and
 `--regions` (and when home has no capacity, exits 3 without offering them). It is refused for every command but `up`, and
-for a member's pbox. A box already running without it is kept as it is: `pbox down N`, then `pbox up N FLAVOR --open`.
+for a member's pbox. A box already running without it is kept as it is: `pbox down N --instance ID`, then `pbox up N FLAVOR --open`.
 
 ## On-demand GPU box
 

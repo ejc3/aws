@@ -673,6 +673,8 @@ if op == "describe-instances":
         print("us-east-2c")
     elif "Fallback" in q or "Ipv6Prefixes" in q:
         print("None")  # no box here was launched at a fallback site or with --open
+    elif "PboxOwner" in q:
+        print("None\tNone\tNone\t2026-10-18T10:00:00+00:00")  # boxes from before the owner tag (#1077)
     else:
         print("\n".join(iid.split()))
 elif op == "describe-volumes":

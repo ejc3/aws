@@ -54,8 +54,12 @@
 #                     GPU work with idle stretches. A LEASED BOX COSTS MONEY FOR THE WHOLE LEASE, busy or not (a
 #                     kvm-gpu-96 is about $4/hr spot, so a 12h lease is about $50). Set only at launch: a box already
 #                     running keeps what it has (down, then up --lease). Not for a member's box.
-#   pbox down [N]     terminate it, wherever it runs. A home box's work volume is KEPT. A box launched in the last hour
-#                     by another caller (its PboxLaunchedBy tag) is refused unless --force or --instance names it.
+#   pbox down [N] --instance i-...
+#                     terminate that instance, wherever it runs. A home box's work volume is KEPT. The id is required
+#                     (#1077: a short `pbox down N` ended another session's leased box): without it, down prints what
+#                     the slot holds (id, launch time, launcher, owner, lease) and terminates nothing. A box with a
+#                     lease that has not ended is refused unless --force; another owner's box (below) unless
+#                     --force-other-owner. A member's `pbox down` needs no id: their one box is only ever theirs.
 #   pbox status       every box: running where, as which flavor? bought spot or ON-DEMAND? disk? open, with which IPv6 /80?
 #                     leased until when? and how the NEXT launch is bought
 #   pbox status N     just box N
@@ -64,6 +68,11 @@
 #   pbox ip|ssh|down [N] --instance i-...
 #                     act only if the slot still holds that instance (the id= field of `up`'s last line); refused when
 #                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
+#   --owner TOKEN     (or PBOX_OWNER) who this caller is. `up` tags the box PboxOwner=TOKEN; `ip`, `ssh` and `down`
+#                     refuse a box whose PboxOwner is another token, and `up` refuses to attach to one, unless
+#                     --force-other-owner. The default is the host plus this Claude session (CLAUDE_CODE_SESSION_ID),
+#                     else the host: set PBOX_OWNER to share boxes across sessions. A box from before the tag (no
+#                     PboxOwner) is anyone's, as before. Not for a member's box (their grant pins the tag keys).
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
 #                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96 and kvm-192.
@@ -192,7 +201,7 @@ flavor_note() {
   local f
   f="$(type_flavor "$1")"
   if [ "$f" != "$FLAVOR" ]; then
-    say "NOTE: $NAME is already running as $1 (flavor ${f:-none}), not $FLAVOR; it is kept. For $FLAVOR: $SELF down ${BOX:-}, then up again."
+    say "NOTE: $NAME is already running as $1 (flavor ${f:-none}), not $FLAVOR; it is kept. For $FLAVOR: $SELF down ${BOX:-}$(down_id_hint), then up again."
   fi
 }
 
@@ -309,6 +318,14 @@ while [ $# -gt 0 ]; do
       INSTANCE="${1#--instance=}"
       [ -n "$INSTANCE" ] || { say "--instance needs an instance id (i-...)"; exit 1; } ;;
     --force) FORCE=1 ;;
+    --force-other-owner) FORCE_OTHER_OWNER=1 ;;
+    --owner)
+      shift
+      [ -n "${1:-}" ] || { say "--owner needs a token"; exit 1; }
+      OWNER_ARG="$1" ;;
+    --owner=*)
+      OWNER_ARG="${1#--owner=}"
+      [ -n "$OWNER_ARG" ] || { say "--owner needs a token"; exit 1; } ;;
     --regions)
       shift
       [ -n "${1:-}" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; }
@@ -318,7 +335,7 @@ while [ $# -gt 0 ]; do
       [ -n "$ONLY_REGIONS" ] || { say "--regions needs a list (us-east-1,us-west-2)"; exit 1; } ;;
     [0-9]*) say "unknown box '$1' (use 1-8)"; exit 1 ;;
     [a-z]*-[0-9]*) FLAVOR="$1" ;;
-    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --min-memory GIB, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force)"; exit 1 ;;
+    *) say "unknown argument '$1' (a box 1-8, a flavor, --local-nvme, --min-memory GIB, --fallback, --regions r1,r2, --open, --on-demand, --lease DURATION, --instance i-..., --force, --owner TOKEN, --force-other-owner)"; exit 1 ;;
   esac
   shift
 done
@@ -342,6 +359,15 @@ if [ -n "$FORCE" ] && [ "$CMD" != "down" ]; then say "--force only applies to 'd
 # job; by default it is this host, so `down` from another host within the first hour asks for --force or --instance.
 PBOX_CALLER="${PBOX_CALLER:-$(hostname -s 2>/dev/null || echo unknown)}"
 PBOX_CALLER="$(printf '%s' "$PBOX_CALLER" | tr -c 'A-Za-z0-9_.:/=+@-' '_' | cut -c1-200)"
+# Whose box (#1077): PboxOwner on the owner's boxes. --owner, else PBOX_OWNER, else this host and this Claude session, so
+# another session's `pbox down N` cannot end a box it did not launch. Not secret; the same safe characters as the caller.
+if [ -n "${OWNER_ARG:-}" ]; then PBOX_OWNER="$OWNER_ARG"
+elif [ -z "${PBOX_OWNER:-}" ]; then PBOX_OWNER="$PBOX_CALLER${CLAUDE_CODE_SESSION_ID:+/${CLAUDE_CODE_SESSION_ID:0:8}}"
+fi
+PBOX_OWNER="$(printf '%s' "$PBOX_OWNER" | tr -c 'A-Za-z0-9_.:/=+@-' '_' | cut -c1-200)"
+if [ -n "${FORCE_OTHER_OWNER:-}" ]; then
+  case "$CMD" in up|ip|ssh|down) ;; *) say "--force-other-owner only applies to up, ip, ssh and down"; exit 1 ;; esac
+fi
 # --open: the owner's boxes, `up`, and the home AZ only. The members' pboxes launch with their SSH-only group, which is
 # also all their IAM grant allows (member-pbox.tf). The fallback sites' VPCs have no IPv6, so there is no /80 to delegate.
 if [ -n "$OPEN" ]; then
@@ -389,6 +415,17 @@ LEASE_UNTIL="" # the lease's end in epoch seconds, set just before each launch a
 start_lease() { [ -z "$LEASE_SECS" ] || LEASE_UNTIL=$(( $(date +%s) + LEASE_SECS )); }
 # lease_line LAUNCH_TIME UNTIL: the lease as status prints it ("until HH:MM UTC (Xh Ym left)" or "ended"), capped at
 # LaunchTime + LEASE_MAX_HOURS as the watchdog caps it; nothing for no lease or an unparseable tag.
+# lease_end EPOCH: "HH:MM UTC (Ym left)" for a lease still running, "ended" for one past, "none" without one.
+# down_id_hint: " --instance ID" for the owner's box whose id is known here (ID), since down needs it; nothing for a member.
+down_id_hint() { [ -n "$MEMBER" ] || [ -z "${ID:-}" ] || printf ' --instance %s' "$ID"; }
+
+lease_end() {
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || { echo none; return; }
+  local left=$(( $1 - $(date +%s) ))
+  if [ "$left" -le 0 ]; then echo ended; return; fi
+  echo "$(date -u -d "@$1" +%H:%M) UTC ($(( left / 60 ))m left)"
+}
+
 lease_line() {
   local launch until now left
   [[ "${2:-}" =~ ^[0-9]{1,12}$ ]] || return 0
@@ -640,6 +677,31 @@ check_instance() {
   fi
 }
 
+# instance_tags ID: "OWNER<TAB>LEASE_UNTIL<TAB>LAUNCHED_BY<TAB>LAUNCH_TIME" of that exact instance ("None" for a missing tag).
+instance_tags() {
+  # shellcheck disable=SC2016 # a JMESPath literal, not a shell expansion
+  aws ec2 describe-instances --region "$REGION" --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxOwner`].Value | [0], Tags[?Key==`PboxLeaseUntil`].Value | [0], Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' \
+    --output text 2>/dev/null
+}
+
+# check_owner ID: refuse another owner's box (#1077) unless --force-other-owner. A box with no PboxOwner (launched before
+# the tag) is anyone's. Fails closed: an unreadable answer refuses. A member's box is only ever theirs and carries no tag.
+check_owner() {
+  [ -n "${1:-}" ] && [ -z "$MEMBER" ] && [ -z "${FORCE_OTHER_OWNER:-}" ] || return 0
+  local tags owner
+  if ! tags="$(instance_tags "$1")" || [ -z "$tags" ]; then
+    say "refusing: could not read who owns $NAME ($1); nothing was done. If it is yours: add --force-other-owner"
+    exit 1
+  fi
+  IFS=$'\t' read -r owner _ <<< "$tags"
+  if [ -n "$owner" ] && [ "$owner" != "None" ] && [ "$owner" != "$PBOX_OWNER" ]; then
+    say "refusing: $NAME ($1) belongs to $owner, not to $PBOX_OWNER (PBOX_OWNER / --owner); nothing was done."
+    say "  It is probably another session's work. If it really is yours: $SELF $CMD ${BOX:-} ... --force-other-owner"
+    exit 1
+  fi
+}
+
 # Point REGION at wherever the box runs: home first, then the fallback regions. A box that is not running anywhere
 # leaves REGION at home, where `up` launches it first.
 locate_box() {
@@ -716,14 +778,14 @@ open_host_ipv6() {
 # nowhere else), so it is not applied.
 lease_note() {
   if [ -n "$LEASE" ]; then
-    say "NOTE: $NAME is already running; --lease applies only to a new launch, so its lease is unchanged. For a lease: $SELF down ${BOX:-}, then up again with --lease."
+    say "NOTE: $NAME is already running; --lease applies only to a new launch, so its lease is unchanged. For a lease: $SELF down ${BOX:-}$(down_id_hint), then up again with --lease."
   fi
 }
 
 # When `up --open` finds the box already running without a prefix: it was not launched open, and is kept as it is.
 open_note() {
   if [ -n "$OPEN" ] && [ -z "$(box_ipv6_prefix "$@")" ]; then
-    say "NOTE: $NAME is already running without --open (no open security group, no IPv6 /80); it is kept. For --open: $SELF down ${BOX:-}, then up again with --open."
+    say "NOTE: $NAME is already running without --open (no open security group, no IPv6 /80); it is kept. For --open: $SELF down ${BOX:-}$(down_id_hint), then up again with --open."
   fi
 }
 
@@ -737,7 +799,7 @@ ondemand_note() {
     "${sel[@]}" \
     --query 'Reservations[0].Instances[0].InstanceLifecycle' --output text 2>/dev/null)
   if [ "$l" = spot ]; then
-    say "NOTE: $NAME is already running as spot; it is kept. For on-demand: $SELF down ${BOX:-}, then up again with --on-demand."
+    say "NOTE: $NAME is already running as spot; it is kept. For on-demand: $SELF down ${BOX:-}$(down_id_hint), then up again with --on-demand."
   fi
 }
 
@@ -807,6 +869,12 @@ status_one() {
       --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
       --query 'Reservations[0].Instances[0].[LaunchTime,Tags[?Key==`PboxLeaseUntil`].Value | [0]]' --output text 2>/dev/null))"
     [ -z "$LZ" ] || echo "  lease:  $LZ"
+    if [ -z "$MEMBER" ]; then
+      OWN="$(aws ec2 describe-instances --region "$REGION" \
+        --filters "Name=tag:Name,Values=$NAME" "Name=instance-state-name,Values=running" \
+        --query 'Reservations[0].Instances[0].Tags[?Key==`PboxOwner`].Value | [0]' --output text 2>/dev/null)"
+      case "$OWN" in ""|None) ;; *) echo "  owner:  $OWN$([ "$OWN" = "$PBOX_OWNER" ] && echo " (you)")" ;; esac
+    fi
     if [ "$(box_work)" = "fresh" ]; then
       echo "  where:  FALLBACK site $(box_az) -- its /mnt/work is a fresh volume, deleted with the box"
     elif [ "$REGION" != "$HOME_REGION" ] || [ -n "$FB_REGIONS" ]; then
@@ -1225,12 +1293,15 @@ case "$CMD" in
   ip)
     locate_box || true
     check_instance
+    check_owner "${INSTANCE:-$(box_id)}"
     if [ -n "$INSTANCE" ]; then instance_ip "$INSTANCE"; else box_ip; fi
     ;;
 
   up)
     member_key
     if locate_box; then
+      # Never attach to another owner's box (#1077: two `up`s landed on one instance, the second printing it as its own).
+      check_owner "$LOCATED_ID"
       if [ -n "$LOCAL_NVME" ]; then
         reuse_local_nvme_box
         exit $?
@@ -1344,7 +1415,7 @@ case "$CMD" in
       TAGS=()
       start_lease
       if [ -z "$MEMBER" ]; then
-        EXTRA_TAGS="{Key=PboxLaunchedBy,Value=$PBOX_CALLER}"
+        EXTRA_TAGS="{Key=PboxLaunchedBy,Value=$PBOX_CALLER},{Key=PboxOwner,Value=$PBOX_OWNER}"
         [ -z "$LEASE" ] || EXTRA_TAGS="$EXTRA_TAGS,{Key=PboxLeaseUntil,Value=$LEASE_UNTIL}"
         TAGS=(--tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=DevEBS,Value=true},$EXTRA_TAGS]")
       fi
@@ -1454,7 +1525,7 @@ case "$CMD" in
         # them per resource type, the box ends up named and tagged Fallback=true (what `status` and `down` read).
         if try_launch "$T" "$FAZ" --launch-template "LaunchTemplateName=$FB_TEMPLATE,Version=\$Latest" \
              --subnet-id "$SUBNET" ${IMG[@]+"${IMG[@]}"} \
-             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true},{Key=PboxLaunchedBy,Value=$PBOX_CALLER}$LEASE_TAG]" \
+             --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$NAME},{Key=Fallback,Value=true},{Key=DevEBS,Value=true},{Key=PboxLaunchedBy,Value=$PBOX_CALLER},{Key=PboxOwner,Value=$PBOX_OWNER}$LEASE_TAG]" \
                                   "ResourceType=volume,Tags=[{Key=Name,Value=$NAME},{Key=Role,Value=fallback}]" \
                                   "ResourceType=network-interface,Tags=[{Key=Name,Value=$NAME}]"; then
           ID="$OUT"; CHOSEN="$T"; CHOSEN_AZ="$FAZ"; break 2
@@ -1498,6 +1569,20 @@ case "$CMD" in
 
   down)
     locate_box || true
+    # The owner's `down` needs the instance id (#1077): a slot is not a reservation, and `pbox down N` alone ended
+    # another session's leased box. Without the id it only says what the slot holds. A member's box is only theirs.
+    if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ]; then
+      ID="$(box_id)"
+      if [ -z "$ID" ]; then
+        say "$NAME is already down."
+        exit 0
+      fi
+      IFS=$'\t' read -r OWN LEASE_AT BY LT_AT <<< "$(instance_tags "$ID")"
+      say "refusing: '$SELF down' needs the instance id; nothing was terminated. $NAME holds:"
+      say "  instance: $ID   launched: ${LT_AT:-?}   by: ${BY:-?}   owner: ${OWN:-?}   lease: $(lease_end "${LEASE_AT:-}")"
+      say "  If it is yours: $SELF down ${BOX:-} --instance $ID"
+      exit 1
+    fi
     check_instance
     # With --instance the target is that instance, validated above, never a second lookup of the slot.
     if [ -n "$INSTANCE" ]; then ID="$INSTANCE"; else ID="$(box_id)"; fi
@@ -1505,30 +1590,17 @@ case "$CMD" in
       say "$NAME is already down."
       exit 0
     fi
-    # A box another caller launched in the last hour is probably someone's work in progress (#621): refuse unless the
-    # caller names it (--instance) or insists (--force).
-    # A member's box is only ever that member's (their grant pins the tag keys, so it carries no PboxLaunchedBy).
-    if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then
-      # Fails closed: an unreadable answer or launch time refuses, as a recent box of another caller does.
-      if ! LAUNCHER="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$ID" \
-          --query 'Reservations[0].Instances[0].[Tags[?Key==`PboxLaunchedBy`].Value | [0], LaunchTime]' --output text 2>/dev/null)" \
-          || [ -z "$LAUNCHER" ]; then
-        say "refusing: could not read who launched $NAME ($ID). If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
+    check_owner "$ID"
+    # A lease (pbox up --lease) is a promise that the box is in use until then: refused unless --force. Fails closed.
+    if [ -z "$MEMBER" ] && [ -z "$FORCE" ]; then
+      if ! TAGS_NOW="$(instance_tags "$ID")" || [ -z "$TAGS_NOW" ]; then
+        say "refusing: could not read $NAME's lease ($ID); nothing was done. To end it anyway: add --force"
         exit 1
       fi
-      IFS=$'\t' read -r BY LT_AT <<< "$LAUNCHER"
-      if [ -n "$BY" ] && [ "$BY" != "None" ] && [ "$BY" != "$PBOX_CALLER" ]; then
-        # An empty time is unreadable too: `date -d ""` answers today's midnight, which would make the age the time of day.
-        if [ -z "$LT_AT" ] || [ "$LT_AT" = "None" ] || ! LT_S=$(date -d "$LT_AT" +%s 2>/dev/null); then
-          say "refusing: $NAME ($ID) has an unreadable launch time; If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
-          exit 1
-        fi
-        AGE_MIN=$(( ( $(date +%s) - LT_S ) / 60 ))
-        if [ "$AGE_MIN" -lt 60 ]; then
-          say "refusing: $NAME ($ID) was launched ${AGE_MIN} min ago by $BY, not by $PBOX_CALLER; it is probably someone else's."
-          say "If it is yours: $SELF down ${BOX:-} --instance $ID   (or --force)"
-          exit 1
-        fi
+      IFS=$'\t' read -r _ LEASE_AT _ <<< "$TAGS_NOW"
+      if [[ "${LEASE_AT:-}" =~ ^[0-9]+$ ]] && [ "$LEASE_AT" -gt "$(date +%s)" ]; then
+        say "refusing: $NAME ($ID) is leased until $(lease_end "$LEASE_AT"); nothing was done. To end it anyway: add --force"
+        exit 1
       fi
     fi
     WORK="$(box_work)"
@@ -1564,6 +1636,7 @@ case "$CMD" in
     member_key
     locate_box || true
     check_instance
+    check_owner "${INSTANCE:-$(box_id)}"
     if [ -n "$INSTANCE" ]; then IP="$(instance_ip "$INSTANCE")"; else IP="$(box_ip)"; fi
     [ -n "$IP" ] || { say "Box is down. Run: $SELF up ${BOX:+$BOX }FLAVOR  ($SELF flavors)"; exit 1; }
     exec ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP"

@@ -352,8 +352,11 @@ there is no `pbox lease` for a running box. Members' boxes and the GPU test boxe
 eight slots, so a slot name can point at another instance minutes later (#621): `up`'s last line carries `id=i-...` (also,
 with `failed=<reason>`, when the box was launched but did not come up), scripts carry that id and pass `--instance i-...` to
 `ip`, `ssh` and `down`, which refuse when the slot holds another instance, and they never re-resolve a slot by name. The
-owner's launches tag `PboxLaunchedBy` (`PBOX_CALLER`, default the host); `down` without `--instance` refuses a box another
-caller launched in the last hour unless `--force`. Members' grants pin their tag keys, so their boxes carry no such tag.
+owner's launches tag `PboxLaunchedBy` (`PBOX_CALLER`, default the host) and `PboxOwner` (#1077: `--owner` or `PBOX_OWNER`,
+default the host plus the Claude session); `ip`, `ssh`, `down` and an `up` that would attach refuse another owner's box
+unless `--force-other-owner`. The owner's `down` requires `--instance` (alone it only prints what the slot holds), and
+refuses a box whose lease has not ended unless `--force`: on 2026-11-25 another session's `pbox down N` ended a leased,
+busy box. Members' grants pin their tag keys, so their boxes carry neither tag, and a member's `pbox down` needs no id.
 Every pbox boot (home, fallback and member) installs the security updates after its packages (`pbox_security_updates`
 in `pbox-flavors.tf`, owner 2026-10-23): `unattended-upgrade`, the security pocket only, retried while apt is busy, never a
 reboot, so a new kernel waits for the next boot and a failed update still leaves a usable box.
