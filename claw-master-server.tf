@@ -52,8 +52,8 @@ variable "enable_claw_master_server" {
 }
 
 locals {
-  claw_master_tag            = "claw-master-10dc6d9"
-  claw_master_sha256_aarch64 = "e6bc6d4cdc3dd4fb5931990a672e75e35dbfaa5c80ecd43c6037c9f93621087d"
+  claw_master_tag            = "claw-master-c62a929"
+  claw_master_sha256_aarch64 = "27c1da3a4576e71186046b02ad03c6aa2cea0eff39596241b8de909eb1d2464b"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
@@ -869,6 +869,26 @@ exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/
 EOF
 chmod 0755 /usr/local/bin/claw-master-login
 
+# Reads, or with --claim spends, a subscription's banked limit reset (claude.ai's "Reset for free") with the
+# server's own login, as the service account: claw-master-reset PROFILE [fable|weekly] [--claim].
+cat > /usr/local/bin/claw-master-reset <<'EOF'
+#!/bin/bash
+usage() { echo "usage: claw-master-reset PROFILE [fable|weekly] [--claim]  (without --claim it only reads)" >&2; exit 2; }
+[ $# -ge 1 ] && [ $# -le 3 ] || usage
+profile=$1; shift
+[[ $profile =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$ ]] || usage  # the add-start rule: a name, never a flag
+kind=fable; claim=()
+for a in "$@"; do
+  case $a in
+    fable|weekly) kind=$a ;;
+    --claim) claim=(--claim) ;;
+    *) usage ;;
+  esac
+done
+exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master reset "$profile" --kind "$kind" "$${claim[@]}"
+EOF
+chmod 0755 /usr/local/bin/claw-master-reset
+
 # Signs a client's certificate request (base64 on stdin) and prints the client certificate and then
 # the CA certificate. scripts/claw-master-enroll.sh calls this over SSM; it is an admin action.
 cat > /usr/local/bin/claw-master-sign <<'EOF'
@@ -968,7 +988,7 @@ sed -i "s/\$TAG/$TAG/" /usr/local/bin/claw-master-status
 chmod 0755 /usr/local/bin/claw-master-status
 
 # The helpers' names before the rename (claude-master-*) stay as links, for anything that still calls them.
-for h in serve account-labels envoy-endpoints rollout login sign status add-start add-finish; do
+for h in serve account-labels envoy-endpoints rollout login reset sign status add-start add-finish; do
   [ "$(readlink /usr/local/bin/claude-master-$h)" = "claw-master-$h" ] && continue
   ln -sfn "claw-master-$h" "/usr/local/bin/claude-master-$h.new" && mv -Tf "/usr/local/bin/claude-master-$h.new" "/usr/local/bin/claude-master-$h"
 done
