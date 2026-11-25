@@ -1826,6 +1826,16 @@ which under steady CI never happened: the volume filled and two runners crashed 
 logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
 `/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
 
+**The CI VM restarts a hung coreaudiod** (#1068). On 2026-11-25 at 06:01 UTC the VM's `coreaudiod` stopped answering
+and stayed that way. From then on, every process that touched CoreAudio blocked for good: WebKit's GPU process,
+AVPlayer, CoreSimulator's device I/O. Every dolphin-labs native test run failed. The same install puts
+`ci-coreaudio-check` beside the disk cleaner and loads the root LaunchDaemon `com.ejcampbell.ci-coreaudio-check`
+(`/Library/LaunchDaemons`), every 5 minutes and at load. Each run asks CoreAudio for the default output device in a
+child process and waits 5 seconds; any answer counts as alive. When there is no answer, it kills `coreaudiod`
+(`killall -KILL`; launchd starts it again) once no runner has a job, or after 30 minutes of no answer even with a job
+running, since a job that touches audio is already stuck. It restarts at most once every 15 minutes, then asks again.
+It logs outcomes and minutes only, to `/Library/Logs/ci-coreaudio-check.log`.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to

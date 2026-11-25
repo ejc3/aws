@@ -1,8 +1,9 @@
 #!/bin/sh
 # Invoked inside the CI VM as root. A staging prefix also permits a disposable install test
-# (with CI_LAUNCH_AGENTS, CI_CLEAN_USER and LAUNCHCTL pointing at stand-ins).
-# Installs the simulator test slots and the hourly disk cleaner (ci-disk-clean, ejc3/aws#1021). Idempotent:
-# the cleaner's LaunchAgent is reloaded only when its plist changed or it is not loaded.
+# (with CI_LAUNCH_AGENTS, CI_LAUNCH_DAEMONS, CI_CLEAN_USER and LAUNCHCTL pointing at stand-ins).
+# Installs the simulator test slots, the hourly disk cleaner (ci-disk-clean, ejc3/aws#1021) and the 5-minute
+# coreaudiod check (ci-coreaudio-check, ejc3/aws#1068). Idempotent: each job is reloaded only when its plist changed
+# or it is not loaded.
 set -eu
 src=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
 prefix=${1:-/usr/local}
@@ -10,9 +11,11 @@ lib=$prefix/libexec/mini-simulator
 link=$prefix/bin/xcodebuild
 target=$lib/sim-slot-shim
 agents=${CI_LAUNCH_AGENTS:-/Library/LaunchAgents}
+daemons=${CI_LAUNCH_DAEMONS:-/Library/LaunchDaemons}
 user=${CI_CLEAN_USER:-admin}
 launchctl=${LAUNCHCTL:-/bin/launchctl}
 label=com.ejcampbell.ci-disk-clean
+audio_label=com.ejcampbell.ci-coreaudio-check
 case "$user" in ''|-*|*[!A-Za-z0-9_.-]*) echo "Invalid user $user" >&2; exit 1 ;; esac
 if [ -e "$link" ] || [ -L "$link" ]; then
   [ "$(readlink "$link")" = "$target" ] || { echo "Refusing to replace unmanaged $link" >&2; exit 1; }
@@ -22,7 +25,7 @@ for dir in "$prefix/bin" "$prefix/libexec" "$lib"; do
 done
 stage=$(mktemp -d "$lib/.install.XXXXXXXX")
 trap 'rm -rf -- "$stage"' EXIT
-for source in bin/mac-build ci/sim-slot-shim ci/ci-disk-clean; do
+for source in bin/mac-build ci/sim-slot-shim ci/ci-disk-clean ci/ci-coreaudio-check; do
   file=${source##*/}
   install -m 755 "$src/$source" "$stage/$file"
   mv -f "$stage/$file" "$lib/$file"
@@ -31,6 +34,39 @@ if [ ! -L "$link" ]; then
   ln -s "$target" "$link" || [ "$(readlink "$link")" = "$target" ]
 fi
 echo "Installed simulator test slots at $link"
+
+# The coreaudiod check runs as root in the system domain: restarting coreaudiod needs root, and a hung coreaudiod
+# hangs a root client's request as it does the runners'.
+[ -d "$daemons" ] || install -d -m 755 "$daemons"
+audio_plist=$daemons/$audio_label.plist
+cat > "$stage/audio.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>$audio_label</string>
+  <key>ProgramArguments</key><array><string>$lib/ci-coreaudio-check</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>StartInterval</key><integer>300</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>/Library/Logs/ci-coreaudio-check.log</string>
+  <key>StandardErrorPath</key><string>/Library/Logs/ci-coreaudio-check.log</string>
+</dict></plist>
+PLIST
+if cmp -s "$stage/audio.plist" "$audio_plist" && "$launchctl" print "system/$audio_label" >/dev/null 2>&1; then
+  echo "coreaudiod check unchanged and loaded"
+else
+  install -m 644 "$stage/audio.plist" "$stage/audio.plist.new"
+  mv -f "$stage/audio.plist.new" "$audio_plist"
+  "$launchctl" bootout "system/$audio_label" >/dev/null 2>&1 || true
+  tries=0
+  while "$launchctl" print "system/$audio_label" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -le 60 ] || { echo "The old coreaudiod check did not unload within 30 seconds" >&2; exit 1; }
+    sleep 0.5
+  done
+  "$launchctl" bootstrap system "$audio_plist"
+  echo "coreaudiod check loaded"
+fi
 
 # The cleaner runs in the user's own login session, where its simulators and their CoreSimulator service live,
 # hourly and at load, at the lowest CPU and I/O priority.
