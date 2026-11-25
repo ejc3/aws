@@ -33,8 +33,8 @@ ID's profile covers a UI-test runner.
 
 ## Testing on the attached iPhones
 
-The phones below are on USB with Developer Mode on, signed in to the owner's account, with
-TestFlight. A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
+The phones below are on USB with Developer Mode on, signed in to the owner's account. TestFlight is
+**not installed** on either (checked 2026-11-25, ejc3/aws#1062; installing it is the owner's). A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
 camera) is yours to run: never hand the owner a step these phones can do.
 
 Limits on those phones: work only in the app under test, TestFlight and the system prompts it raises. No
@@ -43,8 +43,10 @@ owner's other apps.
 
 - `xcrun devicectl device info apps` does not list App Store or TestFlight apps, not even with
   `--include-all-apps`. An app missing from it proves nothing.
-- Use the build testers run first: the project's TestFlight build, installed through TestFlight
-  on the phone. Build and sign here only when no TestFlight build has the change.
+- Until TestFlight is installed, test a development build signed here (the agent keychain and the
+  "Agent wildcard dev mini two phones" profile cover both phones). To see whether it has arrived,
+  `XCUIApplication(bundleIdentifier: "com.apple.TestFlight").activate()` fails while it is missing.
+  Once it is there, use the build testers run first: the project's TestFlight build.
 - **A locked phone refuses every launch** ("Unable to launch … because the device is locked"). A
   phone asleep with no passcode asked for (`devicectl device info lockState`) wakes in the test with
   `XCUIDevice.shared.press(.home)` and a swipe up on the springboard; only a passcode needs the owner.
