@@ -1826,6 +1826,15 @@ which under steady CI never happened: the volume filled and two runners crashed 
 logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
 `/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
 
+**The CI VM runs one `swift test` at a time** (#1075). Four concurrent `swift test` jobs on the VM's 9 vCPUs starved
+WebKit's GPU process: a WKWebView probe answered in 0.1 s on a quiet VM and in 15-16 s under that load, and
+dolphin-labs' reader tests failed, while one run at a time passes. The same install links `/usr/local/bin/swift`, which
+the runners find ahead of `/usr/bin`, to `swift-test-shim`. It hands every command straight to `/usr/bin/swift` except
+`swift test`, which first takes the VM's single test slot: an flock on `~/.local/state/swift-test/slot.1`, held by
+`swift test` itself and released when it ends, however it ends. A job that has to wait says so once in its log
+(`swift test: waiting for the VM's test slot`); `cat ~/.local/state/swift-test/slot.*` shows who holds it. Builds and
+`xcodebuild` are unaffected, and a `swift test` started inside one that holds the slot runs at once.
+
 **The CI VM restarts a hung coreaudiod** (#1068). On 2026-11-25 at 06:01 UTC the VM's `coreaudiod` stopped answering
 and stayed that way. From then on, every process that touched CoreAudio blocked for good: WebKit's GPU process,
 AVPlayer, CoreSimulator's device I/O. Every dolphin-labs native test run failed. The same install puts

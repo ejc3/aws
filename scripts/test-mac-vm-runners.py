@@ -10,6 +10,7 @@ import pwd
 import select
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -24,7 +25,8 @@ if Path(sys.argv[0]).name == "ssh":
     if "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
             assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
-                                                         "ci/ci-coreaudio-check", "install-ci-sim-slots.sh"}
+                                                         "ci/ci-coreaudio-check", "ci/swift-test-shim",
+                                                         "install-ci-sim-slots.sh"}
         print("test: installed CI test slots")
     elif "Print :CFBundleShortVersionString" in cmd:
         print("27.0\n27A123")
@@ -256,6 +258,91 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.install().returncode, 0)
         self.assertEqual(self.shim.resolve(), self.mac_build.with_name("sim-slot-shim"))
+
+    def swift_env(self, **extra):
+        # The real swift stand-in records its arguments and slot, can run for a while, and exits with FAKE_SWIFT_RC.
+        real = self.root / "real-swift"
+        if not real.exists():
+            real.write_text("#!/usr/bin/env python3\n"
+                            "import json, os, sys, time\n"
+                            "print(json.dumps([os.getenv('SWIFT_TEST_SLOT'), sys.argv[1:]]), flush=True)\n"
+                            "time.sleep(float(os.getenv('FAKE_SWIFT_SLEEP', '0')))\n"
+                            "sys.exit(int(os.getenv('FAKE_SWIFT_RC', '0')))\n")
+            real.chmod(0o755)
+        env = dict(os.environ, HOME=str(self.root), SWIFT_REAL=str(real), **extra)
+        for key in ("SWIFT_TEST_SLOT", "SWIFT_TEST_SLOTS", "SWIFT_TEST_STATE_DIR"):
+            if key not in extra:
+                env.pop(key, None)
+        return env
+
+    def test_only_swift_test_takes_the_one_slot(self):
+        self.assertEqual(self.install().returncode, 0)
+        swift = self.prefix / "bin/swift"
+        self.assertEqual(swift.resolve(), self.mac_build.with_name("swift-test-shim"))
+        for args, slot in ((["build", "-c", "release"], None), (["package", "resolve"], None),
+                           (["build", "--product", "test"], None), (["test", "--parallel"], "1"),
+                           (["-v", "test"], "1")):
+            with self.subTest(args=args):
+                out = subprocess.run([swift, *args], env=self.swift_env(), capture_output=True, text=True, timeout=10)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertEqual(json.loads(out.stdout), [slot, args])
+
+    def test_concurrent_swift_tests_run_one_at_a_time_and_keep_their_exit_codes(self):
+        self.assertEqual(self.install().returncode, 0)
+        swift = self.prefix / "bin/swift"
+        first = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="3", FAKE_SWIFT_RC="3"),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        time.sleep(1)  # the first holds the slot
+        started = time.monotonic()
+        second = subprocess.run([swift, "test"], env=self.swift_env(FAKE_SWIFT_RC="5"),
+                                capture_output=True, text=True, timeout=30)
+        waited = time.monotonic() - started
+        self.assertEqual(first.wait(timeout=30), 3)
+        self.assertEqual(second.returncode, 5)
+        self.assertGreater(waited, 1.5)  # it could not start until the first had finished
+        self.assertEqual(second.stderr.count("swift test: waiting for the VM's test slot"), 1)
+        # A build runs beside a test that holds the slot.
+        holder = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="3"),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        started = time.monotonic()
+        build = subprocess.run([swift, "build"], env=self.swift_env(), capture_output=True, text=True, timeout=10)
+        self.assertEqual(build.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertNotIn("waiting", build.stderr)
+        holder.wait(timeout=30)
+
+    def test_a_killed_swift_test_frees_the_slot_and_a_nested_one_does_not_wait(self):
+        self.assertEqual(self.install().returncode, 0)
+        swift = self.prefix / "bin/swift"
+        holder = subprocess.Popen([swift, "test"], env=self.swift_env(FAKE_SWIFT_SLEEP="60"),
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)
+        # A swift test started inside the holder's slot (SWIFT_TEST_SLOT set) runs at once.
+        nested = subprocess.run([swift, "test"], env=self.swift_env(SWIFT_TEST_SLOT="1"),
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(json.loads(nested.stdout)[0], "1")
+        self.assertNotIn("waiting", nested.stderr)
+        holder.kill()  # a cancelled job: the lock goes with the process, however it ends
+        holder.wait(timeout=10)
+        started = time.monotonic()
+        after = subprocess.run([swift, "test"], env=self.swift_env(), capture_output=True, text=True, timeout=10)
+        self.assertEqual(after.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
+        self.assertNotIn("waiting", after.stderr)
+
+    def test_an_unmanaged_swift_is_refused_and_left_alone(self):
+        swift = self.prefix / "bin/swift"
+        swift.parent.mkdir(parents=True)
+        swift.write_text("someone else's swift")
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Refusing to replace unmanaged", result.stderr)
+        self.assertEqual(swift.read_text(), "someone else's swift")
+        swift.unlink()
+        self.assertEqual(self.install().returncode, 0)
+        self.assertEqual(self.install().returncode, 0)  # idempotent
+        self.assertEqual(swift.resolve(), self.mac_build.with_name("swift-test-shim"))
 
     def test_test_actions_take_slots_and_other_actions_pass_through(self):
         self.assertEqual(self.install().returncode, 0)

@@ -1,0 +1,48 @@
+#!/usr/bin/perl
+# Installed as /usr/local/bin/swift on the CI VM, ahead of /usr/bin (ejc3/aws#1075). Every invocation goes straight to
+# the real swift (always by absolute path) except `swift test`, which first takes the VM's one swift-test slot: four
+# concurrent `swift test` jobs on the VM's 9 vCPUs starved WebKit's GPU process (a WKWebView probe went from 0.1 s to
+# 15-16 s and dolphin-labs' reader tests failed), while one at a time passes.
+#
+# The slot is an flock on ~/.local/state/swift-test/slot.N (SWIFT_TEST_STATE_DIR overrides the directory,
+# SWIFT_TEST_SLOTS the count, default 1). The lock's file descriptor is inherited across exec, so `swift test` itself
+# holds it, and it is released when that process and its children exit, however they exit (a cancelled job included);
+# the kernel holds the lock, so a leftover file never blocks anyone. Waiting is reported once on stderr. A `swift test`
+# started under one that holds the slot (SWIFT_TEST_SLOT set) runs at once in its parent's slot.
+use strict;
+use warnings;
+use Fcntl qw(:flock O_RDWR O_CREAT);
+use File::Path qw(make_path);
+
+my $real = $ENV{SWIFT_REAL} // '/usr/bin/swift';
+
+# The subcommand is the first argument that is not an option; `swift -v test` is still a test.
+my ($subcommand) = grep { !/^-/ } @ARGV;
+if (!defined $subcommand || $subcommand ne 'test' || defined $ENV{SWIFT_TEST_SLOT}) {
+    exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; exit 127 };
+}
+
+my $dir = $ENV{SWIFT_TEST_STATE_DIR} // "$ENV{HOME}/.local/state/swift-test";
+make_path($dir, { mode => 0700 });
+my $slots = ($ENV{SWIFT_TEST_SLOTS} // '1') =~ /^([1-9]\d*)$/ ? $1 : 1;
+
+$^F = 1023;    # swift test inherits the slot's descriptor across exec
+my ($held, $said);
+until ($held) {
+    for my $n (1 .. $slots) {
+        sysopen(my $fh, "$dir/slot.$n", O_RDWR | O_CREAT, 0600) or die "swift: $dir/slot.$n: $!\n";
+        if (flock($fh, LOCK_EX | LOCK_NB)) {
+            truncate($fh, 0); seek($fh, 0, 0);
+            my $what = substr(join(' ', @ARGV), 0, 160);
+            syswrite($fh, sprintf("pid %d since %s: swift %s (in %s)\n", $$, scalar localtime, $what, $ENV{PWD} // '?'));
+            $ENV{SWIFT_TEST_SLOT} = $n;
+            $held = $fh;
+            last;
+        }
+        close $fh;
+    }
+    last if $held;
+    print STDERR "swift test: waiting for the VM's test slot (cat $dir/slot.* shows who holds it)\n" unless $said++;
+    sleep 2;
+}
+exec { $real } $real, @ARGV or do { print STDERR "swift: $real: $!\n"; exit 127 };
