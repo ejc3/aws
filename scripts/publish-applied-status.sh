@@ -86,7 +86,9 @@ fi
 # Reserve up to two minutes for the wrapper lock, ten for the backend lock,
 # and the usual 10–15 minutes for the plan. The wrapper's default wait alone
 # would outlive this timeout and turn ordinary contention into a plan error.
-TF_RUN_LOCK_WAIT=120 timeout --signal=TERM 29m "$terraform" plan -detailed-exitcode -lock=true \
+# -parallelism=2: at the default 10, a full plan's provider processes outgrew this 8 GB box and the check was killed
+# for low memory four times on 2026-11-25; at 2 it finished in the same ~13 minutes.
+TF_RUN_LOCK_WAIT=120 timeout --signal=TERM 29m "$terraform" plan -parallelism=2 -detailed-exitcode -lock=true \
   -lock-timeout="$wait" -input=false -no-color >"$plan_log" 2>&1
 rc=$?
 if [ "$rc" -eq 75 ]; then
