@@ -138,7 +138,7 @@ locals {
   fcvm_ami_renders_minutes = 360
   # The renders host's launch templates the publisher moves onto each renders release, and retention reads: none
   # until the renders host class exists (modules/fcvm-fleet-region, renders_image_templates).
-  fcvm_ami_renders_templates = []
+  fcvm_ami_renders_templates = module.fcvm_fleet_east1.renders_image_templates
 }
 
 resource "aws_s3_bucket" "fcvm_ami_pipeline" {

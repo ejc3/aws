@@ -1971,9 +1971,14 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
 - **Renders hosts** (staging only): a second host class for the "One VM per page" mode, one CPU-only `m8gd.metal-24xl`
   per stack while the fleet is awake, launched by the coordinator as a GPU host is (`FLEET_RENDERS_TEMPLATES`,
   `FLEET_RENDERS_SUBNETS`). Its template (`fcvm-fleet-renders-arm64`, instances tagged `Purpose=fcvm-fleet-renders`),
-  its policy (`fcvm-fleet-coordinator-renders`) and those variables exist only once the release pointer has a
-  `renders_amis` entry for us-east-1, which no publisher writes yet: the image factory builds host and tile images
-  only. The publisher is not given the template; Terraform sets its image from the pointer on an apply.
+  security group (443 over both families, nothing else), role and profile (`fcvm-fleet-renders`: the certificate, the
+  agent token, its store's parts, Session Manager), policy (`fcvm-fleet-coordinator-renders`) and those variables exist only once
+  `/fcvm-fleet/ami-release-renders`, which the image factory's renders track publishes, names an image in us-east-1.
+  The renders track's publisher then moves the template onto each renders release; the pair's never touches it. The
+  boot writes the host's own `FLEET_AGENT_ARGS` to `/etc/fcvm-fleet/agent.env` and starts the image's
+  `fcvm-fleet-renders-agent.service`, which runs the agent as `ubuntu` with the image's `renders.env`. Its frame socket
+  is reached over IPv4 through the agent's front on 443, with the certificate in `ubuntu`'s runtime directory
+  (`--tls-dir`). IPv6 waits on ejc3/fcvm: as `ubuntu` the agent refuses the host's prefix and cannot add `<prefix>::1`.
 - The coordinator's task role may launch EC2 only from the tile and host templates (hosts through `ec2:CreateFleet`),
   referencing only their AMIs and the fleet's subnets and group (by exact ARN), only as each template's own types and
   tagged `Purpose=fcvm-fleet-tile` or `fcvm-fleet-host`; terminate only instances so tagged; pass only the host and tile
