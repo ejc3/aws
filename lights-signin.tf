@@ -22,7 +22,7 @@
 # set lights_phone_bypass = true and apply. Before its Access settings arrive, the Worker can only check
 # that an Access token header is present on its other routes, which a bypassed request could forge.
 locals {
-  lights_phone_bypass       = false
+  lights_phone_bypass       = true
   lights_stage_bearer_paths = ["${local.lights_stage_hostname}/api/v1/*"]
 }
 
