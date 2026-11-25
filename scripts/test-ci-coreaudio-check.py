@@ -157,7 +157,8 @@ class Check(unittest.TestCase):
         self.hang()
         for probe in ([str(self.root / "missing")],
                       [sys.executable, "-c", "raise SystemExit(3)"],  # exits before it is ready
-                      [sys.executable, "-c", "print('ready', flush=True); raise SystemExit(3)"]):
+                      [sys.executable, "-c", "print('ready', flush=True); raise SystemExit(3)"],
+                      [sys.executable, "-c", "print('something else')"]):  # exits 0, but never said ready
             with self.subTest(probe=probe):
                 self.m.PROBE = probe
                 state = {}
