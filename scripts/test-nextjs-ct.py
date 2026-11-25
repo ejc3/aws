@@ -86,7 +86,7 @@ class CutoverSwitchTests(unittest.TestCase):
         self.assertIn("volume/${local.nextjs_live_instance.root_block_device[0].volume_id}", NEXTJS_DEV_TF)
         alarms = (ROOT / "nextjs-alarms.tf").read_text()
         self.assertNotIn("aws_instance.nextjs_dev", alarms)
-        self.assertEqual(alarms.count("local.nextjs_live_instance"), 6)
+        self.assertEqual(alarms.count("local.nextjs_live_instance"), 5)  # no CPU-credit alarm since m7g (2026-11-25)
         self.assertIn("[local.nextjs_live_instance.id]", (ROOT / "agents-md.tf").read_text())
         self.assertIn('Name    = local.nextjs_ct_serving ? "nextjs-dev-retired" : "nextjs-dev"', NEXTJS_DEV_TF)
 

@@ -57,26 +57,7 @@ resource "aws_cloudwatch_metric_alarm" "nextjs_disk_read_flood" {
   }
 }
 
-# Burst exhaustion. Not what happened this time (credits stayed at 566/576), but a t4g that
-# runs out of credits is throttled to 20% baseline and behaves like a hung box.
-resource "aws_cloudwatch_metric_alarm" "nextjs_cpu_credits" {
-  count               = local.nextjs_alarm_enabled
-  alarm_name          = "nextjs-dev-cpu-credits-low"
-  comparison_operator = "LessThanThreshold"
-  evaluation_periods  = 2
-  metric_name         = "CPUCreditBalance"
-  namespace           = "AWS/EC2"
-  period              = 300
-  statistic           = "Average"
-  threshold           = 60
-  alarm_description   = "nextjs-dev is nearly out of CPU credits and will be throttled to baseline."
-  alarm_actions       = [aws_sns_topic.cost_alerts.arn]
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    InstanceId = local.nextjs_live_instance.id
-  }
-}
+# No CPU-credit alarm: m7g.2xlarge is not burstable (it had one while the box was a t4g; removed 2026-11-25).
 
 # Parity with the other dev hosts, which have had this since they were built.
 resource "aws_cloudwatch_metric_alarm" "nextjs_status_check" {
