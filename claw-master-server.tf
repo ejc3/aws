@@ -869,6 +869,25 @@ exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/
 EOF
 chmod 0755 /usr/local/bin/claw-master-login
 
+# Reads, or with --claim spends, a subscription's banked limit reset (claude.ai's "Reset for free") with the
+# server's own login, as the service account: claw-master-reset PROFILE [fable|weekly] [--claim].
+cat > /usr/local/bin/claw-master-reset <<'EOF'
+#!/bin/bash
+usage() { echo "usage: claw-master-reset PROFILE [fable|weekly] [--claim]  (without --claim it only reads)" >&2; exit 2; }
+[ $# -ge 1 ] && [ $# -le 3 ] || usage
+profile=$1; shift
+kind=fable; claim=()
+for a in "$@"; do
+  case $a in
+    fable|weekly) kind=$a ;;
+    --claim) claim=(--claim) ;;
+    *) usage ;;
+  esac
+done
+exec runuser -u claude-master -- env HOME=/var/lib/claude-master /usr/local/bin/claude-master reset "$profile" --kind "$kind" "$${claim[@]}"
+EOF
+chmod 0755 /usr/local/bin/claw-master-reset
+
 # Signs a client's certificate request (base64 on stdin) and prints the client certificate and then
 # the CA certificate. scripts/claw-master-enroll.sh calls this over SSM; it is an admin action.
 cat > /usr/local/bin/claw-master-sign <<'EOF'
@@ -968,7 +987,7 @@ sed -i "s/\$TAG/$TAG/" /usr/local/bin/claw-master-status
 chmod 0755 /usr/local/bin/claw-master-status
 
 # The helpers' names before the rename (claude-master-*) stay as links, for anything that still calls them.
-for h in serve account-labels envoy-endpoints rollout login sign status add-start add-finish; do
+for h in serve account-labels envoy-endpoints rollout login reset sign status add-start add-finish; do
   [ "$(readlink /usr/local/bin/claude-master-$h)" = "claw-master-$h" ] && continue
   ln -sfn "claw-master-$h" "/usr/local/bin/claude-master-$h.new" && mv -Tf "/usr/local/bin/claude-master-$h.new" "/usr/local/bin/claude-master-$h"
 done

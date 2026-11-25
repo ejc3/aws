@@ -848,6 +848,11 @@ access token returns 401). One box therefore owns each login: `claude-master-ser
   is used once: a revoked login is replaced under a new name. Add the name to `local.claw_master_profiles` only to change
   its place in the order; a login that exists only on the server stays out of fcvm's default list in the login script
   (refreshing one login on two boxes revokes the other copy).
+- **Claiming a banked limit reset** (claude.ai's "Reset for free") without signing in to that account:
+  `sudo claw-master-reset claude-NAME [fable|weekly]` over SSM shows what the reset would clear and whether Anthropic
+  allows it now. Add `--claim` to spend it; it cannot be undone. A Fable reset clears Fable and gives the week back
+  Fable's share. A weekly reset clears the week. Neither moves the reset time. Needs claw-master with `reset`
+  (ejc3/CLIProxyAPI #48).
 - **Restarts nobody notices: Envoy and blue/green** (`claw-master-server.tf`, ROLLING RESTARTS). Envoy (pinned
   version and sha256) listens on the client address and the tunnel's loopback port and passes TCP through,
   unchanged, to one of two servers on the box, `claude-master-server@blue` or `@green`, each on its own port of

@@ -1177,5 +1177,36 @@ class LoginCountTests(unittest.TestCase):
         self.assertEqual(self.count(["login claude-a: present", "login claude-b: present (served after the preferred ones)"]), "2\n")
         self.assertEqual(self.count([], ssh_ok=False), "0\n")
 
+
+class ResetHelperTests(unittest.TestCase):
+    """claw-master-reset runs `claw-master reset` as the service account; it claims only when told to."""
+
+    def run_helper(self, *args):
+        import os
+        import tempfile
+        script = TF[TF.index("cat > /usr/local/bin/claw-master-reset <<'EOF'\n"):]
+        script = script[script.index("\n") + 1:script.index("\nEOF\n")].replace("$${", "${")
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "runuser").write_text('#!/bin/bash\nprintf "%s|" "$@"\n')
+            (Path(d) / "runuser").chmod(0o755)
+            env = dict(os.environ, PATH="%s:%s" % (d, os.environ["PATH"]))
+            return subprocess.run(["bash", "-c", script, "claw-master-reset", *args], env=env, text=True, capture_output=True, timeout=30)
+
+    def test_it_reads_unless_told_to_claim(self):
+        base = "-u|claude-master|--|env|HOME=/var/lib/claude-master|/usr/local/bin/claude-master|reset|claude-a|--kind|"
+        for args, want in ((("claude-a",), base + "fable|"),
+                           (("claude-a", "weekly"), base + "weekly|"),
+                           (("claude-a", "--claim"), base + "fable|--claim|"),
+                           (("claude-a", "--claim", "weekly"), base + "weekly|--claim|")):
+            out = self.run_helper(*args)
+            self.assertEqual((out.returncode, out.stdout), (0, want), (args, out.stderr))
+
+    def test_anything_else_is_refused_unsent(self):
+        for args in ((), ("claude-a", "monthly"), ("claude-a", "--claim=yes"), ("claude-a", "fable", "--claim", "extra")):
+            out = self.run_helper(*args)
+            self.assertEqual((out.returncode, out.stdout), (2, ""), args)
+            self.assertIn("usage: claw-master-reset", out.stderr)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)
