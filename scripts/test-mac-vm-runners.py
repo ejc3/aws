@@ -208,6 +208,14 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(agent["LimitLoadToSessionType"], "Aqua")
         uid = os.getuid()
         audio = self.daemons / "com.ejcampbell.ci-coreaudio-check.plist"
+        with audio.open("rb") as f:
+            daemon = plistlib.load(f)
+        check = self.mac_build.with_name("ci-coreaudio-check")
+        self.assertTrue(os.access(check, os.X_OK))
+        self.assertEqual(daemon["Label"], "com.ejcampbell.ci-coreaudio-check")
+        self.assertEqual(daemon["ProgramArguments"], [str(check)])
+        self.assertEqual((daemon["StartInterval"], daemon["RunAtLoad"], daemon["ProcessType"]), (300, True, "Standard"))
+        self.assertNotIn("UserName", daemon)  # root: restarting coreaudiod needs it
         self.assertEqual([c for c in self.launchctl() if not c.startswith("print")],
                          ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}",
                           f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
@@ -223,6 +231,18 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(c.startswith("bootstrap gui") for c in self.launchctl()), 2)
         self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 1)
+        # A changed daemon plist is replaced and reloaded too, after its old instance has gone.
+        audio.write_text(audio.read_text().replace("300", "60"))
+        before = len(self.launchctl())
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("coreaudiod check loaded", result.stdout)
+        calls = self.launchctl()[before:]
+        self.assertEqual([c for c in calls if not c.startswith("print")][:2],
+                         ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}"])
+        self.assertGreaterEqual(sum(c == "print system/com.ejcampbell.ci-coreaudio-check" for c in calls), 3)
+        with audio.open("rb") as f:
+            self.assertEqual(plistlib.load(f)["StartInterval"], 300)
         with plist.open("rb") as f:
             self.assertEqual(plistlib.load(f)["StartInterval"], 3600)
 

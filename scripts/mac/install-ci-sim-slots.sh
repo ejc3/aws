@@ -36,7 +36,8 @@ fi
 echo "Installed simulator test slots at $link"
 
 # The coreaudiod check runs as root in the system domain: restarting coreaudiod needs root, and a hung coreaudiod
-# hangs a root client's request as it does the runners'.
+# hangs a root client's request as it does the runners'. Standard priority, not Background: throttled, a slow probe
+# under a busy VM could look like a hang.
 [ -d "$daemons" ] || install -d -m 755 "$daemons"
 audio_plist=$daemons/$audio_label.plist
 cat > "$stage/audio.plist" <<PLIST
@@ -47,7 +48,7 @@ cat > "$stage/audio.plist" <<PLIST
   <key>ProgramArguments</key><array><string>$lib/ci-coreaudio-check</string></array>
   <key>RunAtLoad</key><true/>
   <key>StartInterval</key><integer>300</integer>
-  <key>ProcessType</key><string>Background</string>
+  <key>ProcessType</key><string>Standard</string>
   <key>StandardOutPath</key><string>/Library/Logs/ci-coreaudio-check.log</string>
   <key>StandardErrorPath</key><string>/Library/Logs/ci-coreaudio-check.log</string>
 </dict></plist>

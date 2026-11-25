@@ -6,9 +6,10 @@ scripts/mac/install-ci-sim-slots.sh installs. On 2026-11-25 the VM's coreaudiod 
 from then on every process that touched CoreAudio blocked for good (WebKit's GPU process, AVPlayer, CoreSimulator's
 device I/O), and every dolphin-labs native test run failed. Each run:
 
-  1. asks CoreAudio for the default output device in a child process (this file with --probe) and waits 5 seconds.
-     Any answer, an error status included, is alive; so is a probe that cannot start or exits on its own, since
-     neither says anything about coreaudiod;
+  1. asks CoreAudio for the default output device in a child process (this file with --probe). The child says
+     "ready" once CoreAudio is loaded, so a slow start under load is not counted: only the request itself has 10
+     seconds (a real hang lasts for good). Any answer, an error status included, is alive. A probe that cannot start
+     or exits without answering says nothing about coreaudiod: it never causes a restart, and is logged once;
   2. when it does not answer, kills coreaudiod (launchd starts it again on the next request) once no runner has a
      job (no Runner.Worker process; an unreadable process list counts as a job), or after 30 minutes of no answer
      even with a job running: a job that touches audio is already stuck, and under steady CI an idle moment may
@@ -24,11 +25,13 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import select
 import subprocess
 import sys
 import time
 
-PROBE_TIMEOUT = 5
+PROBE_TIMEOUT = 10
+LOAD_TIMEOUT = 60
 RESTART_GAP = 15 * 60
 MAX_WAIT = 30 * 60
 SETTLE = 3
@@ -53,27 +56,38 @@ def probe():
     # kAudioObjectSystemObject (1), kAudioHardwarePropertyDefaultOutputDevice, kAudioObjectPropertyScopeGlobal.
     address = Address(code("dOut"), code("glob"), 0)
     device, size = ctypes.c_uint32(0), ctypes.c_uint32(4)
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
     audio.AudioObjectGetPropertyData(1, ctypes.byref(address), 0, None, ctypes.byref(size), ctypes.byref(device))
     return 0
 
 
-def answers():
-    """False only when the probe is still waiting after PROBE_TIMEOUT seconds."""
+def ask():
+    """"answers"; "no answer" (ready, then nothing within PROBE_TIMEOUT, or still loading after LOAD_TIMEOUT); or
+    "no probe" (it could not start, or exited without answering). The child stays in this job's process group, so
+    launchd ends it with the job."""
     try:
-        child = subprocess.Popen(PROBE, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL, start_new_session=True)
+        child = subprocess.Popen(PROBE, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     except OSError:
-        return True  # no probe, no evidence: never restart on it
+        return "no probe"
     try:
-        child.wait(timeout=PROBE_TIMEOUT)
-        return True
-    except subprocess.TimeoutExpired:
-        child.kill()  # a thread waiting for a Mach reply still dies on SIGKILL
+        if not select.select([child.stdout], [], [], LOAD_TIMEOUT)[0]:
+            return "no answer"
+        if child.stdout.readline() != b"ready\n":
+            return "no probe"
         try:
-            child.wait(timeout=5)
+            code = child.wait(timeout=PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            pass
-        return False
+            return "no answer"
+        return "answers" if code == 0 else "no probe"
+    finally:
+        if child.poll() is None:
+            child.kill()  # a thread waiting for a Mach reply still dies on SIGKILL
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        child.stdout.close()
 
 
 def job_running():
@@ -102,17 +116,24 @@ def minutes(seconds):
 
 def check(state, now):
     """One pass. Updates state in place; returns the line to log, or None when there is nothing to say."""
-    if answers():
+    result = ask()
+    if result == "no probe":
+        if state.get("probe_failed"):
+            return None
+        state["probe_failed"] = True
+        return "the probe fails, so coreaudiod is not being checked"
+    state.pop("probe_failed", None)
+    if result == "answers":
         if state.get("hung_since") is None:
             return None
         hung = minutes(now - state["hung_since"])
         state["hung_since"] = None
         return f"coreaudiod answers again after {hung} min"
-    if state.get("hung_since") is None:
+    if state.get("hung_since") is None or state["hung_since"] > now:  # a clock set back counts from now
         state["hung_since"] = now
     hung = now - state["hung_since"]
     since_restart = now - state.get("restarted_at", float("-inf"))
-    if since_restart < RESTART_GAP:
+    if 0 <= since_restart < RESTART_GAP:
         return (f"coreaudiod has not answered for {minutes(hung)} min; restarted {minutes(since_restart)} min ago, "
                 "the next restart waits")
     if hung < MAX_WAIT and job_running():
@@ -120,7 +141,7 @@ def check(state, now):
     status = restart()
     state["restarted_at"] = now
     time.sleep(SETTLE)
-    if answers():
+    if ask() == "answers":
         state["hung_since"] = None
         return f"restarted coreaudiod after {minutes(hung)} min without an answer; it answers"
     return (f"restarted coreaudiod after {minutes(hung)} min without an answer (killall {status}); "
@@ -134,8 +155,11 @@ def load(path):
         return {}
     if not isinstance(state, dict):
         return {}
-    return {key: state[key] for key in ("hung_since", "restarted_at")
+    kept = {key: state[key] for key in ("hung_since", "restarted_at")
             if isinstance(state.get(key), (int, float)) and not isinstance(state.get(key), bool)}
+    if state.get("probe_failed") is True:
+        kept["probe_failed"] = True
+    return kept
 
 
 def save(path, state):

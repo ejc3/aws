@@ -20,6 +20,7 @@ MINUTE = 60
 # daemon comes back hung again when FAKE_STAYS_HUNG is set. Every killall is recorded.
 PROBE = r'''#!/usr/bin/env python3
 import os, time
+print("ready", flush=True)
 if os.path.exists(os.environ["FAKE_HUNG"]):
     time.sleep(60)
 '''
@@ -69,7 +70,7 @@ class Check(unittest.TestCase):
         self.m.PROBE = [sys.executable, str(self.root / "probe")]
         self.m.KILLALL, self.m.PS = str(self.root / "killall"), str(self.root / "ps")
         self.m.STATE = self.root / "state"
-        self.m.PROBE_TIMEOUT, self.m.SETTLE = 0.5, 0
+        self.m.PROBE_TIMEOUT, self.m.LOAD_TIMEOUT, self.m.SETTLE = 0.5, 5, 0
         self.now = 1_800_000_000.0
 
     def hang(self):
@@ -152,18 +153,43 @@ class Check(unittest.TestCase):
         self.assertIsNone(self.run_at(state, 15))
         self.assertEqual(self.killed(), [])
 
-    def test_a_probe_that_cannot_start_or_fails_is_never_a_reason_to_restart(self):
+    def test_a_probe_that_cannot_start_or_fails_never_restarts_and_is_logged_once(self):
         self.hang()
-        for probe in ([str(self.root / "missing")], [sys.executable, "-c", "raise SystemExit(3)"]):
+        for probe in ([str(self.root / "missing")],
+                      [sys.executable, "-c", "raise SystemExit(3)"],  # exits before it is ready
+                      [sys.executable, "-c", "print('ready', flush=True); raise SystemExit(3)"]):
             with self.subTest(probe=probe):
                 self.m.PROBE = probe
-                self.assertIsNone(self.run_at({}, 0))
+                state = {}
+                self.assertEqual(self.run_at(state, 0), "the probe fails, so coreaudiod is not being checked")
+                self.assertIsNone(self.run_at(state, 5))
+                self.assertEqual(state, {"probe_failed": True})
         self.assertEqual(self.killed(), [])
+        # Once it works again the flag goes, and a hang is handled as usual.
+        self.m.PROBE = [sys.executable, str(self.root / "probe")]
+        self.assertIn("restarted coreaudiod", self.run_at(state, 10))
+        self.assertNotIn("probe_failed", state)
+
+    def test_only_the_request_is_timed_not_the_probe_starting(self):
+        # Slower to get ready than the request's whole budget, then answers: alive.
+        self.m.PROBE = [sys.executable, "-c", "import time; time.sleep(1.5); print('ready', flush=True)"]
+        self.assertEqual(self.m.ask(), "answers")
+        # Never ready while still running, past the load budget: no answer.
+        self.m.LOAD_TIMEOUT = 0.5
+        self.m.PROBE = [sys.executable, "-c", "import time; time.sleep(60)"]
+        self.assertEqual(self.m.ask(), "no answer")
+
+    def test_a_clock_set_back_does_not_hold_restarts(self):
+        self.hang()
+        state = {"hung_since": self.now + 3600, "restarted_at": self.now + 3600}
+        line = self.run_at(state, 0)
+        self.assertIn("restarted coreaudiod after 0 min", line)
+        self.assertEqual(len(self.killed()), 1)
 
     def test_a_hung_probe_is_killed_not_left_behind(self):
         self.hang()
-        self.m.PROBE = [sys.executable, "-c", f"import os, time; open({str(self.root / 'pid')!r}, 'w').write(str(os.getpid())); time.sleep(60)"]
-        self.assertFalse(self.m.answers())
+        self.m.PROBE = [sys.executable, "-c", "import os, time; open(" + repr(str(self.root / "pid")) + ", 'w').write(str(os.getpid())); print('ready', flush=True); time.sleep(60)"]
+        self.assertEqual(self.m.ask(), "no answer")
         pid = int((self.root / "pid").read_text())
         with self.assertRaises(ProcessLookupError):
             os.kill(pid, 0)
@@ -189,7 +215,7 @@ class Check(unittest.TestCase):
 
     def test_corrupt_or_odd_state_is_read_as_empty(self):
         self.m.STATE.mkdir()
-        for text in ("not json", "[1, 2]", '{"hung_since": "yesterday", "restarted_at": true}'):
+        for text in ("not json", "[1, 2]", '{"hung_since": "yesterday", "restarted_at": true, "probe_failed": 1}'):
             with self.subTest(text=text):
                 (self.m.STATE / "state.json").write_text(text)
                 self.assertEqual(self.m.load(self.m.STATE / "state.json"), {})
