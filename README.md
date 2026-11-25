@@ -1826,6 +1826,19 @@ which under steady CI never happened: the volume filled and two runners crashed 
 logs counts and bytes only, to `~/Library/Logs/ci-disk-clean.log`. In the VM,
 `/usr/local/libexec/mini-simulator/ci-disk-clean --dry-run` shows what it would free.
 
+**The CI VM runs one `swift test` at a time** (#1075). Four concurrent `swift test` jobs on the VM's 9 vCPUs starved
+WebKit's GPU process: a WKWebView probe answered in 0.1 s on a quiet VM and in 15-16 s under that load, and
+dolphin-labs' reader tests failed, while one run at a time passes. The same install links `/usr/local/bin/swift`, which
+the runners find ahead of `/usr/bin`, to `swift-test-shim`. It hands every command straight to `/usr/bin/swift` except
+`swift test` (the first argument), which first takes the VM's single test slot: an flock on
+`/Users/Shared/swift-test/slot.1`, one directory for the VM whatever a job sets HOME to. The shim holds the lock and
+runs the real `swift test` as its child, passing on INT, TERM, HUP and QUIT and ending the way it did, so the slot frees
+the moment that test ends and nothing it leaves running keeps it. A job that has to wait says so once in its log
+(`swift test: waiting for the VM's test slot`) and starts as soon as the slot frees; `cat /Users/Shared/swift-test/slot.*`
+shows who holds it. Builds, `xcodebuild`, `xcrun swift test` and a direct `swift-test` are not affected (only `swift test`
+through PATH takes the slot), and a `swift test` started inside one that holds the slot runs at once. An unmanaged
+`/usr/local/bin/swift` stops the whole install, as an unmanaged `xcodebuild` does.
+
 **The CI VM restarts a hung coreaudiod** (#1068). On 2026-11-25 at 06:01 UTC the VM's `coreaudiod` stopped answering
 and stayed that way. From then on, every process that touched CoreAudio blocked for good: WebKit's GPU process,
 AVPlayer, CoreSimulator's device I/O. Every dolphin-labs native test run failed. The same install puts
