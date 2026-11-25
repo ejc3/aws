@@ -3842,6 +3842,300 @@ class PublisherTests(unittest.TestCase):
         self.env["FACTORY_PAUSED"] = "false"
         self.assertEqual(self.publisher().run(self.event), {"status": "promoted", "generation": 1})
 
+RENDERS_PROJECT = "factory-renders"
+RENDERS_TEMPLATE = "lt-" + "9" * 17
+
+
+class RendersPublisherTests(unittest.TestCase):
+    """The renders track's publication (publish.py run_renders): its own proof, store, copy, pointer, template,
+    retirement and retention, and the pair's release untouched by it."""
+
+    def setUp(self, templates=True):
+        PublisherTests.setUp(self)
+        self.env["BUILD_REGION"] = "us-west-2"
+        self.env["RENDERS_JSON"] = json.dumps({"project": RENDERS_PROJECT, "release_parameter": "/release-renders",
+            "templates": [{"region": "us-east-1", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "arm64"}] if templates else []})
+        self.build = RENDERS_PROJECT + ":00000000-0000-0000-0000-000000000009"
+        self.pair_release = copy.deepcopy(self.fleet_ssm.values["/release"])
+        start = datetime.datetime(2026, 10, 31, tzinfo=datetime.timezone.utc)
+        build = {"id": self.build, "projectName": RENDERS_PROJECT, "buildStatus": "SUCCEEDED", "buildComplete": True,
+            "resolvedSourceVersion": self.source, "startTime": start, "endTime": start + datetime.timedelta(hours=4),
+            "timeoutInMinutes": 360,
+            "environment": {"environmentVariables": [{"name": "SOURCE_SHA", "value": self.source}, {"name": "INPUT_SHA256", "value": self.input},
+                                                     {"name": "FLEET_AMI_TRACK", "value": "renders"}]}}
+        self.codebuild = CodeBuild(build)
+        self.event = {"source": "aws.codebuild", "detail-type": "CodeBuild Build State Change", "account": self.env["CONTROL_ACCOUNT"],
+            "region": "us-west-1", "detail": {"build-status": "SUCCEEDED", "project-name": RENDERS_PROJECT, "build-id": self.build}}
+        # The live renders release: the build region's original and the release region's copy.
+        self.old_original, self.old_copy = "ami-" + "a" * 17, "ami-" + "b" * 17
+        self.renders_release = {"version": 1, "track": "renders", "generation": 1, "source_sha": "9" * 40,
+            "build_id": RENDERS_PROJECT + ":00000000-0000-0000-0000-000000000008", "guard_sha256": self.env["GUARD_SHA256"],
+            "renders_amis": {"us-west-2": {"arm64": self.old_original}, "us-east-1": {"arm64": self.old_copy}},
+            "versions": {"us-east-1/" + RENDERS_TEMPLATE: 1}, "build": {"fcvm_commit": "9" * 40}, "previous": None}
+        self.fleet_ssm.values["/release-renders"] = copy.deepcopy(self.renders_release)
+        self.ec2.templates[RENDERS_TEMPLATE] = {"default": 1, "versions": {1: {"LaunchTemplateId": RENDERS_TEMPLATE, "VersionNumber": 1,
+            "VersionDescription": "terraform", "LaunchTemplateData": {"ImageId": self.old_copy, "UserData": "renders-userdata",
+                "InstanceType": "m8gd.metal-24xl", "SecurityGroupIds": ["renders-group"]}}}}
+        # The candidate, built and validated in us-west-2.
+        self.candidate = "ami-" + "c" * 17
+        tags = {"Purpose": "fcvm-fleet", "FleetImageKind": "renders", "GuardHelperSHA256": self.env["GUARD_SHA256"],
+                "SourceCommit": self.source, "InputSHA256": self.input, "PipelineBuildId": self.build, "PipelineSanitized": "true"}
+        self.west.images[self.candidate] = {"ImageId": self.candidate, "Name": "fcvm-factory-" + MODULE.digest(self.build)[:24] + "-renders",
+            "OwnerId": "222222222222", "Public": False, "State": "available", "Architecture": "arm64", "RootDeviceType": "ebs",
+            "Tags": [{"Key": k, "Value": v} for k, v in tags.items()], "BlockDeviceMappings": [{"Ebs": {"SnapshotId": "snap-" + "c" * 17}}]}
+        self.west.snapshots["snap-" + "c" * 17] = {"SnapshotId": "snap-" + "c" * 17, "OwnerId": "222222222222", "State": "completed",
+            "Encrypted": True, "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+        original_copy = self.ec2.copy_image
+        def copy_image(**arguments):
+            result = original_copy(**arguments)
+            self.ec2.images[result["ImageId"]]["Architecture"] = self.west.images[arguments["SourceImageId"]]["Architecture"]
+            return result
+        self.ec2.copy_image = copy_image
+        journal = {"build_id": self.build, "source_sha": self.source, "input_sha256": self.input, "request_id": self.input,
+                   "deadline_unix": int(start.timestamp()) + 21600, "slots": {}, "candidates": {"renders": self.candidate}}
+        for i, slot in enumerate(sorted(MODULE.RENDERS_SLOTS), 40):
+            instance = "i-" + format(i, "017x")
+            journal["slots"][slot] = {"instance_id": instance, "attempted": True, "terminated_seen": True}
+            self.west.instances[instance] = {"InstanceId": instance, "State": {"Name": "terminated"}, "InstanceType": "m8gd.metal-24xl",
+                "IamInstanceProfile": {"Arn": self.env["BUILDER_PROFILE"]},
+                "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-ami-builder"}, {"Key": "FactoryBuild", "Value": MODULE.digest(self.build)},
+                         {"Key": "FactorySlot", "Value": slot}]}
+        self.main_ssm.values["/factory/renders/control"] = {"active": self.build}
+        self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)] = journal
+        self.main_ssm.values["/factory/renders/requests/" + self.input] = {"request_id": self.input, "input_sha256": self.input,
+            "source_sha": self.source, "build_id": self.build, "priority": "normal", "status": "awaiting-publish", "track": "renders"}
+        self.pair_state = self.pair_keys()
+        record = {"fcvm_commit": self.source, "kitesurf_commit": "e" * 40, "bundle_sha256": "f" * 64,
+                  "kernel_release": "6.18.60-fcvm-0123456789ab", "boot_params": "kvm-arm.mode=nested numa=off arm64.nv2", "hugepages": 34000}
+        self.record = record
+        self.stage_prefix = "runs/" + MODULE.digest(self.build) + "/store/"
+        self.target_prefix = "factory/" + self.input + "/renders/store/"
+        data = {name: ("renders-" + name).encode() for name in MODULE.ARCHIVES}
+        hashes = {name: hashlib.sha256(value).hexdigest() for name, value in data.items()}
+        data["parts"] = ("\n".join(f"part-{i:02d}" for i in range(16)) + "\n").encode()
+        data["sha256.json"] = json.dumps(hashes).encode()
+        objects = {}
+        for i, (name, value) in enumerate(sorted(data.items())):
+            sha, version = hashlib.sha256(value).hexdigest(), "renders-version-" + str(i)
+            self.s3.objects[self.stage_prefix + name] = (value, {"sha256": sha}, version)
+            objects[name] = {"sha256": sha, "version_id": version, "size": len(value)}
+        self.manifest = {"version": 1, "track": "renders", "build_id": self.build, "source_commit": self.source, "input_sha256": self.input,
+            "source_tree_sha256": "f" * 64, "guard_sha256": self.env["GUARD_SHA256"], "deadline_unix": journal["deadline_unix"],
+            "store": {"bucket": "private-stage", "region": "us-east-2", "prefix": self.stage_prefix,
+                      "destination": {"bucket": "runtime-assets", "region": "us-east-2", "prefix": self.target_prefix}, "objects": objects},
+            "images": {"renders": {"image_id": self.candidate, "architecture": "arm64", "build": record,
+                "validation": {"guard": True, "sanitized": True, "launch_path": True, "renders_host": True, "renders_host_problem_count": 0,
+                               "renders_agent": True, "renders_unit": True, "kernel_release": record["kernel_release"],
+                               "boot_ids": [f"00000000-0000-0000-0000-{i:012d}" for i in range(3)]}}}}
+        self.update_manifest()
+        # GitHub's answer for the renders source fence (the active renders source precedes this one).
+        self.compare = mock.patch.object(MODULE.Publisher, "compare_sources", side_effect=lambda base, head: {
+            "status": "ahead", "behind_by": 0, "base_commit": {"sha": base}, "merge_base_commit": {"sha": base}})
+        self.compare.start()
+        self.addCleanup(self.compare.stop)
+
+    def pair_keys(self):
+        """The factory state that is not the renders track's: its queue, its journal and its publication receipt."""
+        ours = ("/renders/", "/builds/" + MODULE.digest(self.build), "/publications/" + MODULE.digest(self.build))
+        return copy.deepcopy({k: v for k, v in self.main_ssm.values.items() if not any(part in k for part in ours)})
+
+    update_manifest = PublisherTests.update_manifest
+    publisher = PublisherTests.publisher
+
+    def publish(self):
+        """Run until the release-region copy is available: the first event finds it pending."""
+        with self.assertRaisesRegex(MODULE.Refused, "copies are still pending: renders"):
+            self.publisher().run(copy.deepcopy(self.event))
+        self.ec2.available()
+        return self.publisher().run(copy.deepcopy(self.event))
+
+    def test_a_renders_build_publishes_its_own_pointer_and_template_only(self):
+        pair_templates = copy.deepcopy({k: v for k, v in self.ec2.templates.items() if k != RENDERS_TEMPLATE})
+        self.assertEqual(self.publish(), {"status": "promoted", "generation": 2})
+        release = self.fleet_ssm.values["/release-renders"]
+        copied = release["renders_amis"]["us-east-1"]["arm64"]
+        self.assertEqual(self.ec2.images[copied]["SourceImageId"], self.candidate)
+        self.assertEqual(release["renders_amis"], {"us-west-2": {"arm64": self.candidate}, "us-east-1": {"arm64": copied}})
+        self.assertEqual((release["track"], release["generation"], release["source_sha"], release["build_id"], release["build"]),
+                         ("renders", 2, self.source, self.build, self.record))
+        self.assertEqual(release["previous"], {k: v for k, v in self.renders_release.items() if k not in ("previous", "build")})
+        template = self.ec2.templates[RENDERS_TEMPLATE]
+        self.assertEqual(release["versions"], {"us-east-1/" + RENDERS_TEMPLATE: template["default"]})
+        self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"],
+                         {**template["versions"][1]["LaunchTemplateData"], "ImageId": copied})
+        # Nothing of the pair's: its pointer, templates and queue are as they were.
+        self.assertEqual(self.fleet_ssm.values["/release"], self.pair_release)
+        self.assertEqual({k: v for k, v in self.ec2.templates.items() if k != RENDERS_TEMPLATE}, pair_templates)
+        self.assertEqual(self.pair_keys(), self.pair_state)
+        self.assertEqual(self.main_ssm.values["/factory/renders/requests/" + self.input]["status"], "promoted")
+        self.assertEqual(sorted(self.assets.copies), sorted(self.target_prefix + name for name in MODULE.STORE_FILES))
+        self.assertEqual(set(self.west.tagged), {self.candidate, "snap-" + "c" * 17})
+        self.assertEqual(self.ec2.tagged, [copied])
+        self.assertIsNone(self.ddb.item)
+        # A replay of the same event finishes idempotently.
+        self.assertEqual(self.publisher().run(copy.deepcopy(self.event)), {"status": "promoted", "generation": 2})
+        self.assertEqual(self.fleet_ssm.values["/release-renders"], release)
+
+    def test_without_a_renders_template_only_the_pointer_moves(self):
+        self.setUp(templates=False)
+        self.assertEqual(self.publish(), {"status": "promoted", "generation": 2})
+        self.assertEqual(self.fleet_ssm.values["/release-renders"]["versions"], {})
+        self.assertEqual((self.ec2.created, self.ec2.selected), ([], []))
+
+    def test_the_renders_publication_refuses_anything_but_its_own_proof(self):
+        variants = ("pair-project", "pair-slots", "pair-candidates", "manifest-track", "manifest-host", "x86_64",
+                    "builder-type", "agent-check", "host-problem", "kernel", "record-commit", "unvalidated-boot",
+                    "control", "request-track", "image-kind", "template-default")
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.setUp()
+                journal = self.main_ssm.values["/factory/builds/" + MODULE.digest(self.build)]
+                image = self.manifest["images"]["renders"]
+                if variant == "pair-project":
+                    self.event["detail"]["build-id"] = "factory:00000000-0000-0000-0000-000000000009"
+                elif variant == "pair-slots":
+                    journal["slots"] = {slot: journal["slots"]["renders-build"] for slot in MODULE.SLOTS}
+                elif variant == "pair-candidates":
+                    journal["candidates"] = {"host": self.candidate, "tile": self.candidate}
+                elif variant == "manifest-track":
+                    del self.manifest["track"]
+                elif variant == "manifest-host":
+                    self.manifest["images"] = {"host": image}
+                elif variant == "x86_64":
+                    self.west.images[self.candidate]["Architecture"] = "x86_64"
+                elif variant == "builder-type":
+                    next(iter(i for i in self.west.instances.values() if i["InstanceType"] == "m8gd.metal-24xl"))["InstanceType"] = "g4dn.metal"
+                elif variant == "agent-check":
+                    image["validation"]["renders_agent"] = False
+                elif variant == "host-problem":
+                    image["validation"]["renders_host_problem_count"] = 1
+                elif variant == "kernel":
+                    image["validation"]["kernel_release"] = "6.18.60-fcvm-ba9876543210"
+                elif variant == "record-commit":
+                    image["build"]["fcvm_commit"] = "1" * 40
+                elif variant == "unvalidated-boot":
+                    image["validation"]["boot_ids"] = image["validation"]["boot_ids"][:2] * 2
+                elif variant == "control":
+                    self.main_ssm.values["/factory/renders/control"]["active"] = "factory-renders:00000000-0000-0000-0000-000000000007"
+                elif variant == "request-track":
+                    del self.main_ssm.values["/factory/renders/requests/" + self.input]["track"]
+                elif variant == "image-kind":
+                    next(t for t in self.west.images[self.candidate]["Tags"] if t["Key"] == "FleetImageKind")["Value"] = "host"
+                elif variant == "template-default":
+                    self.ec2.templates[RENDERS_TEMPLATE]["versions"][1]["LaunchTemplateData"]["ImageId"] = "ami-" + "5" * 17
+                    self.ec2.copy_state = "available"
+                self.update_manifest()
+                with self.assertRaises(MODULE.Refused):
+                    self.publisher().run(copy.deepcopy(self.event))
+                if variant == "template-default":
+                    self.assertEqual(self.ec2.selected, [])
+                    continue
+                self.assertEqual(self.fleet_ssm.values["/release-renders"], self.renders_release)
+                self.assertEqual(self.fleet_ssm.values["/release"], self.pair_release)
+                self.assertEqual((self.ec2.created, self.ec2.tagged, self.west.tagged, self.assets.copies), ([], [], [], []))
+
+    def test_a_failed_renders_promotion_rolls_back_and_is_never_replayed(self):
+        self.ec2.fail_select = RENDERS_TEMPLATE
+        with self.assertRaisesRegex(MODULE.Refused, "copies are still pending"):
+            self.publisher().run(copy.deepcopy(self.event))
+        self.ec2.available()
+        with self.assertRaises(MODULE.Refused):
+            self.publisher().run(copy.deepcopy(self.event))
+        template = self.ec2.templates[RENDERS_TEMPLATE]
+        self.assertEqual(template["versions"][template["default"]]["LaunchTemplateData"]["ImageId"], self.old_copy)
+        self.assertEqual(self.fleet_ssm.values["/release-renders"], self.renders_release)
+        created = list(self.ec2.created)
+        self.assertEqual(self.publisher().run(copy.deepcopy(self.event)), {"status": "failed", "reason": "rolled_back"})
+        self.assertEqual(self.ec2.created, created)
+        self.assertEqual(self.main_ssm.values["/factory/renders/requests/" + self.input]["status"], "failed")
+        self.assertEqual(self.fleet_ssm.values["/release"], self.pair_release)
+        self.assertIsNone(self.ddb.item)
+
+    def host(self, instance, image, kind, template, instance_type):
+        self.ec2.instances[instance] = {"InstanceId": instance, "State": {"Name": "running"}, "InstanceType": instance_type,
+            "ImageId": image, "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet-" + kind},
+                                       {"Key": "aws:ec2launchtemplate:id", "Value": template},
+                                       {"Key": "aws:ec2launchtemplate:version", "Value": "1"}]}
+
+    def test_a_critical_renders_release_retires_old_renders_hosts_only(self):
+        self.main_ssm.values["/factory/renders/requests/" + self.input]["priority"] = "critical"
+        self.host("i-" + "1" * 17, self.old_copy, "renders", RENDERS_TEMPLATE, "m8gd.metal-24xl")
+        self.host("i-" + "2" * 17, self.old["host"], "host", self.ids[0], "g4dn.metal")
+        self.host("i-" + "3" * 17, self.old_copy, "renders", "lt-" + "8" * 17, "m8gd.metal-24xl")
+        self.assertEqual(self.publish(), {"status": "promoted", "generation": 2})
+        self.assertEqual(self.ec2.terminated, ["i-" + "1" * 17])
+        self.assertEqual(self.ec2.instances["i-" + "2" * 17]["State"]["Name"], "running")
+
+    def old_copy_image(self, region, image_id, kind, name, source="ami-" + "d" * 17):
+        ec2 = self.ec2.peers[region]
+        ec2.images[image_id] = {"ImageId": image_id, "Name": name, "OwnerId": "222222222222", "Public": False, "State": "available",
+            "Architecture": "arm64" if kind == "renders" else "x86_64", "RootDeviceType": "ebs", "CreationDate": "2026-10-01T00:00:00.000Z",
+            "Description": "copy of " + source + " from us-west-2", "SourceImageId": source, "SourceImageRegion": "us-west-2",
+            "Tags": [{"Key": "Purpose", "Value": "fcvm-fleet"}, {"Key": "FleetImageKind", "Value": kind}]}
+
+    def test_each_publication_retires_only_its_own_tracks_images(self):
+        renders_name, pair_name = "fcvm-factory-" + "1" * 24 + "-renders", "fcvm-factory-" + "1" * 24 + "-host"
+        self.old_copy_image("us-east-1", "ami-" + "e" * 17, "renders", renders_name)
+        self.old_copy_image("us-east-1", "ami-" + "f" * 17, "host", pair_name, source="ami-" + "0" * 17)
+        # The live renders release's copy (the template's image) is kept.
+        self.old_copy_image("us-east-1", self.old_copy, "renders", "fcvm-factory-" + "2" * 24 + "-renders", source=self.old_original)
+        publisher = self.publisher()
+        publisher.clock = lambda: datetime.datetime(2026, 11, 20, tzinfo=datetime.timezone.utc).timestamp()
+        publisher.retain_renders(self.renders_release)
+        self.assertEqual(self.ec2.deregistered, ["ami-" + "e" * 17])
+        self.assertIn(self.old_copy, self.ec2.images)
+        # The pair's retention never takes a renders image.
+        self.old_copy_image("us-east-1", "ami-" + "e" * 17, "renders", renders_name)
+        self.assertFalse(publisher.retirable(self.ec2.images["ami-" + "e" * 17], "us-east-1"))
+        self.assertTrue(publisher.retirable(self.ec2.images["ami-" + "f" * 17], "us-east-1"))
+        self.assertFalse(publisher.retirable_renders(self.ec2.images["ami-" + "f" * 17], "us-east-1"))
+
+    def test_the_renders_track_is_configured_apart_from_the_pairs(self):
+        for variant, value in (("pair-project", {"project": "factory"}), ("pair-pointer", {"release_parameter": "/release"}),
+                               ("pair-template", {"templates": [{"region": "us-east-1", "id": self.ids[0], "kind": "renders", "arch": "arm64"}]}),
+                               ("other-region", {"templates": [{"region": "us-west-2", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "arm64"}]}),
+                               ("x86_64", {"templates": [{"region": "us-east-1", "id": RENDERS_TEMPLATE, "kind": "renders", "arch": "x86_64"}]})):
+            with self.subTest(variant=variant):
+                configured = json.loads(self.env["RENDERS_JSON"])
+                env = {**self.env, "RENDERS_JSON": json.dumps({**configured, **value})}
+                with self.assertRaisesRegex(MODULE.Refused, "renders track configuration"):
+                    MODULE.Publisher(env, {})
+
+    def test_terraform_gives_the_renders_publication_exactly_its_resources(self):
+        pipeline = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        def block(kind, name):
+            return re.search(r'^' + kind + r' "' + name + r'" \{\n.*?^\}', pipeline, re.S | re.M).group()
+        bundle = block("data", "archive_file\" \"fcvm_ami_publish")
+        for line in ("RENDERS_JSON = jsonencode({", "project           = local.fcvm_ami_renders_project",
+                     "release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name",
+                     "templates         = local.fcvm_ami_renders_templates"):
+            self.assertIn(line, bundle)
+        fleet = block("resource", "aws_iam_role_policy\" \"fcvm_ami_publish_fleet")
+        self.assertIn('{ Sid = "RendersRelease", Effect = "Allow", Action = ["ssm:GetParameter", "ssm:PutParameter"], '
+                      'Resource = aws_ssm_parameter.fcvm_ami_renders_release.arn }', fleet)
+        templates = re.split(r'Sid\s*= "RendersTemplates"', fleet, maxsplit=1)[1].split("},\n", 1)[0]
+        self.assertIn("local.fcvm_ami_renders_templates", templates)
+        self.assertIn('launch-template/none"]', templates)
+        retire = re.split(r'Sid\s*= "RetireOldRendersHosts"', fleet, maxsplit=1)[1].split("} },\n", 1)[0]
+        for condition in ('"ec2:ResourceTag/Purpose" = "fcvm-fleet-renders"', '"ec2:InstanceType" = local.fcvm_ami_renders_type',
+                          '"aws:RequestedRegion" = local.fcvm_ami_region'):
+            self.assertIn(condition, retire)
+        # The pair's retirement statement is the pair's alone.
+        self.assertIn('"ec2:ResourceTag/Purpose" = ["fcvm-fleet-host", "fcvm-fleet-tile"], "ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"]', fleet)
+        control = block("resource", "aws_iam_role_policy\" \"fcvm_ami_publish")
+        self.assertIn('{ Sid = "RendersProjectBuilds", Effect = "Allow", Action = "codebuild:BatchGetBuilds", '
+                      'Resource = aws_codebuild_project.fcvm_ami_renders.arn }', control)
+        self.assertIn('parameter${local.fcvm_ami_state_prefix}/renders/requests/*" }', control)
+        rule = block("resource", "aws_cloudwatch_event_rule\" \"fcvm_ami_renders_success")
+        self.assertIn('"project-name" = [local.fcvm_ami_renders_project]', rule)
+        self.assertIn('"build-status" = ["SUCCEEDED"]', rule)
+        self.assertIn("arn  = aws_lambda_function.fcvm_ami_publish.arn", block("resource", "aws_cloudwatch_event_target\" \"fcvm_ami_renders_success"))
+        self.assertIn("source_arn    = aws_cloudwatch_event_rule.fcvm_ami_renders_success.arn",
+                      block("resource", "aws_lambda_permission\" \"fcvm_ami_renders_success"))
+        # The pair's rule still matches the pair's project only.
+        self.assertIn('"project-name" = [local.fcvm_ami_project]', block("resource", "aws_cloudwatch_event_rule\" \"fcvm_ami_success"))
+
+
 class CloudWatch:
     def __init__(self):
         self.power = [0.0] * 5
