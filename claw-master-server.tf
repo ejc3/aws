@@ -52,8 +52,8 @@ variable "enable_claw_master_server" {
 }
 
 locals {
-  claw_master_tag            = "claw-master-c62a929"
-  claw_master_sha256_aarch64 = "27c1da3a4576e71186046b02ad03c6aa2cea0eff39596241b8de909eb1d2464b"
+  claw_master_tag            = "claw-master-e27da4b"
+  claw_master_sha256_aarch64 = "b13aa8b97c887c594ba3de58092434eaa3210addd7b3317045e58f8ef3b50891"
 
   # CloudWatch agent: receives the proxy's OTLP metrics on loopback and ships them (and the log file) to
   # CloudWatch. Pinned by version and sha256 like cloudflared; the versioned S3 path is the same file as
