@@ -17,7 +17,7 @@
 #                     with the site's x86_64 image; it reboots once at first boot for intel_iommu=on.
 #                     A GPU flavor implies --fallback: home first, then every fallback region that offers
 #                     the type (owner, 2026-10-22: the region does not matter for these).
-#   pbox up [N] kvm-96 --local-nvme
+#   pbox up [N] kvm-96|kvm-192 --local-nvme
 #                     try only the KVM types with disposable instance-store NVMe. A slot already occupied
 #                     by a different type is left alone; choose a free or compatible slot.
 #   pbox up [N] FLAVOR --fallback
@@ -62,7 +62,7 @@
 #                     the slot was relaunched since. Scripts carry the id from `up` and never re-resolve a slot by name.
 #   pbox capacity [N] FLAVOR
 #                     spot placement scores (1-10) for the flavor's types in the home AZ and every
-#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96.
+#                     fallback AZ; launches nothing. Accepts --local-nvme with kvm-96 and kvm-192.
 #
 # For scripts, `up` exits 0 when the box is up (stdout's last line is
 #   "launched box=N region=R az=Z type=T ip=IP id=i-... work=persistent|fresh", or "running ..." when it already was,
@@ -166,8 +166,9 @@ flavor_lines() {
 }
 
 flavor_types() { flavor_lines | awk -v f="$1" '$1 == f { for (i = 6; i <= NF; i++) printf "%s%s", $i, (i < NF ? " " : "") }'; }
-has_kvm96_local_nvme() {
-  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl) return 0 ;; *) return 1 ;; esac
+# The KVM types with instance-store NVMe, which --local-nvme limits kvm-96 and kvm-192 to.
+has_kvm_local_nvme() {
+  case "$1" in c8gd.metal-24xl|m8gd.metal-24xl|c8gd.metal-48xl|c9gd.metal-48xl|m8gd.metal-48xl) return 0 ;; *) return 1 ;; esac
 }
 
 # The flavor an instance type belongs to (each type is in exactly one), or nothing.
@@ -385,8 +386,8 @@ if [ -n "$FLAVOR" ] && [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; then
   say "a flavor only applies to 'up' and 'capacity'"; exit 1
 fi
 if [ -n "$LOCAL_NVME" ]; then
-  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || [ "$FLAVOR" != "kvm-96" ]; then
-    say "--local-nvme only applies to 'up kvm-96' and 'capacity kvm-96'"; exit 2
+  if { [ "$CMD" != "up" ] && [ "$CMD" != "capacity" ]; } || { [ "$FLAVOR" != "kvm-96" ] && [ "$FLAVOR" != "kvm-192" ]; }; then
+    say "--local-nvme only applies to 'up' and 'capacity' with kvm-96 or kvm-192"; exit 2
   fi
 fi
 
@@ -416,7 +417,7 @@ if [ "$CMD" = "up" ] || [ "$CMD" = "capacity" ]; then
   if [ -n "$LOCAL_NVME" ]; then
     NVME_TYPES=()
     for T in $TYPES; do
-      if has_kvm96_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
+      if has_kvm_local_nvme "$T"; then NVME_TYPES+=("$T"); fi
     done
     if [ "${#NVME_TYPES[@]}" -eq 0 ]; then
       say "No local NVMe types are configured for $FLAVOR; nothing was launched."; exit 2
