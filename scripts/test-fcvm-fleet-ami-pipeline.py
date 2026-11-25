@@ -1821,5 +1821,582 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(self.request("critical", "6" * 64)["status"], "disabled")
         self.assertEqual(self.cb.starts, [])
 
+
+class FactoryTestsWithRendersConfigured(FactoryTests):
+    """Every pair test again, with the renders track configured (and off): its configuration must not change one
+    pair key, record, parameter, launch or invocation."""
+
+    def setUp(self):
+        super().setUp()
+        self.env["RENDERS_TRACK"] = json.dumps({**RENDERS_TRACK, "enabled": False})
+        client = self.factory.client
+        self.factory = mod.Factory(self.env, {}, clock=lambda: self.time)
+        self.factory.client = client
+        self.assertIsNotNone(self.factory.renders)
+
+
+RENDERS_BUILD = "factory-renders:77777777-7777-7777-7777-777777777777"
+RENDERS_PROFILE = "arn:aws:iam::123456789012:instance-profile/factory-renders"
+RENDERS_TRACK = {"enabled": True, "project": "factory-renders", "release_parameter": "/release-renders",
+                 "failure_parameter": "/fleet/failure-renders", "canonical_ami": "ami-canonical-arm64", "templates": [],
+                 "builder_profile": RENDERS_PROFILE}
+
+
+class TokenCodeBuild:
+    """CodeBuild's idempotency tokens as one account-wide namespace: a repeated token either answers with the
+    build that first used it ("replay") or is refused ("reject"), whichever project the repeat names."""
+    def __init__(self, mode):
+        self.mode, self.tokens = mode, {}
+
+    def wrap(self, codebuild):
+        start = codebuild.start_build
+        def start_build(**kwargs):
+            token = kwargs["idempotencyToken"]
+            if token in self.tokens:
+                if self.mode == "reject":
+                    raise ClientError({"Error": {"Code": "InvalidInputException"}}, "StartBuild")
+                return {"build": codebuild.builds[self.tokens[token]]}
+            build = start(**kwargs)["build"]
+            self.tokens[token] = build["id"]
+            return {"build": build}
+        codebuild.start_build = start_build
+
+
+class TrackCodeBuild(CodeBuild):
+    """Both projects, as CodeBuild keeps them: a build id names its project, and the renders project's builds
+    carry its FLEET_AMI_TRACK (a project variable, not an override)."""
+    def build(self, build_id, variables=None):
+        value = super().build(build_id, variables)
+        value["projectName"] = build_id.split(":", 1)[0]
+        if value["projectName"] == RENDERS_TRACK["project"]:
+            value["environment"]["environmentVariables"] = [*value["environment"]["environmentVariables"],
+                                                            {"name": "FLEET_AMI_TRACK", "value": "renders"}]
+        return value
+
+    def list_builds_for_project(self, projectName, **kwargs):
+        return {"ids": [i for i in self.builds if i.startswith(projectName + ":")]}
+
+    def start_build(self, **kwargs):
+        self.starts.append(kwargs)
+        # numbered per project, so the pair's ids are the same whether or not a renders build started
+        digit = str(sum(start["projectName"] == kwargs["projectName"] for start in self.starts) + 1)
+        build_id = kwargs["projectName"] + ":" + "-".join(digit * n for n in (8, 4, 4, 4, 12))
+        build = self.build(build_id, kwargs["environmentVariablesOverride"])
+        build.update(resolvedSourceVersion=kwargs["sourceVersion"], timeoutInMinutes=kwargs["timeoutInMinutesOverride"],
+                     startTime=datetime.datetime.fromtimestamp(self.clock(), datetime.timezone.utc))
+        self.builds[build_id] = build
+        return {"build": build}
+
+
+class RendersTrackTests(unittest.TestCase):
+    """The renders track (dispatch.py RENDERS_TRACK): its own project, queue, slots, base, worker session, failure
+    record, reaper and image collection, and the pair's work unchanged beside it."""
+
+    def setUp(self, renders=True, enabled=True):
+        FactoryTests.setUp(self)
+        if renders:
+            self.env["RENDERS_TRACK"] = json.dumps({**RENDERS_TRACK, "enabled": enabled})
+        self.cb = TrackCodeBuild()
+        self.cb.clock = lambda: self.time
+        self.cb.builds[RENDERS_BUILD] = self.cb.build(RENDERS_BUILD)
+        self.ec2.images["ami-canonical-arm64"] = {"ImageId": "ami-canonical-arm64", "OwnerId": "099720109477", "Public": True,
+                                                  "State": "available", "Architecture": "arm64", "RootDeviceName": "/dev/sda1"}
+        self.clients = {("ssm", False): self.store, ("ssm", True): self.fleet_ssm, ("ec2", True): self.ec2,
+                        ("codebuild", False): self.cb, ("sts", False): self.sts, ("dynamodb", False): self.ddb,
+                        ("lambda", False): self.publisher}
+        self.factory = mod.Factory(self.env, self.clients, clock=lambda: self.time)
+        self.factory.client = lambda name, fleet=False: self.clients[(name, fleet)]
+        self.store.values["/factory/renders/control"] = {"active": RENDERS_BUILD, "pending": None}
+        self.store.values["/factory/renders/requests/" + INPUT_SHA] = {
+            "request_id": INPUT_SHA, "status": "building", "source_sha": SOURCE_SHA, "input_sha256": INPUT_SHA,
+            "priority": "normal", "build_id": RENDERS_BUILD, "track": "renders"}
+        self.fleet_ssm.values["/release-renders"] = {"version": 1, "renders_amis": {}, "previous": None}
+
+    request = FactoryTests.request
+    ci_run = FactoryTests.ci_run
+
+    def call(self, action, slot=None, build=RENDERS_BUILD, **extra):
+        event = {"action": action, "build_id": build, "capability": CAP, **extra}
+        if slot:
+            event["slot"] = slot
+        return self.factory.broker(event)
+
+    def fresh_queues(self):
+        for key in ("/factory/control", "/factory/requests/" + INPUT_SHA, "/factory/renders/control",
+                    "/factory/renders/requests/" + INPUT_SHA):
+            self.store.values.pop(key, None)
+        self.queue_prepared = True
+
+    def test_an_admitted_request_queues_its_renders_build_on_the_renders_project(self):
+        self.fresh_queues()
+        answer = self.request("normal")
+        self.assertEqual(answer["status"], "queued")
+        pair = self.store.values["/factory/requests/" + INPUT_SHA]
+        renders = self.store.values["/factory/renders/requests/" + INPUT_SHA]
+        self.assertEqual((renders["track"], renders["status"], renders["source_sha"], renders["priority"], renders["not_before"]),
+                         ("renders", "queued", SOURCE_SHA, "normal", pair["not_before"]))
+        self.assertEqual((renders["ci_head_sha"], renders["ci_run_id"]), (pair["ci_head_sha"], pair["ci_run_id"]))
+        self.assertEqual(self.store.values["/factory/renders/control"]["pending"], INPUT_SHA)
+        self.assertEqual(self.cb.starts, [])
+        self.time += 21600
+        self.factory.tick()
+        self.assertEqual([s["projectName"] for s in self.cb.starts], ["factory", "factory-renders"])
+        start = self.cb.starts[1]
+        self.assertEqual((start["sourceVersion"], start["idempotencyToken"], start["timeoutInMinutesOverride"]),
+                         (SOURCE_SHA, mod.digest("renders/" + INPUT_SHA), 360))
+        self.assertEqual(self.cb.starts[0]["idempotencyToken"], INPUT_SHA, "the pair's token is unchanged")
+        self.assertEqual([v["name"] for v in start["environmentVariablesOverride"]],
+                         ["SOURCE_SHA", "INPUT_SHA256", "FLEET_AMI_CAPABILITY"], "the track is the project's, never an override")
+        renders = self.factory.request_record(INPUT_SHA, "renders")
+        self.assertEqual(renders["status"], "building")
+        self.assertTrue(renders["build_id"].startswith("factory-renders:"))
+        self.assertTrue(self.factory.request_record(INPUT_SHA)["build_id"].startswith("factory:"))
+        # One normal build a day per track: a newer request waits for the next day on each.
+        self.assertEqual(self.store.values["/factory/renders/control"]["active"], renders["build_id"])
+
+    def test_the_pair_answers_writes_and_starts_the_same_with_the_track_on(self):
+        def run(renders, enabled=True):
+            self.setUp(renders=renders, enabled=enabled)
+            self.env["FAILURE_PARAMETER"] = "/fleet/failure"
+            self.fresh_queues()
+            answers = [self.request("normal")]
+            self.time += 21600
+            self.factory.tick()
+            answers.append(self.request("critical", "6" * 64))
+            # Two pair builds end: one fails (its failure record), one succeeds (its publication).
+            for build_id, status in zip([b for b in self.cb.builds if b.startswith("factory:")][-2:], ("FAILED", "SUCCEEDED")):
+                self.cb.builds[build_id].update(buildStatus=status, buildComplete=True,
+                                                endTime=datetime.datetime.fromtimestamp(self.time, datetime.timezone.utc))
+            self.time += 600
+            self.factory.tick()
+            # The renders track's state: its queue, the journals of its builds (keyed by build id), its failure record.
+            journals = {"/factory/builds/" + mod.digest(b) for b in self.cb.builds if b.startswith("factory-renders:")}
+            pair_writes = [name for name in self.store.writes if not name.startswith("/factory/renders/") and name not in journals]
+            pair_state = {k: v for k, v in self.store.values.items() if not k.startswith("/factory/renders/") and k not in journals}
+            fleet = {k: v for k, v in self.fleet_ssm.values.items() if k != RENDERS_TRACK["failure_parameter"]}
+            starts = [{k: v for k, v in s.items() if k != "environmentVariablesOverride"} for s in self.cb.starts if s["projectName"] == "factory"]
+            pair_builds = {b for b in self.cb.builds if b.startswith("factory:")}
+            launches = [l for l in self.ec2.launches if l["InstanceType"] != "m8gd.metal-24xl"]
+            published = [c for c in self.publisher.calls if json.loads(c["Payload"])["detail"]["project-name"] == "factory"]
+            stops = [b for b in self.cb.stops if b.startswith("factory:")]
+            return answers, pair_writes, pair_state, fleet, starts, pair_builds, stops, launches, self.ec2.terminations, published
+        absent, disabled, enabled = run(False), run(True, enabled=False), run(True)
+        self.assertEqual(absent, disabled)
+        self.assertEqual(absent, enabled)
+        self.assertTrue(any(name.startswith("/factory/renders/") for name in self.store.writes))
+        self.assertTrue(any(s["projectName"] == "factory-renders" for s in self.cb.starts))
+
+    def test_a_disabled_track_queues_and_starts_nothing(self):
+        self.setUp(enabled=False)
+        self.fresh_queues()
+        self.request("critical")
+        self.assertEqual([s["projectName"] for s in self.cb.starts], ["factory"])
+        self.assertFalse(any(name.startswith("/factory/renders/") for name in self.store.writes))
+        self.setUp(renders=False)
+        self.fresh_queues()
+        self.request("critical")
+        self.assertFalse(any(name.startswith("/factory/renders/") for name in self.store.writes))
+
+    def test_a_failure_in_the_renders_queue_leaves_the_pairs_answer_and_tick(self):
+        self.fresh_queues()
+        with patch.object(self.factory, "mirror_renders", side_effect=RuntimeError("renders queue unavailable")):
+            answer = self.request("normal")
+        self.assertEqual(answer["status"], "queued")
+        # The pair's work is done first; the renders failure then fails the invocation, so it is a Lambda error.
+        with patch.object(self.factory, "collect_renders_images", side_effect=RuntimeError("renders")), \
+                patch.object(self.factory, "collect_images") as pair:
+            with self.assertRaisesRegex(RuntimeError, "renders track steps failed: RuntimeError"):
+                self.factory.tick()
+        pair.assert_called_once_with()
+        # and the reverse: a pair failure still lets the renders track reconcile and collect
+        with patch.object(self.factory, "collect_images", side_effect=RuntimeError("pair")), \
+                patch.object(self.factory, "collect_renders_images") as renders:
+            with self.assertRaisesRegex(RuntimeError, "pair"):
+                self.factory.tick()
+        renders.assert_called_once_with()
+
+    def test_a_renders_build_launches_only_its_slots_type_root_and_arm64_base(self):
+        launched = self.call("launch", "renders-build")
+        request = self.ec2.launches[0]
+        self.assertEqual((request["InstanceType"], request["ImageId"]), ("m8gd.metal-24xl", "ami-canonical-arm64"))
+        self.assertEqual(request["BlockDeviceMappings"][0]["Ebs"]["VolumeSize"], 128)
+        tags = {t["Key"]: t["Value"] for t in request["TagSpecifications"][0]["Tags"]}
+        self.assertEqual((tags["FactorySlot"], tags["FactoryBuild"]), ("renders-build", mod.digest(RENDERS_BUILD)))
+        self.assertEqual((launched["instance_type"], launched["root_gib"]), ("m8gd.metal-24xl", 128))
+        for slot in mod.SLOTS:
+            with self.subTest(slot=slot), self.assertRaisesRegex(mod.Refused, "unknown fixed slot"):
+                self.call("launch", slot)
+        for slot in mod.RENDERS_SLOTS:
+            with self.subTest(slot=slot), self.assertRaisesRegex(mod.Refused, "unknown fixed slot"):
+                self.call("launch", slot, build=BUILD)
+        self.assertEqual(len(self.ec2.launches), 1)
+
+    def test_a_renders_build_must_carry_the_renders_track(self):
+        variables = self.cb.builds[RENDERS_BUILD]["environment"]["environmentVariables"]
+        self.cb.builds[RENDERS_BUILD]["environment"]["environmentVariables"] = [v for v in variables if v["name"] != "FLEET_AMI_TRACK"]
+        with self.assertRaisesRegex(mod.Refused, "must run the renders track"):
+            self.call("launch", "renders-build")
+        self.assertEqual(self.ec2.launches, [])
+
+    def test_the_renders_base_is_its_own_validated_release_never_another_image(self):
+        released = "ami-" + "7" * 17
+        self.fleet_ssm.values["/release-renders"]["renders_amis"] = {"us-east-1": {"arm64": released}}
+        good = {"Purpose": "fcvm-fleet", "PipelineSanitized": "true", "FleetImageValidated": "true",
+                "FleetImageKind": "renders", "GuardHelperSHA256": "a" * 64}
+        def image(arch="arm64", **tags):
+            return {"ImageId": released, "OwnerId": self.env["FLEET_ACCOUNT"], "Public": False, "State": "available",
+                    "Architecture": arch, "RootDeviceName": "/dev/sda1", "Tags": [{"Key": k, "Value": v} for k, v in {**good, **tags}.items()]}
+        for variant, row, expected in (("released", image(), released), ("x86_64", image("x86_64"), "ami-canonical-arm64"),
+                                       ("host kind", image(FleetImageKind="host"), "ami-canonical-arm64"),
+                                       ("unvalidated", image(FleetImageValidated="false"), "ami-canonical-arm64"),
+                                       ("other guard", image(GuardHelperSHA256="b" * 64), "ami-canonical-arm64")):
+            with self.subTest(variant=variant):
+                self.ec2.images[released] = row
+                self.assertEqual(self.factory.renders_base_image()["ImageId"], expected)
+        # The pair's pointer and an x86_64 Canonical base are never the renders base.
+        self.fleet_ssm.values["/release-renders"]["renders_amis"] = {}
+        self.fleet_ssm.values["/release"] = {"renders_amis": {"us-east-1": {"arm64": released}}}
+        self.assertEqual(self.factory.renders_base_image()["ImageId"], "ami-canonical-arm64")
+        self.ec2.images["ami-canonical-arm64"]["Architecture"] = "x86_64"
+        with self.assertRaisesRegex(mod.Refused, "renders factory base is unavailable"):
+            self.factory.renders_base_image()
+
+    def test_a_renders_worker_session_has_no_secrets_manager_action(self):
+        def actions(build):
+            self.call("credentials", build=build)
+            return json.loads(self.sts.calls[-1]["Policy"])["Statement"][1]["Action"]
+        self.assertEqual(actions(RENDERS_BUILD), ["ssm:SendCommand", "ssm:DescribeInstanceInformation"])
+        self.assertEqual(actions(BUILD), ["ssm:SendCommand", "ssm:DescribeInstanceInformation",
+                                          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"])
+
+    def logs(self, *messages):
+        events = [{"message": m} for m in messages]
+        class Logs:
+            def get_log_events(self, **kwargs):
+                return {"events": events}
+        self.clients[("logs", False)] = Logs()
+
+    def test_a_renders_failure_is_recorded_under_its_own_kind_phase_and_record(self):
+        self.env["FAILURE_PARAMETER"] = "/fleet/failure"
+        self.factory = mod.Factory(self.env, self.clients, clock=lambda: self.time)
+        self.factory.client = lambda name, fleet=False: self.clients[(name, fleet)]
+        # A receipt of another track's kind is not this build's, wherever it is in the log.
+        self.logs(json.dumps({"phaseDiagnostics": {"kind": "renders", "phase": "build", "version_id": "null"}}),
+                  json.dumps({"phaseDiagnostics": {"kind": "host", "phase": "build", "version_id": "null"}}),
+                  "RuntimeError: candidate failed the agent check (2 failures): a private detail")
+        self.factory.journal(RENDERS_BUILD)
+        self.cb.builds[RENDERS_BUILD].update(buildStatus="FAILED", logs={"groupName": "group", "streamName": "stream"},
+                                             endTime=datetime.datetime.fromtimestamp(NOW + 60, datetime.timezone.utc))
+        self.factory.reconcile(track="renders")
+        self.assertEqual(self.factory.request_record(INPUT_SHA, "renders")["status"], "failed")
+        value = self.fleet_ssm.values["/fleet/failure-renders"]
+        self.assertEqual((value["track"], value["executor_error"], value["phase"], value["reason"]),
+                         ("renders", "renders_agent_check_failed", {"kind": "renders", "phase": "build"}, "build_failed_or_expired"))
+        self.assertNotIn("private", json.dumps(value))
+        self.assertNotIn("/fleet/failure", self.fleet_ssm.values, "a renders failure never replaces the pair's record")
+        self.assertEqual(self.store.values["/factory/control"]["active"], BUILD, "the pair's queue is untouched")
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "building")
+
+    def test_each_renders_verdict_keeps_only_its_code(self):
+        for line, code in (("candidate failed the renders host check (1 problems): the pool holds 3 of 4", "renders_host_check_failed"),
+                           ("candidate failed the agent check (no count of failures): x", "renders_agent_check_failed"),
+                           ("candidate failed the agent unit's own words (2 failures): y", "renders_unit_check_failed")):
+            with self.subTest(code=code):
+                self.logs("RuntimeError: " + line)
+                self.assertEqual(self.factory.executor_failure({"id": RENDERS_BUILD, "logs": {"groupName": "g", "streamName": "s"}}),
+                                 (code, None))
+
+    def test_a_successful_renders_build_redrives_its_own_publication(self):
+        self.factory.journal(RENDERS_BUILD)
+        self.cb.builds[RENDERS_BUILD].update(buildStatus="SUCCEEDED", buildComplete=True,
+                                             endTime=datetime.datetime.fromtimestamp(NOW + 120, datetime.timezone.utc))
+        self.time = NOW + 121
+        self.factory.reconcile(track="renders")
+        self.assertEqual(self.factory.request_record(INPUT_SHA, "renders")["status"], "awaiting-publish")
+        event = json.loads(self.publisher.calls[0]["Payload"])
+        self.assertEqual(event["detail"], {"build-status": "SUCCEEDED", "project-name": "factory-renders",
+                                           "build-id": "arn:aws:codebuild:us-west-1:999999999999:build/" + RENDERS_BUILD})
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "building")
+
+    def test_the_reaper_ends_expired_renders_builders_and_only_in_their_own_shape(self):
+        instance_id = self.call("launch", "renders-build")["instance_id"]
+        odd = copy.deepcopy(self.ec2.instances[instance_id])
+        odd.update(InstanceId="i-" + "9" * 17, InstanceType="g4dn.metal")
+        self.ec2.instances[odd["InstanceId"]] = odd
+        self.time = NOW + 360 * 60
+        with patch.object(self.factory, "reconcile"), patch.object(self.factory, "collect_images"), \
+                patch.object(self.factory, "collect_renders_images"):
+            self.factory.tick()
+        self.assertEqual(self.ec2.terminations, [[instance_id]])
+
+    def test_each_track_collects_only_its_own_images(self):
+        pair_image = self.seal_in(BUILD, "host-build")
+        renders_image = self.seal_in(RENDERS_BUILD, "renders-build")
+        self.fleet_ssm.values["/release"] = {"host_amis": {}, "tile_amis": {}, "previous": None}
+        self.time = NOW + 86400
+        self.factory.collect_images()
+        self.assertEqual(self.ec2.deleted_images, [pair_image])
+        # Kept while the renders pointer, its previous release or a renders template names it.
+        self.fleet_ssm.values["/release-renders"] = {"renders_amis": {}, "previous": {"renders_amis": {"us-west-2": {"arm64": renders_image}}}}
+        self.factory.collect_renders_images()
+        class Templates:
+            def describe_launch_template_versions(self, **kwargs):
+                return {"LaunchTemplateVersions": [{"LaunchTemplateData": {"ImageId": renders_image}}]}
+        self.fleet_ssm.values["/release-renders"] = {"renders_amis": {}, "previous": None}
+        self.factory.renders["templates"] = [{"region": "us-east-1", "id": "lt-" + "1" * 17, "kind": "renders", "arch": "arm64"}]
+        ec2 = self.ec2
+        ec2.describe_launch_template_versions = Templates().describe_launch_template_versions
+        self.factory.collect_renders_images()
+        self.assertEqual(self.ec2.deleted_images, [pair_image])
+        self.factory.renders["templates"] = []
+        self.factory.collect_renders_images()
+        self.assertEqual(self.ec2.deleted_images, [pair_image, renders_image])
+        # A missing renders pointer collects nothing.
+        again = self.seal_in(RENDERS_BUILD, "renders-build", fresh=True)
+        del self.fleet_ssm.values["/release-renders"]
+        with self.assertRaises(Missing):
+            self.factory.collect_renders_images()
+        self.assertIn(again, self.ec2.images)
+
+    def seal_in(self, build, slot, fresh=False):
+        if fresh:
+            self.ec2.launches.clear()
+            self.store.values.pop("/factory/builds/" + mod.digest(build))
+            self.cb.builds[build]["buildStatus"] = "IN_PROGRESS"
+            self.time = NOW
+        instance_id = self.call("launch", slot, build=build)["instance_id"]
+        self.ec2.instances[instance_id]["State"]["Name"] = "stopped"
+        image = self.call("seal", slot, build=build)["image_id"]
+        self.ec2.instances[instance_id]["State"]["Name"] = "terminated"
+        self.cb.builds[build].update(buildStatus="FAILED", endTime=datetime.datetime.fromtimestamp(NOW, datetime.timezone.utc))
+        if fresh:
+            self.time = NOW + 86400
+        return image
+
+    def test_both_tracks_start_one_build_each_under_account_wide_tokens(self):
+        for mode in ("replay", "reject"):
+            with self.subTest(mode=mode):
+                self.setUp()
+                TokenCodeBuild(mode).wrap(self.cb)
+                self.fresh_queues()
+                self.request("normal")
+                self.time += 21600
+                self.factory.tick()
+                pair, renders = self.factory.request_record(INPUT_SHA), self.factory.request_record(INPUT_SHA, "renders")
+                self.assertEqual((pair["status"], renders["status"]), ("building", "building"))
+                self.assertTrue(pair["build_id"].startswith("factory:"))
+                self.assertTrue(renders["build_id"].startswith("factory-renders:"))
+                self.assertEqual(self.store.values["/factory/renders/control"]["active"], renders["build_id"])
+                self.assertEqual(self.cb.stops, [])
+
+    def test_a_build_of_the_other_track_is_never_bound_or_stopped(self):
+        # StartBuild answers with the pair's build: the renders intent stays fenced and nothing is bound.
+        self.fresh_queues()
+        self.request("normal")
+        self.time += 21600
+        self.factory.reconcile()
+        pair_build = self.factory.request_record(INPUT_SHA)["build_id"]
+        start = self.cb.start_build
+        self.cb.start_build = lambda **kwargs: (start(**kwargs), {"build": self.cb.builds[pair_build]})[1]
+        with self.assertRaisesRegex(mod.Refused, "another track's build"):
+            self.factory.reconcile(track="renders")
+        self.assertEqual(self.store.values["/factory/renders/control"]["active"], {"intent": INPUT_SHA})
+        self.assertIsNone(self.factory.request_record(INPUT_SHA, "renders")["build_id"])
+        # A renders control naming a pair build refuses before it reads, stops or cleans up anything.
+        self.store.values["/factory/renders/control"]["active"] = pair_build
+        self.cb.builds[pair_build]["buildStatus"] = "FAILED"
+        with self.assertRaisesRegex(mod.Refused, "another track's build"):
+            self.factory.reconcile(track="renders")
+        self.assertEqual((self.cb.stops, self.ec2.terminations), ([], []))
+        self.assertEqual(self.factory.request_record(INPUT_SHA)["status"], "building")
+
+    def test_a_failing_renders_builder_does_not_stall_the_pairs_tick(self):
+        self.call("launch", "renders-build")
+        del self.cb.builds[RENDERS_BUILD]  # the renders build's metadata cannot be read
+        self.time = NOW + 360 * 60
+        with patch.object(self.factory, "collect_images") as pair:
+            with self.assertRaisesRegex(RuntimeError, "renders track steps failed"):
+                self.factory.tick()
+        pair.assert_called_once_with()
+
+    def test_only_a_live_pair_request_queues_a_renders_build(self):
+        self.fresh_queues()
+        for status in ("promoted", "superseded", "failed"):
+            with self.subTest(status=status):
+                self.store.values["/factory/requests/" + INPUT_SHA] = {
+                    "request_id": INPUT_SHA, "status": status, "source_sha": SOURCE_SHA, "input_sha256": INPUT_SHA,
+                    "priority": "normal", "build_id": BUILD, "not_before": NOW}
+                self.request("normal")
+                self.assertNotIn("/factory/renders/requests/" + INPUT_SHA, self.store.values)
+                self.assertNotIn("/factory/renders/control", self.store.values)
+        # An existing renders record only gains priority from a repeat.
+        self.store.values["/factory/requests/" + INPUT_SHA]["status"] = "building"
+        self.store.values["/factory/renders/requests/" + INPUT_SHA] = {
+            "request_id": INPUT_SHA, "status": "queued", "source_sha": SOURCE_SHA, "input_sha256": INPUT_SHA,
+            "priority": "normal", "build_id": None, "track": "renders", "not_before": NOW + 21600}
+        self.request("critical")
+        renders = self.factory.request_record(INPUT_SHA, "renders")
+        self.assertEqual((renders["priority"], renders["not_before"]), ("critical", NOW))
+
+    def test_a_request_only_queues_the_renders_build_and_the_tick_starts_it(self):
+        self.fresh_queues()
+        self.request("critical")
+        self.assertEqual([s["projectName"] for s in self.cb.starts], ["factory"])
+        self.assertEqual(self.store.values["/factory/renders/control"], {"pending": INPUT_SHA})
+        self.factory.tick()
+        self.assertEqual([s["projectName"] for s in self.cb.starts], ["factory", "factory-renders"])
+
+    def test_a_bad_renders_configuration_turns_the_track_off_and_the_pair_runs(self):
+        for bad in ("{", json.dumps({**RENDERS_TRACK, "builder_profile": ""}), json.dumps({**RENDERS_TRACK, "extra": 1})):
+            with self.subTest(bad=bad[:20]):
+                self.env["RENDERS_TRACK"] = bad
+                factory = mod.Factory(self.env, self.clients, clock=lambda: self.time)
+                factory.client = lambda name, fleet=False: self.clients[(name, fleet)]
+                self.assertIsNone(factory.renders)
+                self.factory = factory
+                self.fresh_queues()
+                self.assertEqual(self.request("critical")["status"], "building")
+                with patch.object(factory, "collect_images") as pair:
+                    with self.assertRaisesRegex(RuntimeError, "renders track steps failed: configuration"):
+                        factory.tick()
+                pair.assert_called_once_with()
+                self.assertFalse(any(name.startswith("/factory/renders/") for name in self.store.writes))
+
+    def test_renders_builders_run_with_their_own_profile(self):
+        self.call("launch", "renders-build")
+        self.assertEqual(self.ec2.launches[0]["IamInstanceProfile"], {"Arn": RENDERS_PROFILE})
+        self.call("launch", "host-build", build=BUILD)
+        self.assertEqual(self.ec2.launches[1]["IamInstanceProfile"], {"Arn": self.env["BUILDER_PROFILE"]})
+        # A renders-slot instance with the pair's profile is not the renders build's and is never reaped as one.
+        instance = next(i for i in self.ec2.instances.values() if i["InstanceType"] == "m8gd.metal-24xl")
+        instance["IamInstanceProfile"] = {"Arn": self.env["BUILDER_PROFILE"]}
+        self.assertEqual(self.call("status", "renders-build")["state"], "uncertain")
+        self.time = NOW + 360 * 60
+        with patch.object(self.factory, "reconcile"), patch.object(self.factory, "collect_images"), \
+                patch.object(self.factory, "collect_renders_images"):
+            self.factory.tick()
+        self.assertNotIn([instance["InstanceId"]], self.ec2.terminations)
+
+    def test_a_malformed_renders_pointer_starts_no_build(self):
+        for pointer in ({"renders_amis": []}, {"renders_amis": {"us-east-1": "ami-" + "7" * 17}},
+                        {"renders_amis": {"us-east-1": {"x86_64": "ami-" + "7" * 17}}}, {}, []):
+            with self.subTest(pointer=pointer):
+                self.fleet_ssm.values["/release-renders"] = pointer
+                with self.assertRaisesRegex(mod.Refused, "renders release pointer is malformed"):
+                    self.factory.renders_base_image()
+        del self.fleet_ssm.values["/release-renders"]
+        self.assertEqual(self.factory.renders_base_image()["ImageId"], "ami-canonical-arm64")
+
+    def test_the_dispatchers_environment_stays_under_lambdas_limit(self):
+        # Lambda refuses an environment over 4 KB. Bound every value the way the publisher's test does, with the
+        # two JSON values at their largest: every compute and copy-region template, and one renders template.
+        root = SOURCE.parents[1]
+        source = (root / "fcvm-fleet-ami-pipeline.tf").read_text()
+        function = re.search(r'^resource "aws_lambda_function" "fcvm_ami_dispatch" \{\n.*?^\}', source, re.S | re.M).group()
+        variables = function[function.index("variables = {"):]
+        regions = len(json.loads(re.search(r"fcvm_fleet_regions\s*=\s*(\[[^\]]+\])", (root / "fcvm-fleet-account.tf").read_text()).group(1)))
+        template = len('{"arch":"x86_64","id":"lt-0123456789abcdef0","kind":"host","region":"us-east-1"},')
+        bounds = [
+            (r'"[^"$]*"', lambda v: len(v) - 2), (r"tostring\(.*\)", lambda v: 5), (r"var\.aws_region", lambda v: 14),
+            (r"local\.fcvm_ami_project|local\.fcvm_ami_build_region|local\.fcvm_ami_region|local\.fcvm_fleet_home_region", lambda v: 32),
+            (r"local\.fcvm_ami_state_prefix|local\.fcvm_prod_ami_release_parameter|local\.fcvm_stage_lock_id", lambda v: 64),
+            (r"local\.fcvm_ami_guard_sha", lambda v: 64), (r"local\.fcvm_fleet_account_id|data\.aws_caller_identity\.current\.account_id", lambda v: 12),
+            (r"local\.fcvm_ami_builder_subnet|aws_security_group\.\w+\.id|data\.aws_ami\.\w+\.id", lambda v: 24),
+            # IAM caps a role or profile name at 64 and 128 characters, SSM a parameter name at 2048 (these are under 64).
+            (r"aws_iam_(role|instance_profile)\.[a-z0-9_]+\.arn", lambda v: 31 + 128),
+            (r"aws_ssm_parameter\.[a-z0-9_]+\.name", lambda v: 64), (r"aws_s3_bucket\.[a-z0-9_]+\.id", lambda v: 63),
+            (r"aws_[a-z0-9_]+\.[a-z0-9_]+\.(arn|name|id)", lambda v: 256),
+            (r'"arn:aws:lambda:[^"]+"', lambda v: 128),
+            (r"jsonencode\(local\.fcvm_ami_templates\).*", lambda v: 2 + (4 + regions) * template),
+        ]
+        total = 2
+        pairs = re.findall(r"^      ([A-Z][A-Z0-9_]*)\s*=\s*(.+?)\s*$", variables, re.M)
+        for key, value in pairs:
+            if key == "RENDERS_TRACK":
+                # project, two parameter names, an image id, a profile ARN, the flag, one template.
+                total += len(key) + 6 + 2 + 32 + 2 * 64 + 24 + 31 + 128 + 5 + template + 120
+                continue
+            for pattern, bound in bounds:
+                if re.fullmatch(pattern, value):
+                    total += len(key) + 6 + bound(value)
+                    break
+            else:
+                self.fail(f"no size bound for {key} = {value}")
+        self.assertIn("RENDERS_TRACK", dict(pairs))
+        print(f"worst-case dispatcher environment: {total} bytes", file=sys.stderr)
+        self.assertLessEqual(total, 3072, "keep a quarter of Lambda's 4 KB environment free")
+
+    def test_the_renders_project_runs_the_unchanged_buildspec_as_the_renders_track(self):
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        def block(kind, name):
+            return re.search(r'^' + kind + r' "' + name + r'" \{\n.*?^\}', source, re.S | re.M).group()
+        pair, renders = block("resource", "aws_codebuild_project\" \"fcvm_ami"), block("resource", "aws_codebuild_project\" \"fcvm_ami_renders")
+        self.assertIn("name                   = local.fcvm_ami_renders_project", renders)
+        self.assertIn('fcvm_ami_renders_project = "fcvm-fleet-image-factory-renders"', source)
+        self.assertIn("build_timeout          = local.fcvm_ami_renders_minutes", renders)
+        self.assertRegex(source, r"fcvm_ami_renders_minutes = 360\n")
+        self.assertIn("concurrent_build_limit = 1", renders)
+        self.assertIn('buildspec       = file("${path.module}/fcvm-fleet-ami-pipeline/buildspec.yml")', renders)
+        self.assertRegex(renders, r'name  = "FLEET_AMI_TRACK"\s+value = "renders"')
+        self.assertNotIn("FLEET_AMI_TRACK", pair)
+        # Everything else in the environment is the pair's.
+        strip = lambda text: re.sub(r'\s*# The track is.*\n\s*environment_variable \{\s*name  = "FLEET_AMI_TRACK"\s*value = "renders"\s*\}', "", text[text.index("environment {"):])
+        self.assertEqual(strip(renders), pair[pair.index("environment {"):])
+        trust = block("resource", "aws_iam_role\" \"fcvm_ami_codebuild")
+        self.assertIn("[for project in [local.fcvm_ami_project, local.fcvm_ami_renders_project] :", trust)
+        dispatch = block("resource", "aws_iam_role_policy\" \"fcvm_ami_dispatch")
+        self.assertIn('{ Sid = "RendersProject", Effect = "Allow", Action = ["codebuild:StartBuild", "codebuild:ListBuildsForProject", '
+                      '"codebuild:BatchGetBuilds", "codebuild:StopBuild"], Resource = aws_codebuild_project.fcvm_ami_renders.arn }', dispatch)
+        function = block("resource", "aws_lambda_function\" \"fcvm_ami_dispatch")
+        for line in ("enabled           = var.fcvm_ami_renders_track_enabled", "project           = local.fcvm_ami_renders_project",
+                     "release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name",
+                     "failure_parameter = aws_ssm_parameter.fcvm_ami_renders_failure.name",
+                     "canonical_ami     = data.aws_ami.fcvm_ami_canonical_arm64.id", "templates         = local.fcvm_ami_renders_templates"):
+            self.assertIn(line, function)
+        self.assertRegex(block("variable", "fcvm_ami_renders_track_enabled"), r"default\s*=\s*false")
+
+    def test_the_broker_launches_the_renders_type_and_root_only_in_renders_slots(self):
+        source = (SOURCE.parents[1] / "fcvm-fleet-ami-pipeline.tf").read_text()
+        broker = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_broker_fleet" \{\n.*?^\}', source, re.S | re.M).group()
+        statements = {m.group(1): m.group(2) for m in re.finditer(r'Sid = "(\w+)"(.*?)(?=\n    \{|\n  \] \}\))', broker, re.S)}
+        instance, root = statements["RendersInstance"], statements["RendersRoot"]
+        for statement in (instance, root):
+            self.assertIn('"aws:RequestTag/FactorySlot" = local.fcvm_ami_renders_slots', statement)
+            self.assertIn('"aws:RequestTag/Purpose" = local.fcvm_ami_builder_tag', statement)
+        self.assertIn('"ec2:InstanceType" = local.fcvm_ami_renders_type', instance)
+        self.assertIn('"ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_renders_builder.arn', instance)
+        self.assertIn('"ec2:InstanceProfile" = aws_iam_instance_profile.fcvm_ami_builder.arn', statements["FixedInstance"])
+        # The renders builders' role reaches no secret; both builder roles, and only they, may be passed.
+        role = re.search(r'^resource "aws_iam_role_policy" "fcvm_ami_renders_builder_data" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertNotIn('Effect = "Allow", Action = "secretsmanager', role)
+        self.assertIn('"secretsmanager:*"], Resource = "*" }', role)
+        self.assertNotIn("aws_iam_role.fcvm_ami_renders_builder", re.search(
+            r'^resource "aws_secretsmanager_secret_policy" "fcvm_ami_tls" \{\n.*?^\}', source, re.S | re.M).group())
+        both = "[aws_iam_role.fcvm_ami_builder.arn, aws_iam_role.fcvm_ami_renders_builder.arn]"
+        self.assertIn("Resource = " + both, statements["OnlyBuilderProfile"])
+        self.assertIn("NotResource = " + both, statements["NoOtherProfile"])
+        self.assertIn("builder_profile   = aws_iam_instance_profile.fcvm_ami_renders_builder.arn", source)
+        self.assertIn('"ec2:MetadataHttpTokens" = "required"', instance)
+        self.assertIn('NumericLessThanEquals = { "ec2:VolumeSize" = local.fcvm_ami_renders_root }', root)
+        self.assertIn('"ec2:Encrypted" = "true"', root)
+        self.assertRegex(source, r'fcvm_ami_renders_type    = "' + re.escape(mod.RENDERS_TYPES["renders"]) + '"')
+        self.assertRegex(source, r"fcvm_ami_renders_root    = " + str(mod.RENDERS_VOLUMES["renders"]) + r"\n")
+        self.assertIn('fcvm_ami_renders_slots   = ["' + '", "'.join(mod.RENDERS_SLOTS) + '"]', source)
+        # The pair's statements admit neither the renders type nor its root.
+        self.assertIn('"ec2:InstanceType" = ["g4dn.metal", "g4dn.xlarge"]', statements["FixedInstance"])
+        self.assertIn('"ec2:VolumeSize" = 96', statements["FixedRoot"])
+        self.assertIn("image/${data.aws_ami.fcvm_ami_canonical_arm64.id}", statements["CanonicalRendersBase"])
+        self.assertIn('Resource = aws_ssm_parameter.fcvm_ami_renders_release.arn', statements["RendersRelease"])
+        self.assertIn('Resource = aws_ssm_parameter.fcvm_ami_renders_failure.arn', statements["RendersFailureReason"])
+        canonical = re.search(r'^data "aws_ami" "fcvm_ami_canonical_arm64" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('owners      = ["099720109477"]', canonical)
+        self.assertIn('"ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-arm64-server-*"', canonical)
+        offerings = re.search(r'^data "aws_ec2_instance_type_offerings" "fcvm_ami_builder" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('toset(["g4dn.metal", "g4dn.xlarge", local.fcvm_ami_renders_type])', offerings)
+        failure = re.search(r'^resource "aws_ssm_parameter" "fcvm_ami_renders_failure" \{\n.*?^\}', source, re.S | re.M).group()
+        self.assertIn('name        = "/fcvm-fleet/ami-factory-failure-renders"', failure)
+        self.assertIn("provider    = aws.fcvm_fleet_east1", failure)
+
+
 if __name__ == "__main__":
     unittest.main(buffer=True)

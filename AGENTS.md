@@ -1881,6 +1881,8 @@ trusts anything in `fcvm-fleet`, and no peering, shared subnet or resource polic
   role can publish the coordinator image and invoke the scoped release function.
 - **Quotas** (#605, #937): G and VT Spot (L-3819A6DF) reached 480 vCPUs in us-east-1 on 2026-11-21.
   us-west-2 closed at 0 spot (384 on-demand) and us-east-2 was still under review; neither is requested by Terraform now.
+  The image factory's renders builder (one m8gd.metal-24xl at a time) draws on Standard on demand (L-1216C47A) in
+  us-west-2; Terraform asks for 96 vCPUs there (`local.fcvm_fleet_factory_standard_vcpus`) and never lowers a larger value.
 - **fcvm.dev** (`fcvm-dev.tf`, #607): registered 2026-10-22 through Cloudflare Registrar (USD 8.20, auto-renew off), DNSSEC
   on, SSL Full (strict). Staging only, behind Access for the owner, the main-only CI service token and the metal agents' staging token (#1032): `fleet-api-stage.fcvm.dev` (tunnel `fcvm-fleet-coordinator`
   to the coordinator's task, localhost:8080; the connector requires an Access token on every path, `/agent` taking the

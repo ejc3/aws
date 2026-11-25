@@ -214,6 +214,19 @@ class ReleaseContracts(unittest.TestCase):
         self.assertRegex(pointer, r"ignore_changes\s*=\s*\[value\]")
         self.assertRegex(pointer, r"prevent_destroy\s*=\s*true")
 
+    def test_the_renders_pointer_is_its_own_publisher_owned_parameter(self):
+        pointer = block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_renders_release")
+        self.assertIn("provider    = aws.fcvm_fleet_east1", pointer)
+        self.assertIn('name        = "/fcvm-fleet/ami-release-renders"', pointer)
+        for line in ('track        = "renders"', "generation   = 0", "renders_amis = {}", "previous     = null",
+                     'guard_sha256 = filesha256("${path.module}/scripts/cve-2026-98432-mitigation.py")'):
+            self.assertIn(line, pointer)
+        self.assertNotIn("host_amis", pointer)
+        self.assertRegex(pointer, r"ignore_changes\s*=\s*\[value\]")
+        self.assertRegex(pointer, r"prevent_destroy\s*=\s*true")
+        # The pair's pointer has no renders key: a renders publication never writes it.
+        self.assertNotIn("renders", block(self.release, 'resource "aws_ssm_parameter"', "fcvm_ami_release"))
+
     def test_active_catalog_requires_schema_and_reviewed_guard(self):
         data = block(self.release, 'data "aws_ssm_parameter"', "fcvm_ami_release")
         self.assertIn("try(jsondecode(self.value).version, 0) == 1", data)
