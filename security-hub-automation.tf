@@ -139,8 +139,8 @@ locals {
   }) if contains(["guardduty-protection-plans-off-by-design", "inspector-ecr-lambda-code-off-by-design", "config-custom-recorder-role-by-design"], r.name)]
 
   # The Dolphin account (dolphin-security.tf, the same modules/security-region): Inspector's ECR and Lambda code scanning,
-  # plus ECS.2 on exactly its Redis service, which takes a public IP only to egress (its group allows no inbound and the
-  # account has no NAT; dolphin-aws redis.tf), and Config.1, which fails by design on the recorder's own role. A rule cannot
+  # plus ECS.2 on exactly its Redis and rundown-collector services, which take a public IP only to egress (their groups
+  # allow no inbound, they sit behind no load balancer, and the account has no NAT; dolphin-aws), and Config.1, which fails by design on the recorder's own role. A rule cannot
   # match the finding's status reason, so that one would also hide a stopped or deleted recorder: Dolphin has no
   # security-forward-audit path, so the alarm in its own account (dolphin_config_recorder, dolphin-security.tf) raises
   # that instead. EC2.9 on the podcast speech-to-text workers (dolphin-aws podcasts.tf): AWS Batch GPU instances that,
@@ -162,12 +162,15 @@ locals {
     {
       name                = "dolphin-redis-public-ip-by-design"
       order               = 9
-      description         = "ECS.2 on the Dolphin Redis service only: it takes a public IP to egress (no NAT in the account) and its security group allows no inbound (dolphin-aws redis.tf). Any other service still alerts."
-      note                = "Dolphin Redis: public IP for egress only, no inbound rule (dolphin-aws redis.tf). security-hub-automation.tf"
+      description         = "ECS.2 on the Dolphin Redis and rundown-collector services only: each takes a public IP to egress (no NAT in the account), sits behind no load balancer, and its security group allows no inbound (dolphin-aws). Any other service still alerts."
+      note                = "Dolphin Redis and rundown-collector: public IP for egress only, no inbound rule, no load balancer (dolphin-aws). security-hub-automation.tf"
       controls            = ["ECS.2"]
       resource_comparison = "EQUALS"
-      resource_ids        = ["arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/redis"]
-      resource_tags       = []
+      resource_ids = [
+        "arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/redis",
+        "arn:aws:ecs:us-west-1:${data.aws_caller_identity.dolphin.account_id}:service/dolphin/rundown-collector",
+      ]
+      resource_tags = []
     },
     {
       name                = "dolphin-config-custom-recorder-role-by-design"
