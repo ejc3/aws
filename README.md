@@ -2257,12 +2257,13 @@ ends with `launched box=N ... id=i-...` (with ` failed=<reason>` and exit 1 when
 so scripts carry that id and use `pbox ip|ssh|down N --instance i-...`, which refuse when the slot holds another instance;
 they never re-resolve a slot by name. `pbox down` requires the id (#1077): `pbox down N` alone prints what the slot holds
 (instance, launch time, `PboxLaunchedBy`, owner, lease) and terminates nothing, because on 2026-11-25 another session's
-`pbox down N` ended a leased, busy box. `down` also refuses a box whose lease has not ended unless `--force`.
+`pbox down N` ended a leased, busy box. `down` also refuses a leased box whose lease has not ended unless `--force`, except for the box's own owner naming the instance.
 
 Every owner's launch is tagged `PboxOwner`: `--owner TOKEN`, else `PBOX_OWNER`, else the host plus this Claude session
 (`CLAUDE_CODE_SESSION_ID`). `ip`, `ssh`, `down`, and an `up` that finds the slot running, refuse a box another token owns
 unless `--force-other-owner`, so one session's command cannot end, reuse or attach to another's box. A box from before
-the tag is anyone's. To share boxes across sessions (a watcher in another process), set the same `PBOX_OWNER` in each.
+the tag is anyone's. To share boxes across sessions (a watcher in another process), set the same `PBOX_OWNER` in each. A caller with no `CLAUDE_CODE_SESSION_ID` (cron, systemd, Codex, a plain shell) gets the host name as its owner, so it
+should set `PBOX_OWNER` to share boxes with a session.
 `pbox status` shows the owner beside the lease. A member's box carries no owner tag and a member's `pbox down` needs no id.
 
 Use only `pbox` (or `scripts/parallel-box.sh`, which is the same script) for this

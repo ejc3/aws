@@ -283,6 +283,8 @@ ONDEMAND=""
 LEASE=""
 INSTANCE=""
 FORCE=""
+FORCE_OTHER_OWNER="" # not read from the environment: an inherited value would turn every owner check off
+OWNER_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
@@ -413,12 +415,10 @@ if [ -n "$LEASE" ]; then
 fi
 LEASE_UNTIL="" # the lease's end in epoch seconds, set just before each launch attempt (start_lease)
 start_lease() { [ -z "$LEASE_SECS" ] || LEASE_UNTIL=$(( $(date +%s) + LEASE_SECS )); }
-# lease_line LAUNCH_TIME UNTIL: the lease as status prints it ("until HH:MM UTC (Xh Ym left)" or "ended"), capped at
-# LaunchTime + LEASE_MAX_HOURS as the watchdog caps it; nothing for no lease or an unparseable tag.
-# lease_end EPOCH: "HH:MM UTC (Ym left)" for a lease still running, "ended" for one past, "none" without one.
 # down_id_hint: " --instance ID" for the owner's box whose id is known here (ID), since down needs it; nothing for a member.
 down_id_hint() { [ -n "$MEMBER" ] || [ -z "${ID:-}" ] || printf ' --instance %s' "$ID"; }
 
+# lease_end EPOCH: "HH:MM UTC (Ym left)" for a lease still running, "ended" for one past, "none" without one.
 lease_end() {
   [[ "${1:-}" =~ ^[0-9]+$ ]] || { echo none; return; }
   local left=$(( $1 - $(date +%s) ))
@@ -426,6 +426,8 @@ lease_end() {
   echo "$(date -u -d "@$1" +%H:%M) UTC ($(( left / 60 ))m left)"
 }
 
+# lease_line LAUNCH_TIME UNTIL: the lease as status prints it ("until HH:MM UTC (Xh Ym left)" or "ended"), capped at
+# LaunchTime + LEASE_MAX_HOURS as the watchdog caps it; nothing for no lease or an unparseable tag.
 lease_line() {
   local launch until now left
   [[ "${2:-}" =~ ^[0-9]{1,12}$ ]] || return 0
@@ -697,7 +699,8 @@ check_owner() {
   IFS=$'\t' read -r owner _ <<< "$tags"
   if [ -n "$owner" ] && [ "$owner" != "None" ] && [ "$owner" != "$PBOX_OWNER" ]; then
     say "refusing: $NAME ($1) belongs to $owner, not to $PBOX_OWNER (PBOX_OWNER / --owner); nothing was done."
-    say "  It is probably another session's work. If it really is yours: $SELF $CMD ${BOX:-} ... --force-other-owner"
+    say "  It is another session's box. See which slots are free with '$SELF status' and use one of those."
+    say "  Only if you are taking over that box on purpose: add --force-other-owner"
     exit 1
   fi
 }
@@ -1215,7 +1218,7 @@ attach_work() {
   if aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" >/dev/null 2>&1; then
     say "Terminated $id; nothing was changed on the volume."
   else
-    say "Could not terminate $id either: run $SELF down"
+    say "Could not terminate $id either: run $SELF down ${BOX:-} --instance $id"
   fi
   return 1
 }
@@ -1580,7 +1583,11 @@ case "$CMD" in
       IFS=$'\t' read -r OWN LEASE_AT BY LT_AT <<< "$(instance_tags "$ID")"
       say "refusing: '$SELF down' needs the instance id; nothing was terminated. $NAME holds:"
       say "  instance: $ID   launched: ${LT_AT:-?}   by: ${BY:-?}   owner: ${OWN:-?}   lease: $(lease_end "${LEASE_AT:-}")"
-      say "  If it is yours: $SELF down ${BOX:-} --instance $ID"
+      if [[ "${LEASE_AT:-}" =~ ^[0-9]+$ ]] && [ "$LEASE_AT" -gt "$(date +%s)" ] && { [ -z "${OWN:-}" ] || [ "$OWN" = None ] || [ "$OWN" != "$PBOX_OWNER" ]; }; then
+        say "  If it is yours: $SELF down ${BOX:-} --instance $ID --force   (its lease has not ended)"
+      else
+        say "  If it is yours: $SELF down ${BOX:-} --instance $ID"
+      fi
       exit 1
     fi
     check_instance
@@ -1591,14 +1598,17 @@ case "$CMD" in
       exit 0
     fi
     check_owner "$ID"
-    # A lease (pbox up --lease) is a promise that the box is in use until then: refused unless --force. Fails closed.
+    # A lease (pbox up --lease) is a promise that the box is in use until then. Its own owner, naming the instance, may end
+    # it early (a session's cleanup must not leave a leased box billing); a box with no owner tag, or another owner's taken
+    # over with --force-other-owner, is refused unless --force. Fails closed.
     if [ -z "$MEMBER" ] && [ -z "$FORCE" ]; then
       if ! TAGS_NOW="$(instance_tags "$ID")" || [ -z "$TAGS_NOW" ]; then
         say "refusing: could not read $NAME's lease ($ID); nothing was done. To end it anyway: add --force"
         exit 1
       fi
-      IFS=$'\t' read -r _ LEASE_AT _ <<< "$TAGS_NOW"
-      if [[ "${LEASE_AT:-}" =~ ^[0-9]+$ ]] && [ "$LEASE_AT" -gt "$(date +%s)" ]; then
+      IFS=$'\t' read -r OWN LEASE_AT _ <<< "$TAGS_NOW"
+      if [[ "${LEASE_AT:-}" =~ ^[0-9]+$ ]] && [ "$LEASE_AT" -gt "$(date +%s)" ] \
+         && { [ -z "${OWN:-}" ] || [ "$OWN" = None ] || [ "$OWN" != "$PBOX_OWNER" ]; }; then
         say "refusing: $NAME ($ID) is leased until $(lease_end "$LEASE_AT"); nothing was done. To end it anyway: add --force"
         exit 1
       fi

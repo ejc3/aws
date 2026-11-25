@@ -252,21 +252,55 @@ class InstanceScoped(unittest.TestCase):
         self.assertIn("--force-other-owner only applies to up, ip, ssh and down", err)
 
     # ---------------------------------------------------------------------------------------------- leases
-    def test_down_refuses_a_running_lease_unless_forced(self):
+    def test_its_own_owner_ends_a_leased_box_early_others_need_force(self):
+        # A session's own cleanup (`down --instance $ID`) must not leave a leased box billing (#1080 review).
         rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
                                FAKE_OWNER="job-a", FAKE_LEASE_UNTIL="4102444800")
-        self.assertEqual(rc, 1, err)
-        self.assertIn("is leased until", err)
-        self.assertIn("add --force", err)
-        self.assertEqual(self.calls("terminate-instances"), [])
-        for env, extra in (({"FAKE_LEASE_UNTIL": "4102444800"}, ("--force",)), ({"FAKE_LEASE_UNTIL": "1600000000"}, ())):
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.calls("terminate-instances")), 1)
+        for env, extra in (({}, ()),  # an untagged box from before the owner tag
+                           ({"FAKE_OWNER": "job-b"}, ("--force-other-owner",))):  # taking over another owner's box
             with self.subTest(env=env, extra=extra):
                 if self.log.exists():
                     self.log.unlink()
                 rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", *extra,
-                                       current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a", **env)
+                                       current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800", **env)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("is leased until", err)
+                self.assertIn("add --force", err)
+                self.assertEqual(self.calls("terminate-instances"), [])
+                rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", "--force", *extra,
+                                       current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800", **env)
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(len(self.calls("terminate-instances")), 1)
+        # An ended lease is no lease.
+        if self.log.exists():
+            self.log.unlink()
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_LEASE_UNTIL="1600000000")
+        self.assertEqual(rc, 0, err)
+
+    def test_the_no_id_hint_prints_the_command_that_works(self):
+        _, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800")
+        self.assertIn("down 3 --instance i-0bbbbbbbbbbbbbbbb --force", err)  # untagged and leased: --force is needed
+        _, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a", FAKE_LEASE_UNTIL="4102444800")
+        self.assertIn("down 3 --instance i-0bbbbbbbbbbbbbbbb\n", err)  # its own owner's lease does not need it
+
+    def test_an_inherited_force_other_owner_does_nothing(self):
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_OWNER="job-b", FORCE_OTHER_OWNER="1")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("belongs to job-b", err)
+        self.assertEqual(self.calls("terminate-instances"), [])
+        rc, out, err = self.pbox("status", "3", current="i-0bbbbbbbbbbbbbbbb", FORCE_OTHER_OWNER="1", OWNER_ARG="x")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("parallel-box 3:", out)
+
+    def test_refusals_point_to_status_first_and_attach_failure_names_the_id(self):
+        _, _, err = self.pbox("up", "3", "compute-192", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-b")
+        self.assertLess(err.index("status"), err.index("--force-other-owner"))
+        self.assertIn("Only if you are taking over that box on purpose", err)
+        self.assertIn('say "Could not terminate $id either: run $SELF down ${BOX:-} --instance $id"', SCRIPT.read_text())
 
     def test_status_shows_the_owner(self):
         rc, out, _ = self.pbox("status", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a")
