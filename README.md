@@ -616,7 +616,8 @@ on-demand quota in us-west-2 (96 vCPUs, `fcvm-fleet-account.tf`). `fcvm_ami_rend
 keeps the track off until ejc3/fcvm's executor has it on main: an older executor ignores the track
 and the broker refuses its first launch. With it off these exist and do nothing: the renders
 project, the renders builders' role and profile, `/fcvm-fleet/ami-release-renders` (empty), the
-renders failure record, the broker and dispatcher grants for the track, and the quota request.
+renders failure record, the broker, dispatcher and publisher grants for the track, the renders
+success rule (the publisher refuses a renders build while the flag is off), and the quota request.
 A successful renders build reaches the publisher through a rule of its own. The publisher checks
 its journal, its two terminated m8gd.metal-24xl builders and its manifest (`"track": "renders"`,
 one arm64 image, the build record and every boot proof), copies its store to

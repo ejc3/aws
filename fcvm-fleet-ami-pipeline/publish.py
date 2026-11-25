@@ -193,7 +193,12 @@ class Publisher:
         # COMPUTE_REGION; a candidate built elsewhere is copied there before it is promoted.
         self.build_region = self.env["BUILD_REGION"]
         need(COPY_REGION.fullmatch(self.build_region), "image build region is outside its fixed scope")
-        self.renders = self.renders_config(self.env.get("RENDERS_JSON"))
+        try:
+            self.renders = self.renders_config(self.env.get("RENDERS_JSON"))
+        except (Refused, ValueError, TypeError) as error:
+            # A bad renders configuration turns the renders publication off; the pair's runs as without it.
+            self.renders = None
+            print(json.dumps({"renders_track_error": "configuration", "message": str(error) if isinstance(error, Refused) else type(error).__name__}))
         self.build_id = None
         self.lock_info = None
         self.transaction = None
@@ -201,12 +206,16 @@ class Publisher:
         self.recovery_failed = False
 
     def renders_config(self, raw):
-        """The renders track: its project, its pointer and its templates (none until the renders host
-        class exists), each in the compute region. Absent, the publisher has no renders track."""
+        """The renders track: whether it is on, its project, its builders' instance profile, its pointer and
+        its templates (none until the renders host class exists), each in the compute region. Absent, the
+        publisher has no renders track."""
         if not raw:
             return None
         value = json.loads(raw)
-        need(isinstance(value, dict) and set(value) == {"project", "release_parameter", "templates"}
+        need(isinstance(value, dict) and set(value) == {"enabled", "project", "builder_profile", "release_parameter", "templates"}
+             and type(value["enabled"]) is bool
+             and isinstance(value["builder_profile"], str) and value["builder_profile"].startswith("arn:aws:iam::")
+             and value["builder_profile"] != self.env["BUILDER_PROFILE"]
              and isinstance(value["project"], str) and re.fullmatch(r"[A-Za-z0-9_-]{1,100}", value["project"])
              and value["project"] != self.env["PROJECT_NAME"]
              and isinstance(value["release_parameter"], str) and value["release_parameter"].startswith("/")
@@ -2028,9 +2037,11 @@ class Publisher:
         regions = sorted({self.env["COMPUTE_REGION"], self.build_region, *self.copy_regions})
         return self.remove_unneeded(keep, regions, self.retirable)
 
-    def remove_unneeded(self, keep, regions, retirable):
+    def remove_unneeded(self, keep, regions, retirable, sweep=True):
         """Deregister the images `retirable` admits in `regions` that nothing in `keep` (or an instance, an
-        open Spot request or a copy link to a kept image) needs, at most RETAIN_LIMIT per region and run."""
+        open Spot request or a copy link to a kept image) needs, at most RETAIN_LIMIT per region and run.
+        `sweep` also deletes snapshots an earlier run marked FleetRetired and could not delete; a mark does
+        not say which track made it, so only the pair's run sweeps, as it did before the renders track."""
         listed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
@@ -2059,7 +2070,7 @@ class Publisher:
         removed = {}
         for region in regions:
             ec2 = self.client("ec2", True, region)
-            for snapshot in self.copy_snapshots(ec2):
+            for snapshot in (self.copy_snapshots(ec2) if sweep else []):
                 self.delete_retired_snapshot(ec2, snapshot)
             stale = sorted((image for image in listed[region] if retirable(image, region) and image["ImageId"] not in keep),
                            key=lambda image: image["ImageId"])
@@ -2257,7 +2268,7 @@ class Publisher:
                 need(reservation.get("OwnerId") == self.env["FLEET_ACCOUNT"] and item["State"]["Name"] == "terminated"
                      and item.get("InstanceType") == RENDERS_TYPE and tags.get("Purpose") == "fcvm-fleet-ami-builder"
                      and tags.get("FactoryBuild") == digest(self.build_id) and tags.get("FactorySlot") == slots[instance_id]
-                     and ("IamInstanceProfile" not in item or item["IamInstanceProfile"].get("Arn") == self.env["BUILDER_PROFILE"]),
+                     and ("IamInstanceProfile" not in item or item["IamInstanceProfile"].get("Arn") == self.renders["builder_profile"]),
                      "instance metadata contradicts its recorded termination")
         response = self.client("s3").get_object(Bucket=self.env["PIPELINE_BUCKET"], Key="runs/" + digest(self.build_id) + "/manifest.json")
         raw = response["Body"].read(32769)
@@ -2442,7 +2453,7 @@ class Publisher:
                 keep.update(arches.values())
         keep.update(self.current(template["id"], template["region"])["LaunchTemplateData"].get("ImageId")
                     for template in self.renders["templates"])
-        return self.remove_unneeded(keep, sorted({self.env["COMPUTE_REGION"], self.build_region}), self.retirable_renders)
+        return self.remove_unneeded(keep, sorted({self.env["COMPUTE_REGION"], self.build_region}), self.retirable_renders, sweep=False)
 
     def finish_renders(self, result, source, input_sha):
         name, request = self.renders_request(source, input_sha)
@@ -2460,6 +2471,7 @@ class Publisher:
 
     def run_renders(self, event):
         """Publish a successful renders build: its own proof, store, copy, pointer and template."""
+        need(self.renders["enabled"], "the renders track is off (fcvm_ami_renders_track_enabled)")
         build, source, input_sha = self.event(event, self.renders["project"])
         pointer = self.renders["release_parameter"]
         active = self.load(pointer, True)

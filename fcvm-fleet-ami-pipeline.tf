@@ -434,7 +434,9 @@ data "archive_file" "fcvm_ami_publish" {
       PROD_RELEASE_PARAMETER = local.fcvm_prod_ami_release_parameter
       # The renders track's publication (publish.py run_renders): its project, its pointer and its templates.
       RENDERS_JSON = jsonencode({
+        enabled           = var.fcvm_ami_renders_track_enabled
         project           = local.fcvm_ami_renders_project
+        builder_profile   = aws_iam_instance_profile.fcvm_ami_renders_builder.arn
         release_parameter = aws_ssm_parameter.fcvm_ami_renders_release.name
         templates         = local.fcvm_ami_renders_templates
       })
