@@ -2,9 +2,10 @@
 """pbox acts on the instance a caller launched, not on whatever holds the slot now (ejc3/aws#621).
 
 `up`'s machine-readable last line carries `id=i-...`, also when the box was launched but did not come up (`failed=...`).
-`ip`, `ssh` and `down` take `--instance i-...` and refuse when the slot holds another instance. The owner's launches
-tag the box `PboxLaunchedBy`, and `down` without `--instance` refuses a box another caller launched in the last hour
-unless `--force`. Offline: the real scripts/parallel-box.sh against a fake `aws`, `ssh` and `sleep`."""
+`ip`, `ssh` and `down` take `--instance i-...` and refuse when the slot holds another instance. #1077: `down` requires
+the id (alone it only reports what the slot holds), refuses a box with a lease still running unless `--force`, and the
+owner's launches tag the box `PboxOwner`: `ip`, `ssh`, `down` and an attaching `up` refuse another owner's box unless
+`--force-other-owner`. Offline: the real scripts/parallel-box.sh against a fake `aws`, `ssh` and `sleep`."""
 import json
 import os
 import stat
@@ -17,8 +18,8 @@ ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = Path(os.environ.get("PBOX_SCRIPT", ROOT / "scripts" / "parallel-box.sh"))
 POINTER = {"region": "us-east-2", "x86_image": "ami-x86-home", "fallback": {"template": "parallel-box-fallback", "regions": {}}}
 
-# The slot's current instance is $FAKE_STATE ("<instance id>"), launched by $FAKE_BY at $FAKE_LT. A launch writes
-# i-0new there. Every call is appended to $FAKE_LOG.
+# The slot's current instance is $FAKE_STATE ("<instance id>"), launched by $FAKE_BY at $FAKE_LT, owned by $FAKE_OWNER,
+# leased until $FAKE_LEASE_UNTIL (epoch). A launch writes i-0new there. Every call is appended to $FAKE_LOG.
 FAKE_AWS = r'''#!/usr/bin/env python3
 import json, os, sys
 args = sys.argv[1:]
@@ -33,6 +34,12 @@ if "get-parameter" in a:
     print(os.environ["FAKE_POINTER"])
 elif "describe-launch-template-versions" in a:
     print("spot")
+elif "describe-instances" in a and "--instance-ids" in a and "PboxOwner" in a:
+    if os.environ.get("FAKE_TAGS_FAIL"):
+        sys.exit(255)
+    print("\t".join(os.environ.get(k) or "None" for k in ("FAKE_OWNER", "FAKE_LEASE_UNTIL", "FAKE_BY", "FAKE_LT")))
+elif "describe-instances" in a and "PboxOwner" in a:
+    print(os.environ.get("FAKE_OWNER") or "None")  # status, by the slot's name
 elif "describe-instances" in a and "--instance-ids" in a and "PboxLaunchedBy" in a:
     if os.environ.get("FAKE_BY_FAIL"):
         sys.exit(255)
@@ -88,7 +95,8 @@ class InstanceScoped(unittest.TestCase):
         if current is not None:
             (self.tmp / "state").write_text(current)
         env = dict(os.environ, PATH=f"{self.tmp}:{os.environ['PATH']}", HOME=str(self.tmp), FAKE_LOG=str(self.log),
-                   FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER), PBOX_CALLER="job-a")
+                   FAKE_STATE=str(self.tmp / "state"), FAKE_POINTER=json.dumps(POINTER), PBOX_CALLER="job-a",
+                   PBOX_OWNER="job-a")
         env.update(extra)
         env.pop("PARALLEL_BOX_REGION", None)
         env.setdefault("MEMBER_BOX_USER", "example-owner")
@@ -166,64 +174,152 @@ class InstanceScoped(unittest.TestCase):
         self.assertEqual(self.calls("run-instances"), [])
 
     # ---------------------------------------------------------------------------------------------- who launched it
-    def test_launches_tag_the_launcher(self):
+    def test_launches_tag_the_launcher_and_the_owner(self):
         self.pbox("up", "3", "compute-192")
         run = self.calls("run-instances")[0]
         spec = [s for s in run if s.startswith("ResourceType=instance,")][0]
-        self.assertIn("{Key=PboxLaunchedBy,Value=job-a}", spec)
+        self.assertIn("{Key=PboxLaunchedBy,Value=job-a},{Key=PboxOwner,Value=job-a}", spec)
         src = SCRIPT.read_text()
-        self.assertIn('{Key=DevEBS,Value=true},{Key=PboxLaunchedBy,Value=$PBOX_CALLER}$LEASE_TAG]', src)  # fallback
-        self.assertIn('if [ -z "$MEMBER" ]; then\n        EXTRA_TAGS="{Key=PboxLaunchedBy,Value=$PBOX_CALLER}"', src)  # not members
+        self.assertIn('{Key=PboxLaunchedBy,Value=$PBOX_CALLER},{Key=PboxOwner,Value=$PBOX_OWNER}$LEASE_TAG]', src)  # fallback
+        self.assertIn('if [ -z "$MEMBER" ]; then\n        EXTRA_TAGS="{Key=PboxLaunchedBy,Value=$PBOX_CALLER},'
+                      '{Key=PboxOwner,Value=$PBOX_OWNER}"', src)  # not members: their grant pins the tag keys
 
-    def test_down_refuses_a_young_box_another_caller_launched(self):
-        rc, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_BY="job-b", FAKE_LT="2099-01-01T00:00:00+00:00")
+    def test_the_owner_defaults_to_the_host_and_the_claude_session_and_takes_overrides(self):
+        for env, args, want in (({"PBOX_OWNER": "", "CLAUDE_CODE_SESSION_ID": "abcdef0123456789"}, (), "job-a/abcdef01"),
+                                ({"PBOX_OWNER": "", "CLAUDE_CODE_SESSION_ID": ""}, (), "job-a"),
+                                ({"PBOX_OWNER": "team x"}, (), "team_x"),
+                                ({"PBOX_OWNER": "team-x"}, ("--owner", "mine"), "mine")):
+            with self.subTest(env=env, args=args):
+                if self.log.exists():
+                    self.log.unlink()
+                (self.tmp / "state").write_text("")
+                self.pbox("up", "3", "compute-192", *args, **env)
+                spec = [s for s in self.calls("run-instances")[0] if s.startswith("ResourceType=instance,")][0]
+                self.assertIn("{Key=PboxOwner,Value=%s}" % want, spec)
+
+    # ---------------------------------------------------------------------------------------------- down needs the id
+    def test_down_without_the_id_reports_the_slot_and_terminates_nothing(self):
+        rc, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_BY="fcvm-arm", FAKE_OWNER="job-b",
+                               FAKE_LT="2026-11-25T20:39:19+00:00", FAKE_LEASE_UNTIL="4102444800")
         self.assertEqual(rc, 1, err)
-        self.assertIn("launched", err)
-        self.assertIn("by job-b, not by job-a", err)
+        self.assertIn("needs the instance id; nothing was terminated", err)
+        self.assertIn("instance: i-0bbbbbbbbbbbbbbbb   launched: 2026-11-25T20:39:19+00:00   by: fcvm-arm   owner: job-b", err)
+        self.assertIn("UTC (", err)  # the lease end
         self.assertIn("--instance i-0bbbbbbbbbbbbbbbb", err)
+        for extra in (("--force",), ("--force-other-owner",), ("--force", "--force-other-owner")):
+            with self.subTest(extra=extra):
+                rc, _, err = self.pbox("down", "3", *extra, current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a")
+                self.assertEqual(rc, 1, err)  # neither force stands in for the id
         self.assertEqual(self.calls("terminate-instances"), [])
 
-    def test_down_goes_ahead_with_force_for_its_own_or_for_an_old_box(self):
-        cases = (
-            ({"FAKE_BY": "job-b", "FAKE_LT": "2099-01-01T00:00:00+00:00"}, ("--force",)),
-            ({"FAKE_BY": "job-a", "FAKE_LT": "2099-01-01T00:00:00+00:00"}, ()),
-            ({"FAKE_BY": "job-b", "FAKE_LT": "2020-01-01T00:00:00+00:00"}, ()),
-            ({"FAKE_BY": "None"}, ()),
-        )
-        for env, extra in cases:
+    def test_down_of_an_empty_slot_is_already_down(self):
+        rc, _, err = self.pbox("down", "3", current="")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("already down", err)
+
+    # ---------------------------------------------------------------------------------------------- whose box
+    def test_ip_ssh_down_and_up_refuse_another_owners_box(self):
+        for args in (("ip", "3", "--instance", "i-0bbbbbbbbbbbbbbbb"), ("ssh", "3", "--instance", "i-0bbbbbbbbbbbbbbbb"),
+                     ("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb"), ("ip", "3"), ("up", "3", "compute-192")):
+            with self.subTest(args=args):
+                rc, out, err = self.pbox(*args, current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-b")
+                self.assertEqual(rc, 1, err)
+                self.assertIn("belongs to job-b, not to job-a", err)
+                self.assertEqual(out, "")
+        self.assertEqual(self.calls("terminate-instances"), [])
+        self.assertEqual([c for c in self.calls("attach-volume")], [])
+
+    def test_force_other_owner_and_an_untagged_box_go_ahead(self):
+        for env, extra in (({"FAKE_OWNER": "job-b"}, ("--force-other-owner",)), ({"FAKE_OWNER": "job-a"}, ()), ({}, ())):
             with self.subTest(env=env, extra=extra):
                 if self.log.exists():
                     self.log.unlink()
-                rc, _, err = self.pbox("down", "3", *extra, current="i-0bbbbbbbbbbbbbbbb", **env)
+                rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", *extra,
+                                       current="i-0bbbbbbbbbbbbbbbb", **env)
                 self.assertEqual(rc, 0, err)
                 self.assertEqual(len(self.calls("terminate-instances")), 1)
+        rc, out, err = self.pbox("ip", "3", "--force-other-owner", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-b")
+        self.assertEqual((rc, out.strip()), (0, "203.0.113.9"), err)
 
-    def test_down_fails_closed_when_the_launcher_cannot_be_read(self):
-        cases = (
-            ({"FAKE_BY_FAIL": "1"}, "could not read who launched"),
-            ({"FAKE_BY": "job-b", "FAKE_LT": "not-a-time"}, "unreadable launch time"),
-            ({"FAKE_BY": "job-b", "FAKE_LT": ""}, "unreadable launch time"),  # `date -d ""` is today's midnight
-            ({"FAKE_BY": "job-b", "FAKE_LT": "None"}, "unreadable launch time"),
-        )
-        for env, msg in cases:
-            with self.subTest(env=env):
-                rc, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", **env)
-                self.assertEqual(rc, 1, err)
-                self.assertIn(msg, err)
-                self.assertIn("--instance i-0bbbbbbbbbbbbbbbb", err)
+    def test_an_unreadable_owner_refuses(self):
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_TAGS_FAIL="1")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("could not read who owns", err)
         self.assertEqual(self.calls("terminate-instances"), [])
+        rc, _, err = self.pbox("status", "3", "--force-other-owner")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("--force-other-owner only applies to up, ip, ssh and down", err)
 
-    def test_a_members_down_skips_the_launcher_check(self):
-        # A member's box carries no PboxLaunchedBy (their grant pins the tag keys) and is only ever theirs; the
-        # members' own test only fails on this before 01:00 UTC, so pin the condition here.
-        self.assertIn('if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ] && [ -z "$FORCE" ]; then', SCRIPT.read_text())
+    # ---------------------------------------------------------------------------------------------- leases
+    def test_its_own_owner_ends_a_leased_box_early_others_need_force(self):
+        # A session's own cleanup (`down --instance $ID`) must not leave a leased box billing (#1080 review).
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_OWNER="job-a", FAKE_LEASE_UNTIL="4102444800")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len(self.calls("terminate-instances")), 1)
+        for env, extra in (({}, ()),  # an untagged box from before the owner tag
+                           ({"FAKE_OWNER": "job-b"}, ("--force-other-owner",))):  # taking over another owner's box
+            with self.subTest(env=env, extra=extra):
+                if self.log.exists():
+                    self.log.unlink()
+                rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", *extra,
+                                       current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800", **env)
+                self.assertEqual(rc, 1, err)
+                self.assertIn("is leased until", err)
+                self.assertIn("add --force", err)
+                self.assertEqual(self.calls("terminate-instances"), [])
+                rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", "--force", *extra,
+                                       current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800", **env)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(len(self.calls("terminate-instances")), 1)
+        # An ended lease is no lease.
+        if self.log.exists():
+            self.log.unlink()
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_LEASE_UNTIL="1600000000")
+        self.assertEqual(rc, 0, err)
+
+    def test_the_no_id_hint_prints_the_command_that_works(self):
+        _, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_LEASE_UNTIL="4102444800")
+        self.assertIn("down 3 --instance i-0bbbbbbbbbbbbbbbb --force", err)  # untagged and leased: --force is needed
+        _, _, err = self.pbox("down", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a", FAKE_LEASE_UNTIL="4102444800")
+        self.assertIn("down 3 --instance i-0bbbbbbbbbbbbbbbb\n", err)  # its own owner's lease does not need it
+
+    def test_an_inherited_force_other_owner_does_nothing(self):
+        rc, _, err = self.pbox("down", "3", "--instance", "i-0bbbbbbbbbbbbbbbb", current="i-0bbbbbbbbbbbbbbbb",
+                               FAKE_OWNER="job-b", FORCE_OTHER_OWNER="1")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("belongs to job-b", err)
+        self.assertEqual(self.calls("terminate-instances"), [])
+        rc, out, err = self.pbox("status", "3", current="i-0bbbbbbbbbbbbbbbb", FORCE_OTHER_OWNER="1", OWNER_ARG="x")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("parallel-box 3:", out)
+
+    def test_refusals_point_to_status_first_and_attach_failure_names_the_id(self):
+        _, _, err = self.pbox("up", "3", "compute-192", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-b")
+        self.assertLess(err.index("status"), err.index("--force-other-owner"))
+        self.assertIn("Only if you are taking over that box on purpose", err)
+        self.assertIn('say "Could not terminate $id either: run $SELF down ${BOX:-} --instance $id"', SCRIPT.read_text())
+
+    def test_status_shows_the_owner(self):
+        rc, out, _ = self.pbox("status", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-a")
+        self.assertIn("  owner:  job-a (you)", out)
+        rc, out, _ = self.pbox("status", "3", current="i-0bbbbbbbbbbbbbbbb", FAKE_OWNER="job-b")
+        self.assertIn("  owner:  job-b\n", out)
+
+    def test_a_members_down_needs_no_id(self):
+        # A member's box carries no owner tag (their grant pins the tag keys) and is only ever theirs.
+        src = SCRIPT.read_text()
+        self.assertIn('if [ -z "$MEMBER" ] && [ -z "$INSTANCE" ]; then', src)
+        self.assertIn('[ -n "${1:-}" ] && [ -z "$MEMBER" ] && [ -z "${FORCE_OTHER_OWNER:-}" ] || return 0', src)
 
     def test_a_caller_name_with_a_space_is_one_field(self):
         # The tag is read back tab-separated, so a space in it must not split the launcher from the launch time.
         self.pbox("up", "3", "compute-192", PBOX_CALLER="job a")
         spec = [s for s in self.calls("run-instances")[0] if s.startswith("ResourceType=instance,")][0]
         self.assertIn("{Key=PboxLaunchedBy,Value=job_a}", spec)
-        self.assertIn("IFS=$'\\t' read -r BY LT_AT", SCRIPT.read_text())
+        self.assertIn("IFS=$'\\t' read -r OWN LEASE_AT BY LT_AT", SCRIPT.read_text())
 
     def test_docs_say_to_carry_the_id(self):
         for f in ("AGENTS.md", "README.md"):

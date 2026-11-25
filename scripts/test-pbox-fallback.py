@@ -89,7 +89,7 @@ elif "describe-launch-template-versions" in a:
 elif "describe-instances" in a and "PublicIpAddress" in a:
     print("203.0.113.9" if here else "None")
 elif "describe-instances" in a and "InstanceId" in a:
-    print("i-0fallback" if here else "None")
+    print("i-0fa11bac4" if here else "None")
 elif "describe-instances" in a and "AvailabilityZone" in a:
     print(state[1] if here else "None")
 elif "describe-instances" in a and "Fallback" in a:
@@ -331,7 +331,7 @@ class FallbackScript(unittest.TestCase):
         _, out, _ = self.pbox("status", "4", launched="us-west-2 us-west-2b")
         self.assertIn("RUNNING at 203.0.113.9", out)
         self.assertIn("FALLBACK site us-west-2b", out)
-        rc, _, err = self.pbox("down", "4", launched="us-west-2 us-west-2b")
+        rc, _, err = self.pbox("down", "4", "--instance", "i-0fa11bac4", launched="us-west-2 us-west-2b")
         self.assertEqual(rc, 0)
         term = self.calls("terminate-instances")
         self.assertEqual(term[0][term[0].index("--region") + 1], "us-west-2")
