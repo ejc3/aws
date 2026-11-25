@@ -297,8 +297,8 @@ it is suppressed while GitHub is unreachable, where `online` is 0 by constructio
 
 The cleanup poll (every 5 minutes) publishes the fleet itself: `GitHubRunners/LiveRunners`
 (running `Role=github-runner` hosts) and `OldestRunnerAgeMinutes`. `too-many-runners` fires
-above 12 (both architecture pools' caps, `sum(values(local.runner_max_by_arch))`) for 30 minutes, `runner-long-running` when a host passes 2 hours (warm reuse can
-legitimately reach that on a heavy day), and `runner-cleanup-silent` when no count arrives for
+above 12 (both architecture pools' caps, `sum(values(local.runner_max_by_arch))`) for 30 minutes, `runner-long-running` when a host outlives the age ceiling (12 hours plus the
+90-minute drain, and four polls: 830 minutes), which means the cleanup is not ending it, and `runner-cleanup-silent` when no count arrives for
 15 minutes, because then nothing is enforcing leases or age ceilings. These replace alarms
 that counted instances by tag through EC2 Metrics Insights, which cannot work (a tag is not a
 dimension) and so never fired.

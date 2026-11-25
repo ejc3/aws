@@ -336,15 +336,19 @@ resource "aws_cloudwatch_metric_alarm" "runner_leases_held" {
   period              = 300
 }
 
-# Alert if any runner is running for more than 2 hours. Warm reuse (up to 12 hours,
-# runner-autoscale.tf) can keep a host busy that long on a heavy day, so read it as "look",
-# not "broken".
+# Alert when a runner host outlives the age ceiling the cleanup Lambda enforces
+# (MAX_INSTANCE_AGE_HOURS plus DRAIN_GRACE_MINUTES in runner-autoscale.tf: 12 hours and a
+# 90-minute drain, 810 minutes). A host is reused for job after job until then, so its age
+# says nothing about any one job: at the old threshold of 2 hours this alarm was in ALARM
+# for 47 of the 72 hours to 2026-11-25 04:00 UTC with no job stuck (the oldest host reached
+# 419 minutes). Past the ceiling plus four 5-minute polls, the cleanup is not ending hosts
+# it should have ended.
 resource "aws_cloudwatch_metric_alarm" "runner_long_running" {
   alarm_name          = "runner-long-running"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
-  threshold           = 120
-  alarm_description   = "Runner(s) running for 2+ hours - possible stuck job"
+  threshold           = 830
+  alarm_description   = "A runner host is older than the 12-hour age ceiling plus its 90-minute drain: the cleanup Lambda is not ending it"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   treat_missing_data  = "notBreaching"
   namespace           = "GitHubRunners"
