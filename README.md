@@ -2425,14 +2425,32 @@ The job checks for running processes in each account's filesystem and runs Git
 as the worktree owner, rechecking eligibility before removal. It keeps main
 checkouts, branches, interactive or locked worktrees, worktrees in use, and
 worktrees with local files or changes. Merge evidence must come from the
-upstream default branch or a verified GitHub merge of the exact worktree head.
+upstream default branch or a verified GitHub merge of a PR whose final head is the worktree head or
+descends from it (the branch moved on after the worktree's last commit).
 `sudo nextjs-worktree-prune` previews the job without removing anything. The
 dedicated SSM association installs the timer without rerunning Next.js setup
 or starting cleanup during installation.
 fcvm-metal-arm runs the same job for its `ubuntu` account only, as
 `fcvm-worktree-prune.timer` (`--host-only`: no containers, no `machinectl`), from
 its own association; `sudo fcvm-worktree-prune --host-only` previews it there.
-There, after the merged-worktree pass and under the same pressure test, it also
+There the worktree pass also retires (`--retire`). A worktree may hold ignored
+files (`.scratch/`, `.env.local`): before removal they are packed into
+`~/.local/share/worktree-archive/<repo>/<worktree>-<path hash>-<head>-<UTC time>.tar.gz`
+(mode 0600, with a `MANIFEST.json`), written as `ubuntu` rather than root, read back
+through gzip to its end with every member's content hash compared, synced, and
+published without replacing an existing file. A `node_modules`, `.next` or
+`target` directory that Git ignores as a whole is left out; one inside other
+ignored files is kept. Restore an archive with `tar -xzf <archive>`; it unpacks
+into `worktree/`. A worktree is kept instead when its ignored files (build output
+included) hold a nested repository, a file another account owns or one on another
+disk, a file that changes from when it is listed until just before removal, or more than
+1 GiB, or when fewer than 4 GiB are free. A clean worktree whose `HEAD` is not
+merged also qualifies when that commit is on a branch that exists on GitHub now
+(confirmed against GitHub's branch tip, so a branch deleted upstream does not
+count) and Git has not used the worktree for 14 days, with the same idle test as
+below. Each applying run deletes archives older than 90 days; the preview never does.
+Untracked or modified files still keep a worktree, and Next.js hosts do not retire.
+After the worktree pass and under the same pressure test, it also
 deletes regenerable build output from idle linked worktrees, oldest first, and
 stops once space recovers: only `node_modules`, `.next` and `target` directories
 at most three levels below the worktree root, each a real directory on the same

@@ -206,7 +206,7 @@ class IncompleteAccounts(Exception):
     """Some accounts were preserved because their lists could not be verified."""
 
 
-def clean(accounts, query, pressure, apply, busy_accounts):
+def clean(accounts, query, pressure, apply, busy_accounts, retire=False):
     busy = busy_accounts(accounts)
     for account in sorted(busy):
         print(f"nextjs-worktree-prune: preserving {account}; host process in home")
@@ -218,7 +218,7 @@ def clean(accounts, query, pressure, apply, busy_accounts):
         if account in busy:
             continue
         try:
-            candidates.extend(candidates_from(account, query(account, "--list")))
+            candidates.extend(candidates_from(account, query(account, "--list", *(("--retire",) if retire else ()))))
         except (OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             print(f"nextjs-worktree-prune: preserving {account}; listing failed ({type(error).__name__})")
             incomplete += 1
@@ -233,7 +233,7 @@ def clean(accounts, query, pressure, apply, busy_accounts):
         if busy_accounts([candidate.account]):
             print(f"nextjs-worktree-prune: preserving {candidate.account}; host process in home")
             continue
-        result = query(candidate.account, "--remove", candidate.token)
+        result = query(candidate.account, "--remove", candidate.token, *(("--retire",) if retire else ()))
         if (not isinstance(result, dict) or result.keys() != {"status"}
                 or result["status"] not in ("removed", "skipped", "healthy", "declined")):
             raise ValueError(f"invalid removal result from {candidate.account}")
@@ -243,6 +243,16 @@ def clean(accounts, query, pressure, apply, busy_accounts):
     if incomplete:
         raise IncompleteAccounts
     return removed
+
+
+def expire_archives(query):
+    """fcvm-metal-arm, applying runs only: delete retirement archives older than 90 days."""
+    answer = query("ubuntu", "--expire-archives")
+    if (not isinstance(answer, dict) or answer.keys() != {"deleted"}
+            or type(answer["deleted"]) is not int or not 0 <= answer["deleted"] < 2**31):
+        raise ValueError("invalid archive expiry result from ubuntu")
+    print(f"nextjs-worktree-prune: {answer['deleted']} expired archives deleted")
+    return answer["deleted"]
 
 
 def clean_builds(query, pressure, apply, deadline, clock=time.monotonic):
@@ -300,12 +310,17 @@ def main():
             return
         incomplete = False
         try:
-            clean(managed_accounts(args.host_only), query_worker, pressured, args.apply, host_busy_accounts)
+            # fcvm-metal-arm (host-only) retires: ignored files are archived before
+            # removal, and idle worktrees pushed to a live branch qualify too.
+            clean(managed_accounts(args.host_only), query_worker, pressured, args.apply, host_busy_accounts,
+                  retire=args.host_only)
         except IncompleteAccounts:
             incomplete = True
         # Build output only on a host-only run (fcvm-metal-arm), after the merged
         # pass. managed_accounts has already refused host-only on a Next.js host.
         if args.host_only:
+            if args.apply:
+                expire_archives(query_worker)
             clean_builds(query_worker, pressured, args.apply, start + BUILD_DEADLINE)
         if incomplete:
             raise IncompleteAccounts

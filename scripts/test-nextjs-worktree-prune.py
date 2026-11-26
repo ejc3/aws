@@ -10,8 +10,10 @@ import re
 import subprocess
 import tempfile
 import time
+import tarfile
 import unittest
 from unittest import mock
+from urllib.parse import unquote
 
 
 SPEC = importlib.util.spec_from_file_location(
@@ -66,10 +68,16 @@ class Fixture(unittest.TestCase):
                 self.network.append(endpoint)
                 if endpoint == "repos/example/app":
                     return b'{"full_name":"example/app","default_branch":"main"}'
-                if endpoint == "repos/example/app/git/ref/heads/main":
-                    tip = self.git(self.remote, "rev-parse", "refs/heads/main").decode().strip()
-                    return json.dumps({"ref": "refs/heads/main",
-                                       "object": {"type": "commit", "sha": tip}}).encode()
+                if endpoint.startswith("repos/example/app/git/ref/heads/"):
+                    # Any branch's live tip, read from the bare fixture; a missing branch fails like gh.
+                    branch = unquote(endpoint.removeprefix("repos/example/app/git/ref/heads/"))
+                    found = subprocess.run([GIT, "-C", str(self.remote), "rev-parse", "--verify", "-q",
+                                            "refs/heads/" + branch], env=self.environment,
+                                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                    if found.returncode:
+                        return None
+                    return json.dumps({"ref": "refs/heads/" + branch,
+                                       "object": {"type": "commit", "sha": found.stdout.decode().strip()}}).encode()
                 if endpoint.startswith("repos/example/app/commits/") and endpoint.endswith("/pulls?per_page=30"):
                     return json.dumps(self.github_responses or []).encode()
                 if endpoint.startswith("repos/example/app/compare/"):
@@ -221,10 +229,10 @@ class WorktreePruneTests(Fixture):
         self.set_age(eligible, 2)
         real_clean = WORKER.clean
 
-        def verify(home, path, head, admin):
+        def verify(home, path, head, admin, **options):
             if path == unreadable:
                 raise WORKER.Incomplete("command timed out")
-            return real_clean(home, path, head, admin)
+            return real_clean(home, path, head, admin, **options)
 
         with mock.patch.object(WORKER, "clean", side_effect=verify):
             [candidate] = self.list()
@@ -258,6 +266,48 @@ class WorktreePruneTests(Fixture):
         [candidate] = self.list()
         self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
         self.assertFalse(path.exists())
+
+    def test_squash_of_a_later_pr_head_covers_an_earlier_worktree_commit(self):
+        path = self.worktree("early")
+        early = self.commit(path)
+        # The PR's branch moved on after this worktree's last commit, then was
+        # squash-merged and deleted: its final head descends from this worktree's HEAD.
+        later = self.home / "later"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(later), early)
+        (later / "src/code").write_text("more\n")
+        self.git(later, "commit", "-qam", "more")
+        pr_head = self.git(later, "rev-parse", "HEAD").decode().strip()
+        self.git(self.repo, "worktree", "remove", "--force", str(later))
+        self.git(self.repo, "merge", "--squash", pr_head)
+        self.git(self.repo, "commit", "-qm", "squashed")
+        tip = self.git(self.repo, "rev-parse", "HEAD").decode().strip()
+        self.push()
+        pull = {"head": {"sha": pr_head}, "merged_at": "2026-11-04T00:00:00Z",
+                "base": {"ref": "main", "repo": {"full_name": "example/app"}},
+                "merge_commit_sha": tip}
+        self.github_responses = [pull]
+        [candidate] = self.list()
+        self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertFalse(path.exists())
+
+    def test_squash_of_an_unrelated_pr_head_proves_nothing(self):
+        path = self.worktree("early")
+        self.commit(path)
+        other = self.home / "other"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(other), "main")
+        (other / "src/code").write_text("unrelated\n")
+        self.git(other, "commit", "-qam", "unrelated")
+        pr_head = self.git(other, "rev-parse", "HEAD").decode().strip()
+        self.git(self.repo, "worktree", "remove", "--force", str(other))
+        self.git(self.repo, "merge", "--squash", pr_head)
+        self.git(self.repo, "commit", "-qm", "squashed")
+        tip = self.git(self.repo, "rev-parse", "HEAD").decode().strip()
+        self.push()
+        self.github_responses = [{"head": {"sha": pr_head}, "merged_at": "2026-11-04T00:00:00Z",
+                                  "base": {"ref": "main", "repo": {"full_name": "example/app"}},
+                                  "merge_commit_sha": tip}]
+        self.assertEqual(self.list(), [])
+        self.assertTrue(path.exists())
 
     def test_healthy_disk_and_unknown_token_do_not_contact_origin(self):
         self.worktree("candidate")
@@ -367,11 +417,11 @@ class WorktreePruneTests(Fixture):
         real_clean = WORKER.clean
         checked = []
 
-        def clean(home, path, head, directory):
+        def clean(home, path, head, directory, **options):
             checked.append(path)
             if len(checked) == 2:
                 now[0] = WORKER.RANK_SECONDS + 1  # the budget runs out during the second check
-            return real_clean(home, path, head, directory)
+            return real_clean(home, path, head, directory, **options)
 
         with mock.patch.object(WORKER, "clock", lambda: now[0]), mock.patch.object(WORKER, "clean", clean):
             candidates = self.list()
@@ -708,6 +758,361 @@ class BuildOutputTests(Fixture):
         with mock.patch.object(WORKER.sys, "argv", ["worker", "--list", "--after", "1:" + "a" * 64]), \
              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             WORKER.main()
+
+
+class RetireTests(Fixture):
+    """--retire (fcvm-metal-arm): archive ignored files, then remove; pushed idle worktrees qualify."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / ".git/info/exclude").write_text(".scratch/\nnode_modules/\n")
+        # Everything made during the test is a month old for the idle check.
+        later = time.time() + 30 * 86400
+        patch = mock.patch.object(WORKER, "wall", lambda: later)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.archives = self.home / ".local/share/worktree-archive/app"
+
+    def retire_list(self):
+        return WORKER.prune(self.home, self.uid, retire=True)["candidates"]
+
+    def retire_remove(self, token):
+        return WORKER.prune(self.home, self.uid, token, retire=True)
+
+    def unique_commit(self, path):
+        # Distinct content, so two worktrees never share one commit object.
+        (path / "src/code").write_text(f"feature {path.name}\n")
+        self.git(path, "commit", "-qam", path.name)
+
+    def pushed(self, name):
+        path = self.worktree(name)
+        self.unique_commit(path)
+        self.git(path, "push", "-q", "origin", name)
+        return path
+
+    def scratch(self, path):
+        (path / ".scratch/sub").mkdir(parents=True)
+        (path / ".scratch/notes.md").write_text("keep me\n")
+        (path / ".scratch/sub/run.log").write_text("log\n")
+        os.symlink("notes.md", path / ".scratch/link")
+        (path / ".scratch/node_modules").mkdir()
+        (path / ".scratch/node_modules/dep.js").write_text("x\n")
+        (path / "node_modules").mkdir()
+        (path / "node_modules/big.js").write_text("y\n")
+        (path / "app.local").write_text("SECRET=1\n")
+
+    def archived(self):
+        return sorted(self.archives.iterdir()) if self.archives.exists() else []
+
+    def members(self, archive):
+        with tarfile.open(archive, "r:gz") as tar:
+            return {m.name: (tar.extractfile(m).read() if m.isfile() else m.type) for m in tar}
+
+    def test_pushed_idle_worktree_is_archived_then_removed_keeping_its_branch(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        self.assertEqual(self.retire_remove(candidate["token"]), {"status": "removed"})
+        self.assertFalse(path.exists())
+        self.assertTrue(self.git(self.repo, "rev-parse", "--verify", "refs/heads/feature"))
+        [archive] = self.archived()
+        self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+        members = self.members(archive)
+        self.assertEqual(members["worktree/.scratch/notes.md"], b"keep me\n")
+        self.assertEqual(members["worktree/.scratch/sub/run.log"], b"log\n")
+        self.assertEqual(members["worktree/.scratch/link"], tarfile.SYMTYPE)
+        self.assertEqual(members["worktree/app.local"], b"SECRET=1\n")
+        # A build directory Git ignores whole is not kept; one inside kept files is.
+        self.assertFalse([m for m in members if m.startswith("worktree/node_modules")])
+        self.assertEqual(members["worktree/.scratch/node_modules/dep.js"], b"x\n")
+        manifest = json.loads(members["MANIFEST.json"])
+        self.assertEqual(manifest["worktree"], str(path))
+
+    def test_merged_worktree_is_archived_before_removal(self):
+        path = self.worktree("merged")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        self.assertEqual(self.retire_remove(candidate["token"]), {"status": "removed"})
+        [archive] = self.archived()
+        self.assertIn("worktree/.scratch/notes.md", self.members(archive))
+
+    def test_without_retire_ignored_files_still_keep_the_worktree(self):
+        path = self.worktree("merged")
+        self.scratch(path)
+        self.assertEqual(self.list(), [])
+        self.assertTrue(path.exists())
+
+    def test_work_not_safe_in_git_or_in_use_is_kept(self):
+        unpushed = self.worktree("unpushed")
+        self.unique_commit(unpushed)
+        deleted = self.pushed("deleted-upstream")
+        self.git(self.remote, "branch", "-D", "deleted-upstream")
+        untracked = self.pushed("untracked")
+        (untracked / "draft.txt").write_text("not ignored\n")
+        modified = self.pushed("modified")
+        (modified / "src/code").write_text("edited\n")
+        marked = self.pushed("marked")
+        (self.admin(marked) / "claude-interactive").touch()
+        self.assertEqual(self.retire_list(), [])
+        for path in (unpushed, deleted, untracked, modified, marked):
+            self.assertTrue(path.exists())
+
+    def test_recent_pushed_worktree_is_kept(self):
+        path = self.pushed("recent")
+        with mock.patch.object(WORKER, "wall", time.time):
+            self.assertEqual(self.retire_list(), [])
+        self.assertTrue(path.exists())
+
+    def test_a_repository_inside_ignored_files_keeps_the_worktree(self):
+        nested = self.pushed("nested")
+        self.scratch(nested)
+        self.git(self.home, "init", "-q", str(nested / ".scratch/clone"))
+        [candidate] = self.retire_list()
+        self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue((nested / ".scratch/clone/.git").exists())
+        self.assertEqual(self.archived(), [])  # no partial archive left behind
+
+    def test_ignored_files_over_the_archive_limit_keep_the_worktree(self):
+        big = self.pushed("big")
+        self.scratch(big)
+        (big / ".scratch/huge.bin").write_bytes(b"z" * 4096)
+        [candidate] = self.retire_list()
+        with mock.patch.object(WORKER, "ARCHIVE_LIMIT", 1024):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue((big / ".scratch/huge.bin").exists())
+        self.assertEqual(self.archived(), [])
+
+    def test_an_archive_that_does_not_read_back_keeps_the_worktree(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        real_open = tarfile.open
+        empty = io.BytesIO()
+        with real_open(fileobj=empty, mode="w"):
+            pass
+
+        def truncated(*args, mode="r", **kwargs):
+            if mode == "r|":  # the read-back sees an archive with no members
+                return real_open(fileobj=io.BytesIO(empty.getvalue()), mode=mode)
+            return real_open(*args, mode=mode, **kwargs)
+
+        with mock.patch.object(WORKER.tarfile, "open", truncated):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue((path / ".scratch/notes.md").exists())
+        self.assertEqual(self.archived(), [])
+
+    def test_only_this_cleaners_old_archives_expire(self):
+        self.archives.mkdir(parents=True)
+        old = self.archives / "wt-01234567-0123456789ab-20260101T000000Z.tar.gz"
+        fresh = self.archives / "wt-01234567-0123456789ab-20260901T000000Z.tar.gz"
+        other = self.archives / "notes.txt"
+        for file in (old, fresh, other):
+            file.write_text("x")
+        ancient = time.time() - 200 * 86400
+        for file in (old, other):
+            os.utime(file, (ancient, ancient))
+        self.retire_list()
+        self.retire_remove("0" * 64)
+        self.assertTrue(old.exists())  # listing and removal never expire archives
+        # Its own mode, which the driver sends on applying runs whether or not anything is eligible.
+        self.assertEqual(WORKER.expire_archives(self.home, self.uid, self.home.stat().st_dev), 1)
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists() and other.exists())
+
+    def test_expiry_skips_a_directory_on_another_disk(self):
+        mounted = self.archives.parent / "backup"
+        mounted.mkdir(parents=True)
+        old = mounted / "wt-01234567-0123456789ab-20260101T000000Z.tar.gz"
+        old.write_text("x")
+        ancient = time.time() - 200 * 86400
+        os.utime(old, (ancient, ancient))
+        real_fstat = os.fstat
+        inode = mounted.stat().st_ino
+
+        def other_disk(fd):
+            info = real_fstat(fd)
+            if info.st_ino == inode:  # the mounted directory reports another device
+                values = list(info)
+                values[2] = info.st_dev + 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(WORKER.os, "fstat", other_disk):
+            self.assertEqual(WORKER.expire_archives(self.home, self.uid, self.home.stat().st_dev), 0)
+        self.assertTrue(old.exists())
+
+    def test_a_change_after_archiving_keeps_the_worktree(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        real = WORKER.fingerprint
+        calls = []
+
+        def changing(*args):
+            calls.append(1)
+            if len(calls) == 2:  # the recheck after the archive is written
+                (path / ".scratch/late.txt").write_text("written after archiving\n")
+            return real(*args)
+
+        with mock.patch.object(WORKER, "fingerprint", changing):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue((path / ".scratch/late.txt").exists())
+        self.assertEqual(self.archived(), [])
+
+    def test_a_repository_inside_build_output_keeps_the_worktree(self):
+        for name, clone in (("top", "node_modules/pkg"), ("inner", ".scratch/target/clone")):
+            path = self.pushed(name)
+            self.scratch(path)
+            (path / clone).mkdir(parents=True, exist_ok=True)
+            self.git(self.home, "init", "-q", str(path / clone))
+        for candidate in self.retire_list():
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue((self.home / "top/node_modules/pkg/.git").exists())
+        self.assertTrue((self.home / "inner/.scratch/target/clone/.git").exists())
+
+    def test_two_worktrees_with_one_name_and_head_keep_two_archives(self):
+        first = self.pushed("feature")
+        self.scratch(first)
+        (self.home / "other").mkdir()
+        second = self.home / "other/feature"
+        self.git(self.repo, "worktree", "add", "-q", "-b", "feature-copy", str(second), "feature")
+        self.scratch(second)
+        (second / ".scratch/notes.md").write_text("second copy\n")
+        real_gmtime = time.gmtime
+        with mock.patch.object(WORKER.time, "gmtime", lambda *_: real_gmtime(0)):  # the same second
+            candidates = self.retire_list()
+            self.assertEqual(len(candidates), 2)
+            for candidate in candidates:
+                self.assertEqual(self.retire_remove(candidate["token"]), {"status": "removed"})
+        archives = self.archived()
+        self.assertEqual(len(archives), 2)
+        notes = {self.members(a)["worktree/.scratch/notes.md"] for a in archives}
+        self.assertEqual(notes, {b"keep me\n", b"second copy\n"})
+
+    def test_an_ignored_file_named_like_build_output_is_archived(self):
+        (self.repo / ".git/info/exclude").write_text(".scratch/\nnode_modules/\ntarget\n")
+        path = self.pushed("feature")
+        (path / "target").write_text("user data, not a build directory\n")
+        [candidate] = self.retire_list()
+        self.assertEqual(self.retire_remove(candidate["token"]), {"status": "removed"})
+        [archive] = self.archived()
+        self.assertEqual(self.members(archive)["worktree/target"], b"user data, not a build directory\n")
+
+    def test_a_damaged_archive_keeps_the_worktree(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        real_fsync = os.fsync
+        done = []
+
+        def damage(fd):
+            if not done and stat_is_file(fd):
+                done.append(1)
+                os.ftruncate(fd, os.fstat(fd).st_size - 4)  # lose the gzip length trailer
+            return real_fsync(fd)
+
+        with mock.patch.object(WORKER.os, "fsync", damage):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertTrue(done)
+        self.assertTrue((path / ".scratch/notes.md").exists())
+        self.assertEqual(self.archived(), [])
+
+
+    def test_as_root_the_archive_is_written_as_the_account_with_no_chown(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        calls = []
+        effective = [0]
+
+        def record(name):
+            def call(*args):
+                calls.append((name, *args))
+                if name == "seteuid":
+                    effective[0] = args[0]
+            return call
+
+        def refuse(*args, **kwargs):
+            raise AssertionError("chown as root")
+
+        archive = WORKER.archive_ignored
+        def checked(*args):
+            result = archive(*args)
+            self.assertEqual(effective[0], 0)  # root again once the file work ends
+            return result
+
+        with mock.patch.object(WORKER, "COMMAND_OWNER", (1234, 5678)), \
+                mock.patch.object(WORKER.os, "geteuid", lambda: effective[0]), \
+                mock.patch.object(WORKER.os, "getgroups", lambda: [0]), \
+                mock.patch.object(WORKER.os, "setgroups", record("setgroups")), \
+                mock.patch.object(WORKER.os, "setegid", record("setegid")), \
+                mock.patch.object(WORKER.os, "seteuid", record("seteuid")), \
+                mock.patch.object(WORKER.os, "chown", refuse), mock.patch.object(WORKER.os, "fchown", refuse), \
+                mock.patch.object(WORKER, "run", lambda *a, **k: self.fail("a command ran during the archive")):
+            # The archive step alone, as the root-run worker calls it.
+            archived, _ = checked(self.home, self.uid, self.home.stat().st_dev, self.repo, path,
+                                  "0" * 40, [".scratch", "app.local"], time.monotonic() + 60)
+        self.assertTrue(archived.exists())
+        self.assertEqual(calls[:3], [("setgroups", [5678]), ("setegid", 5678), ("seteuid", 1234)])
+        self.assertEqual(calls[3:], [("seteuid", 0), ("setegid", 0), ("setgroups", [0])])
+        self.assertEqual(len(self.archived()), 1)
+
+    def test_a_write_just_before_removal_keeps_the_worktree(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        real = WORKER.archive_ignored
+
+        def then_write(*args):
+            result = real(*args)
+            # Same size and the old mtime put back: only ctime shows the write.
+            note = path / ".scratch/notes.md"
+            before = note.stat()
+            note.write_text("KEEP ME\n")
+            os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+
+        with mock.patch.object(WORKER, "archive_ignored", then_write):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertEqual((path / ".scratch/notes.md").read_text(), "KEEP ME\n")
+
+    def test_a_file_that_grows_past_the_limit_while_copying_stops_the_archive(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        (path / ".scratch/grow.bin").write_bytes(b"a" * 100)
+        [candidate] = self.retire_list()
+        real = WORKER.fingerprint
+        calls = []
+
+        def grow(*args):
+            result = real(*args)
+            calls.append(1)
+            if len(calls) == 1:  # after the size check, before the copy
+                (path / ".scratch/grow.bin").write_bytes(b"a" * 5000)
+            return result
+
+        copied = []
+        real_read = WORKER.Hashing.read
+
+        def count(self_, size=-1):
+            data = real_read(self_, size)
+            copied.append(len(data))
+            return data
+
+        with mock.patch.object(WORKER, "ARCHIVE_LIMIT", 1024), mock.patch.object(WORKER, "fingerprint", grow), \
+                mock.patch.object(WORKER.Hashing, "read", count):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertLessEqual(sum(copied), 1024)
+        self.assertTrue(path.exists())
+
+    def test_retire_is_refused_with_a_build_pass(self):
+        with mock.patch.object(WORKER.sys, "argv", ["worker", "--builds", "--retire"]), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            WORKER.main()
+
+
+def stat_is_file(fd):
+    import stat as st
+    return st.S_ISREG(os.fstat(fd).st_mode)
 
 
 if __name__ == "__main__":
