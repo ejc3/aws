@@ -124,7 +124,12 @@ else
   /bin/sh "$src/peekaboo-install.sh"
 fi
 
-agents_md mac "$src/mac-AGENTS.md"
+# mac-setup.sh sends exactly one of the two desktop templates: the owner's Mac, or a family member's.
+if [ -f "$src/member-mac-AGENTS.md" ]; then
+  agents_md member "$src/member-mac-AGENTS.md"
+else
+  agents_md mac "$src/mac-AGENTS.md"
+fi
 echo "mac-setup: installed mac-gui, mac-lease, mac-build (+ swift/xcodebuild/xcrun shims), peekaboo, mac-agents-md into $bin; ~/AGENTS.md written (and hourly)"
 "$bin/mac-lease" status | sed 's/^/mac-setup: desktop lease: /'
 "$bin/mac-build" --status | sed 's/^/mac-setup: build /'

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """The jumpbox terraform wrapper (scripts/terraform-run-lock.sh): one state-touching run at a time, cheap commands pass."""
+import json
 import os
 import pathlib
 import re
@@ -421,6 +422,37 @@ class StopHookBackgroundTests(unittest.TestCase):
         self.assertEqual(r.stdout, "")
         time.sleep(1)
         self.assertEqual(self.publishes(), 0)
+
+    def watch_state(self, **entry):
+        path = self.tmp / "state" / "pr-watch" / "state.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"unapplied": [dict({"key": "ejc3/aws#1"}, **entry)]}))
+
+    def test_a_merge_waiting_for_its_apply_starts_no_check(self):
+        self.watch_state(added=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        r, _ = self.run_hook()
+        self.assertEqual(r.stdout, "")
+        self.assertIn("waiting for its apply", r.stderr)
+        time.sleep(1)
+        self.assertEqual(self.publishes(), 0, "a check started in front of a pending apply")
+
+    def test_an_applied_old_future_or_unparsed_entry_does_not_stop_the_check(self):
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        for entry in ({"added": now, "applied_at": now},
+                      {"added": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 3600))},
+                      {"added": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 86400))},
+                      {"added": "pending"}, {}):
+            self.watch_state(**entry)
+            self.mark.unlink(missing_ok=True)
+            self.run_hook()
+            self.assertTrue(self.started(), f"no check started for {entry}")
+            self.wait_idle()
+
+    def test_a_pending_apply_does_not_hide_a_drift_result(self):
+        self.watch_state(added=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        self.last_check(self.sha, 2)
+        r, _ = self.run_hook()
+        self.assertIn("Terraform drift", r.stdout)
 
     def test_a_clean_result_older_than_the_refresh_interval_is_rechecked(self):
         self.last_check(self.sha, 0, seconds_ago=3600)

@@ -811,13 +811,15 @@ class Files(unittest.TestCase):
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
+            member = desktop - {"mac-AGENTS.md"} | {"member-mac-AGENTS.md"}
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
                 (["mini"], build | mini, "--build-only"),
                 ([], build | desktop | cleaner, ""),
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
-                (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
+                (["colton-mac", "--update-peekaboo"], build | member, "--update-peekaboo"),
+                (["colin-mac"], build | member, ""),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
                 with tarfile.open(dest / "files.tar") as archive:
@@ -918,6 +920,33 @@ class AgentsMd(Base):
         self.assertNotIn("iOS toolchain", text)
         self.assertNotIn("signing keychains", text)
 
+    def test_a_members_mac_says_whether_it_is_on_the_pool(self):
+        self.env["MAC_AGENTS_HOST"] = "member"
+        bindir = self.temp / "fakebin"
+        bindir.mkdir()
+        launchctl = bindir / "launchctl"
+        launchctl.write_text("#!/bin/sh\nexit \"${LAUNCHCTL_RC:-1}\"\n")
+        launchctl.chmod(0o755)
+        self.env["PATH"] = f"{bindir}:{self.env['PATH']}"
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text())
+        (self.temp / ".claude").mkdir()
+        (self.temp / ".claude" / "settings.json").write_text('{"env": {"HTTPS_PROXY": "http://127.0.0.1:8445"}}')
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text(), "settings without a loaded agent is not the pool")
+        (self.temp / ".claude" / "settings.json").write_text("{}")
+        self.env["LAUNCHCTL_RC"] = "0"
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text(), "a loaded agent without the settings is not the pool")
+        (self.temp / ".claude" / "settings.json").write_text('{"env": {"HTTPS_PROXY": "http://127.0.0.1:8445"}}')
+        self.assertEqual(self.write().returncode, 0)
+        text = self.out.read_text()
+        self.assertIn("## Found: Claude and the shared pool", text)
+        self.assertIn("On the pool:", text)
+        self.env["MAC_AGENTS_HOST"] = "mini"
+        self.write()
+        self.assertNotIn("shared pool", self.out.read_text(), "only a member's Mac gets the pool line")
+
     def test_refuses_without_its_template_and_leaves_no_file(self):
         self.env["MAC_AGENTS_TEMPLATE"] = str(self.temp / "missing.md")
         r = self.write()
@@ -958,6 +987,13 @@ class IosToolchain(unittest.TestCase):
         self.assertIn('"$bin/mac-agents-md"', install)
         self.assertIn('agents_md mini "$src/mini-AGENTS.md"', install)
         self.assertIn('agents_md mac "$src/mac-AGENTS.md"', install)
+        self.assertIn('agents_md member "$src/member-mac-AGENTS.md"', install)
+
+    def test_a_family_members_mac_is_not_told_it_is_the_owners(self):
+        member = (ROOT / "scripts" / "mac" / "member-mac-AGENTS.md").read_text()
+        self.assertNotIn("owner's own desktop Mac", member)
+        for needle in ("environment **Local**", "/login", "--foreground", "peekaboo see --no-elements"):
+            self.assertIn(needle, member)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

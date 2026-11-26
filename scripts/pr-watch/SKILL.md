@@ -116,7 +116,11 @@ If filtering fails, stop before posting. Continue to check other private informa
    read indirectly): then plan everything. Nothing printed with exit 0 means the merge changed nothing Terraform reads
    (tests, docs, CI): skip the plan and apply, and note `no infrastructure change` on the PR's `unapplied` entry, which
    the next full plan clears. Any other exit (a missing commit, a traceback) is a failure of the helper, not an answer:
-   plan everything. Read the plan, apply the saved plan, require an empty follow-up plan with the same targets. A full
+   plan everything. Read the plan, apply the saved plan, require an empty follow-up plan with the same targets, and
+   then set `applied_at` (UTC, `%Y-%m-%dT%H:%M:%SZ`) on the PR's `unapplied` entry; set it too when the helper says
+   nothing to apply, and drop the entry of a merge that did not happen. Each entry carries `added`, the same format, set
+   when it is added: for two hours from then, while it has no `applied_at`, the Stop hook starts no drift check, which
+   would only report the pending merge and hold the run lock in front of its apply. A full
    plan of everything takes 10-15 minutes on this box; a targeted one two or three. Check `df -h /` before the init,
    and `git worktree remove --force` the worktree on every way out, a failed or stopped run included. Stop a run with
    SIGINT or SIGTERM, never SIGKILL: the wrapper turns either into Terraform's own cancel, which releases the state

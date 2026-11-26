@@ -1,6 +1,6 @@
 #!/bin/zsh
 # mac-agents-md -- writes ~/AGENTS.md on a Mac: the template ejc3/aws scripts/mac-setup.sh installed for
-# it (~/.local/share/mac-setup/AGENTS.template.md: mini-AGENTS.md or mac-AGENTS.md) and what is on the
+# it (~/.local/share/mac-setup/AGENTS.template.md: mini-AGENTS.md, mac-AGENTS.md or member-mac-AGENTS.md) and what is on the
 # machine now: the attached devices and, on the mini (MAC_AGENTS_HOST=mini), the iOS toolchain's
 # versions and the development-signing keychains made for agents. ~/CLAUDE.md
 # points at it, so Claude and Codex sessions here read the same file. Run by setup and hourly by its
@@ -55,6 +55,17 @@ trap 'rm -f "$tmp"' EXIT
     [ $found = 1 ] || echo "- None: device builds cannot be signed here yet."
   fi
   echo
+  if [ "$host" = member ]; then
+    echo "## Found: Claude and the shared pool"
+    echo
+    if launchctl print "gui/$(id -u)/dev.claw-master.agent" >/dev/null 2>&1 &&
+      grep -q '127\.0\.0\.1:8445' "$HOME/.claude/settings.json" 2>/dev/null; then
+      echo "- On the pool: \`claw-master agent\` is loaded and \`~/.claude/settings.json\` routes Claude Code through it."
+    else
+      echo "- Not on the pool: Claude Code here uses the person's own subscription and its limits."
+    fi
+    echo
+  fi
   echo "_Written $(date -u +%Y-%m-%dT%H:%MZ) by mac-agents-md._"
 } > "$tmp"
 chmod 644 "$tmp"

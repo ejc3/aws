@@ -1668,10 +1668,16 @@ A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_s
 5. From a jumpbox: `scripts/claw-master-mac-setup.sh colin-mac --default`. That is the pool's tunnel and `claude-pool`,
    a request to Anthropic through that tunnel (it stops here, nothing switched, unless one answers), then the pinned
    claw-master's own `agent install` and the same request through the agent (undone with `agent uninstall` if it fails): a launchd agent on `127.0.0.1:8445` and its proxy in Colin's
-   `~/.claude/settings.json`, so plain `claude`, the desktop app's Code tab and the IDE extensions all use the pool. No
-   fallback: while the pool is down, Claude's requests fail. `claw-master agent uninstall` on the Mac undoes it.
+   `~/.claude/settings.json`, so plain `claude`, the desktop app's **local** Code sessions and the IDE extensions all use
+   the pool. No fallback: while the pool is down, Claude's requests fail. `claw-master agent uninstall` on the Mac undoes it.
+   Two things that look like a broken pool and are not (2026-11-26): the desktop app's Code tab defaults to a **cloud**
+   environment, which runs on Anthropic's servers on the person's own account and weekly limit (pick environment
+   **Local**); and Claude Code needs the person's own `/login` before it sends anything.
 6. Check `ssh colin-mac true` from each client, then retire the tunnel: `scripts/windows-pc-bootstrap.sh retire
    colin-mac` on fcvm-arm, and close the Terminal window on the Mac.
+7. From fcvm-arm: `scripts/mac-setup.sh colin-mac` (Peekaboo, `mac-gui`, `mac-lease`, the build cap, and `~/AGENTS.md`
+   from `scripts/mac/member-mac-AGENTS.md`, the family-member template; only alias `mac` gets the owner's), then grant
+   Peekaboo Screen Recording, Accessibility and Event Synthesizing at the Mac (`peekaboo permissions status`).
 
 ### SSH to Colin's PC, and its screen: `ssh colin-pc`, Windows-MCP
 
