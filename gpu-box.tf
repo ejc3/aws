@@ -86,15 +86,20 @@ locals {
   gbox_hold_gpu_stack = <<-HOLD
 printf '%s\n' 'Unattended-Upgrade::Package-Blacklist { "linux-"; "nvidia-"; "libnvidia-"; "cuda-"; "libcudnn"; "libnccl"; "datacenter-gpu-manager"; };' > /etc/apt/apt.conf.d/52gbox-hold-gpu-stack
   HOLD
-  # Fresh package lists first (unattended-upgrade never fetches them), at the lowest CPU and I/O priority so the first
-  # minutes of work on the box are not slowed; /etc/gpu-box-updated says when it is done (gbox status shows it).
+  # Fresh package lists first (unattended-upgrade never fetches them), in a subshell at nice 19 (and the idle I/O class,
+  # where the disk's scheduler honours one) so the first minutes of work on the box are not slowed. Its stdin is
+  # /dev/null, so no child can read the rest of the boot script. /etc/gpu-box-updated says when it finished and whether
+  # the package lists could be fetched (gbox status shows it).
   gbox_security_updates = <<-SEC
 export DEBIAN_FRONTEND=noninteractive
-nice -n 19 ionice -c3 apt-get -o DPkg::Lock::Timeout=300 update
-nice -n 19 ionice -c3 bash -s <<'UPDATES'
+(
+  renice -n 19 -p $BASHPID >/dev/null
+  ionice -c3 -p $BASHPID 2>/dev/null || true
+  lists=ok
+  apt-get -o DPkg::Lock::Timeout=300 update || lists=FAILED
 ${local.pbox_security_updates}
-UPDATES
-date -u +%Y-%m-%dT%H:%M:%SZ > /etc/gpu-box-updated
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) package lists: $lists" > /etc/gpu-box-updated
+) < /dev/null
   SEC
 }
 

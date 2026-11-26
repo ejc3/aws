@@ -54,8 +54,9 @@ class GpuBoxTests(unittest.TestCase):
         self.assertIn("${local.pbox_security_updates}", updates)
         self.assertLess(updates.index("apt-get -o DPkg::Lock::Timeout=300 update"), updates.index("${local.pbox_security_updates}"),
                         "unattended-upgrade never fetches package lists itself")
-        self.assertIn("nice -n 19 ionice -c3", updates)
-        self.assertTrue(updates.rstrip().endswith("> /etc/gpu-box-updated"), "the done marker is written last")
+        self.assertIn("renice -n 19 -p $BASHPID", updates)
+        self.assertTrue(updates.rstrip().endswith(") < /dev/null"), "no child may read the rest of the boot script")
+        self.assertIn('package lists: $lists" > /etc/gpu-box-updated', updates, "the marker says whether the lists came")
         self.assertIn("/etc/gpu-box-updated", self.script, "gbox status shows when the updates are done")
         held = re.search(r"Package-Blacklist \{([^}]*)\}", hold).group(1)
         for name in ('"linux-"', '"nvidia-"', '"libnvidia-"', '"cuda-"'):
