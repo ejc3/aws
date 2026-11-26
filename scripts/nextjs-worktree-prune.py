@@ -3,9 +3,18 @@
 
 On fcvm-metal-arm only, the host driver then asks for a second pass: the
 ignored build output (node_modules, .next, target) of idle linked worktrees.
+
+With --retire (fcvm-metal-arm only) a worktree may hold ignored files
+(.scratch/, .env.local): they are packed into a verified archive under
+~/.local/share/worktree-archive before the worktree is removed, and a worktree
+whose HEAD is on a live remote branch and that Git has not used for
+RETIRE_IDLE_SECONDS qualifies as well as a merged one.
 """
 import argparse
+import contextlib
+import gzip
 import hashlib
+import io
 import itertools
 import json
 import os
@@ -18,6 +27,7 @@ import stat
 import subprocess
 import sys
 import syslog
+import tarfile
 import time
 import traceback
 from urllib.parse import quote
@@ -51,6 +61,15 @@ WALK_LIMIT = 1_000_000
 CURSOR = re.compile(r"([0-9]{1,19}):([0-9a-f]{64})")
 # The time of a reflog line: "<old> <new> <name> <email> <seconds> <zone>\t<message>".
 REFLOG_TIME = re.compile(rb"> ([0-9]{1,12}) [+-][0-9]{4}\t")
+# Retirement (--retire): archive ignored files, then remove. Build output is not
+# archived. A worktree whose archive input would exceed ARCHIVE_LIMIT is kept.
+RETIRE_IDLE_SECONDS = 14 * 86400
+ARCHIVE_DIR = Path(".local/share/worktree-archive")
+ARCHIVE_LIMIT = 1024**3
+ARCHIVE_SPACE = 4 * 1024**3
+ARCHIVE_KEEP_SECONDS = 90 * 86400
+ARCHIVE_NAME = re.compile(r"[A-Za-z0-9._-]{1,200}-[0-9a-f]{12}-[0-9]{8}T[0-9]{6}Z\.tar\.gz")
+ARCHIVE_SECONDS = 120
 # File times are wall-clock times, so the idle cutoff is too.
 wall = time.time
 
@@ -238,6 +257,214 @@ def merged(home, repo, head, ref, tip, origin):
     return False
 
 
+def on_remote(home, repo, head, origin):
+    """HEAD is reachable from a branch that exists on the GitHub origin now.
+
+    Candidate branches come from the local remote-tracking refs that contain
+    HEAD; each is confirmed against GitHub's current branch tip, so a branch
+    deleted upstream (a closed PR) does not count.
+    """
+    refs = git(home, repo, "for-each-ref", "--contains", head, "--format=%(refname)", "refs/remotes/origin/")
+    if refs is None:
+        return False
+    for line in os.fsdecode(refs).splitlines()[:20]:
+        branch = line.removeprefix("refs/remotes/origin/")
+        if not branch or branch == "HEAD" or line == branch or len(branch) > 512:
+            continue
+        if git(home, repo, "check-ref-format", "refs/heads/" + branch) is None:
+            continue
+        row = github(home, f"repos/{origin}/git/ref/heads/{quote(branch, safe='')}")
+        if not (isinstance(row, dict) and row.get("ref") == "refs/heads/" + branch
+                and isinstance(row.get("object"), dict) and row["object"].get("type") == "commit"):
+            continue
+        tip = row["object"].get("sha")
+        if isinstance(tip, str) and SHA.fullmatch(tip) and ancestor(home, repo, head, tip, origin):
+            return True
+    return False
+
+
+def archive_root(home, uid, device):
+    """The account's archive directory, created 0700 and owned by the account."""
+    path = home
+    for part in ARCHIVE_DIR.parts:
+        path = path / part
+        try:
+            os.mkdir(path, 0o700)
+            if os.geteuid() == 0:
+                os.chown(path, *COMMAND_OWNER)
+        except FileExistsError:
+            pass
+        if not owned(path, uid, device):
+            raise Incomplete("unsafe archive directory")
+    return path
+
+
+def expire_archives(home, uid, device):
+    """Delete this cleaner's own archives older than ARCHIVE_KEEP_SECONDS."""
+    try:
+        root = archive_root(home, uid, device)
+    except (OSError, Incomplete):
+        return
+    cutoff = wall() - ARCHIVE_KEEP_SECONDS
+    for repo_dir in os.scandir(root):
+        if not repo_dir.is_dir(follow_symlinks=False) or not owned(Path(repo_dir.path), uid, device):
+            continue
+        for entry in os.scandir(repo_dir.path):
+            info = entry.stat(follow_symlinks=False)
+            if (ARCHIVE_NAME.fullmatch(entry.name) and stat.S_ISREG(info.st_mode)
+                    and info.st_uid == uid and info.st_mtime < cutoff):
+                os.unlink(entry.path)
+
+
+def open_below(root_fd, parts):
+    """Open a directory below root_fd one component at a time, never through a symlink."""
+    fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            nxt = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def archive_ignored(home, uid, device, repo, path, head, ignored, end):
+    """Pack the worktree's ignored files, except build output, into a verified archive.
+
+    Returns the archive's path, or None when there is nothing to keep. Raises
+    NotIdle (keep the worktree) for anything it cannot copy faithfully: a nested
+    repository, another filesystem, more than ARCHIVE_LIMIT bytes, a file that
+    changes while it is read, or an archive that does not read back. Reads
+    without following symlinks; symlinks are stored as links, and sockets,
+    FIFOs and devices are listed in the manifest as not archived.
+    """
+    roots = []
+    for relative in ignored:
+        rel = Path(relative)
+        if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+            raise NotIdle
+        if not (BUILD_NAMES & set(rel.parts)):
+            roots.append(rel)
+    if not roots:
+        return None
+    usage = os.statvfs(home)
+    if usage.f_bavail * usage.f_frsize < ARCHIVE_SPACE:
+        raise NotIdle  # too little room to write an archive safely
+    directory = archive_root(home, uid, device) / repo.name
+    try:
+        os.mkdir(directory, 0o700)
+        if os.geteuid() == 0:
+            os.chown(directory, *COMMAND_OWNER)
+    except FileExistsError:
+        pass
+    if not owned(directory, uid, device):
+        raise Incomplete("unsafe archive directory")
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(wall()))
+    name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)[:200] + f"-{head[:12]}-{stamp}.tar.gz"
+    final = directory / name
+    part = directory / ("." + name + ".part")
+    expected, skipped = {}, []
+    total = 0
+
+    def fail(error):
+        raise NotIdle from error
+
+    def add(tar, rel, dir_fd, entry_name):
+        nonlocal total
+        if clock() >= end:
+            raise Incomplete("archive timed out")
+        info = os.stat(entry_name, dir_fd=dir_fd, follow_symlinks=False)
+        if info.st_dev != device or info.st_uid != uid:
+            raise NotIdle  # another filesystem, or a file this account does not own
+        member = tarfile.TarInfo(os.fspath(Path("worktree") / rel))
+        member.mode, member.mtime = stat.S_IMODE(info.st_mode), int(info.st_mtime)
+        if stat.S_ISDIR(info.st_mode):
+            member.type = tarfile.DIRTYPE
+            tar.addfile(member)
+        elif stat.S_ISLNK(info.st_mode):
+            member.type = tarfile.SYMTYPE
+            member.linkname = os.readlink(entry_name, dir_fd=dir_fd)
+            tar.addfile(member)
+        elif stat.S_ISREG(info.st_mode):
+            total += info.st_size
+            if total > ARCHIVE_LIMIT:
+                raise NotIdle
+            src = os.open(entry_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+            with os.fdopen(src, "rb") as stream:
+                now = os.fstat(stream.fileno())
+                if (now.st_ino, now.st_dev, now.st_size) != (info.st_ino, info.st_dev, info.st_size):
+                    raise NotIdle  # replaced since it was listed
+                member.size = now.st_size
+                tar.addfile(member, stream)
+                if os.fstat(stream.fileno()).st_mtime_ns != now.st_mtime_ns:
+                    raise NotIdle  # written to while being read
+        else:
+            skipped.append(os.fspath(rel))
+            return info
+        expected[member.name] = (member.type, member.size)
+        return info
+
+    fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        if os.geteuid() == 0:
+            os.fchown(fd, *COMMAND_OWNER)
+        root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            with os.fdopen(fd, "wb") as raw:
+                with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as zipped, \
+                        tarfile.open(fileobj=zipped, mode="w|", format=tarfile.PAX_FORMAT) as tar:
+                    for rel in roots:
+                        pfd = open_below(root_fd, rel.parts[:-1])
+                        try:
+                            if stat.S_ISDIR(add(tar, rel, pfd, rel.name).st_mode):
+                                for top, dirs, files, dfd in os.fwalk(rel.name, dir_fd=pfd,
+                                                                      follow_symlinks=False, onerror=fail):
+                                    here = rel.parent / top
+                                    if ".git" in dirs or ".git" in files:
+                                        raise NotIdle  # a repository inside is not ours to pack
+                                    dirs[:] = [d for d in dirs if d not in BUILD_NAMES]
+                                    for entry in dirs + files:
+                                        add(tar, here / entry, dfd, entry)
+                        finally:
+                            os.close(pfd)
+                    manifest = json.dumps({"worktree": str(path), "repository": str(repo), "head": head,
+                                           "archived_at": stamp, "members": len(expected), "bytes": total,
+                                           "not_archived": skipped}, indent=1).encode()
+                    info = tarfile.TarInfo("MANIFEST.json")
+                    info.size = len(manifest)
+                    tar.addfile(info, io.BytesIO(manifest))
+                raw.flush()
+                os.fsync(raw.fileno())
+        finally:
+            os.close(root_fd)
+        # Read the whole archive back: gzip intact, every member present with its size.
+        check = os.open(part, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        seen = {}
+        with os.fdopen(check, "rb") as raw, tarfile.open(fileobj=raw, mode="r|gz") as tar:
+            for member in tar:
+                if member.isfile():
+                    stream = tar.extractfile(member)
+                    while stream.read(1 << 20):
+                        if clock() >= end:
+                            raise Incomplete("archive check timed out")
+                seen[member.name] = (member.type, member.size)
+        if "MANIFEST.json" not in seen or any(seen.get(k) != v for k, v in expected.items()):
+            raise NotIdle
+        os.rename(part, final)
+        dsync = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(dsync)
+        finally:
+            os.close(dsync)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(part)
+        raise
+    return final
+
+
 def protected_paths(home, uid, inspect_all=False, mapped=False):
     """Protect kernel paths and ndev registrations; production inspects every UID.
 
@@ -363,7 +590,13 @@ def identity(repo, path, head, uid, device):
         return None
 
 
-def clean(home, path, head, directory):
+def clean(home, path, head, directory, allow_ignored=False):
+    """True when the checkout has nothing Git would lose.
+
+    With allow_ignored, ignored files may remain and a list of their paths
+    (relative, as Git reports them) is returned instead of True; untracked,
+    modified, staged or hidden edits still return False.
+    """
     actual = git(home, path, "rev-parse", "--verify", "HEAD")
     if actual is None or os.fsdecode(actual).strip() != head:
         return False
@@ -374,6 +607,22 @@ def clean(home, path, head, directory):
     marker = directory / "claude-interactive"
     if marker.exists() and time.time() - marker.stat().st_mtime < MARKER_AGE:
         return False
+    if allow_ignored:
+        status = git(home, path, "status", "--porcelain=v1", "-z", "--untracked-files=normal",
+                     "--ignored=matching", "--ignore-submodules=none")
+        if status is None:
+            return False
+        ignored = []
+        for row in status.split(b"\0"):
+            if not row:
+                continue
+            if not row.startswith(b"!! "):
+                return False
+            ignored.append(os.fsdecode(row[3:]).rstrip("/"))
+        index = git(home, path, "ls-files", "-v", "-z")
+        if index is None or not all(e.startswith(b"H ") for e in index.split(b"\0") if e):
+            return False
+        return ignored
     # A top-level entry absent from HEAD is already a reason to preserve the
     # checkout, including a staged addition. Read only the root tree so large
     # ignored dependency and build caches do not require a recursive scan.
@@ -409,7 +658,7 @@ def local_repo_ok(home, repo):
         and not (repo / ".git/info/grafts").exists())
 
 
-def prune(home, uid, token=None, *, inspect_all=False):
+def prune(home, uid, token=None, *, inspect_all=False, retire=False):
     skipped = {"status": "skipped"} if token else {"candidates": []}
     healthy = {"status": "healthy"} if token else {"candidates": []}
     if not pressure(home):
@@ -418,6 +667,8 @@ def prune(home, uid, token=None, *, inspect_all=False):
     device = home.stat().st_dev
     if not owned(home, uid, device):
         raise OSError("unsafe home")
+    if retire and not token:
+        expire_archives(home, uid, device)
     directories = list(dict.fromkeys(roots(home, uid, device)))
     candidates = []
     registered = set(directories)
@@ -441,6 +692,7 @@ def prune(home, uid, token=None, *, inspect_all=False):
     if not candidates or (token and len(candidates) != 1):
         return skipped
     paths = protected_paths(home, uid, inspect_all)
+    retire_cutoff = int((wall() - RETIRE_IDLE_SECONDS) * 1e9)
     eligible = []
     origins = {}
     defaults = {}
@@ -464,12 +716,12 @@ def prune(home, uid, token=None, *, inspect_all=False):
         if not valid_repos[repo]:
             continue
         try:
-            is_clean = clean(home, path, head, info[0])
+            is_clean = clean(home, path, head, info[0], allow_ignored=retire)
         except Incomplete:
             # A bounded Git read did not prove this checkout clean. Keep this
             # tree, but continue checking independently verified candidates.
             continue
-        if not is_clean:
+        if is_clean is False:
             continue
         if repo not in origins:
             url = git(home, repo, "remote", "get-url", "origin")
@@ -485,9 +737,13 @@ def prune(home, uid, token=None, *, inspect_all=False):
             continue
         proof = (origin, head, *default)
         if proof not in merge_proofs:
-            if not merged(home, repo, head, *default, origin):
+            if merged(home, repo, head, *default, origin):
+                merge_proofs.add(proof)
+            elif not (retire and git_idle(home, path, info[0], uid, device, retire_cutoff) is not None
+                      and on_remote(home, repo, head, origin)):
+                # Retirement also takes an idle worktree whose HEAD is on a
+                # live remote branch: nothing in Git would be lost.
                 continue
-            merge_proofs.add(proof)
         if not token:
             eligible.append({"token": info[2], "age_ns": age})
             if len(eligible) == LIST_LIMIT:
@@ -499,10 +755,25 @@ def prune(home, uid, token=None, *, inspect_all=False):
         if (record not in records or identity(repo, path, head, uid, device) != info
                 or any(Path(x["worktree"]) != path and under(Path(x["worktree"]).resolve(), path)
                        for x in records if "worktree" in x)
-                or not clean(home, path, head, info[0]) or protected(path, protected_paths(home, uid, inspect_all))):
+                or protected(path, protected_paths(home, uid, inspect_all))):
+            return skipped
+        ignored = clean(home, path, head, info[0], allow_ignored=retire)
+        if ignored is False:
             return skipped
         if not pressure(home):
             return healthy
+        if retire and ignored:
+            # git worktree remove deletes ignored files without asking. Keep them
+            # in a read-back archive first; anything not archivable keeps the tree.
+            try:
+                archive_ignored(home, uid, device, repo, path, head, ignored, clock() + ARCHIVE_SECONDS)
+            except (NotIdle, OSError):
+                return skipped
+            # The archive took time: nothing may have changed meanwhile.
+            if (identity(repo, path, head, uid, device) != info
+                    or clean(home, path, head, info[0], allow_ignored=True) != ignored
+                    or protected(path, protected_paths(home, uid, inspect_all))):
+                return skipped
         removed = git(home, repo, "worktree", "remove", "--", str(path), timeout=50) is not None
         return {"status": "removed" if removed else "declined"}
     if token and clock() >= end:
@@ -758,7 +1029,12 @@ def main():
     mode.add_argument("--clean-builds", action="store_true",
                       help="remove idle worktrees' ignored build output while the disk is pressured")
     parser.add_argument("--after", metavar="CURSOR", help="continue a build pass after this cursor")
+    parser.add_argument("--retire", action="store_true",
+                        help="with --list or --remove: archive ignored files, then remove; also take idle"
+                             " worktrees whose HEAD is on a live remote branch")
     args = parser.parse_args()
+    if args.retire and (args.builds or args.clean_builds):
+        parser.error("--retire applies to --list and --remove")
     if args.remove and not TOKEN.fullmatch(args.remove):
         parser.error("invalid worktree token")
     after = None
@@ -783,7 +1059,7 @@ def main():
         if args.builds or args.clean_builds:
             result = builds(home, uid, args.clean_builds, after, inspect_all=root)
         else:
-            result = prune(home, uid, args.remove, inspect_all=root)
+            result = prune(home, uid, args.remove, inspect_all=root, retire=args.retire)
     except (OSError, RuntimeError, ValueError, KeyError, IndexError, Incomplete) as error:
         if not args.remove:
             # The host discards container stderr. Keep diagnostics in this account's journal;

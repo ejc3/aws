@@ -116,13 +116,13 @@ class HostCleanup(unittest.TestCase):
             with patch.object(sys, "argv", ["driver", "--apply", "--host-only"]), patch.object(
                 host.os, "geteuid", return_value=0
             ), patch.object(host, "pressured", return_value=True), patch.object(
-                host, "clean", side_effect=lambda accounts, *rest: seen.append((accounts, rest[2]))
+                host, "clean", side_effect=lambda accounts, *rest, retire=False: seen.append((accounts, rest[2], retire))
             ), patch.object(
                 host, "clean_builds", side_effect=lambda query, pressure, apply, deadline: seen.append(("builds", apply))
             ):
                 host.main()
-            # The build-output pass follows the merged-worktree pass.
-            self.assertEqual(seen, [(["ubuntu"], True), ("builds", True)])
+            # The build-output pass follows the merged-worktree pass, which retires on this host.
+            self.assertEqual(seen, [(["ubuntu"], True, True), ("builds", True)])
 
     def test_host_only_refuses_a_container_host(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -259,10 +259,11 @@ class HostCleanup(unittest.TestCase):
             with patch.object(sys, "argv", argv), patch.object(host.os, "geteuid", return_value=0), patch.object(
                 host, "pressured", return_value=True
             ), patch.object(host, "managed_accounts", return_value=["ubuntu", "ejc3"]), patch.object(
-                host, "clean", side_effect=lambda accounts, *rest: seen.append(accounts)
+                host, "clean", side_effect=lambda accounts, *rest, retire=False: seen.append((accounts, retire))
             ), patch.object(host, "clean_builds", side_effect=AssertionError("build pass on Next.js")):
                 host.main()
-            self.assertEqual(seen, [["ubuntu", "ejc3"]])
+            # Next.js hosts never retire: ignored files still keep a worktree there.
+            self.assertEqual(seen, [(["ubuntu", "ejc3"], False)])
 
     def test_host_only_on_a_nextjs_host_stops_before_the_build_pass(self):
         with tempfile.TemporaryDirectory() as temp:

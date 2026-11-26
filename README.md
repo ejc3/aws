@@ -2432,7 +2432,21 @@ or starting cleanup during installation.
 fcvm-metal-arm runs the same job for its `ubuntu` account only, as
 `fcvm-worktree-prune.timer` (`--host-only`: no containers, no `machinectl`), from
 its own association; `sudo fcvm-worktree-prune --host-only` previews it there.
-There, after the merged-worktree pass and under the same pressure test, it also
+There the worktree pass also retires (`--retire`). A worktree may hold ignored
+files (`.scratch/`, `.env.local`): before removal they are packed, except
+`node_modules`, `.next` and `target`, into
+`~/.local/share/worktree-archive/<repo>/<worktree>-<head>-<UTC time>.tar.gz`
+(mode 0600, with a `MANIFEST.json`), read back in full and synced. Restore one with
+`tar -xzf <archive>`; it unpacks into `worktree/`. A worktree is kept instead when
+its ignored files hold a nested repository, a file another account owns or one on
+another disk, a file that changes while it is read, or more than 1 GiB, or when
+fewer than 4 GiB are free. A clean worktree whose `HEAD` is not merged also
+qualifies when that commit is on a branch that exists on GitHub now (confirmed
+against GitHub's branch tip, so a branch deleted upstream does not count) and Git
+has not used the worktree for 14 days, with the same idle test as below. Archives
+older than 90 days are deleted. Untracked or modified files still keep a worktree,
+and Next.js hosts do not retire.
+After the worktree pass and under the same pressure test, it also
 deletes regenerable build output from idle linked worktrees, oldest first, and
 stops once space recovers: only `node_modules`, `.next` and `target` directories
 at most three levels below the worktree root, each a real directory on the same
