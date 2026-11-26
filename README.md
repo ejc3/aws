@@ -1642,6 +1642,37 @@ it once). The agent tools are `scripts/mac-setup.sh colton-mac`. Keep the Mac lo
 (its secret follows; nothing changes on the box), and a leaked connector token means replacing
 `cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh` with the connector stopped, then step 2 over a temporary route.
 
+### SSH to Colin's Mac, and the pool on it: `ssh colin-mac`
+
+Built exactly like Colton's (above): Cloudflare Access in front of the Mac's Remote Login at `colin-mac-ssh.cc-games.dev`
+(`colin-mac-ssh.tf`), a connector LaunchAgent on the Mac, and the `mac-ssh-client.tf` installer with alias `colin-mac` (entry
+`colin-mac` of `local.mac_ssh_macs`, user `colincampbell`, its host key read at the Mac on 2026-11-26). Clients, each with
+its own token: fcvm-arm `ubuntu` (`colin-mac-ssh-access-fcvm`), Colin's own container (`colin-mac-ssh-access-nextjs-colin`,
+denied to every other member's container) and the owner's (`colin-mac-ssh-access-nextjs-ejc3`, denied to every member's).
+A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_ssh_pinned`).
+
+**First bring-up**, with a temporary reverse tunnel that ends on fcvm-arm's `pcboot` account, never on `ubuntu`
+("Machines outside AWS" in AGENTS.md). The port is the first of colin-mac's block in fcvm-arm's port registry
+(`ports claim colin-mac`: 23440). Pass `--bootstrap-port` the port the tunnel was actually allowed on with `allow`.
+`~/.ssh/to-colin-mac` is made only when missing, so a key already authorized on the Mac is kept:
+
+1. Apply. fcvm-arm's `fcvm-mac-ssh-clients` association makes `~/.ssh/to-colin-mac` and the `colin-mac` alias.
+2. On the Mac, System Settings > General > Sharing > Remote Login: on, for Colin's account only.
+3. On fcvm-arm: `FCVM_HOST=<firecracker_dev_public_ip> scripts/windows-pc-bootstrap.sh print-mac colin-mac 23440`
+   prints the Terminal paste (`scripts/mac/bootstrap-tunnel.sh` with the values filled in; nothing in it is secret). At the
+   Mac, paste it into Terminal as Colin. It authorizes fcvm-arm's key, pins fcvm-arm's host key, prints the Mac's own
+   tunnel key and keeps retrying the tunnel. On fcvm-arm, authorize that key for the tunnel only:
+   `scripts/windows-pc-bootstrap.sh allow colin-mac 23440 '<the line it printed>'` (it expires in two days).
+4. From a jumpbox: `scripts/mac-ssh-connector-setup.sh colin-mac --bootstrap-port 23440`. The connector token travels
+   through ssh stdin only, from its administration-only secret.
+5. From a jumpbox: `scripts/claw-master-mac-setup.sh colin-mac --default`. That is the pool's tunnel and `claude-pool`,
+   a request to Anthropic through that tunnel (it stops here, nothing switched, unless one answers), then the pinned
+   claw-master's own `agent install` and the same request through the agent (undone with `agent uninstall` if it fails): a launchd agent on `127.0.0.1:8445` and its proxy in Colin's
+   `~/.claude/settings.json`, so plain `claude`, the desktop app's Code tab and the IDE extensions all use the pool. No
+   fallback: while the pool is down, Claude's requests fail. `claw-master agent uninstall` on the Mac undoes it.
+6. Check `ssh colin-mac true` from each client, then retire the tunnel: `scripts/windows-pc-bootstrap.sh retire
+   colin-mac` on fcvm-arm, and close the Terminal window on the Mac.
+
 ### SSH to Colin's PC, and its screen: `ssh colin-pc`, Windows-MCP
 
 Colton's Mac's shape on a Windows PC (owner, 2026-10-20): Cloudflare Access in front of the PC's OpenSSH Server at

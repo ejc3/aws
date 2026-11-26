@@ -4,7 +4,9 @@
 # tunnel (claw-master-tunnel.tf), reaching it from fcvm-metal-arm (mac-ssh-client.tf: `ssh mac`
 # from there, through Cloudflare Access).
 #
-#   scripts/claw-master-mac-setup.sh mac        run on a jumpbox as an AWS administrator
+#   scripts/claw-master-mac-setup.sh mac             run on a jumpbox as an AWS administrator
+#   scripts/claw-master-mac-setup.sh colin-mac --default
+#                                                    the same, and every Claude Code on the Mac uses the pool
 #
 # ADDITIVE AND OPT-IN. It installs into the user's home only (~/.local/bin, ~/.config/claude-master,
 # ~/Library/LaunchAgents) and leaves the Mac's own `claude`, its login and its settings alone: a
@@ -19,6 +21,14 @@
 #     from the 0600 file, not from the plist)
 #   * ~/.local/bin/claude-pool: `claude` with inference from the pool; arguments pass straight through
 # Re-running is safe: it re-verifies the binaries, rewrites the files and reloads the agent.
+#
+# --default (owner, 2026-11-26, for Colin's Mac: "his claude on mac should go through pool just like any claude"): also
+# runs the pinned claw-master's own `agent install` on the Mac, against the open listener this script sets up. That runs
+# the claw-master agent as a launchd job (dev.claw-master.agent) on 127.0.0.1:8445 and sets its proxy, CA and loopback
+# exemption in the user's ~/.claude/settings.json, which the CLI, the desktop app's Code tab and the IDE extensions all
+# read, so a plain `claude` and the app use the pool too, as every Claude Code in a nextjs-ct container does. No fallback:
+# while the tunnel, the agent or the server is down, Claude's requests fail rather than go out on the Mac's own login.
+# `claw-master agent uninstall` on the Mac puts back what the install replaced in settings.json and removes the job.
 set -euo pipefail
 
 REGION=${AWS_REGION:-us-west-1}
@@ -44,8 +54,17 @@ CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291
 # The executable inside that tarball: an installed cloudflared is judged by this, not by its version string.
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
+usage() { echo "usage: claw-master-mac-setup.sh ALIAS [--default]   (ALIAS: the Mac's ssh alias on fcvm-arm)" >&2; exit 2; }
 ALIAS=${1:-}
-[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || { echo "usage: claw-master-mac-setup.sh ALIAS   (mac: the ssh alias on fcvm-arm)" >&2; exit 2; }
+[[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
+DEFAULT=""
+case "${2:-}" in
+  "") ;;
+  --default) DEFAULT=1 ;;
+  *) usage ;;
+esac
+[ $# -le 2 ] || usage
+AGENT_LISTEN=127.0.0.1:8445
 FCVM=$(fcvm_host)
 
 # Run something on the Mac: jumpbox -> fcvm -> (Cloudflare Access) -> Mac. stdin is passed through.
@@ -184,4 +203,44 @@ echo "listening on 127.0.0.1:8444: $(lsof -nP -iTCP:8444 -sTCP:LISTEN 2>/dev/nul
 ls -l "$HOME/.config/claude-master" | awk 'NR>1{print $1, $NF}'
 tail -3 "$HOME/Library/Logs/claude-master-tunnel.log" 2>/dev/null | cut -c1-160
 REMOTE
-echo "done. On the Mac: claude-pool   (needs the shared server running and ca.pem installed)"
+if [ -n "$DEFAULT" ]; then
+  echo "7/7 every Claude Code on the Mac through the pool (claw-master agent install), checked before and after"
+  # The pinned binary's own installer, against the open listener the tunnel agent above serves; its port comes from the
+  # same secret as the tunnel's. There is no fallback once it is installed, so a request must reach Anthropic through the
+  # tunnel and the server BEFORE the Mac is switched over, and through the agent AFTER, else the install is undone.
+  # 127.0.0.1:PORT is cloudflared relaying to the server's open listener, a plain-HTTP CONNECT proxy, so curl uses it with
+  # -x and trusts the server's CA for the TLS inside it (--cacert; claw-master-windows-setup.sh steps 6-7). The proxy
+  # answers CONNECT 200 before it reaches Anthropic and a failed upstream request as 5xx, so the HTTP status must be
+  # Anthropic's own: 2xx or 4xx. The agent's proxy URL carries its token: it is read from settings.json into the
+  # environment only (plutil, which every Mac has), never onto an argument, and never printed.
+  on_mac "PORT=$PORT LISTEN=$AGENT_LISTEN bash -s" <<'DEFAULTMAC'
+set -u
+export PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+D="$HOME/.config/claude-master"
+answered() { [[ $1 =~ ^200\ [24][0-9][0-9]$ ]]; }
+out=none
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  out=$(curl -s -m 30 -o /dev/null -w '%{http_connect} %{http_code}' -x "http://127.0.0.1:$PORT" --cacert "$D/ca.pem" \
+    https://api.anthropic.com/v1/models) || out="curl exit $?"
+  answered "$out" && break
+  sleep 3
+done
+answered "$out" || { echo "the pool did not answer through the tunnel ($out); the Mac was not switched over" >&2; exit 1; }
+echo "through the pool: CONNECT and HTTP status $out"
+claw-master agent install --listen "$LISTEN" --open "127.0.0.1:$PORT" --ca "$D/ca.pem" ||
+  { echo "agent install failed; undoing what it wrote" >&2; claw-master agent uninstall || true; exit 1; }
+HTTPS_PROXY=$(plutil -extract env.HTTPS_PROXY raw -o - "$HOME/.claude/settings.json" 2>/dev/null) || HTTPS_PROXY=""
+export HTTPS_PROXY
+out=$(curl -s -m 30 -o /dev/null -w '%{http_connect} %{http_code}' --cacert "$D/ca.pem" https://api.anthropic.com/v1/models) || out="curl exit $?"
+unset HTTPS_PROXY
+if ! answered "$out"; then
+  echo "the agent did not reach the pool ($out); undoing the install" >&2
+  claw-master agent uninstall || true
+  exit 1
+fi
+echo "through the agent: CONNECT and HTTP status $out"
+DEFAULTMAC
+  echo "done. On the Mac: claude (and the desktop app, once restarted) use the pool; claw-master agent uninstall undoes it"
+else
+  echo "done. On the Mac: claude-pool   (needs the shared server running and ca.pem installed)"
+fi

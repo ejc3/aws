@@ -1,5 +1,6 @@
-# `ssh mac`, `ssh colton-mac` and `ssh colin-pc`: the ONE way to each Mac (and Colin's Windows PC), the same on every box
-# that has it. Each client goes through Cloudflare Access (macbook-ssh.tf, colton-mac-ssh.tf, colin-pc-ssh.tf) with ITS
+# `ssh mac`, `ssh colton-mac`, `ssh colin-mac` and `ssh colin-pc`: the ONE way to each Mac (and Colin's Windows PC), the
+# same on every box that has it. Each client goes through Cloudflare Access (macbook-ssh.tf, colton-mac-ssh.tf,
+# colin-mac-ssh.tf, colin-pc-ssh.tf) with ITS
 # OWN service token, to the machine's connector, and ends at its SSH server (macOS Remote Login, or OpenSSH Server on
 # Windows; 127.0.0.1:22). No inbound port anywhere, and no reverse tunnel.
 #
@@ -9,6 +10,9 @@
 #   colton-mac   fcvm-arm, ubuntu      colton-mac-ssh-access-fcvm               dev-user-data.tf (fcvm_mac_ssh_clients)
 #                nextjs-dev, colton    colton-mac-ssh-access-nextjs-colton      nextjs-user-data.tf
 #                nextjs-dev, ejc3      colton-mac-ssh-access-nextjs-ejc3        nextjs-user-data.tf
+#   colin-mac    fcvm-arm, ubuntu      colin-mac-ssh-access-fcvm                dev-user-data.tf (fcvm_mac_ssh_clients)
+#                nextjs-ct, colin      colin-mac-ssh-access-nextjs-colin        nextjs-ct-user-data.tf
+#                nextjs-ct, ejc3       colin-mac-ssh-access-nextjs-ejc3         nextjs-ct-user-data.tf
 #   colin-pc     fcvm-arm, ubuntu      colin-pc-ssh-access-fcvm                 dev-user-data.tf (fcvm_mac_ssh_clients)
 #   mini         fcvm-arm, ubuntu      mini-ssh-access-fcvm                     dev-user-data.tf (fcvm_mac_ssh_clients)
 #                nextjs-ct, ejc3       mini-ssh-access-nextjs-ejc3              nextjs-ct-user-data.tf
@@ -65,6 +69,15 @@ locals {
       host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBljGktqmAak5c1kul5ELE+4jUXZTvArNfpOW+ja7yNB"
       make_key       = true
     }
+    # Colin's Mac (colin-mac-ssh.tf): Remote Login's host key, read at the Mac by the owner on 2026-11-26. A Mac whose key is
+    # "" here is left out of every client (mac_ssh_pinned below): a client with no pin cannot tell the Mac from anything else.
+    colin-mac = {
+      hostname       = "colin-mac-ssh.cc-games.dev"
+      user           = "colincampbell"
+      host_key_alias = "colin-mac"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGWKTmLcLRso4diFUNj+TKt/bMaEyRKCm1UWNCSDEmX"
+      make_key       = true
+    }
     # Colin's Windows PC: OpenSSH Server's host key (C:\ProgramData\ssh\ssh_host_ed25519_key.pub, read on the PC).
     colin-pc = {
       hostname       = "colin-pc-ssh.cc-games.dev"
@@ -76,7 +89,9 @@ locals {
   }
 
   # The map as the rows the installer reads: alias hostname user host_key_alias make_key host_key.
-  mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} ${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\n"])
+  # Only the Macs whose host key is pinned: a row with no key would be a client that trusts whatever answers.
+  mac_ssh_pinned       = [for alias, m in local.mac_ssh_macs : alias if m.host_key != ""]
+  mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} ${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\n" if contains(local.mac_ssh_pinned, alias)])
 
   # cloudflared for the proxy command, pinned with claw-master's (claw-master-tunnel.tf), into the account's
   # ~/.local/bin. Expects MAC_USER (see mac_ssh_client_setup). Kept out of mac_ssh_client_setup, which
@@ -278,7 +293,7 @@ else
 fi
 PCBOOT
 
-  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh mini` and `ssh ci-mac`, each with fcvm-arm's own service token, and the pcboot
+  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh colin-mac` (once pinned), `ssh mini` and `ssh ci-mac`, each with fcvm-arm's own service token, and the pcboot
   # account above. The arm setup script runs it at boot (dev-user-data.tf) and the association below runs it on the running
   # box, daily.
   fcvm_mac_ssh_clients = <<-FCVMMACS
@@ -294,6 +309,11 @@ ${local.mac_ssh_client_setup}
 MAC_ALIAS=colin-pc
 MAC_SECRET=colin-pc-ssh-access-fcvm
 ${local.mac_ssh_client_setup}
+%{if contains(local.mac_ssh_pinned, "colin-mac")~}
+MAC_ALIAS=colin-mac
+MAC_SECRET=colin-mac-ssh-access-fcvm
+${local.mac_ssh_client_setup}
+%{endif~}
 MAC_ALIAS=mini
 MAC_SECRET=mini-ssh-access-fcvm
 ${local.mac_ssh_client_setup}

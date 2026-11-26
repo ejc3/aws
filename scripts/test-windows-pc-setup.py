@@ -270,6 +270,40 @@ class BootstrapPrint(unittest.TestCase):
             self.assertIn((ssh / "to-test-pc.pub").read_text().split()[1], body)
 
 
+    def test_print_mac_is_a_terminal_paste_that_authorizes_fcvm_and_tunnels_to_pcboot_only(self):
+        with tempfile.TemporaryDirectory() as box, tempfile.TemporaryDirectory() as mac:
+            ssh = Path(box) / ".ssh"
+            ssh.mkdir()
+            subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(ssh / "to-test-mac")], check=True)
+            r = subprocess.run(["bash", str(BOOT_GEN), "print-mac", "test-mac", "23440"], capture_output=True, text=True,
+                               env=dict(os.environ, HOME=box, FCVM_HOST="203.0.113.7"))
+            self.assertEqual(r.returncode, 0, r.stderr)
+            paste = r.stdout
+            self.assertNotIn("$HOME", paste)  # every value is filled in on the box
+            # Run it on a stand-in Mac: a fake HOME and an ssh that records its arguments and succeeds.
+            stub = Path(mac) / "bin"
+            stub.mkdir()
+            (stub / "ssh").write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$HOME/ssh-args"\n')
+            (stub / "ssh").chmod(0o755)
+            run = subprocess.run(["bash", "-e", "-c", paste], capture_output=True, text=True, timeout=30,
+                                 env=dict(os.environ, HOME=mac, PATH=f"{stub}:{os.environ['PATH']}"))
+            self.assertEqual(run.returncode, 0, run.stderr)
+            client = " ".join((ssh / "to-test-mac.pub").read_text().split()[:2])
+            self.assertEqual((Path(mac) / ".ssh/authorized_keys").read_text(), f"{client} fcvm-arm-to-test-mac\n")
+            self.assertTrue((Path(mac) / ".ssh/known_hosts.test-mac-bootstrap").read_text().startswith("203.0.113.7 ssh-ed25519 "))
+            own = (Path(mac) / ".ssh/test-mac-bootstrap.pub").read_text().strip()
+            self.assertIn(own, run.stdout)  # the line to hand to `allow`
+            args = (Path(mac) / "ssh-args").read_text().split("\n")
+            self.assertIn("127.0.0.1:23440:127.0.0.1:22", args)
+            self.assertEqual(args[args.index("-R") + 1], "127.0.0.1:23440:127.0.0.1:22")
+            self.assertIn("pcboot@203.0.113.7", args)
+            self.assertIn("StrictHostKeyChecking=yes", args)
+            # Run again: nothing is added twice.
+            subprocess.run(["bash", "-e", "-c", paste], capture_output=True, text=True, timeout=30,
+                           env=dict(os.environ, HOME=mac, PATH=f"{stub}:{os.environ['PATH']}"))
+            self.assertEqual((Path(mac) / ".ssh/authorized_keys").read_text().count(client), 1)
+
+
 class Client(unittest.TestCase):
     def test_the_key_travels_in_a_private_header_file_never_an_argument(self):
         self.assertIn('--header-file "$HEADERS"', BRIDGE)

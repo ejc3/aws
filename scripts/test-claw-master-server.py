@@ -707,9 +707,16 @@ class MacSetupTests(unittest.TestCase):
         self.assertIn("chmod 600", text)
 
     def test_it_changes_nothing_about_the_macs_own_claude(self):
+        # Without --default nothing touches the Mac's own Claude. With it, claw-master's own `agent install` writes
+        # settings.json (and `agent uninstall` restores it); the script itself only READS the proxy back for its check.
         text = code(MACSETUP)
+        head, default = text.split('if [ -n "$DEFAULT" ]; then', 1)
         for forbidden in ("~/.claude", "$HOME/.claude", "settings.json", "alias claude", ".zshrc", ".zprofile", "/usr/local/bin/claude"):
-            self.assertNotIn(forbidden, text)
+            self.assertNotIn(forbidden, head)
+        for forbidden in ("alias claude", ".zshrc", ".zprofile", "/usr/local/bin/claude", "> \"$HOME/.claude", ">> \"$HOME/.claude"):
+            self.assertNotIn(forbidden, default)
+        self.assertEqual(default.count("$HOME/.claude/settings.json"), 1)
+        self.assertIn('plutil -extract env.HTTPS_PROXY raw -o - "$HOME/.claude/settings.json"', default)
         self.assertIn("claude-pool", text)
 
     def test_the_tunnel_log_rotates_and_the_token_is_not_in_the_plist(self):

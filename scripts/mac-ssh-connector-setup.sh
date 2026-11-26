@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # mac-ssh-connector-setup -- put a Mac on its Cloudflare route (macbook-ssh.tf for `mac`, colton-mac-ssh.tf for
-# `colton-mac`): the pinned cloudflared, the connector LaunchAgent with its token, the clients' public keys and a
+# `colton-mac`, colin-mac-ssh.tf for `colin-mac`): the pinned cloudflared, the connector LaunchAgent with its token, the clients' public keys and a
 # keys-only Remote Login. Run on a jumpbox as an AWS administrator.
 #
 #   scripts/mac-ssh-connector-setup.sh mac                              EJ's MacBook, over its own route
@@ -55,7 +55,7 @@ CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
-usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT | --lan SSH_DEST]   (ALIAS: mac, colton-mac, mini)" >&2; exit 2; }
+usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT | --lan SSH_DEST]   (ALIAS: mac, colton-mac, colin-mac, mini)" >&2; exit 2; }
 ALIAS=${1:-}
 shift || true
 BOOTSTRAP_PORT=""
@@ -89,6 +89,13 @@ case "$ALIAS" in
     LABEL=com.ccgames.colton-mac-ssh.cloudflared
     TOKEN_FILE=.cloudflared/colton-mac-ssh.token
     LOG_FILE=Library/Logs/colton-mac-ssh-cloudflared.log
+    ;;
+  colin-mac)
+    TUNNEL_SECRET=colin-mac-ssh-tunnel-token
+    CLIENTS="fcvm:ubuntu nextjs:colin nextjs:ejc3"
+    LABEL=com.ccgames.colin-mac-ssh.cloudflared
+    TOKEN_FILE=.cloudflared/colin-mac-ssh.token
+    LOG_FILE=Library/Logs/colin-mac-ssh-cloudflared.log
     ;;
   mini)
     TUNNEL_SECRET=mini-ssh-tunnel-token
