@@ -408,6 +408,13 @@ class BoxAgentNotesTests(unittest.TestCase):
             self.assertIn(phrase, notes)
 
 
+    def test_the_notes_say_the_github_api_is_a_shared_budget(self):
+        notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
+        for phrase in ("The GitHub API is a shared budget", "gh event listen", "at most once every 10 minutes",
+                       "gh api rate_limit", "never a person's token"):
+            self.assertIn(phrase, notes)
+
+
 class EternalTerminalTests(unittest.TestCase):
     """The phone connects with Eternal Terminal: nextjs-dev ran etserver on 2022, the containers did not, and the phone's
     `etterminal` over ssh exited 127. One container, the owner's, gets the pinned build and the host's port."""
