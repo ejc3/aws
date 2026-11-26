@@ -932,7 +932,13 @@ class AgentsMd(Base):
         self.assertIn("Not on the pool", self.out.read_text())
         (self.temp / ".claude").mkdir()
         (self.temp / ".claude" / "settings.json").write_text('{"env": {"HTTPS_PROXY": "http://127.0.0.1:8445"}}')
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text(), "settings without a loaded agent is not the pool")
+        (self.temp / ".claude" / "settings.json").write_text("{}")
         self.env["LAUNCHCTL_RC"] = "0"
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text(), "a loaded agent without the settings is not the pool")
+        (self.temp / ".claude" / "settings.json").write_text('{"env": {"HTTPS_PROXY": "http://127.0.0.1:8445"}}')
         self.assertEqual(self.write().returncode, 0)
         text = self.out.read_text()
         self.assertIn("## Found: Claude and the shared pool", text)
