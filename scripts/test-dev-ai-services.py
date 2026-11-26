@@ -110,6 +110,28 @@ class ElevenLabsSecretTests(unittest.TestCase):
 
 
 
+class FamilyTelegramBotTests(unittest.TestCase):
+    """Family's bot token is the owner's: nextjs-dev-role may read and put it, so every member container is denied both."""
+
+    def test_only_nextjs_dev_role_may_put_and_only_this_secret(self):
+        doc = TF[TF.index('data "aws_iam_policy_document" "family_telegram_bot_put"'):]
+        doc = doc[:doc.index("\n}\n")]
+        self.assertIn('actions   = ["secretsmanager:PutSecretValue"]', doc)
+        self.assertIn("resources = [aws_secretsmanager_secret.family_telegram_bot.arn]", doc)
+        self.assertIn("role   = aws_iam_role.nextjs_dev.name", TF)
+
+    def test_every_member_container_is_denied_reading_and_putting_it(self):
+        parity = (ROOT / "nextjs-dev-fcvm-parity.tf").read_text()
+        block = parity[parity.index("nextjs_dev_parity_secrets = concat("):]
+        block = block[:block.index("\n  )\n")]
+        self.assertIn("aws_secretsmanager_secret.family_telegram_bot.arn", block)
+        deny = (ROOT / "nextjs-ct-user-data.tf").read_text()
+        stmt = deny[deny.index('Sid      = "OwnerOnlyFcvmSecrets"'):]
+        stmt = stmt[:stmt.index("}")]
+        self.assertIn('"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"', stmt)
+        self.assertIn("Resource = local.nextjs_dev_parity_secrets", stmt)
+
+
 class StabilitySecretTests(unittest.TestCase):
     def test_value_is_out_of_band_and_not_in_deployed_apps(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "stability_api_key"', TF)

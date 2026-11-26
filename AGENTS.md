@@ -1529,7 +1529,8 @@ Available if a task needs them; neither needs a key on disk.
   `family/telegram-bot` in us-west-1, JSON `{"TELEGRAM_BOT_TOKEN": ...}`, with the same
   admin/dev-role read boundary as ElevenLabs. nextjs-dev-role may also put its value
   (`PutSecretValue` on this secret alone), so an agent there stores the token BotFather
-  gave the owner. Fetch it at use time as `TELEGRAM_BOT_TOKEN`, and pass it to `curl` on
+  gave the owner; the owner's container only (members are denied both, `nextjs_dev_parity_secrets`). Fetch it at use
+  time as `TELEGRAM_BOT_TOKEN`, and pass it to `curl` on
   stdin (`curl -K -`), never in a URL on a command line. Terraform owns only the container and grants.
 - **The run.cloud reaper** (`run-cloud-reaper.tf`, `scripts/run-cloud-reaper.py`): the Lambda `run-cloud-reaper` runs every 5
   minutes, reads that key, lists the account's active iOS and Android sessions, sandboxes and boxes, and deletes an active
