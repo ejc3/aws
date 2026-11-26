@@ -1062,8 +1062,9 @@ SSH and Eternal Terminal provide interactive access. `t-claude` supplies Claude'
 phone-oriented remote-control workflow; Codex uses its own app-server remote-control
 daemon. Conversation history is synchronized through `claude-code-sync`. On each metal
 box, `fcvm-claude-rc.service` starts remote-control sessions at boot for the user's
-active repositories under `/home/ubuntu`. A human prompt or a `claude-interactive`
-marker in the preceding 30 days qualifies a checkout from an allowed origin.
+active repositories under `/home/ubuntu`. A human prompt in the preceding 30 days qualifies a
+checkout from an allowed origin; a `claude-interactive` marker alone qualifies it only for 3 days
+after the marker was created.
 The launcher uses the normal path-derived `t-claude` session so a later interactive
 launch attaches to the same work when run from that repository root.
 

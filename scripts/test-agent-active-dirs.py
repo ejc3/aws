@@ -133,6 +133,47 @@ class MarkerTests(Base):
         os.utime(m, (old, old))
         self.assertEqual(self.active(), {})
 
+    def test_a_marker_alone_counts_only_while_it_is_new_however_often_it_is_touched(self):
+        r = self.repo("game")
+        m = r / ".git" / "claude-interactive"
+        m.touch()  # touched just now, as an agent does on every command
+        born = {"value": self.now - 1 * DAY}
+        real = aad.marker_born
+        aad.marker_born = lambda path: born["value"]
+        self.addCleanup(setattr, aad, "marker_born", real)
+        self.assertTrue(self.active()["game"]["marked"])
+        born["value"] = self.now - (aad.MARKER_GRACE_DAYS + 1) * DAY
+        self.assertEqual(self.active(), {}, "an old marker re-touched by an agent keeps nothing open")
+
+    def test_a_prompted_folder_keeps_its_old_marker(self):
+        r = self.repo("game")
+        (r / ".git" / "claude-interactive").touch()
+        real = aad.marker_born
+        aad.marker_born = lambda path: self.now - 20 * DAY
+        self.addCleanup(setattr, aad, "marker_born", real)
+        self.say(r, "keep going", age_days=5, origin={"kind": "human"})
+        found = self.active()
+        self.assertEqual(found["game"]["prompts"], 1)
+        self.assertTrue(found["game"]["marked"])
+
+    def test_a_message_from_another_session_is_not_a_prompt(self):
+        r = self.repo("game")
+        self.say(r, "<cross-session-message>do this</cross-session-message>", isMeta=True,
+                 origin={"kind": "peer", "name": "other"}, promptSource="system")
+        self.say(r, "do this", origin={"kind": "peer", "name": "other"})
+        self.assertEqual(self.active(), {})
+
+    def test_marker_birth_falls_back_to_modification_time(self):
+        r = self.repo("game")
+        m = r / ".git" / "claude-interactive"
+        m.touch()
+        old = self.now - 5 * DAY
+        os.utime(m, (old, old))
+        real_run = aad.subprocess.run
+        aad.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="0\n", stderr="")
+        self.addCleanup(setattr, aad.subprocess, "run", real_run)
+        self.assertEqual(aad.marker_born(str(m)), os.path.getmtime(m))
+
     def test_an_unmarked_unprompted_checkout_does_not_count(self):
         self.repo("game")
         self.assertEqual(self.active(), {})

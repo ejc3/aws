@@ -7,9 +7,12 @@ A folder qualifies when, within --days (default 30), either:
     subagent turns, background-task notices and SDK-injected turns are not prompts. An entry from a Claude
     Code that did not record an origin counts unless it is a settings command (/model, /effort, ...), which
     tools broadcast to every window; or
-  * an agent or person marked it for interactive use: the file `claude-interactive` in its git directory,
-    touched within the window. `touch "$(git rev-parse --git-dir)/claude-interactive"` marks a clone or a
-    worktree; the git directory is never tracked, so the marker never shows in `git status`.
+  * an agent or person marked it for interactive use: the file `claude-interactive` in its git directory.
+    `touch "$(git rev-parse --git-dir)/claude-interactive"` marks a clone or a worktree; the git directory is
+    never tracked, so the marker never shows in `git status`. A marker alone (no prompt in the window) keeps a
+    folder for only MARKER_GRACE_DAYS after the marker file was created (its birth time; its modification
+    time where the filesystem records none), so an agent touching it again cannot keep a folder nobody
+    prompts open for ever (owner, 2026-11-26).
 Each prompt's working directory maps to its git root (a linked worktree is its own root). Folders that no
 longer exist, lie outside HOME, or sit under .claude/worktrees (subagent scratch) are left out.
 
@@ -33,6 +36,18 @@ SYNTHETIC = ("<local-command-stdout>", "<local-command-stderr>", "<local-command
 SETTINGS_COMMANDS = ("/model", "/effort", "/remote-control", "/rc", "/login", "/logout", "/status", "/config",
                      "/permissions", "/output-style", "/theme", "/fast")
 HUMAN_SOURCES = ("typed", "queued", "remote", "remote-control", "bridge")
+# A folder nobody has prompted stays open on a marker alone for this long after the marker was created.
+MARKER_GRACE_DAYS = 3
+
+
+def marker_born(path):
+    """When the marker file was created: its birth time (statx, via GNU stat), else its modification time."""
+    try:
+        r = subprocess.run(["stat", "-c", "%W", "--", path], capture_output=True, text=True, timeout=10)
+        born = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
+    except (OSError, subprocess.SubprocessError, ValueError):
+        born = 0
+    return born or os.path.getmtime(path)
 
 
 def prompt_text(msg):
@@ -125,7 +140,8 @@ def prompted(claude_dir, cutoff):
 
 
 def marked(roots, cutoff):
-    """folder -> marker time, for checkouts under the roots and their linked worktrees (wherever they live)."""
+    """folder -> marker path, for checkouts under the roots and their linked worktrees (wherever they live),
+    with the marker touched since the cutoff."""
     out = {}
     for pattern in roots:
         for top in glob.glob(os.path.expanduser(pattern)):
@@ -133,22 +149,22 @@ def marked(roots, cutoff):
             if not os.path.isdir(gitdir) or os.path.islink(gitdir):
                 continue
             try:
-                t = os.path.getmtime(os.path.join(gitdir, MARKER))
-                if t >= cutoff:
-                    out[top] = max(out.get(top, 0), t)
+                m = os.path.join(gitdir, MARKER)
+                if os.path.getmtime(m) >= cutoff:
+                    out[top] = m
             except OSError:
                 pass
             for admin in glob.glob(os.path.join(gitdir, "worktrees", "*")):
                 try:
-                    t = os.path.getmtime(os.path.join(admin, MARKER))
-                    if t < cutoff:
+                    m = os.path.join(admin, MARKER)
+                    if os.path.getmtime(m) < cutoff:
                         continue
                     with open(os.path.join(admin, "gitdir")) as fh:
                         wt = os.path.dirname(fh.read().strip())
                 except (OSError, ValueError):
                     continue
                 if wt:
-                    out[wt] = max(out.get(wt, 0), t)
+                    out[wt] = m
     return out
 
 
@@ -166,10 +182,19 @@ def active_dirs(claude_dir, home, days=30, roots=DEFAULT_ROOTS, now=None):
         if root:
             e = out.setdefault(root, {"time": 0, "prompts": 0, "marked": False})
             e["time"], e["prompts"] = max(e["time"], t), e["prompts"] + n
-    for folder, t in marked(roots, cutoff).items():
-        if os.path.isdir(folder):
-            e = out.setdefault(folder, {"time": 0, "prompts": 0, "marked": False})
-            e["time"], e["marked"] = max(e["time"], t), True
+    grace = now - MARKER_GRACE_DAYS * 86400
+    for folder, m in marked(roots, cutoff).items():
+        if not os.path.isdir(folder):
+            continue
+        try:
+            t, born = os.path.getmtime(m), marker_born(m)
+        except OSError:
+            continue
+        # Prompted folders already count; a marker alone counts only while it is new.
+        if folder not in out and born < grace:
+            continue
+        e = out.setdefault(folder, {"time": 0, "prompts": 0, "marked": False})
+        e["time"], e["marked"] = max(e["time"], t), True
     keep = []
     for folder, e in out.items():
         real = os.path.realpath(folder)
