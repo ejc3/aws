@@ -16,3 +16,5 @@ agent sessions. Swap and throttling are not substitutes for RAM.
   `pbox up memory-32`, `pbox ssh` and `pbox down`. Use pbox's direct SSH path from this dev
   account, never a jumpbox. Copy results back and stop your box when done. If you cannot get
   a pbox, report the blocker; don't run the heavy job here instead.
+- A pbox's `/mnt/work` is cleaned hourly: caches unused for 2 days and task directories unused for 7
+  go, sooner when it is over 85% full. Put a `.pbox-keep` file in any directory you need for longer.

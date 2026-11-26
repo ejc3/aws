@@ -1016,6 +1016,7 @@ wait_ready() {
       say "Ready at $IP"
       ssh -i "$KEY" -o StrictHostKeyChecking=no "ubuntu@$IP" \
         'echo "  cores: $(nproc)"; echo "  work:  $(df -h /mnt/work 2>/dev/null | awk "NR==2{print \$2\" total, \"\$4\" free\"}" || echo "not mounted yet")"; '"$KERNEL_CHECK" >&2 2>/dev/null || true
+      say "  clean: /mnt/work drops caches unused 2 days and task dirs unused 7 (sooner when over 85% full); touch DIR/.pbox-keep to keep one"
       if [ "$MODE" = "kvm" ]; then
         # Prepare a new box for KVM. Reusing an incumbent with --local-nvme only checks it.
         local kvm_message=""

@@ -360,6 +360,11 @@ busy box. Members' grants pin their tag keys, so their boxes carry neither tag, 
 Every pbox boot (home, fallback and member) installs the security updates after its packages (`pbox_security_updates`
 in `pbox-flavors.tf`, owner 2026-10-23): `unattended-upgrade`, the security pocket only, retried while apt is busy, never a
 reboot, so a new kernel waits for the next boot and a failed update still leaves a usable box.
+Every pbox's `/mnt/work` is cleaned hourly and once after boot (`pbox-work-clean.tf`, installed by SSM associations in
+the four pbox regions because a home box's user data is already near its 16 KiB cap; owner 2026-11-26, after several
+slots filled to 100%): idle build caches after 2 days, idle top-level task directories after 7, and over 85% the oldest
+idle ones until under 70%. Never a directory with a process in it, anything changed in 24 hours, or anything holding a
+`.pbox-keep`; the unit can write only `/mnt/work` and its lock. Agents keep a directory longer with `.pbox-keep`.
 The I/O box ignores `user_data`, so an SSM association (`aws_ssm_association.io_box_exports`)
 keeps its `/etc/exports.d/io-box.exports` equal to the security group's client list whenever it is up. Known region
 pins to lift when each move is wired up:
