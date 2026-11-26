@@ -54,11 +54,12 @@ trap 'rm -f "$tmp"' EXIT
     done
     [ $found = 1 ] || echo "- None: device builds cannot be signed here yet."
   fi
+  echo
   if [ "$host" = member ]; then
     echo "## Found: Claude and the shared pool"
     echo
     if launchctl print "gui/$(id -u)/dev.claw-master.agent" >/dev/null 2>&1 &&
-      grep -q 'HTTPS_PROXY' "$HOME/.claude/settings.json" 2>/dev/null; then
+      grep -q '127\.0\.0\.1:8445' "$HOME/.claude/settings.json" 2>/dev/null; then
       echo "- On the pool: \`claw-master agent\` is loaded and \`~/.claude/settings.json\` routes Claude Code through it."
     else
       echo "- Not on the pool: Claude Code here uses the person's own subscription and its limits."
