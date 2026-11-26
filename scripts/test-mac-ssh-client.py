@@ -19,6 +19,8 @@ SOURCE = (ROOT / "mac-ssh-client.tf").read_text()
 TUNNEL = (ROOT / "macbook-ssh.tf").read_text()
 COLTON = (ROOT / "colton-mac-ssh.tf").read_text()
 COLIN_PC = (ROOT / "colin-pc-ssh.tf").read_text()
+COLIN_MAC = (ROOT / "colin-mac-ssh.tf").read_text()
+COLIN_MAC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGWKTmLcLRso4diFUNj+TKt/bMaEyRKCm1UWNCSDEmX"
 COLIN_PC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++RvLicN7v0rY9Nxvr9lEmp4"
 CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
 REMOTE_LOGIN_KEY = "AAAAC3NzaC1lZDI1NTE5AAAAID1DlX7dlpsRWSQuPOHoiDxtiyZd7/W4I1toKoLi7zfL"
@@ -271,7 +273,10 @@ class MacSshClient(unittest.TestCase):
 class Wiring(unittest.TestCase):
     def test_the_map_pins_the_macs_the_mini_its_vms_and_colins_pc(self):
         macs = mac_map()
-        self.assertEqual(sorted(macs), ["ci-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
+        self.assertEqual(sorted(macs), ["ci-mac", "colin-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
+        self.assertEqual(macs["colin-mac"], {"hostname": "colin-mac-ssh.cc-games.dev", "user": "colincampbell",
+                                             "host_key_alias": "colin-mac", "host_key": COLIN_MAC_HOST_KEY, "make_key": True})
+        self.assertIn('colin_mac_ssh_hostname = "colin-mac-ssh.cc-games.dev"', COLIN_MAC)
         self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
                                        "host_key_alias": "ejs-macbook-pro-via-fcvm",
                                        "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
@@ -290,8 +295,10 @@ class Wiring(unittest.TestCase):
             self.assertEqual({k: macs[f"{vm}-mac"][k] for k in ("hostname", "user", "host_key_alias", "make_key")},
                              {"hostname": f"{vm}-mac-ssh.cc-games.dev", "user": "admin", "host_key_alias": f"{vm}-mac", "make_key": True})
             self.assertRegex(macs[f"{vm}-mac"]["host_key"], r"^ssh-ed25519 AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$")
+        self.assertIn('mac_ssh_pinned       = [for alias, m in local.mac_ssh_macs : alias if m.host_key != ""]', SOURCE)
         self.assertIn('mac_ssh_client_table = join("", [for alias, m in local.mac_ssh_macs : "${alias} ${m.hostname} '
-                      '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n"])', SOURCE)
+                      '${m.user} ${m.host_key_alias} ${m.make_key ? "yes" : "no"} ${m.host_key}\\n" '
+                      'if contains(local.mac_ssh_pinned, alias)])', SOURCE)
 
     def test_fcvm_arm_gets_the_macs_and_colins_pc_as_ubuntu_with_its_tokens_and_x86_does_not(self):
         source = (ROOT / "dev-user-data.tf").read_text()
@@ -303,6 +310,9 @@ class Wiring(unittest.TestCase):
                                   "MAC_ALIAS=mac\nMAC_SECRET=macbook-ssh-access\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colton-mac\nMAC_SECRET=colton-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  '%{if contains(local.mac_ssh_pinned, "colin-mac")~}\n'
+                                  "MAC_ALIAS=colin-mac\nMAC_SECRET=colin-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "%{endif~}\n"
                                   "MAC_ALIAS=mini\nMAC_SECRET=mini-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=ci-mac\nMAC_SECRET=mac-vm-ci-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
 
@@ -430,6 +440,117 @@ class ColtonCloudflare(unittest.TestCase):
         self.assertIn("name    = local.colton_mac_ssh_hostname", record)
         self.assertIn('content = "${cloudflare_zero_trust_tunnel_cloudflared.colton_mac_ssh.id}.cfargotunnel.com"', record)
 
+
+class ColinMacCloudflare(unittest.TestCase):
+    def resource(self, kind, name):
+        return re.search(rf'resource "{kind}" "{name}" \{{(.*?)\n\}}', COLIN_MAC, re.S).group(1)
+
+    def clients(self):
+        body = re.search(r"colin_mac_ssh_clients = \{\n(.*?)\n  \}", COLIN_MAC, re.S).group(1)
+        return {k: dict(re.findall(r'(\w+) = ("[^"]*"|[\w.]+)', v))
+                for k, v in re.findall(r"^    ([\w-]+)\s+= \{ (.*) \}$", body, re.M)}
+
+    def test_three_clients_each_with_its_own_token_and_secret(self):
+        clients = self.clients()
+        self.assertEqual(sorted(clients), ["fcvm", "nextjs-colin", "nextjs-ejc3"])
+        self.assertEqual({k: (c["secret"], c["reader"]) for k, c in clients.items()}, {
+            "fcvm": ('"colin-mac-ssh-access-fcvm"', "aws_iam_role.dev_server.arn"),
+            "nextjs-colin": ('"colin-mac-ssh-access-nextjs-colin"', "aws_iam_role.nextjs_dev.arn"),
+            "nextjs-ejc3": ('"colin-mac-ssh-access-nextjs-ejc3"', "aws_iam_role.nextjs_dev.arn"),
+        })
+        self.assertIn("for_each   = local.colin_mac_ssh_clients", self.resource("cloudflare_zero_trust_access_service_token", "colin_mac_ssh"))
+
+    def test_the_route_ends_at_remote_login_and_the_connector_checks_access(self):
+        config = self.resource("cloudflare_zero_trust_tunnel_cloudflared_config", "colin_mac_ssh")
+        self.assertEqual(re.findall(r'service\s*=\s*"([^"]+)"', config), ["ssh://127.0.0.1:22", "http_status:404"])
+        self.assertIn("required  = true", config)
+        self.assertIn("aud_tag   = [cloudflare_zero_trust_access_application.colin_mac_ssh.aud]", config)
+
+    def test_access_admits_the_clients_tokens_and_the_owner(self):
+        policy = self.resource("cloudflare_zero_trust_access_policy", "colin_mac_ssh_clients")
+        self.assertIn('decision         = "non_identity"', policy)
+        self.assertIn("for k in sort(keys(local.colin_mac_ssh_clients)) : { service_token = { token_id = "
+                      "cloudflare_zero_trust_access_service_token.colin_mac_ssh[k].id } }", policy)
+        self.assertNotRegex(policy, r"email|group|everyone|ip\s*=")
+        app = self.resource("cloudflare_zero_trust_access_application", "colin_mac_ssh")
+        self.assertEqual(re.findall(r"id\s+= cloudflare_zero_trust_access_policy\.(\w+)\.id\n\s+precedence = (\d)", app),
+                         [("browser_manager_owner", "1"), ("colin_mac_ssh_clients", "2")])
+        self.assertIn("domain           = local.colin_mac_ssh_hostname", app)
+
+    def test_the_connector_token_is_administration_only(self):
+        admins = re.search(r"colin_mac_ssh_admins = \[(.*?)\n  \]", COLIN_MAC, re.S).group(1)
+        self.assertNotIn("dev_server", admins)
+        self.assertNotIn("nextjs_dev", admins)
+        policy = self.resource("aws_secretsmanager_secret_policy", "colin_mac_ssh_tunnel")
+        self.assertIn('"aws:PrincipalArn" = local.colin_mac_ssh_admins', policy)
+        for grant in ("dev_server_colin_mac_ssh", "nextjs_dev_colin_mac_ssh"):
+            self.assertNotIn("colin_mac_ssh_tunnel", self.resource("aws_iam_role_policy", grant))
+
+    def test_each_access_secret_admits_administration_and_its_one_client(self):
+        policy = self.resource("aws_secretsmanager_secret_policy", "colin_mac_ssh_access")
+        self.assertIn('"aws:PrincipalArn" = concat(local.colin_mac_ssh_admins, [each.value.reader])', policy)
+        fcvm = self.resource("aws_iam_role_policy", "dev_server_colin_mac_ssh")
+        self.assertIn('Resource = aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn', fcvm)
+        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', fcvm)
+        nextjs = self.resource("aws_iam_role_policy", "nextjs_dev_colin_mac_ssh")
+        self.assertEqual(re.findall(r'colin_mac_ssh_access\["([\w-]+)"\]', nextjs), ["nextjs-colin", "nextjs-ejc3"])
+
+    def test_the_dns_record_overrides_the_wildcard_for_the_tunnel(self):
+        record = self.resource("cloudflare_dns_record", "colin_mac_ssh")
+        self.assertIn("name    = local.colin_mac_ssh_hostname", record)
+        self.assertIn('content = "${cloudflare_zero_trust_tunnel_cloudflared.colin_mac_ssh.id}.cfargotunnel.com"', record)
+
+
+
+
+class ColinMacConnector(unittest.TestCase):
+    def test_the_connector_setup_knows_colins_mac_and_its_three_clients(self):
+        text = CONNECTOR.read_text()
+        block = text[text.index("  colin-mac)\n"):text.index("    ;;", text.index("  colin-mac)\n"))]
+        self.assertIn("TUNNEL_SECRET=colin-mac-ssh-tunnel-token", block)
+        self.assertIn('CLIENTS="fcvm:ubuntu nextjs:colin nextjs:ejc3"', block)  # exactly colin-mac-ssh.tf's clients
+        self.assertIn("LABEL=com.ccgames.colin-mac-ssh.cloudflared", block)
+        self.assertIn('name                    = "colin-mac-ssh-tunnel-token"', COLIN_MAC)
+
+class MacPoolDefault(unittest.TestCase):
+    """scripts/claw-master-mac-setup.sh --default (owner, 2026-11-26): every Claude Code on the Mac uses the pool."""
+    SCRIPT = ROOT / "scripts" / "claw-master-mac-setup.sh"
+
+    def run_setup(self, *args):
+        with tempfile.TemporaryDirectory() as home:
+            # Stand-ins first on PATH: an ssh that resolves no address (so the script stops at fcvm-arm's address) and an
+            # aws that fails, so no run of this test can reach a real box or account whatever the machine's ssh config.
+            stub = Path(home) / "bin"
+            stub.mkdir()
+            for tool in ("ssh", "aws"):
+                (stub / tool).write_text("#!/bin/sh\nexit 99\n")
+                (stub / tool).chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k != "FCVM_HOST"}
+            env.update(HOME=home, PATH=f"{stub}:{os.environ['PATH']}")
+            return subprocess.run(["bash", str(self.SCRIPT), *args], capture_output=True, text=True, env=env, timeout=30)
+
+    def test_default_is_the_only_option_and_is_parsed_before_anything_runs(self):
+        for args in (("colin-mac", "--bogus"), ("colin-mac", "--default", "extra"), ("Colin-Mac",), ()):
+            with self.subTest(args=args):
+                r = self.run_setup(*args)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("usage: claw-master-mac-setup.sh ALIAS [--default]", r.stderr)
+        for args in (("colin-mac",), ("colin-mac", "--default")):
+            with self.subTest(args=args):
+                r = self.run_setup(*args)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("no address for fcvm-metal-arm", r.stderr)  # past the arguments
+
+    def test_default_runs_the_pinned_binarys_agent_install_against_the_open_listener(self):
+        text = self.SCRIPT.read_text()
+        step = text[text.index('if [ -n "$DEFAULT" ]; then'):]
+        self.assertIn("AGENT_LISTEN=127.0.0.1:8445", text)
+        self.assertIn("\\$HOME/.local/bin/claw-master agent install --listen $AGENT_LISTEN --open 127.0.0.1:$PORT "
+                      "--ca \\$HOME/.config/claude-master/ca.pem", step)
+        # It comes after the tunnel agent is loaded and the CA is installed, and never touches the Mac's login.
+        self.assertLess(text.index("launchctl bootstrap \"gui/\\$uid\" \"\\$PLIST\""), text.index('if [ -n "$DEFAULT" ]; then'))
+        self.assertNotIn("claude login", step)
+        self.assertNotIn("--backup", step)
 
 class ConnectorScript(unittest.TestCase):
     """scripts/mac-ssh-connector-setup.sh end to end, with ssh, aws and the macOS tools stubbed."""

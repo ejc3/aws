@@ -5,6 +5,8 @@
 # for the reverse tunnel only. Then a jumpbox runs scripts/windows-pc-setup.sh ALIAS --bootstrap-port PORT.
 #
 #   scripts/windows-pc-bootstrap.sh print ALIAS PORT            the paste, on stdout (publish it behind a Copy button)
+#   scripts/windows-pc-bootstrap.sh print-mac ALIAS PORT        the same for a Mac (Terminal), for
+#                                                               scripts/mac-ssh-connector-setup.sh ALIAS --bootstrap-port PORT
 #   scripts/windows-pc-bootstrap.sh allow ALIAS PORT 'KEY LINE'  authorize the PC's key: -R 127.0.0.1:PORT only
 #   scripts/windows-pc-bootstrap.sh retire ALIAS                remove the PC's key once its Cloudflare route works
 #
@@ -21,7 +23,7 @@
 # days after it is allowed (expiry-time): the tunnel is for the first setup only, and is retired after it.
 set -euo pipefail
 
-usage() { echo "usage: windows-pc-bootstrap.sh print ALIAS PORT | allow ALIAS PORT 'ssh-ed25519 KEY [comment]' | retire ALIAS" >&2; exit 2; }
+usage() { echo "usage: windows-pc-bootstrap.sh print|print-mac ALIAS PORT | allow ALIAS PORT 'ssh-ed25519 KEY [comment]' | retire ALIAS" >&2; exit 2; }
 ACTION=${1:-}; ALIAS=${2:-}; PORT=${3:-}
 [[ $ALIAS =~ ^[a-z][a-z0-9-]{0,30}$ ]] || usage
 [ "$ACTION" = retire ] || [[ $PORT =~ ^[0-9]{4,5}$ ]] || usage
@@ -50,6 +52,19 @@ case "$ACTION" in
     sed -e "s|@@BOX@@|pcboot@$ip|" -e "s|@@BOX_HOST_KEY_LINE@@|$ip $hostkey|" \
       -e "s|@@CLIENT_KEY@@|$client fcvm-arm-to-$ALIAS|" -e "s|@@PORT@@|$PORT|" "$HERE/windows/bootstrap.ps1"
     ;;
+  print-mac)
+    # A Mac's first step, as Terminal commands for its user (Remote Login already on, for that user only): authorize
+    # fcvm-arm's key for ALIAS, pin fcvm-arm's host key, make the Mac's own tunnel key and print its public half (for
+    # `allow`), then keep the reverse tunnel to pcboot open, retrying until `allow` has run. Nothing here is secret.
+    client=$(cut -d' ' -f1-2 "$HOME/.ssh/to-$ALIAS.pub")
+    [[ $client =~ ^ssh-ed25519\ AAAAC3NzaC1lZDI1NTE5[A-Za-z0-9+/]{48}$ ]] ||
+      { echo "no ~/.ssh/to-$ALIAS.pub here (mac-ssh-client.tf makes it)" >&2; exit 1; }
+    ip=${FCVM_HOST:-}
+    [ -n "$ip" ] || { echo "no address for fcvm-metal-arm: set FCVM_HOST to its public address" >&2; exit 2; }
+    hostkey=$(cut -d' ' -f1-2 /etc/ssh/ssh_host_ed25519_key.pub)
+    grep -v '^#' "$HERE/mac/bootstrap-tunnel.sh" | sed -e "s|@@BOX@@|pcboot@$ip|" -e "s|@@BOX_HOST_KEY_LINE@@|$ip $hostkey|" \
+      -e "s|@@CLIENT_KEY@@|$client|g" -e "s|@@ALIAS@@|$ALIAS|g" -e "s|@@PORT@@|$PORT|g"
+    ;;
   allow)
     raw=${4:-}
     case "$raw" in *$'\n'* | *$'\r'*) usage ;; esac
@@ -63,7 +78,7 @@ case "$ACTION" in
     ;;
   retire)
     write_keys
-    echo "removed $ALIAS's key from pcboot; on the PC, Unregister-ScheduledTask 'devbox tunnel' (over ssh $ALIAS)"
+    echo "removed $ALIAS's key from pcboot; on a PC, Unregister-ScheduledTask 'devbox tunnel' (over ssh $ALIAS); on a Mac, stop the ssh loop in its Terminal"
     ;;
   *) usage ;;
 esac

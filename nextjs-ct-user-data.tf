@@ -95,6 +95,7 @@ locals {
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:macbook-ssh-access-nextjs-ejc3-*"],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-ejc3-*"],
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colin-mac-ssh-access-nextjs-ejc3-*"],
         # The Mac mini and its CI VM (mini-ssh.tf, mac-vms.tf).
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mini-ssh-access-nextjs-ejc3-*"],
         ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mac-vm-ci-ssh-access-nextjs-ejc3-*"],
@@ -228,19 +229,19 @@ locals {
       NotResource = [b.role]
     },
   ] }
-  # Each member's own Cloudflare Access token for their own machine (colton-mac-ssh.tf, colin-pc-ssh.tf): denied to every
+  # Each member's own Cloudflare Access tokens for their own machines (colton-mac-ssh.tf, colin-mac-ssh.tf, colin-pc-ssh.tf): denied to every
   # other member, with or without boxes (ejc3's tokens are in OwnerOnlySecrets above), in one statement so a member's
   # session policy grows by an ARN per machine, not a statement. By name: a secret ARN ends in a random suffix.
   nextjs_ct_member_machine_tokens = {
-    colton = "colton-mac-ssh-access-nextjs-colton"
-    colin  = "colin-pc-ssh-access-nextjs-colin"
-    skevh  = "mac-vm-skevh-ssh-access-nextjs-skevh"
+    colton = ["colton-mac-ssh-access-nextjs-colton"]
+    colin  = ["colin-pc-ssh-access-nextjs-colin", "colin-mac-ssh-access-nextjs-colin"]
+    skevh  = ["mac-vm-skevh-ssh-access-nextjs-skevh"]
   }
   nextjs_ct_member_machine_ssh = { for u in local.nextjs_ct_member_users : u => [for s in [{
     Sid      = "MemberMachineTokensOwnOnly"
     Effect   = "Deny"
     Action   = "secretsmanager:GetSecretValue"
-    Resource = [for owner, secret in local.nextjs_ct_member_machine_tokens : "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${secret}-*" if owner != u]
+    Resource = flatten([for owner, secrets in local.nextjs_ct_member_machine_tokens : [for secret in secrets : "arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:${secret}-*"] if owner != u])
   }] : s if length(s.Resource) > 0] }
 
   # A member with no boxes of their own (added to local.nextjs_users, not to local.member_box_people).
@@ -303,7 +304,7 @@ locals {
       keys       = lookup(local.nextjs_user_keys, u, [])
       repos      = lookup(local.nextjs_user_repos, u, [])
       box_ips    = try(local.nextjs_ct_member_box[u].ips, [])
-      macs       = lookup(local.nextjs_ct_mac_clients, u, {})
+      macs       = { for a, s in lookup(local.nextjs_ct_mac_clients, u, {}) : a => s if contains(local.mac_ssh_pinned, a) }
       # Of those, the Windows PCs whose Windows-MCP the account's Claude Code gets (provision runs
       # windows-mcp-client-setup.sh as the account).
       windows_mcp = [for a in keys(lookup(local.nextjs_ct_mac_clients, u, {})) : a if contains(local.windows_mcp_pcs, a)]
@@ -319,11 +320,12 @@ locals {
     ejc3 = {
       mac        = "macbook-ssh-access-nextjs-ejc3"
       colton-mac = "colton-mac-ssh-access-nextjs-ejc3"
+      colin-mac  = "colin-mac-ssh-access-nextjs-ejc3"
       mini       = "mini-ssh-access-nextjs-ejc3"
       ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"
     }
     colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }
-    colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }
+    colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin", colin-mac = "colin-mac-ssh-access-nextjs-colin" }
     skevh  = { skevh-mac = "mac-vm-skevh-ssh-access-nextjs-skevh" }
   }
   # Run as root in the container by provision, once per alias: mac-ssh.sh <account> <alias> <secret>.

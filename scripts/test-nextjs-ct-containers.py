@@ -96,6 +96,7 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
         self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
         self.assertIn(":secret:colton-mac-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for Colton's Mac
+        self.assertIn(":secret:colin-mac-ssh-access-nextjs-ejc3-*", member)  # and for Colin's Mac
         # The owner's `wbox run` output (security review of #502): the bucket (ListBucket) and its objects.
         out = member.split('Sid      = "OwnerOnlyWboxOutput"', 1)[1].split("},", 1)[0]
         self.assertIn('Action   = ["s3:GetObject", "s3:ListBucket"]', out)
@@ -188,7 +189,8 @@ class HostScriptTests(unittest.TestCase):
             {"Sid": "OwnerOnlySecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
                           arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token"),
-                          sp + "macbook-ssh-access-nextjs-ejc3-*", sp + "colton-mac-ssh-access-nextjs-ejc3-*"]},
+                          sp + "macbook-ssh-access-nextjs-ejc3-*", sp + "colton-mac-ssh-access-nextjs-ejc3-*",
+                          sp + "colin-mac-ssh-access-nextjs-ejc3-*"]},
             {"Sid": "OwnerOnlyWboxOutput", "Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
              "Resource": ["arn:aws:s3:::wbox-output-111111111111", "arn:aws:s3:::wbox-output-111111111111/*"]},
             {"Sid": "NoMemberNeedsThese", "Effect": "Deny", "Action": acts("NoMemberNeedsThese"), "Resource": "*"},
@@ -211,9 +213,10 @@ class HostScriptTests(unittest.TestCase):
         self.assertEqual(len(acts("Sid       = \"OwnBoxesOnly\"")), 6)
         size = len(json.dumps({"Version": "2012-10-17", "Statement": managed}, separators=(",", ":")))
         self.assertLess(size, 5500, size)
-        # Every other member also carries the deny on the members' own machine tokens (Colton's Mac, Colin's PC).
+        # Every other member also carries the deny on the members' own machine tokens (Colton's Mac, Colin's PC and Mac).
         other = managed + [{"Sid": "MemberMachineTokensOwnOnly", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
-                            "Resource": [sp + "colton-mac-ssh-access-nextjs-colton-*", sp + "colin-pc-ssh-access-nextjs-colin-*"]}]
+                            "Resource": [sp + "colton-mac-ssh-access-nextjs-colton-*", sp + "colin-pc-ssh-access-nextjs-colin-*",
+                                         sp + "colin-mac-ssh-access-nextjs-colin-*"]}]
         size = len(json.dumps({"Version": "2012-10-17", "Statement": other}, separators=(",", ":")))
         self.assertLess(size, 5800, size)
 
@@ -240,11 +243,12 @@ class HostScriptTests(unittest.TestCase):
         # members' machines. ejc3's are owner-only (above); colton's (Colton's Mac) and colin's (Colin's PC) are each
         # denied to every member but its owner, boxes or not.
         tokens = TF.split("nextjs_ct_member_machine_tokens = {", 1)[1].split("\n  }\n", 1)[0]
-        self.assertIn('colton = "colton-mac-ssh-access-nextjs-colton"', tokens)
-        self.assertIn('colin  = "colin-pc-ssh-access-nextjs-colin"', tokens)
+        self.assertIn('colton = ["colton-mac-ssh-access-nextjs-colton"]', tokens)
+        self.assertIn('colin  = ["colin-pc-ssh-access-nextjs-colin", "colin-mac-ssh-access-nextjs-colin"]', tokens)
         stmt = TF.split("nextjs_ct_member_machine_ssh = {", 1)[1].split("\n\n", 1)[0]
         self.assertIn("for u in local.nextjs_ct_member_users : u =>", stmt)
-        self.assertIn(':secret:${secret}-*" if owner != u]', stmt)
+        self.assertIn('[for secret in secrets : "arn:aws:secretsmanager:', stmt)
+        self.assertIn(':secret:${secret}-*"] if owner != u])', stmt)
         self.assertIn(": s if length(s.Resource) > 0] }", stmt)
         self.assertIn('Action   = "secretsmanager:GetSecretValue"', stmt)
         self.assertIn('Effect   = "Deny"', stmt)
@@ -746,15 +750,17 @@ class MacTests(unittest.TestCase):
         self.assertIn('    ejc3 = {\n'
                       '      mac        = "macbook-ssh-access-nextjs-ejc3"\n'
                       '      colton-mac = "colton-mac-ssh-access-nextjs-ejc3"\n'
+                      '      colin-mac  = "colin-mac-ssh-access-nextjs-ejc3"\n'
                       '      mini       = "mini-ssh-access-nextjs-ejc3"\n'
                       '      ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"\n'
                       '    }\n', clients)
         self.assertIn('colton = { colton-mac = "colton-mac-ssh-access-nextjs-colton" }', clients)
-        self.assertIn('colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin" }', clients)
+        self.assertIn('colin  = { colin-pc = "colin-pc-ssh-access-nextjs-colin", colin-mac = "colin-mac-ssh-access-nextjs-colin" }', clients)
         # Steve's VM on the Mac mini (mac-vms.tf), his own token only.
         self.assertIn('skevh  = { skevh-mac = "mac-vm-skevh-ssh-access-nextjs-skevh" }', clients)
         self.assertEqual(clients.count(" = {"), 4)  # nobody else
-        self.assertIn("macs       = lookup(local.nextjs_ct_mac_clients, u, {})", TF)
+        # Only the machines whose host key is pinned (mac-ssh-client.tf): a client with no pin trusts whatever answers.
+        self.assertIn("macs       = { for a, s in lookup(local.nextjs_ct_mac_clients, u, {}) : a => s if contains(local.mac_ssh_pinned, a) }", TF)
         self.assertNotIn("macbook-ssh.sh", TF + (CT / "provision").read_text())
         snippet = TF.split("nextjs_ct_mac_ssh = <<-MACSSH", 1)[1].split("\nMACSSH", 1)[0]
         install = snippet.index("${local.mac_cloudflared_install}")
