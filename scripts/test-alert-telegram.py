@@ -425,6 +425,46 @@ class AlertTelegram(unittest.TestCase):
         for leak in ("111111111111", "222222222222", "333333333333", "someone@example.com", "AKIAIOSFODNN7EXAMPLE"):
             self.assertNotIn(leak, self.telegram.sent[0]["text"])
 
+    def test_a_console_capture_shows_its_summary_but_never_the_console_tail(self):
+        body = ("i-0abc is failing its status check.\n\nConsole captured to CloudWatch Logs:\n  group:  /dev-servers/console-capture\n"
+                "  stream: i-0abc/2026\nBuffer timestamp: now\n\nNo panic signature matched.\n\nLast 40 console lines:\n"
+                "+ GH_TOKEN=ghp_secretvalue123\nlogin:\n\nThe console buffer is DESTROYED by stop/start.")
+        self.run_records({"Sns": {"Subject": "console captured: i-0abc", "Message": body, "Timestamp": iso(NOW)}})
+        self.assertIn("stream: i-0abc/2026", self.texts()[0] + self.details()[0])
+        self.assertNotIn("ghp_secretvalue123", json.dumps(self.telegram.sent))
+        self.assertNotIn("Last 40 console lines", json.dumps(self.telegram.sent))
+
+    def test_an_eventbridge_alarm_shows_only_the_rule_it_knows(self):
+        event = {"detail-type": "CloudWatch Alarm State Change", "region": "us-east-2", "account": MAIN,
+                 "resources": [f"arn:aws:cloudwatch:us-east-2:{MAIN}:alarm:watchdog"], "time": iso(NOW),
+                 "detail": {"alarmName": "watchdog", "state": {"value": "ALARM", "reason": "no datapoints", "timestamp": iso(NOW)},
+                            "previousState": {"value": "OK"},
+                            "configuration": {"description": "The watchdog stopped.", "metrics": [{"metricStat": {
+                                "metric": {"name": "Invocations", "namespace": "AWS/Lambda", "dimensions": {"FunctionName": "w"}},
+                                "period": 300, "stat": "Sum"}}]}}}
+        self.run_records({"Sns": {"Message": json.dumps(event), "Timestamp": iso(NOW)}})
+        details = self.details()[0]
+        self.assertIn("Rule: Sum per 300s", details)
+        self.assertNotIn("None", details)
+        self.assertIn("Region: us-east-2", details)
+
+    def test_a_json_body_shown_whole_is_not_repeated_and_hex_ids_are_not_masked(self):
+        self.run_records({"Sns": {"Subject": "Budget", "Message": json.dumps({"budget": "dev", "spent": 12}),
+                                  "Timestamp": iso(NOW)}})
+        self.assertEqual(self.details(), [""])
+        self.run_records({"Sns": {"Subject": "Security alert: x", "Message": "on i-0a123456789012 in 111111111111",
+                                  "Timestamp": iso(NOW)}})
+        self.assertEqual(self.details()[-1], "on i-0a123456789012 in main")
+
+    def test_a_crafted_region_never_reaches_the_console_button(self):
+        record = alarm("x", "ALARM", NOW)
+        message = json.loads(record["Sns"]["Message"])
+        message["AlarmArn"] = "arn:aws:cloudwatch:x@evil.example#:111111111111:alarm:x"
+        record["Sns"]["Message"] = json.dumps(message)
+        self.run_records(record)
+        url = self.telegram.sent[0]["reply_markup"]["inline_keyboard"][0][0]["url"]
+        self.assertTrue(url.startswith("https://us-west-1.console.aws.amazon.com/"), url)
+
     def test_a_short_body_shown_whole_gets_no_collapsed_section(self):
         self.run_records({"Sns": {"Subject": "Budget", "Message": "Spend is 80% of the budget.", "Timestamp": iso(NOW)}})
         self.assertEqual(self.texts(), ["ℹ️ Budget\nSpend is 80% of the budget."])

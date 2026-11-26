@@ -58,7 +58,11 @@ BODY_CHARS = 600
 TEXT_LIMIT = 4000  # Telegram allows 4096 characters after entity parsing (an escaped "&lt;" counts as one)
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
-ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
+ACCOUNT_ID = re.compile(r"(?<![A-Za-z0-9])\d{12}(?![A-Za-z0-9])")  # not inside a hex id or a UUID
+REGION_SHAPE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
+# The console capture's raw tail (dev-diagnostics.tf) is boot output, which can carry tokens no pattern here knows:
+# its collapsed section stops before it.
+CONSOLE_TAIL = "\nLast 40 console lines:"
 OPERATORS = {"GreaterThanThreshold": ">", "GreaterThanOrEqualToThreshold": ">=", "LessThanThreshold": "<",
              "LessThanOrEqualToThreshold": "<=", "LessThanLowerOrGreaterThanUpperThreshold": "outside the band",
              "LessThanLowerThreshold": "below the band", "GreaterThanUpperThreshold": "above the band"}
@@ -126,7 +130,8 @@ def compose(text, details="", button=None):
     """The sendMessage fields: the visible line as it always was, and under it, when there is more to show, the
     masked details in a collapsed blockquote (HTML, every text escaped), cut to fit Telegram's limit."""
     text = text[:TEXT_LIMIT]
-    details = mask(details).strip()
+    # Cut before masking as well as after: masking a very long body is slow, and a timeout would lose the alert.
+    details = mask(str(details)[:3 * TEXT_LIMIT]).strip()
     fields = {"text": text}
     if details:
         room = TEXT_LIMIT - len(text) - 1
@@ -150,6 +155,7 @@ def send(token, chat, text, details="", button=None):
     except TelegramRefused:
         if fields.get("parse_mode") != "HTML":
             raise RuntimeError("telegram sendMessage failed: HTTP 400") from None
+        log(outcome="html refused, sent plain")
         post(token, chat, {"text": text[:TEXT_LIMIT]})
 
 
@@ -230,7 +236,8 @@ def utc_clock(t):
 
 def region_of(alarm):
     parts = str(alarm.get("AlarmArn") or "").split(":")
-    return parts[3] if len(parts) > 4 and parts[3] else HOME_REGION
+    region = parts[3] if len(parts) > 4 else ""
+    return region if REGION_SHAPE.fullmatch(region) else HOME_REGION
 
 
 def console_button(alarm):
@@ -243,7 +250,7 @@ def console_button(alarm):
 
 def number(value):
     try:
-        return f"{float(value):g}"
+        return f"{float(value):.15g}"
     except (TypeError, ValueError):
         return str(value)
 
@@ -264,15 +271,17 @@ def alarm_details(alarm):
         dims = ", ".join(f"{d.get('name') or d.get('Name')}={d.get('value') or d.get('Value')}"
                          for d in trigger.get("Dimensions") or [] if isinstance(d, dict))
         lines.append(f"Metric: {trigger.get('Namespace', '')}/{trigger['MetricName']}" + (f" ({dims})" if dims else ""))
-        stat = trigger.get("Statistic") or trigger.get("ExtendedStatistic") or ""
-        op = trigger.get("ComparisonOperator", "")
-        rule = f"Rule: {stat} {OPERATORS.get(op, op)} {number(trigger.get('Threshold'))}".replace("  ", " ")
+        # An EventBridge event carries no threshold, operator or evaluation periods: only what is known is written.
+        rule = ["Rule:", str(trigger.get("Statistic") or trigger.get("ExtendedStatistic") or "")]
+        if trigger.get("Threshold") is not None:
+            op = trigger.get("ComparisonOperator", "")
+            rule += [OPERATORS.get(op, op), number(trigger["Threshold"])]
+        periods, datapoints = trigger.get("EvaluationPeriods"), trigger.get("DatapointsToAlarm")
+        if periods:
+            rule.append(f"in {datapoints} of {periods}" if datapoints and datapoints != periods else f"for {periods}")
         if trigger.get("Period"):
-            periods = trigger.get("EvaluationPeriods") or 1
-            datapoints = trigger.get("DatapointsToAlarm")
-            rule += (f" in {datapoints} of {periods}" if datapoints and datapoints != periods else f" for {periods}") + \
-                f" × {trigger['Period']}s"
-        lines.append(rule)
+            rule.append(f"{'× ' if periods else 'per '}{trigger['Period']}s")
+        lines.append(" ".join(x for x in rule if x))
         if trigger.get("TreatMissingData"):
             lines.append(f"Missing data: {trigger['TreatMissingData']}")
     elif trigger.get("Metrics"):
@@ -475,10 +484,13 @@ def lambda_handler(event, context=None):
                 # CloudTrail's access-audit notice (access-audit.tf) has no Subject: its first sentence only.
                 subject, text = "Access audit: " + str(message).lstrip('"')[len("ACCESS AUDIT:"):].split(".")[0].strip(), ""
             else:
+                if subject.startswith("console captured:"):
+                    message = str(message).split(CONSOLE_TAIL)[0]  # never the raw console tail, shown or collapsed
                 text = "" if subject.startswith(SUBJECT_ONLY) else readable(message)
-            # The whole body goes in the collapsed section unless the visible line already shows all of it.
+            # The whole body goes in the collapsed section unless the visible line already shows all of it (a JSON body
+            # is shown as "k: v; k: v" there and one per line here).
             whole = full_body(message)
-            more = whole if " ".join(whole.split()) != text else ""
+            more = whole if " ".join(whole.replace("\n", "; ").split()) != text and " ".join(whole.split()) != text else ""
             send(token, chat, f"ℹ️ {subject}" + (f"\n{text}" if text else ""), more)
             outcome = "message"
         counts[outcome] = counts.get(outcome, 0) + 1
