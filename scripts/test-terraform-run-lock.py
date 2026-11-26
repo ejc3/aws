@@ -436,10 +436,12 @@ class StopHookBackgroundTests(unittest.TestCase):
         time.sleep(1)
         self.assertEqual(self.publishes(), 0, "a check started in front of a pending apply")
 
-    def test_an_applied_merge_or_a_day_old_entry_does_not_stop_the_check(self):
+    def test_an_applied_old_future_or_unparsed_entry_does_not_stop_the_check(self):
         now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         for entry in ({"added": now, "applied_at": now},
-                      {"added": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 25 * 3600))}):
+                      {"added": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 3 * 3600))},
+                      {"added": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 86400))},
+                      {"added": "pending"}, {}):
             self.watch_state(**entry)
             self.mark.unlink(missing_ok=True)
             self.run_hook()

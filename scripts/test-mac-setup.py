@@ -920,6 +920,27 @@ class AgentsMd(Base):
         self.assertNotIn("iOS toolchain", text)
         self.assertNotIn("signing keychains", text)
 
+    def test_a_members_mac_says_whether_it_is_on_the_pool(self):
+        self.env["MAC_AGENTS_HOST"] = "member"
+        bindir = self.temp / "fakebin"
+        bindir.mkdir()
+        launchctl = bindir / "launchctl"
+        launchctl.write_text("#!/bin/sh\nexit \"${LAUNCHCTL_RC:-1}\"\n")
+        launchctl.chmod(0o755)
+        self.env["PATH"] = f"{bindir}:{self.env['PATH']}"
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn("Not on the pool", self.out.read_text())
+        (self.temp / ".claude").mkdir()
+        (self.temp / ".claude" / "settings.json").write_text('{"env": {"HTTPS_PROXY": "http://127.0.0.1:8445"}}')
+        self.env["LAUNCHCTL_RC"] = "0"
+        self.assertEqual(self.write().returncode, 0)
+        text = self.out.read_text()
+        self.assertIn("## Found: Claude and the shared pool", text)
+        self.assertIn("On the pool:", text)
+        self.env["MAC_AGENTS_HOST"] = "mini"
+        self.write()
+        self.assertNotIn("shared pool", self.out.read_text(), "only a member's Mac gets the pool line")
+
     def test_refuses_without_its_template_and_leaves_no_file(self):
         self.env["MAC_AGENTS_TEMPLATE"] = str(self.temp / "missing.md")
         r = self.write()

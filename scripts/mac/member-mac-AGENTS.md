@@ -13,17 +13,19 @@ in ejc3/aws.
   their Claude conversations.
 - **Never leave the only copy of work here**: commit and push from the dev box. The Mac sleeps, travels and goes offline.
 - **Check it is up first**: `timeout 15 ssh <alias> true`. It answers only while the Mac is awake, logged in and online.
-- **The desktop lease:** take it (`mac-lease run NAME -- CMD`) before driving the screen or relaunching an app;
-  `peekaboo` waits while another session holds it.
+- **The screen is theirs.** Drive it (Peekaboo, `--foreground`) only when the person or the owner asked for that task;
+  `--foreground` is Peekaboo's guard, not a permission you give yourself. Take the desktop lease first
+  (`mac-lease run NAME -- CMD`); `peekaboo` waits while another session holds it.
 - **No Homebrew** unless the person installed it. `~/.local/bin` is first on PATH in every SSH session.
 - **Keychain:** plain SSH cannot reach the login keychain (GitHub logins, signing); run such a step through
   `mac-gui [--timeout S] -- CMD`.
 
-## Claude on this Mac goes through the shared pool
+## Claude on this Mac and the shared pool
 
-Every Claude Code here (the `claude` CLI, IDE extensions, and the Claude desktop app's **local** Code sessions) uses
-the shared subscription pool through `claw-master agent` (`~/.claude/settings.json` env; ejc3/aws
-`scripts/claw-master-mac-setup.sh`). Two things that look like "the pool is broken" and are not:
+"Found: Claude and the shared pool" below says whether this Mac is on the pool. When it is, every Claude Code here (the
+`claude` CLI, IDE extensions, and the Claude desktop app's **local** Code sessions) goes through `claw-master agent`
+(`~/.claude/settings.json` env; ejc3/aws `scripts/claw-master-mac-setup.sh <alias> --default`). Two things that look
+like "the pool is broken" and are not:
 
 - **The desktop app's Code tab defaults to a cloud environment** ("Default", a cloud icon). A cloud session runs on
   Anthropic's servers on the person's own account and its own weekly limit, never through the pool. Choose

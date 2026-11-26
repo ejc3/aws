@@ -92,14 +92,17 @@ if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; 
       { [ -z "$age" ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
       problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) after its last result. See $state/background.log; the next stop retries it.")
     fi
-    # A merge the PR watch has not applied yet (an `unapplied` entry with no `applied_at`, added in the last
-    # 24 hours) is drift by definition, and its own apply and follow-up plan are about to take the run lock:
-    # a full check now would only report it and hold the lock in front of that apply (owner, 2026-11-26).
-    # An entry older than a day no longer suppresses it, so a forgotten one cannot switch the check off.
+    # A merge the PR watch has not applied yet (an `unapplied` entry with no `applied_at`, its `added` time in
+    # the last 2 hours) is drift by definition, and its own apply and follow-up plan are about to take the run
+    # lock: a full check now would only report it and hold the lock in front of that apply (owner, 2026-11-26).
+    # Only a parsed UTC time inside that window counts (a missing, malformed or future one does not), so a
+    # forgotten or abandoned entry cannot switch the check off for longer than that.
     pending_apply=""
     watch_state="${XDG_STATE_HOME:-$HOME/.local/state}/pr-watch/state.json"
-    if [ -r "$watch_state" ] && jq -e --arg since "$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
-      '[.unapplied[]? | select(.applied_at == null and (.added // "") >= $since)] | length > 0' \
+    if [ -r "$watch_state" ] && jq -e \
+      '[.unapplied[]? | select(.applied_at == null)
+        | (.added | strings | sub("\\.[0-9]+"; "") | try fromdateiso8601 catch null) as $t
+        | select($t != null and $t > now - 7200 and $t < now + 600)] | length > 0' \
       "$watch_state" >/dev/null 2>&1; then
       pending_apply=1
       echo "verify-consistent: a merged pull request is waiting for its apply; no drift check until it is applied" >&2
