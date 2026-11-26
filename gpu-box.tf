@@ -82,9 +82,19 @@ locals {
   # never a reboot), run AFTER the box reports ready so `gbox up`'s wait is unchanged. The image's kernel and its
   # NVIDIA/CUDA stack stay as the image ships them: a new kernel would need the driver module rebuilt, so kernel fixes
   # arrive by bumping var.gpu_box_ami. A 2-month-old image raised 2,279 Inspector findings on one box (2026-11-26).
-  gbox_security_updates = <<-SEC
+  # The hold is written first thing at boot, before the image's own apt timers can run.
+  gbox_hold_gpu_stack = <<-HOLD
 printf '%s\n' 'Unattended-Upgrade::Package-Blacklist { "linux-"; "nvidia-"; "libnvidia-"; "cuda-"; "libcudnn"; "libnccl"; "datacenter-gpu-manager"; };' > /etc/apt/apt.conf.d/52gbox-hold-gpu-stack
+  HOLD
+  # Fresh package lists first (unattended-upgrade never fetches them), at the lowest CPU and I/O priority so the first
+  # minutes of work on the box are not slowed; /etc/gpu-box-updated says when it is done (gbox status shows it).
+  gbox_security_updates = <<-SEC
+export DEBIAN_FRONTEND=noninteractive
+nice -n 19 ionice -c3 apt-get -o DPkg::Lock::Timeout=300 update
+nice -n 19 ionice -c3 bash -s <<'UPDATES'
 ${local.pbox_security_updates}
+UPDATES
+date -u +%Y-%m-%dT%H:%M:%SZ > /etc/gpu-box-updated
   SEC
 }
 
@@ -277,6 +287,9 @@ resource "aws_launch_template" "gpu_box" {
     ) : base64encode(<<-INIT
     #!/bin/bash
     set -uxo pipefail
+
+    # Before anything else (gpu-box.tf local.gbox_hold_gpu_stack).
+    ${local.gbox_hold_gpu_stack}
 
     ${local.linux_ip_options_bootstrap}
 

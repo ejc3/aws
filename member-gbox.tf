@@ -147,6 +147,9 @@ resource "aws_launch_template" "member_gbox" {
     #!/bin/bash
     set -uxo pipefail
 
+    # Before anything else (gpu-box.tf local.gbox_hold_gpu_stack).
+    ${local.gbox_hold_gpu_stack}
+
     ${local.linux_ip_options_bootstrap}
 
     HOURS=${var.gpu_box_max_hours}
