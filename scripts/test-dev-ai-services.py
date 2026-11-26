@@ -110,6 +110,25 @@ class ElevenLabsSecretTests(unittest.TestCase):
 
 
 
+class FamilyTelegramBotTests(unittest.TestCase):
+    """Family's bot token is the owner's: its own policy admits administration, the metal boxes (read) and the owner's
+    container session (read and put); every member's ct-<member> session is refused, old sessions included."""
+
+    def policy(self):
+        doc = TF[TF.index('resource "aws_secretsmanager_secret_policy" "family_telegram_bot"'):]
+        return doc[:doc.index("\n}\n")]
+
+    def test_the_owner_session_reads_and_sets_and_nobody_else_sets(self):
+        doc = self.policy()
+        self.assertIn('Condition = { StringEquals = { "aws:userid" = local.family_apple_owner_session } }', doc)
+        self.assertIn('"secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"', doc)
+        self.assertEqual(doc.count("local.nextjs_ct_serving ? { StringNotEquals"), 2, "both denies exempt only the owner session")
+
+    def test_no_identity_policy_grants_it_to_the_whole_nextjs_role(self):
+        self.assertNotIn("family_telegram_bot_put", TF)
+        self.assertNotIn("family_telegram_bot", (ROOT / "nextjs-dev-fcvm-parity.tf").read_text())
+
+
 class StabilitySecretTests(unittest.TestCase):
     def test_value_is_out_of_band_and_not_in_deployed_apps(self):
         self.assertNotIn('resource "aws_secretsmanager_secret_version" "stability_api_key"', TF)
