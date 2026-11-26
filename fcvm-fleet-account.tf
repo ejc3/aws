@@ -654,6 +654,10 @@ data "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
 
 locals {
   fcvm_fleet_on_demand_g_granted = data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value
+  # Held (owner, 2026-11-26): AWS closed both 768 requests (filed 2026-11-06 and 2026-11-15, the second closed
+  # 2026-11-26) without raising the quota from 384. While false, the quota follows what AWS has granted and no
+  # increase is filed; set it true to ask again with the logic below.
+  fcvm_fleet_on_demand_g_request = false
 }
 
 # AWS accepts one open increase per quota. Keep the existing 768 request until AWS grants
@@ -664,7 +668,9 @@ resource "aws_servicequotas_service_quota" "fcvm_fleet_on_demand_g_east1" {
   service_code = "ec2"
   quota_code   = "L-DB2E81BA"
   value = (
-    local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus
+    !local.fcvm_fleet_on_demand_g_request
+    ? local.fcvm_fleet_on_demand_g_granted
+    : local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus
     ? local.fcvm_fleet_on_demand_g_base_vcpus
     : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted)
   )

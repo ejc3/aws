@@ -610,10 +610,15 @@ class QuotaTests(unittest.TestCase):
             self.assertIn('quota_code   = "L-DB2E81BA"', section)
         self.assertIn("fcvm_fleet_on_demand_g_granted = data.aws_servicequotas_service_quota.fcvm_fleet_on_demand_g_east1.value", TF)
         self.assertIn(
-            "value = ( local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus "
+            "value = ( !local.fcvm_fleet_on_demand_g_request ? local.fcvm_fleet_on_demand_g_granted "
+            ": local.fcvm_fleet_on_demand_g_granted < local.fcvm_fleet_on_demand_g_base_vcpus "
             "? local.fcvm_fleet_on_demand_g_base_vcpus : max(local.fcvm_fleet_on_demand_g_vcpus, local.fcvm_fleet_on_demand_g_granted) )",
             " ".join(quota.split()),
         )
+
+    def test_the_on_demand_request_is_held_until_the_owner_asks_again(self):
+        # Owner, 2026-11-26: "hold" after AWS closed both 768 requests without a grant. Held, the quota follows the grant.
+        self.assertRegex(TF, r"(?m)^\s*fcvm_fleet_on_demand_g_request = false$")
 
     def test_g_spot_is_480_in_us_east_1_and_never_lowered(self):
         # #913: prod's two hosts (192) and a replacement (96), staging's host (96), an image-factory host (96).
