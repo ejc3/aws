@@ -1923,7 +1923,8 @@ def rerun_parent(repo, job, attempt):
     while True:
         response = dynamodb.query(
             TableName=RERUNS_TABLE, ConsistentRead=True, KeyConditionExpression='repo = :repo',
-            FilterExpression='run_id = :run AND called = :yes',
+            # `called` is a DynamoDB reserved word: a bare one fails every query (ValidationException).
+            FilterExpression='run_id = :run AND #called = :yes', ExpressionAttributeNames={'#called': 'called'},
             ExpressionAttributeValues={':repo': {'S': repo}, ':run': {'S': str(job['run_id'])}, ':yes': {'BOOL': True}},
             **page)
         for item in response.get('Items', []):

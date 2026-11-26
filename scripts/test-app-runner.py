@@ -129,6 +129,20 @@ class FakeEC2:
                            and all(matches(i, f["Name"], f["Values"]) for f in Filters)]}
 
 
+# DynamoDB reserved words among the attribute names these tables use, as live DynamoDB answered on 2026-11-26
+# ("Attribute name is a reserved keyword"). A bare one in any expression fails the call for real, so the fake fails too.
+DYNAMO_RESERVED = {"called", "error", "name", "state", "status", "ttl"}
+EXPRESSION_WORDS = {"and", "or", "not", "in", "set", "remove", "between", "attribute_exists", "attribute_not_exists",
+                    "begins_with", "contains", "size", "if_not_exists", "list_append"}
+
+
+def no_reserved(*expressions):
+    for expression in expressions:
+        for word in re.findall(r"(?<![:#\w])[A-Za-z_][A-Za-z0-9_]*", expression or ""):
+            assert word.lower() in EXPRESSION_WORDS or word.lower() not in DYNAMO_RESERVED, (
+                f"reserved word {word!r} used bare in {expression!r}: DynamoDB rejects it (use #name)")
+
+
 class FakeDynamo:
     """The launch-claim table: a conditional put that only one caller can win. And the budget table: one item per group,
     a consistent get and a put conditional on the item's absence or its version. `conflicts` makes that many bucket
@@ -146,6 +160,7 @@ class FakeDynamo:
         self.state = {}
 
     def put_rerun(self, Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames):
+        no_reserved(ConditionExpression)
         assert ConditionExpression == "attribute_not_exists(job)", ConditionExpression
         key = (Item["repo"]["S"], Item["job"]["S"])
         if key in self.reruns:
@@ -154,6 +169,7 @@ class FakeDynamo:
 
     def update_item(self, TableName, Key, UpdateExpression, ConditionExpression, ExpressionAttributeNames,
                     ExpressionAttributeValues):
+        no_reserved(UpdateExpression, ConditionExpression)
         assert TableName == "github-app-runner-reruns" and ConditionExpression == "#s = :from", (TableName, ConditionExpression)
         key = (Key["repo"]["S"], Key["job"]["S"])
         held = self.reruns.get(key)
@@ -179,6 +195,7 @@ class FakeDynamo:
     def put_item(self, TableName, Item, ConditionExpression=None, ExpressionAttributeValues=None, ExpressionAttributeNames=None):
         if TableName == "github-app-runner-reruns":
             return self.put_rerun(Item, ConditionExpression, ExpressionAttributeValues, ExpressionAttributeNames)
+        no_reserved(ConditionExpression)
         if TableName == "github-app-runner-budget":
             group = Item["group"]["S"]
             if group.startswith("waiting/"):
@@ -212,6 +229,7 @@ class FakeDynamo:
         self.items[key] = Item
 
     def query(self, TableName, ConsistentRead, KeyConditionExpression, ExpressionAttributeValues, **kw):
+        no_reserved(KeyConditionExpression, kw.get("FilterExpression"))
         repo = ExpressionAttributeValues[":repo"]["S"]
         if TableName == "github-app-runner-reruns":
             v, mine = ExpressionAttributeValues, [i for (r, _), i in self.reruns.items() if r == repo]
@@ -219,8 +237,9 @@ class FakeDynamo:
             if kw["FilterExpression"] == "#s IN (:pending, :spot)":
                 keep = [i for i in mine if i["state"]["S"] in (v[":pending"]["S"], v[":spot"]["S"])]
             else:
-                assert kw["FilterExpression"] == "run_id = :run AND called = :yes", kw
-                keep = [i for i in mine if i["run_id"] == v[":run"] and i["called"] == v[":yes"]]
+                assert kw["FilterExpression"] == "run_id = :run AND #called = :yes", kw
+                called = kw["ExpressionAttributeNames"]["#called"]
+                keep = [i for i in mine if i["run_id"] == v[":run"] and i[called] == v[":yes"]]
             return {"Items": json.loads(json.dumps(keep))}
         self.queries.append(ConsistentRead)
         return {"Items": [item for (r, _), item in self.items.items() if r == repo]}
