@@ -142,8 +142,8 @@ class MarkerTests(Base):
 
         def fake_stat(argv, **kwargs):
             # GNU stat's "%W %n" for each marker, as the real helper parses it.
-            if argv[:3] == ["stat", "-c", "%W %n"]:
-                out = "".join("%d %s\n" % (born["value"], p) for p in argv[4:])
+            if argv[:3] == ["stat", "--printf", "%W %n\\0"]:
+                out = "".join("%d %s\0" % (born["value"], p) for p in argv[4:])
                 return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
             return real_run(argv, **kwargs)
 
@@ -152,6 +152,17 @@ class MarkerTests(Base):
         self.assertTrue(self.active()["game"]["marked"])
         born["value"] = int(self.now - (aad.MARKER_GRACE_DAYS + 1) * DAY)
         self.assertEqual(self.active(), {}, "an old marker re-touched by an agent keeps nothing open")
+
+    def test_birth_time_is_read_for_a_path_with_a_newline(self):
+        odd = self.home / "line\nbreak"
+        odd.mkdir()
+        m = odd / "claude-interactive"
+        m.touch()
+        old = self.now - 10 * DAY
+        os.utime(m, (old, old))
+        # The real GNU stat: a file made just now has a birth time of now (or none, then mtime).
+        born = aad.markers_born([str(m)])[str(m)]
+        self.assertTrue(born == os.path.getmtime(m) or born > self.now - DAY, born)
 
     def test_a_prompted_folder_keeps_its_old_marker(self):
         r = self.repo("game")
@@ -184,7 +195,7 @@ class MarkerTests(Base):
 
         def unknown(argv, **kwargs):
             calls.append(argv)
-            return subprocess.CompletedProcess(argv, 0, stdout="0 %s\n" % argv[-1], stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="0 %s\0" % argv[-1], stderr="")
 
         aad.subprocess.run = unknown
         self.addCleanup(setattr, aad.subprocess, "run", real_run)

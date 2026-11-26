@@ -47,8 +47,10 @@ def markers_born(paths):
     born = {}
     if paths:
         try:
-            r = subprocess.run(["stat", "-c", "%W %n", "--", *paths], capture_output=True, text=True, timeout=10)
-            for line in r.stdout.splitlines():
+            # NUL-terminated records: a path may hold any byte but NUL, a newline included.
+            r = subprocess.run(["stat", "--printf", "%W %n\\0", "--", *paths], capture_output=True, text=True,
+                               timeout=10)
+            for line in r.stdout.split("\0"):
                 stamp, _, name = line.partition(" ")
                 if stamp.isdigit() and int(stamp) > 0:
                     born[name] = int(stamp)
