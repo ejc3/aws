@@ -434,6 +434,16 @@ class AlertTelegram(unittest.TestCase):
         self.assertNotIn("ghp_secretvalue123", json.dumps(self.telegram.sent))
         self.assertNotIn("Last 40 console lines", json.dumps(self.telegram.sent))
 
+    def test_a_console_capture_without_the_separator_sends_its_subject_alone(self):
+        self.run_records({"Sns": {"Subject": "console captured: i-0abc", "Message": "Last 60 console lines:\nGH_TOKEN=ghp_x",
+                                  "Timestamp": iso(NOW)}})
+        self.assertEqual(self.texts(), ["ℹ️ console captured: i-0abc"])
+        self.assertNotIn("ghp_x", json.dumps(self.telegram.sent))
+
+    def test_the_console_capture_still_writes_the_separator_this_cuts_at(self):
+        diagnostics = (Path(__file__).resolve().parent.parent / "dev-diagnostics.tf").read_text()
+        self.assertIn(at.CONSOLE_TAIL.replace("\n", "\\n"), diagnostics)
+
     def test_an_eventbridge_alarm_shows_only_the_rule_it_knows(self):
         event = {"detail-type": "CloudWatch Alarm State Change", "region": "us-east-2", "account": MAIN,
                  "resources": [f"arn:aws:cloudwatch:us-east-2:{MAIN}:alarm:watchdog"], "time": iso(NOW),

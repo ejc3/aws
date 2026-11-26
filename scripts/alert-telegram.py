@@ -59,7 +59,7 @@ TEXT_LIMIT = 4000  # Telegram allows 4096 characters after entity parsing (an es
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
 ACCOUNT_ID = re.compile(r"(?<![A-Za-z0-9])\d{12}(?![A-Za-z0-9])")  # not inside a hex id or a UUID
-REGION_SHAPE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d")
+REGION_SHAPE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d+")
 # The console capture's raw tail (dev-diagnostics.tf) is boot output, which can carry tokens no pattern here knows:
 # its collapsed section stops before it.
 CONSOLE_TAIL = "\nLast 40 console lines:"
@@ -131,7 +131,10 @@ def compose(text, details="", button=None):
     masked details in a collapsed blockquote (HTML, every text escaped), cut to fit Telegram's limit."""
     text = text[:TEXT_LIMIT]
     # Cut before masking as well as after: masking a very long body is slow, and a timeout would lose the alert.
-    details = mask(str(details)[:3 * TEXT_LIMIT]).strip()
+    details = str(details)
+    if len(details) > 3 * TEXT_LIMIT:
+        details = details[:3 * TEXT_LIMIT].rsplit(None, 1)[0]  # at whitespace, so no token is masked by halves
+    details = mask(details).strip()
     fields = {"text": text}
     if details:
         room = TEXT_LIMIT - len(text) - 1
@@ -281,7 +284,8 @@ def alarm_details(alarm):
             rule.append(f"in {datapoints} of {periods}" if datapoints and datapoints != periods else f"for {periods}")
         if trigger.get("Period"):
             rule.append(f"{'× ' if periods else 'per '}{trigger['Period']}s")
-        lines.append(" ".join(x for x in rule if x))
+        if len([x for x in rule if x]) > 1:
+            lines.append(" ".join(x for x in rule if x))
         if trigger.get("TreatMissingData"):
             lines.append(f"Missing data: {trigger['TreatMissingData']}")
     elif trigger.get("Metrics"):
@@ -485,7 +489,8 @@ def lambda_handler(event, context=None):
                 subject, text = "Access audit: " + str(message).lstrip('"')[len("ACCESS AUDIT:"):].split(".")[0].strip(), ""
             else:
                 if subject.startswith("console captured:"):
-                    message = str(message).split(CONSOLE_TAIL)[0]  # never the raw console tail, shown or collapsed
+                    # Never the raw console tail, shown or collapsed; a body without the separator sends nothing of it.
+                    message = str(message).split(CONSOLE_TAIL)[0] if CONSOLE_TAIL in str(message) else ""
                 text = "" if subject.startswith(SUBJECT_ONLY) else readable(message)
             # The whole body goes in the collapsed section unless the visible line already shows all of it (a JSON body
             # is shown as "k: v; k: v" there and one per line here).
