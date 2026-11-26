@@ -227,7 +227,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
 done
 answered "$out" || { echo "the pool did not answer through the tunnel ($out); the Mac was not switched over" >&2; exit 1; }
 echo "through the pool: CONNECT and HTTP status $out"
-claw-master agent install --listen "$LISTEN" --open "127.0.0.1:$PORT" --ca "$D/ca.pem" || { echo "agent install failed" >&2; exit 1; }
+claw-master agent install --listen "$LISTEN" --open "127.0.0.1:$PORT" --ca "$D/ca.pem" ||
+  { echo "agent install failed; undoing what it wrote" >&2; claw-master agent uninstall || true; exit 1; }
 HTTPS_PROXY=$(plutil -extract env.HTTPS_PROXY raw -o - "$HOME/.claude/settings.json" 2>/dev/null) || HTTPS_PROXY=""
 export HTTPS_PROXY
 out=$(curl -s -m 30 -o /dev/null -w '%{http_connect} %{http_code}' --cacert "$D/ca.pem" https://api.anthropic.com/v1/models) || out="curl exit $?"
