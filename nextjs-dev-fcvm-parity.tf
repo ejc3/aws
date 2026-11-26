@@ -29,9 +29,6 @@ locals {
       aws_secretsmanager_secret.dolphin_maps_pems.arn,
       aws_secretsmanager_secret.claw_master_dashboard_agent_access.arn,
       aws_secretsmanager_secret.abliteration_api_key.arn,
-      # Family's Telegram bot (dev-ai-services.tf): the owner's; nextjs-dev-role may read and put it, so every member
-      # container is denied both here (OwnerOnlyFcvmSecrets).
-      aws_secretsmanager_secret.family_telegram_bot.arn,
     ],
     [for k, s in aws_secretsmanager_secret.dolphin_films : s.arn if startswith(k, "nonprod/")],
   )

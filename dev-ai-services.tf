@@ -613,43 +613,55 @@ resource "aws_iam_role_policy_attachment" "nextjs_dev_bedrock_deepseek" {
   policy_arn = aws_iam_policy.nextjs_dev_bedrock_deepseek.arn
 }
 
-# Family's Telegram bot (constellation docs/FAMILY.md, "Messaging surfaces"): JSON
-# {"TELEGRAM_BOT_TOKEN": ...}, issued by BotFather to the owner. Same admin/dev-role read boundary as
-# ElevenLabs. nextjs-dev-role may also put the value (and only on this secret), so the agent the owner
-# handed the token to can store it without the owner pasting it again; it cannot read or write any
-# other secret this way. Terraform owns only the container and grants, never the value.
+# Family's Telegram bot (constellation docs/FAMILY.md, "Messaging surfaces"): JSON {"TELEGRAM_BOT_TOKEN": ...}, issued by
+# BotFather to the owner. The owner's, as family/apple-development is (family-apple-signing.tf): the secret's own policy
+# decides, so no identity policy and no member session issued before an apply can reach it. Read: administration, the
+# metal boxes (dev-server-role, through elevenlabs_read) and the owner's nextjs-ct container session (ct-ejc3). Put:
+# administration and that session, so the agent the owner handed the token to stores it. Every member container is a
+# different ct-<member> session and is refused. Terraform owns only the container and its policy, never the value.
 resource "aws_secretsmanager_secret" "family_telegram_bot" {
   name                    = "family/telegram-bot"
   description             = "Family's Telegram bot token (BotFather); value supplied out of band, never in git."
   recovery_window_in_days = 7
-  tags                    = { Name = "family/telegram-bot", Project = "dev" }
+  tags                    = { Name = "family/telegram-bot", Project = "constellation" }
 }
 
 resource "aws_secretsmanager_secret_policy" "family_telegram_bot" {
   secret_arn = aws_secretsmanager_secret.family_telegram_bot.arn
   policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
-      Effect    = "Deny"
-      Principal = "*"
-      Action    = "secretsmanager:GetSecretValue"
-      Resource  = aws_secretsmanager_secret.family_telegram_bot.arn
-      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
-    }]
+    Statement = [
+      {
+        Sid       = "OwnerContainerReadAndSet"
+        Effect    = "Allow"
+        Principal = { AWS = aws_iam_role.nextjs_dev.arn }
+        Action    = ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"]
+        Resource  = aws_secretsmanager_secret.family_telegram_bot.arn
+        Condition = { StringEquals = { "aws:userid" = local.family_apple_owner_session } }
+      },
+      {
+        Sid       = "OnlyAdministrationTheMetalBoxesAndTheOwnerRead"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = "secretsmanager:GetSecretValue"
+        Resource  = aws_secretsmanager_secret.family_telegram_bot.arn
+        # On rollback to the shared host (nextjs_ct_serving false) only administration and the metal boxes read it.
+        Condition = merge(
+          { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, [aws_iam_role.dev_server.arn]) } },
+          local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.family_apple_owner_session } } : {},
+        )
+      },
+      {
+        Sid       = "OnlyAdministrationAndTheOwnerSet"
+        Effect    = "Deny"
+        Principal = "*"
+        Action    = ["secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:UpdateSecretVersionStage"]
+        Resource  = aws_secretsmanager_secret.family_telegram_bot.arn
+        Condition = merge(
+          { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } },
+          local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.family_apple_owner_session } } : {},
+        )
+      },
+    ]
   })
-}
-
-data "aws_iam_policy_document" "family_telegram_bot_put" {
-  statement {
-    sid       = "PutTheFamilyTelegramBotToken"
-    actions   = ["secretsmanager:PutSecretValue"]
-    resources = [aws_secretsmanager_secret.family_telegram_bot.arn]
-  }
-}
-
-resource "aws_iam_role_policy" "family_telegram_bot_put" {
-  name   = "family-telegram-bot-put"
-  role   = aws_iam_role.nextjs_dev.name
-  policy = data.aws_iam_policy_document.family_telegram_bot_put.json
 }

@@ -111,25 +111,22 @@ class ElevenLabsSecretTests(unittest.TestCase):
 
 
 class FamilyTelegramBotTests(unittest.TestCase):
-    """Family's bot token is the owner's: nextjs-dev-role may read and put it, so every member container is denied both."""
+    """Family's bot token is the owner's: its own policy admits administration, the metal boxes (read) and the owner's
+    container session (read and put); every member's ct-<member> session is refused, old sessions included."""
 
-    def test_only_nextjs_dev_role_may_put_and_only_this_secret(self):
-        doc = TF[TF.index('data "aws_iam_policy_document" "family_telegram_bot_put"'):]
-        doc = doc[:doc.index("\n}\n")]
-        self.assertIn('actions   = ["secretsmanager:PutSecretValue"]', doc)
-        self.assertIn("resources = [aws_secretsmanager_secret.family_telegram_bot.arn]", doc)
-        self.assertIn("role   = aws_iam_role.nextjs_dev.name", TF)
+    def policy(self):
+        doc = TF[TF.index('resource "aws_secretsmanager_secret_policy" "family_telegram_bot"'):]
+        return doc[:doc.index("\n}\n")]
 
-    def test_every_member_container_is_denied_reading_and_putting_it(self):
-        parity = (ROOT / "nextjs-dev-fcvm-parity.tf").read_text()
-        block = parity[parity.index("nextjs_dev_parity_secrets = concat("):]
-        block = block[:block.index("\n  )\n")]
-        self.assertIn("aws_secretsmanager_secret.family_telegram_bot.arn", block)
-        deny = (ROOT / "nextjs-ct-user-data.tf").read_text()
-        stmt = deny[deny.index('Sid      = "OwnerOnlyFcvmSecrets"'):]
-        stmt = stmt[:stmt.index("}")]
-        self.assertIn('"secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue"', stmt)
-        self.assertIn("Resource = local.nextjs_dev_parity_secrets", stmt)
+    def test_the_owner_session_reads_and_sets_and_nobody_else_sets(self):
+        doc = self.policy()
+        self.assertIn('Condition = { StringEquals = { "aws:userid" = local.family_apple_owner_session } }', doc)
+        self.assertIn('"secretsmanager:PutSecretValue", "secretsmanager:UpdateSecret"', doc)
+        self.assertEqual(doc.count("local.nextjs_ct_serving ? { StringNotEquals"), 2, "both denies exempt only the owner session")
+
+    def test_no_identity_policy_grants_it_to_the_whole_nextjs_role(self):
+        self.assertNotIn("family_telegram_bot_put", TF)
+        self.assertNotIn("family_telegram_bot", (ROOT / "nextjs-dev-fcvm-parity.tf").read_text())
 
 
 class StabilitySecretTests(unittest.TestCase):

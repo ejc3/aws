@@ -1525,13 +1525,6 @@ Available if a task needs them; neither needs a key on disk.
   (with `RUN_CLOUD_API_URL=https://api.run.cloud`) for the `runcloud` CLI or `@run-cloud/sdk`.
   Billed per active simulator minute: give each session an inactivity and a hard timeout,
   and delete it when done. Terraform owns only the container and grants.
-- **Family's Telegram bot** (constellation `docs/FAMILY.md`, "Messaging surfaces").
-  `family/telegram-bot` in us-west-1, JSON `{"TELEGRAM_BOT_TOKEN": ...}`, with the same
-  admin/dev-role read boundary as ElevenLabs. nextjs-dev-role may also put its value
-  (`PutSecretValue` on this secret alone), so an agent there stores the token BotFather
-  gave the owner; the owner's container only (members are denied both, `nextjs_dev_parity_secrets`). Fetch it at use
-  time as `TELEGRAM_BOT_TOKEN`, and pass it to `curl` on
-  stdin (`curl -K -`), never in a URL on a command line. Terraform owns only the container and grants.
 - **The run.cloud reaper** (`run-cloud-reaper.tf`, `scripts/run-cloud-reaper.py`): the Lambda `run-cloud-reaper` runs every 5
   minutes, reads that key, lists the account's active iOS and Android sessions, sandboxes and boxes, and deletes an active
   session or a running, non-persistent sandbox that has no inactivity and no hard timeout or one over its cap (once it is 5 minutes
@@ -1548,6 +1541,12 @@ Available if a task needs them; neither needs a key on disk.
   minutes, or no run for 15. `aws lambda invoke --function-name run-cloud-reaper --payload '{"dry_run": true}'
   --cli-binary-format raw-in-base64-out /dev/stdout` shows the decisions without deleting anything.
 
+- **Family's Telegram bot** (constellation `docs/FAMILY.md`, "Messaging surfaces").
+  `family/telegram-bot` in us-west-1, JSON `{"TELEGRAM_BOT_TOKEN": ...}`. The secret's own policy, in
+  `family/apple-development`'s shape (`family-apple-signing.tf`), admits administration, the metal boxes (read) and the owner's
+  nextjs-ct container session `ct-ejc3` (read and put, so an agent there stores the token BotFather gave the owner); every
+  member container is refused. Fetch it at use time as `TELEGRAM_BOT_TOKEN`, and pass it to `curl` on stdin (`curl -K -`),
+  never in a URL on a command line. Terraform owns only the container and its policy.
 - **Suno offline utility** (optional unofficial adapter). games/suno-cookie in us-west-1
   uses the same admin/dev-role read boundary as ElevenLabs and Stability. Fetch as
   SUNO_COOKIE at use time only. It is a full website session: never in files, command
