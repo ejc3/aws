@@ -58,6 +58,11 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.run_cloud_api_key.arn]
   }
+  statement {
+    sid       = "ReadTheFamilyTelegramBotToken"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.family_telegram_bot.arn]
+  }
 }
 
 # Keep the existing immutable name/description to avoid replacing this live policy.
@@ -606,4 +611,45 @@ resource "aws_iam_policy" "nextjs_dev_bedrock_deepseek" {
 resource "aws_iam_role_policy_attachment" "nextjs_dev_bedrock_deepseek" {
   role       = aws_iam_role.nextjs_dev.name
   policy_arn = aws_iam_policy.nextjs_dev_bedrock_deepseek.arn
+}
+
+# Family's Telegram bot (constellation docs/FAMILY.md, "Messaging surfaces"): JSON
+# {"TELEGRAM_BOT_TOKEN": ...}, issued by BotFather to the owner. Same admin/dev-role read boundary as
+# ElevenLabs. nextjs-dev-role may also put the value (and only on this secret), so the agent the owner
+# handed the token to can store it without the owner pasting it again; it cannot read or write any
+# other secret this way. Terraform owns only the container and grants, never the value.
+resource "aws_secretsmanager_secret" "family_telegram_bot" {
+  name                    = "family/telegram-bot"
+  description             = "Family's Telegram bot token (BotFather); value supplied out of band, never in git."
+  recovery_window_in_days = 7
+  tags                    = { Name = "family/telegram-bot", Project = "dev" }
+}
+
+resource "aws_secretsmanager_secret_policy" "family_telegram_bot" {
+  secret_arn = aws_secretsmanager_secret.family_telegram_bot.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.family_telegram_bot.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
+    }]
+  })
+}
+
+data "aws_iam_policy_document" "family_telegram_bot_put" {
+  statement {
+    sid       = "PutTheFamilyTelegramBotToken"
+    actions   = ["secretsmanager:PutSecretValue"]
+    resources = [aws_secretsmanager_secret.family_telegram_bot.arn]
+  }
+}
+
+resource "aws_iam_role_policy" "family_telegram_bot_put" {
+  name   = "family-telegram-bot-put"
+  role   = aws_iam_role.nextjs_dev.name
+  policy = data.aws_iam_policy_document.family_telegram_bot_put.json
 }
