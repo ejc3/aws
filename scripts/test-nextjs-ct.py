@@ -415,6 +415,12 @@ class BoxAgentNotesTests(unittest.TestCase):
             self.assertIn(phrase, notes)
 
 
+    def test_the_notes_prefer_a_pooled_merge_queue(self):
+        notes = (SCRIPTS / "ct" / "box-agents.md").read_text()
+        for phrase in ("Merge through a pooled queue", "split the batch in halves", "a native stack is one unit"):
+            self.assertIn(phrase, notes)
+
+
 class EternalTerminalTests(unittest.TestCase):
     """The phone connects with Eternal Terminal: nextjs-dev ran etserver on 2022, the containers did not, and the phone's
     `etterminal` over ssh exited 127. One container, the owner's, gets the pinned build and the host's port."""
