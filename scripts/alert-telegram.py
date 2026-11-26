@@ -16,21 +16,29 @@ Subscribed to the cost-alerts topic beside the email subscription. For each mess
   - the EventBridge "CloudWatch Alarm State Change" events that watchdog-alarms.tf relays to the topic raw are
     read as the same alarms.
   - anything else (budgets, auto-reboot notices): "ℹ️ <subject>" and the start of the body, whitespace collapsed, a
-    JSON body reduced to its readable fields. The security digest and the access-audit notices send their subject
-    alone: their bodies name findings, resources and paths, and stay in the email.
+    JSON body reduced to its readable fields. The security digest and the access-audit notices show their subject
+    alone.
+
+Tap to see more (owner, 2026-11-26): under that one visible line, a collapsed Telegram "expandable blockquote" holds the
+detail: for an alarm its whole description, CloudWatch's reason (the datapoints), the metric, statistic, threshold and
+periods, the previous state, the exact time, account and region, with an "Open in console" button; for anything else
+the whole body. Account ids there become account names, e-mail addresses and access key ids are masked. Messages use
+parse_mode HTML with every text escaped, and a message Telegram refuses as HTML (400) is sent again as the plain
+visible line, so a formatting fault never loses an alert.
 
 The bot token and chat id are the JSON secret alerts/telegram (bot_token, chat_id). Until it has a value this does
-nothing and succeeds. Messages go out as plain text (no parse_mode), so nothing in them is interpreted. Nothing it
-logs carries the token, the chat id or a message: counts and outcomes only. A failed send raises, so the
-invocation fails and Lambda retries it; the state is written only after a send.
+nothing and succeeds. Nothing it logs carries the token, the chat id or a message: counts and outcomes only. A failed
+send raises, so the invocation fails and Lambda retries it; the state is written only after a send.
 """
 
 import datetime
+import html
 import json
 import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 SECRET_ID = os.environ.get("SECRET_ID", "alerts/telegram")
@@ -47,7 +55,17 @@ SUBJECT_ONLY = ("Security alert: ", "Security alerts: ", "Access audit: ")
 TOKEN_SHAPE = re.compile(r"\d+:[A-Za-z0-9_-]+")
 CHAT_SHAPE = re.compile(r"-?\d+")
 BODY_CHARS = 600
-TEXT_LIMIT = 4000  # Telegram allows 4096
+TEXT_LIMIT = 4000  # Telegram allows 4096 characters after entity parsing (an escaped "&lt;" counts as one)
+EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+ACCESS_KEY = re.compile(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b")
+ACCOUNT_ID = re.compile(r"(?<![A-Za-z0-9])\d{12}(?![A-Za-z0-9])")  # not inside a hex id or a UUID
+REGION_SHAPE = re.compile(r"[a-z]{2}(-[a-z]+)+-\d+")
+# The console capture's raw tail (dev-diagnostics.tf) is boot output, which can carry tokens no pattern here knows:
+# its collapsed section stops before it.
+CONSOLE_TAIL = "\nLast 40 console lines:"
+OPERATORS = {"GreaterThanThreshold": ">", "GreaterThanOrEqualToThreshold": ">=", "LessThanThreshold": "<",
+             "LessThanOrEqualToThreshold": "<=", "LessThanLowerOrGreaterThanUpperThreshold": "outside the band",
+             "LessThanLowerThreshold": "below the band", "GreaterThanUpperThreshold": "above the band"}
 API = "https://api.telegram.org"
 TIMEOUT = 10
 RETRY_CAP = 20
@@ -101,10 +119,55 @@ def credentials(client):
     return token, chat
 
 
-def send(token, chat, text):
-    """One sendMessage, retried once on 429 (after its retry_after) or a 5xx. Errors never carry the URL: it holds
-    the token."""
-    body = json.dumps({"chat_id": chat, "text": text[:TEXT_LIMIT], "disable_web_page_preview": True}).encode()
+def mask(text):
+    """Account ids as their names (else "(account)"), e-mail addresses and access key ids masked."""
+    text = EMAIL.sub("(email)", str(text))
+    text = ACCESS_KEY.sub("(access key)", text)
+    return ACCOUNT_ID.sub(lambda m: ACCOUNT_NAMES.get(m.group(), "(account)"), text)
+
+
+def compose(text, details="", button=None):
+    """The sendMessage fields: the visible line as it always was, and under it, when there is more to show, the
+    masked details in a collapsed blockquote (HTML, every text escaped), cut to fit Telegram's limit."""
+    text = text[:TEXT_LIMIT]
+    # Cut before masking as well as after: masking a very long body is slow, and a timeout would lose the alert.
+    details = str(details)
+    if len(details) > 3 * TEXT_LIMIT:
+        details = details[:3 * TEXT_LIMIT].rsplit(None, 1)[0]  # at whitespace, so no token is masked by halves
+    details = mask(details).strip()
+    fields = {"text": text}
+    if details:
+        room = TEXT_LIMIT - len(text) - 1
+        if room > 20:
+            if len(details) > room:
+                details = details[:room - 1] + "…"
+            fields = {"text": f"{html.escape(text, quote=False)}\n<blockquote expandable>"
+                              f"{html.escape(details, quote=False)}</blockquote>", "parse_mode": "HTML"}
+    if button:
+        label, url = button
+        fields["reply_markup"] = {"inline_keyboard": [[{"text": label, "url": url}]]}
+    return fields
+
+
+def send(token, chat, text, details="", button=None):
+    """One sendMessage, retried once on 429 (after its retry_after) or a 5xx; a 400 for an HTML message is sent again
+    as the plain visible line. Errors never carry the URL: it holds the token."""
+    fields = compose(text, details, button)
+    try:
+        post(token, chat, fields)
+    except TelegramRefused:
+        if fields.get("parse_mode") != "HTML":
+            raise RuntimeError("telegram sendMessage failed: HTTP 400") from None
+        log(outcome="html refused, sent plain")
+        post(token, chat, {"text": text[:TEXT_LIMIT]})
+
+
+class TelegramRefused(Exception):
+    pass
+
+
+def post(token, chat, fields):
+    body = json.dumps({"chat_id": chat, **fields, "disable_web_page_preview": True}).encode()
     for attempt in (1, 2):
         request = urllib.request.Request(f"{API}/bot{token}/sendMessage", data=body, method="POST",
                                          headers={"Content-Type": "application/json"})
@@ -123,6 +186,8 @@ def send(token, chat, text):
             if attempt == 1 and (status == 429 or status >= 500):
                 sleep(min(max(wait, 0), RETRY_CAP))
                 continue
+            if status == 400:
+                raise TelegramRefused() from None
             raise RuntimeError(f"telegram sendMessage failed: HTTP {status}") from None
         except (urllib.error.URLError, OSError) as error:
             if attempt == 1:
@@ -172,6 +237,69 @@ def utc_clock(t):
     return datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%H:%M UTC")
 
 
+def region_of(alarm):
+    parts = str(alarm.get("AlarmArn") or "").split(":")
+    region = parts[3] if len(parts) > 4 else ""
+    return region if REGION_SHAPE.fullmatch(region) else HOME_REGION
+
+
+def console_button(alarm):
+    name, region = str(alarm.get("AlarmName") or ""), region_of(alarm)
+    if not name:
+        return None
+    return ("Open in console", f"https://{region}.console.aws.amazon.com/cloudwatch/home?region={region}"
+                               f"#alarmsV2:alarm/{urllib.parse.quote(name, safe='')}")
+
+
+def number(value):
+    try:
+        return f"{float(value):.15g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def alarm_details(alarm):
+    """Everything an alarm message says, one fact per line (shown collapsed under the visible line)."""
+    lines = []
+    description = " ".join(str(alarm.get("AlarmDescription") or "").split())
+    if description:
+        lines.append(description)
+    if alarm.get("NewStateReason"):
+        lines.append(f"Why: {' '.join(str(alarm['NewStateReason']).split())}")
+    old, new = alarm.get("OldStateValue"), alarm.get("NewStateValue")
+    if old and new:
+        lines.append(f"State: {old} → {new}")
+    trigger = alarm.get("Trigger") or {}
+    if trigger.get("MetricName"):
+        dims = ", ".join(f"{d.get('name') or d.get('Name')}={d.get('value') or d.get('Value')}"
+                         for d in trigger.get("Dimensions") or [] if isinstance(d, dict))
+        lines.append(f"Metric: {trigger.get('Namespace', '')}/{trigger['MetricName']}" + (f" ({dims})" if dims else ""))
+        # An EventBridge event carries no threshold, operator or evaluation periods: only what is known is written.
+        rule = ["Rule:", str(trigger.get("Statistic") or trigger.get("ExtendedStatistic") or "")]
+        if trigger.get("Threshold") is not None:
+            op = trigger.get("ComparisonOperator", "")
+            rule += [OPERATORS.get(op, op), number(trigger["Threshold"])]
+        periods, datapoints = trigger.get("EvaluationPeriods"), trigger.get("DatapointsToAlarm")
+        if periods:
+            rule.append(f"in {datapoints} of {periods}" if datapoints and datapoints != periods else f"for {periods}")
+        if trigger.get("Period"):
+            rule.append(f"{'× ' if periods else 'per '}{trigger['Period']}s")
+        if len([x for x in rule if x]) > 1:
+            lines.append(" ".join(x for x in rule if x))
+        if trigger.get("TreatMissingData"):
+            lines.append(f"Missing data: {trigger['TreatMissingData']}")
+    elif trigger.get("Metrics"):
+        parts = [m.get("Expression") or m.get("Label") or m.get("Id") for m in trigger["Metrics"] if isinstance(m, dict)]
+        lines.append("Metric math: " + "; ".join(str(p) for p in parts if p))
+    if alarm.get("AlarmRule"):
+        lines.append(f"Rule: {alarm['AlarmRule']}")
+    if alarm.get("StateChangeTime"):
+        lines.append(f"Changed: {alarm['StateChangeTime']}")
+    account = str(alarm.get("AWSAccountId") or "")
+    lines.append(f"Account: {ACCOUNT_NAMES.get(account, account) or '?'} · Region: {region_of(alarm)}")
+    return "\n".join(lines)
+
+
 def handle_alarm(alarm, when, table, token, chat):
     """Returns what was done: 'sent', 'recovered', 'flapping', 'muted', 'stale' or 'silent'."""
     state = alarm.get("NewStateValue")
@@ -198,20 +326,23 @@ def handle_alarm(alarm, when, table, token, chat):
             outcome = "muted"
         elif len(fired) > FLAP_COUNT:
             send(token, chat, f"🔁 {name}{where(alarm)} is flapping ({len(fired)} times in "
-                              f"{FLAP_WINDOW // 3600}h); muted until {utc_clock(when + MUTE)}")
+                              f"{FLAP_WINDOW // 3600}h); muted until {utc_clock(when + MUTE)}",
+                 "Fired at: " + ", ".join(utc_clock(t) for t in fired) + "\n" + alarm_details(alarm),
+                 console_button(alarm))
             item["muted_until"] = str(when + MUTE)
             item.pop("sent_at", None)
             outcome = "flapping"
         else:
             reason = first_sentence(alarm.get("AlarmDescription")) or name
-            send(token, chat, f"🔴 {name}{where(alarm)}: {reason}")
+            send(token, chat, f"🔴 {name}{where(alarm)}: {reason}", alarm_details(alarm), console_button(alarm))
             item["sent_at"] = str(when)
             outcome = "sent"
     elif muted or "sent_at" not in item:
         outcome = "muted" if muted else "silent"
     else:
         minutes = max(0, int((when - float(item["sent_at"])) // 60))
-        send(token, chat, f"✅ {name}{where(alarm)} recovered after {minutes} min")
+        send(token, chat, f"✅ {name}{where(alarm)} recovered after {minutes} min", alarm_details(alarm),
+             console_button(alarm))
         item.pop("sent_at", None)
         outcome = "recovered"
     item["expires"] = int(when + KEEP)
@@ -249,7 +380,13 @@ def sweep(table, token, chat, now):
                 if now - since < SETTLED:
                     counts["unsettled"] = counts.get("unsettled", 0) + 1
                     continue
-                send(token, chat, f"🔴 {name} is still in ALARM after its mute")
+                region = item.get("region") or HOME_REGION
+                arn = f"arn:aws:cloudwatch:{region}:{account or MAIN_ACCOUNT}:alarm:{name}"
+                send(token, chat, f"🔴 {name} is still in ALARM after its mute",
+                     alarm_details({"AlarmName": name, "AlarmArn": arn, "AWSAccountId": account or MAIN_ACCOUNT,
+                                    "AlarmDescription": current.get("AlarmDescription"),
+                                    "NewStateReason": current.get("StateReason")}),
+                     console_button({"AlarmName": name, "AlarmArn": arn}))
                 item["sent_at"] = str(now)
                 outcome = "still in alarm"
         item.pop("muted_until", None)
@@ -271,14 +408,38 @@ def from_eventbridge(message):
     if not name or not state.get("value"):
         return None
     region, account = message.get("region", ""), str(message.get("account", ""))
+    metrics = (detail.get("configuration") or {}).get("metrics") or []
+    stat = (metrics[0].get("metricStat") or {}) if len(metrics) == 1 and isinstance(metrics[0], dict) else {}
+    metric = stat.get("metric") or {}
+    trigger = {"MetricName": metric.get("name"), "Namespace": metric.get("namespace"), "Statistic": stat.get("stat"),
+               "Period": stat.get("period"),
+               "Dimensions": [{"name": k, "value": v} for k, v in (metric.get("dimensions") or {}).items()]} \
+        if metric.get("name") else {}
     return {
         "AlarmName": name,
         "NewStateValue": state.get("value"),
+        "NewStateReason": state.get("reason"),
+        "OldStateValue": (detail.get("previousState") or {}).get("value"),
+        "Trigger": trigger,
         "AlarmDescription": (detail.get("configuration") or {}).get("description"),
         "AWSAccountId": account,
         "AlarmArn": resources[0] if resources else f"arn:aws:cloudwatch:{region}:{account}:alarm:{name}",
         "StateChangeTime": state.get("timestamp") or message.get("time"),
     }
+
+
+def full_body(body):
+    """The whole of a non-alarm message for the collapsed section: a JSON object as one "key: value" line per field."""
+    try:
+        value = json.loads(body)
+    except (ValueError, TypeError):
+        value = None
+    if isinstance(value, dict):
+        return "\n".join(f"{k}: {v if isinstance(v, (str, int, float)) else json.dumps(v, sort_keys=True)}"
+                         for k, v in value.items())
+    if isinstance(value, str):
+        return value
+    return str(body or "")
 
 
 def readable(body):
@@ -327,8 +488,15 @@ def lambda_handler(event, context=None):
                 # CloudTrail's access-audit notice (access-audit.tf) has no Subject: its first sentence only.
                 subject, text = "Access audit: " + str(message).lstrip('"')[len("ACCESS AUDIT:"):].split(".")[0].strip(), ""
             else:
+                if subject.startswith("console captured:"):
+                    # Never the raw console tail, shown or collapsed; a body without the separator sends nothing of it.
+                    message = str(message).split(CONSOLE_TAIL)[0] if CONSOLE_TAIL in str(message) else ""
                 text = "" if subject.startswith(SUBJECT_ONLY) else readable(message)
-            send(token, chat, f"ℹ️ {subject}" + (f"\n{text}" if text else ""))
+            # The whole body goes in the collapsed section unless the visible line already shows all of it (a JSON body
+            # is shown as "k: v; k: v" there and one per line here).
+            whole = full_body(message)
+            more = whole if " ".join(whole.replace("\n", "; ").split()) != text and " ".join(whole.split()) != text else ""
+            send(token, chat, f"ℹ️ {subject}" + (f"\n{text}" if text else ""), more)
             outcome = "message"
         counts[outcome] = counts.get(outcome, 0) + 1
     log(outcome="done", **counts)
