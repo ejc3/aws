@@ -763,7 +763,10 @@ check both the allow and a deliberate deny.
 `fcvm-claude-rc.service` starts `t-claude --remote-control` at boot in every folder with session
 activity in the last 30 days (owner, 2026-10-13): a person prompted a Claude conversation there, or it
 was marked for interactive use (`claude-interactive` in its git directory; interactive t-claude use
-touches it, and agents touch it when they clone or create a worktree for the user). The rule is one
+touches it, and agents touch it when they clone or create a worktree for the user). A marker with no
+prompt in the window keeps a folder for only 3 days after the marker file was created, however often it
+is touched again, so a folder nobody prompts drops off (owner, 2026-11-26). Messages between Claude sessions
+are never prompts. The rule is one
 script, `scripts/agent-active-dirs.py` (`/usr/local/bin/agent-active-dirs --explain` shows why each folder
 qualifies), shared with nextjs-dev's `agents-start` and with `agent-session-sync` after a reboot. It
 reads the prompt's origin Claude Code records (`origin.kind: human`), so SDK-injected turns, background

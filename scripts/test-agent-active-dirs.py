@@ -133,6 +133,82 @@ class MarkerTests(Base):
         os.utime(m, (old, old))
         self.assertEqual(self.active(), {})
 
+    def test_a_marker_alone_counts_only_while_it_is_new_however_often_it_is_touched(self):
+        r = self.repo("game")
+        m = r / ".git" / "claude-interactive"
+        m.touch()  # touched just now, as an agent does on every command
+        born = {"value": self.now - 1 * DAY}
+        real_run = aad.subprocess.run
+
+        def fake_stat(argv, **kwargs):
+            # GNU stat's "%W %n" for each marker, as the real helper parses it.
+            if argv[:3] == ["stat", "--printf", "%W %n\\0"]:
+                out = "".join("%d %s\0" % (born["value"], p) for p in argv[4:])
+                return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+            return real_run(argv, **kwargs)
+
+        aad.subprocess.run = fake_stat
+        self.addCleanup(setattr, aad.subprocess, "run", real_run)
+        self.assertTrue(self.active()["game"]["marked"])
+        born["value"] = int(self.now - (aad.MARKER_GRACE_DAYS + 1) * DAY)
+        self.assertEqual(self.active(), {}, "an old marker re-touched by an agent keeps nothing open")
+
+    def test_birth_time_is_read_for_a_path_with_a_newline(self):
+        odd = self.home / "line\nbreak"
+        odd.mkdir()
+        m = odd / "claude-interactive"
+        m.touch()
+        old = self.now - 10 * DAY
+        os.utime(m, (old, old))
+        # The real GNU stat: a file made just now has a birth time of now (or none, then mtime).
+        born = aad.markers_born([str(m)])[str(m)]
+        self.assertTrue(born == os.path.getmtime(m) or born > self.now - DAY, born)
+
+    def test_a_prompted_folder_keeps_its_old_marker(self):
+        r = self.repo("game")
+        (r / ".git" / "claude-interactive").touch()
+        asked = []
+        real = aad.markers_born
+        aad.markers_born = lambda paths: asked.append(list(paths)) or {p: self.now - 20 * DAY for p in paths}
+        self.addCleanup(setattr, aad, "markers_born", real)
+        self.say(r, "keep going", age_days=5, origin={"kind": "human"})
+        found = self.active()
+        self.assertEqual(found["game"]["prompts"], 1)
+        self.assertTrue(found["game"]["marked"])
+        self.assertEqual(asked, [[]], "a prompted folder's marker needs no birth-time lookup")
+
+    def test_a_message_from_another_session_is_not_a_prompt(self):
+        r = self.repo("game")
+        self.say(r, "<cross-session-message>do this</cross-session-message>", isMeta=True,
+                 origin={"kind": "peer", "name": "other"}, promptSource="system")
+        self.say(r, "do this", origin={"kind": "peer", "name": "other"})
+        self.assertEqual(self.active(), {})
+
+    def test_marker_birth_falls_back_to_modification_time(self):
+        r = self.repo("game")
+        m = r / ".git" / "claude-interactive"
+        m.touch()
+        old = self.now - 5 * DAY
+        os.utime(m, (old, old))
+        real_run = aad.subprocess.run
+        calls = []
+
+        def unknown(argv, **kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="0 %s\0" % argv[-1], stderr="")
+
+        aad.subprocess.run = unknown
+        self.addCleanup(setattr, aad.subprocess, "run", real_run)
+        self.assertEqual(aad.markers_born([str(m)]), {str(m): os.path.getmtime(m)})
+
+        def stalled(argv, **kwargs):
+            calls.append(argv)
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        aad.subprocess.run = stalled
+        self.assertEqual(aad.markers_born([str(m), str(m)]), {str(m): os.path.getmtime(m)})
+        self.assertEqual(len(calls), 2, "one stat call per lookup, however many markers")
+
     def test_an_unmarked_unprompted_checkout_does_not_count(self):
         self.repo("game")
         self.assertEqual(self.active(), {})
