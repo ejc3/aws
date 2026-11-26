@@ -40,14 +40,27 @@ HUMAN_SOURCES = ("typed", "queued", "remote", "remote-control", "bridge")
 MARKER_GRACE_DAYS = 3
 
 
-def marker_born(path):
-    """When the marker file was created: its birth time (statx, via GNU stat), else its modification time."""
-    try:
-        r = subprocess.run(["stat", "-c", "%W", "--", path], capture_output=True, text=True, timeout=10)
-        born = int(r.stdout.strip()) if r.returncode == 0 and r.stdout.strip().isdigit() else 0
-    except (OSError, subprocess.SubprocessError, ValueError):
-        born = 0
-    return born or os.path.getmtime(path)
+def markers_born(paths):
+    """path -> when the marker file was created: its birth time (statx, via one GNU stat call for all of
+    them, bounded by one timeout), else its modification time. Any failure falls back to mtime, which keeps
+    a folder rather than dropping it."""
+    born = {}
+    if paths:
+        try:
+            r = subprocess.run(["stat", "-c", "%W %n", "--", *paths], capture_output=True, text=True, timeout=10)
+            for line in r.stdout.splitlines():
+                stamp, _, name = line.partition(" ")
+                if stamp.isdigit() and int(stamp) > 0:
+                    born[name] = int(stamp)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    out = {}
+    for path in paths:
+        try:
+            out[path] = born.get(path) or os.path.getmtime(path)
+        except OSError:
+            continue
+    return out
 
 
 def prompt_text(msg):
@@ -183,15 +196,16 @@ def active_dirs(claude_dir, home, days=30, roots=DEFAULT_ROOTS, now=None):
             e = out.setdefault(root, {"time": 0, "prompts": 0, "marked": False})
             e["time"], e["prompts"] = max(e["time"], t), e["prompts"] + n
     grace = now - MARKER_GRACE_DAYS * 86400
-    for folder, m in marked(roots, cutoff).items():
-        if not os.path.isdir(folder):
-            continue
+    markers = {f: m for f, m in marked(roots, cutoff).items() if os.path.isdir(f)}
+    # Prompted folders already count; only a marker-only folder needs its marker's birth time.
+    born = markers_born([m for f, m in markers.items() if f not in out])
+    for folder, m in markers.items():
         try:
-            t, born = os.path.getmtime(m), marker_born(m)
+            t = os.path.getmtime(m)
         except OSError:
             continue
-        # Prompted folders already count; a marker alone counts only while it is new.
-        if folder not in out and born < grace:
+        # A marker alone counts only while it is new.
+        if folder not in out and born.get(m, t) < grace:
             continue
         e = out.setdefault(folder, {"time": 0, "prompts": 0, "marked": False})
         e["time"], e["marked"] = max(e["time"], t), True
