@@ -4,6 +4,7 @@ sent alarm, flapping alarms are muted, the function is inert until its secret ha
 the chat id reaches a log. Offline: fake Secrets Manager, DynamoDB and HTTP."""
 import contextlib
 import datetime
+import html
 import importlib.util
 import io
 import json
@@ -134,9 +135,24 @@ class AlertTelegram(unittest.TestCase):
         return result
 
     def texts(self):
-        return [m["text"] for m in self.telegram.sent]
+        """The visible line of each message, as the person sees it before tapping."""
+        out = []
+        for m in self.telegram.sent:
+            text = m["text"]
+            if m.get("parse_mode") == "HTML":
+                text = html.unescape(text.split("\n<blockquote expandable>")[0])
+            out.append(text)
+        return out
 
-    def test_alarm_sends_one_readable_line_as_plain_text(self):
+    def details(self):
+        """The collapsed section of each message ('' when there is none), unescaped."""
+        out = []
+        for m in self.telegram.sent:
+            found = re.search(r"\n<blockquote expandable>(.*)</blockquote>$", m["text"], re.S)
+            out.append(html.unescape(found.group(1)) if found and m.get("parse_mode") == "HTML" else "")
+        return out
+
+    def test_alarm_sends_one_readable_line_and_the_rest_collapsed(self):
         self.run_records(alarm("claude-master-NoAccountAvailable", "ALARM", NOW,
                                desc="No subscription could take a request: every one is out. Clients are refused."))
         self.assertEqual(self.texts(), ["🔴 claude-master-NoAccountAvailable: No subscription could take a request: "
@@ -144,8 +160,50 @@ class AlertTelegram(unittest.TestCase):
         [message] = self.telegram.sent
         self.assertEqual(message["chat_id"], CHAT)
         self.assertTrue(message["disable_web_page_preview"])
-        self.assertNotIn("parse_mode", message)
+        self.assertEqual(message["parse_mode"], "HTML")
+        self.assertIn("Clients are refused.", self.details()[0], "the whole description, not just its first sentence")
+        self.assertIn("Account: main · Region: us-west-1", self.details()[0])
+        [[button]] = message["reply_markup"]["inline_keyboard"]
+        self.assertEqual(button["url"], "https://us-west-1.console.aws.amazon.com/cloudwatch/home?region=us-west-1"
+                                        "#alarmsV2:alarm/claude-master-NoAccountAvailable")
         self.assertEqual(self.telegram.calls[0][1], 10)
+
+    def test_the_collapsed_section_carries_cloudwatchs_reason_and_rule_escaped(self):
+        record = alarm("lambda <errors> & co", "ALARM", NOW, desc="Errors > 0. See <runbook> & fix.")
+        message = json.loads(record["Sns"]["Message"])
+        message.update(NewStateReason="Threshold Crossed: 1 out of the last 2 datapoints [3.0 (26/11/26 06:00:00)] was "
+                                      "greater than the threshold (0.0).", OldStateValue="OK",
+                       Trigger={"MetricName": "Errors", "Namespace": "AWS/Lambda", "Statistic": "SUM", "Period": 300,
+                                "EvaluationPeriods": 2, "DatapointsToAlarm": 1, "ComparisonOperator": "GreaterThanThreshold",
+                                "Threshold": 0.0, "TreatMissingData": "notBreaching",
+                                "Dimensions": [{"value": "github-app-runner", "name": "FunctionName"}]})
+        record["Sns"]["Message"] = json.dumps(message)
+        self.run_records(record)
+        [text] = self.texts()
+        self.assertEqual(text, "🔴 lambda <errors> & co: Errors > 0.")
+        raw = self.telegram.sent[0]["text"]
+        self.assertNotIn("<runbook>", raw, "every text is escaped for HTML")
+        self.assertEqual(raw.count("<blockquote expandable>"), 1)
+        details = self.details()[0]
+        for want in ("See <runbook> & fix.", "Why: Threshold Crossed: 1 out of the last 2 datapoints",
+                     "State: OK → ALARM", "Metric: AWS/Lambda/Errors (FunctionName=github-app-runner)",
+                     "Rule: SUM > 0 in 1 of 2 × 300s", "Missing data: notBreaching"):
+            self.assertIn(want, details)
+        url = self.telegram.sent[0]["reply_markup"]["inline_keyboard"][0][0]["url"]
+        self.assertTrue(url.endswith("#alarmsV2:alarm/lambda%20%3Cerrors%3E%20%26%20co"), url)
+
+    def test_a_message_telegram_refuses_as_html_is_sent_again_as_the_plain_line(self):
+        self.telegram.fail = [(400, b'{"ok":false,"description":"Bad Request: can\'t parse entities"}')]
+        self.run_records(alarm("x", "ALARM", NOW))
+        [plain] = self.telegram.sent
+        self.assertEqual(plain["text"], "🔴 x: The thing broke.")
+        self.assertNotIn("parse_mode", plain)
+
+    def test_the_collapsed_section_is_cut_to_fit_telegrams_limit(self):
+        self.run_records(alarm("big", "ALARM", NOW, desc="Short first. " + "x" * 9000))
+        [message] = self.telegram.sent
+        self.assertLessEqual(len(html.unescape(re.sub(r"</?blockquote[^>]*>", "", message["text"]))), 4000)
+        self.assertTrue(self.details()[0].endswith("…"))
 
     def test_recovery_follows_a_sent_alarm_with_its_duration(self):
         self.run_records(alarm("x", "ALARM", NOW))
@@ -353,6 +411,25 @@ class AlertTelegram(unittest.TestCase):
                      "Timestamp": iso(NOW)}})
         self.assertEqual(self.texts(), ["ℹ️ Security alerts: 3 Inspector, 1 GuardDuty", "ℹ️ Security alert: GuardDuty: Recon",
                                         "ℹ️ Access audit: jumpbox: credentials opened by python3"])
+        # Tap to see more (owner, 2026-11-26: "Include, IDs masked"): the bodies are in the collapsed section.
+        self.assertEqual(self.details(), ["finding arn:aws:... on i-0abc", "the resource detail", "path: /x"])
+
+    def test_the_collapsed_section_masks_accounts_emails_and_access_keys(self):
+        body = ("Finding on arn:aws:ec2:us-west-2:111111111111:instance/i-1 and 222222222222 and 333333333333, "
+                "reported to someone@example.com; key AKIAIOSFODNN7EXAMPLE.")
+        self.run_records({"Sns": {"Subject": "Security alert: Inspector: CVE", "Message": body, "Timestamp": iso(NOW)}})
+        [details] = self.details()
+        self.assertIn(":main:instance/i-1", details)
+        self.assertIn("dev-staging", details)
+        self.assertIn("(account)", details)
+        for leak in ("111111111111", "222222222222", "333333333333", "someone@example.com", "AKIAIOSFODNN7EXAMPLE"):
+            self.assertNotIn(leak, self.telegram.sent[0]["text"])
+
+    def test_a_short_body_shown_whole_gets_no_collapsed_section(self):
+        self.run_records({"Sns": {"Subject": "Budget", "Message": "Spend is 80% of the budget.", "Timestamp": iso(NOW)}})
+        self.assertEqual(self.texts(), ["ℹ️ Budget\nSpend is 80% of the budget."])
+        self.assertEqual(self.details(), [""])
+        self.assertNotIn("parse_mode", self.telegram.sent[0])
 
 
     def test_cloudtrails_access_audit_notice_sends_its_first_sentence_only(self):
@@ -362,6 +439,8 @@ class AlertTelegram(unittest.TestCase):
         self.assertEqual(self.texts(), ["ℹ️ Access audit: registered principal used"])
         for leak in ("AKIAEXAMPLE", "203.0.113.9", "someone", "curl"):
             self.assertNotIn(leak, self.texts()[0])
+        self.assertIn("called iam CreateUser from 203.0.113.9", self.details()[0])
+        self.assertNotIn("123456789012", self.telegram.sent[0]["text"])
 
 
 class Terraform(unittest.TestCase):
