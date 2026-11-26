@@ -82,7 +82,8 @@ class HostCleanup(unittest.TestCase):
         nextjs, fcvm = render_installer("nextjs"), render_installer("fcvm")
         self.assertIn("ExecStart=/usr/local/sbin/nextjs-worktree-prune --apply\n", nextjs)
         self.assertIn("/run/nextjs-worktree-prune.lock", nextjs)
-        self.assertNotIn("fcvm", nextjs)
+        # Outside the embedded base64 payloads, whose letters can spell anything.
+        self.assertNotIn("fcvm", re.sub(r"[A-Za-z0-9+/=]{200,}", "", nextjs))
         self.assertIn("ExecStart=/usr/local/sbin/fcvm-worktree-prune --apply --host-only\n", fcvm)
         for unit in ("/etc/systemd/system/fcvm-worktree-prune.service",
                      "/etc/systemd/system/fcvm-worktree-prune.timer", "/run/fcvm-worktree-prune.lock",
@@ -119,10 +120,25 @@ class HostCleanup(unittest.TestCase):
                 host, "clean", side_effect=lambda accounts, *rest, retire=False: seen.append((accounts, rest[2], retire))
             ), patch.object(
                 host, "clean_builds", side_effect=lambda query, pressure, apply, deadline: seen.append(("builds", apply))
-            ):
+            ), patch.object(host, "expire_archives", side_effect=lambda query: seen.append("expire")):
                 host.main()
-            # The build-output pass follows the merged-worktree pass, which retires on this host.
-            self.assertEqual(seen, [(["ubuntu"], True, True), ("builds", True)])
+            # The worktree pass retires on this host; an applying run then expires old archives.
+            self.assertEqual(seen, [(["ubuntu"], True, True), "expire", ("builds", True)])
+            seen.clear()
+            with patch.object(sys, "argv", ["driver", "--host-only"]), patch.object(
+                host.os, "geteuid", return_value=0
+            ), patch.object(host, "pressured", return_value=True), patch.object(
+                host, "clean", side_effect=lambda accounts, *rest, retire=False: seen.append((accounts, rest[2], retire))
+            ), patch.object(
+                host, "clean_builds", side_effect=lambda query, pressure, apply, deadline: seen.append(("builds", apply))
+            ), patch.object(host, "expire_archives", side_effect=lambda query: seen.append("expire")):
+                host.main()
+            self.assertEqual(seen, [(["ubuntu"], False, True), ("builds", False)], "a preview never expires")
+            # The expiry answer is bounded like every other worker answer.
+            self.assertEqual(host.expire_archives(lambda *a: {"deleted": 2}), 2)
+            for bad in ({"deleted": -1}, {"deleted": "2"}, {"deleted": 1, "x": 1}, []):
+                with self.assertRaises(ValueError):
+                    host.expire_archives(lambda *a, bad=bad: bad)
 
     def test_host_only_refuses_a_container_host(self):
         with tempfile.TemporaryDirectory() as temp:

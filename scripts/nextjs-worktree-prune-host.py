@@ -245,6 +245,16 @@ def clean(accounts, query, pressure, apply, busy_accounts, retire=False):
     return removed
 
 
+def expire_archives(query):
+    """fcvm-metal-arm, applying runs only: delete retirement archives older than 90 days."""
+    answer = query("ubuntu", "--expire-archives")
+    if (not isinstance(answer, dict) or answer.keys() != {"deleted"}
+            or type(answer["deleted"]) is not int or not 0 <= answer["deleted"] < 2**31):
+        raise ValueError("invalid archive expiry result from ubuntu")
+    print(f"nextjs-worktree-prune: {answer['deleted']} expired archives deleted")
+    return answer["deleted"]
+
+
 def clean_builds(query, pressure, apply, deadline, clock=time.monotonic):
     """fcvm-metal-arm only: idle worktrees' ignored build output, oldest first.
 
@@ -309,6 +319,8 @@ def main():
         # Build output only on a host-only run (fcvm-metal-arm), after the merged
         # pass. managed_accounts has already refused host-only on a Next.js host.
         if args.host_only:
+            if args.apply:
+                expire_archives(query_worker)
             clean_builds(query_worker, pressured, args.apply, start + BUILD_DEADLINE)
         if incomplete:
             raise IncompleteAccounts

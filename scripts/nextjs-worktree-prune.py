@@ -239,15 +239,19 @@ def ancestor(home, repo, older, newer, origin):
 def merged(home, repo, head, ref, tip, origin):
     if ancestor(home, repo, head, tip, origin):
         return True
-    # A squash merge need not retain the original commit as an ancestor. Require
-    # GitHub's exact PR head and a merge commit still on the verified default.
+    # A squash merge need not retain the original commit as an ancestor. Require a
+    # merged PR whose final head is this commit or descends from it (the branch
+    # moved on after this worktree's last commit), and a merge commit still on the
+    # verified default: everything up to the PR's head is in that merge.
     pulls = github(home, f"repos/{origin}/commits/{head}/pulls?per_page=30")
     if not isinstance(pulls, list):
         return False
     try:
         for pull in pulls:
             commit = pull.get("merge_commit_sha") or ""
-            if (pull.get("merged_at") and pull["head"]["sha"] == head
+            pr_head = pull["head"]["sha"]
+            if (pull.get("merged_at") and isinstance(pr_head, str) and SHA.fullmatch(pr_head)
+                    and (pr_head == head or ancestor(home, repo, head, pr_head, origin))
                     and pull["base"]["ref"] == ref.removeprefix("refs/heads/")
                     and pull["base"]["repo"]["full_name"].lower() == origin.lower()
                     and SHA.fullmatch(commit) and ancestor(home, repo, commit, tip, origin)):
@@ -330,13 +334,17 @@ def archive_dir_fd(home, uid, device, *parts):
 
 
 def expire_archives(home, uid, device):
-    """Delete this cleaner's own archives older than ARCHIVE_KEEP_SECONDS (removal runs only)."""
+    """Delete this cleaner's own archives older than ARCHIVE_KEEP_SECONDS; returns how many.
+
+    Run by --expire-archives, which the host driver sends on applying runs only.
+    """
     cutoff = wall() - ARCHIVE_KEEP_SECONDS
+    deleted = 0
     with as_owner():
         try:
             root = archive_dir_fd(home, uid, device)
         except (OSError, Incomplete):
-            return
+            return 0
         try:
             for repo_dir in os.scandir(root):
                 if not repo_dir.is_dir(follow_symlinks=False):
@@ -347,15 +355,20 @@ def expire_archives(home, uid, device):
                 except OSError:
                     continue
                 try:
+                    info = os.fstat(sub)
+                    if info.st_uid != uid or info.st_dev != device:
+                        continue  # not this cleaner's directory (another owner, a mount)
                     for entry in os.scandir(sub):
                         info = entry.stat(follow_symlinks=False)
                         if (ARCHIVE_NAME.fullmatch(entry.name) and stat.S_ISREG(info.st_mode)
-                                and info.st_uid == uid and info.st_mtime < cutoff):
+                                and info.st_uid == uid and info.st_dev == device and info.st_mtime < cutoff):
                             os.unlink(entry.name, dir_fd=sub)
+                            deleted += 1
                 finally:
                     os.close(sub)
         finally:
             os.close(root)
+    return deleted
 
 
 def open_below(root_fd, parts):
@@ -431,14 +444,28 @@ def ignored_entries(root_fd, roots, uid, device, end):
 
 
 def fingerprint(root_fd, roots, uid, device, end):
-    return {os.fspath(rel): (stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns, info.st_ino)
+    # ctime too: any write changes it, and unlike mtime it cannot be set back.
+    return {os.fspath(rel): (stat.S_IFMT(info.st_mode), info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+                             info.st_ino)
             for rel, info, _, _ in ignored_entries(root_fd, roots, uid, device, end)}
+
+
+def ignored_unchanged(path, ignored, before, uid, device, end):
+    """The ignored files still match what was archived; checked again just before removal."""
+    roots = [Path(r) for r in ignored]
+    with as_owner():
+        root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            return fingerprint(root_fd, roots, uid, device, end) == before
+        finally:
+            os.close(root_fd)
 
 
 def archive_ignored(home, uid, device, repo, path, head, ignored, end):
     """Pack the worktree's ignored files into a verified archive; build output is left out.
 
-    Returns the archive's path, or None when nothing would be kept. Raises
+    Returns (archive path or None when nothing would be kept, the fingerprint
+    the archive matches, for ignored_unchanged just before removal). Raises
     NotIdle (keep the worktree) for anything it cannot copy faithfully: a nested
     repository (also inside build output), another filesystem, a file the
     account does not own, more than ARCHIVE_LIMIT bytes, too little free space,
@@ -454,7 +481,7 @@ def archive_ignored(home, uid, device, repo, path, head, ignored, end):
             raise NotIdle
         roots.append(rel)
     if not roots:
-        return None
+        return None, {}
     with as_owner():
         root_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
@@ -466,8 +493,8 @@ def archive_ignored(home, uid, device, repo, path, head, ignored, end):
 def _archive(home, uid, device, repo, path, head, roots, root_fd, end):
     before = fingerprint(root_fd, roots, uid, device, end)
     if not before:
-        return None
-    if sum(size for kind, size, _, _ in before.values() if kind == stat.S_IFREG) > ARCHIVE_LIMIT:
+        return None, before
+    if sum(entry[1] for entry in before.values() if entry[0] == stat.S_IFREG) > ARCHIVE_LIMIT:
         raise NotIdle
     usage = os.statvfs(home)
     if usage.f_bavail * usage.f_frsize < ARCHIVE_SPACE:
@@ -480,6 +507,7 @@ def _archive(home, uid, device, repo, path, head, roots, root_fd, end):
         name = re.sub(r"[^A-Za-z0-9._-]", "_", path.name)[:200] + f"-{where}-{head[:12]}-{stamp}.tar.gz"
         part = "." + name + ".part"
         expected, skipped = {}, []
+        copied = 0
         fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=dfd)
         try:
             with os.fdopen(fd, "wb") as raw:
@@ -505,6 +533,9 @@ def _archive(home, uid, device, repo, path, head, roots, root_fd, end):
                                                                                   info.st_mtime_ns):
                                     raise NotIdle  # replaced or written since it was listed
                                 member.size = now.st_size
+                                copied += now.st_size
+                                if copied > ARCHIVE_LIMIT:
+                                    raise NotIdle  # grew past the limit since it was listed
                                 reader = Hashing(stream)
                                 tar.addfile(member, reader)
                                 if os.fstat(stream.fileno()).st_mtime_ns != now.st_mtime_ns:
@@ -556,7 +587,7 @@ def _archive(home, uid, device, repo, path, head, roots, root_fd, end):
             if isinstance(error, (gzip.BadGzipFile, EOFError, tarfile.TarError, FileExistsError)):
                 raise NotIdle from error
             raise
-        return home / ARCHIVE_DIR / folder / name
+        return home / ARCHIVE_DIR / folder / name, before
     finally:
         os.close(dfd)
 
@@ -763,9 +794,6 @@ def prune(home, uid, token=None, *, inspect_all=False, retire=False):
     device = home.stat().st_dev
     if not owned(home, uid, device):
         raise OSError("unsafe home")
-    if retire and token:
-        # Only a removal run (the driver's --apply) expires archives; a preview never deletes.
-        expire_archives(home, uid, device)
     directories = list(dict.fromkeys(roots(home, uid, device)))
     candidates = []
     registered = set(directories)
@@ -863,13 +891,16 @@ def prune(home, uid, token=None, *, inspect_all=False, retire=False):
             # git worktree remove deletes ignored files without asking. Keep them
             # in a read-back archive first; anything not archivable keeps the tree.
             try:
-                archive_ignored(home, uid, device, repo, path, head, ignored, clock() + ARCHIVE_SECONDS)
+                _, archived = archive_ignored(home, uid, device, repo, path, head, ignored,
+                                              clock() + ARCHIVE_SECONDS)
+                # The archive took time: nothing may have changed meanwhile. The ignored
+                # files are compared last, immediately before git removes them.
+                if (identity(repo, path, head, uid, device) != info
+                        or clean(home, path, head, info[0], allow_ignored=True) != ignored
+                        or protected(path, protected_paths(home, uid, inspect_all))
+                        or not ignored_unchanged(path, ignored, archived, uid, device, clock() + ARCHIVE_SECONDS)):
+                    return skipped
             except (NotIdle, OSError):
-                return skipped
-            # The archive took time: nothing may have changed meanwhile.
-            if (identity(repo, path, head, uid, device) != info
-                    or clean(home, path, head, info[0], allow_ignored=True) != ignored
-                    or protected(path, protected_paths(home, uid, inspect_all))):
                 return skipped
         removed = git(home, repo, "worktree", "remove", "--", str(path), timeout=50) is not None
         return {"status": "removed" if removed else "declined"}
@@ -1126,11 +1157,13 @@ def main():
     mode.add_argument("--clean-builds", action="store_true",
                       help="remove idle worktrees' ignored build output while the disk is pressured")
     parser.add_argument("--after", metavar="CURSOR", help="continue a build pass after this cursor")
+    mode.add_argument("--expire-archives", action="store_true",
+                      help="delete this cleaner's archives older than 90 days (the driver's applying runs only)")
     parser.add_argument("--retire", action="store_true",
                         help="with --list or --remove: archive ignored files, then remove; also take idle"
                              " worktrees whose HEAD is on a live remote branch")
     args = parser.parse_args()
-    if args.retire and (args.builds or args.clean_builds):
+    if args.retire and (args.builds or args.clean_builds or args.expire_archives):
         parser.error("--retire applies to --list and --remove")
     if args.remove and not TOKEN.fullmatch(args.remove):
         parser.error("invalid worktree token")
@@ -1153,7 +1186,12 @@ def main():
                     or entry.pw_dir != "/home/" + args.owner):
                 raise OSError("invalid owner")
             COMMAND_OWNER = (uid, entry.pw_gid)
-        if args.builds or args.clean_builds:
+        if args.expire_archives:
+            device = home.stat().st_dev
+            if not owned(home, uid, device):
+                raise OSError("unsafe home")
+            result = {"deleted": expire_archives(home, uid, device)}
+        elif args.builds or args.clean_builds:
             result = builds(home, uid, args.clean_builds, after, inspect_all=root)
         else:
             result = prune(home, uid, args.remove, inspect_all=root, retire=args.retire)

@@ -267,6 +267,48 @@ class WorktreePruneTests(Fixture):
         self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
         self.assertFalse(path.exists())
 
+    def test_squash_of_a_later_pr_head_covers_an_earlier_worktree_commit(self):
+        path = self.worktree("early")
+        early = self.commit(path)
+        # The PR's branch moved on after this worktree's last commit, then was
+        # squash-merged and deleted: its final head descends from this worktree's HEAD.
+        later = self.home / "later"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(later), early)
+        (later / "src/code").write_text("more\n")
+        self.git(later, "commit", "-qam", "more")
+        pr_head = self.git(later, "rev-parse", "HEAD").decode().strip()
+        self.git(self.repo, "worktree", "remove", "--force", str(later))
+        self.git(self.repo, "merge", "--squash", pr_head)
+        self.git(self.repo, "commit", "-qm", "squashed")
+        tip = self.git(self.repo, "rev-parse", "HEAD").decode().strip()
+        self.push()
+        pull = {"head": {"sha": pr_head}, "merged_at": "2026-11-04T00:00:00Z",
+                "base": {"ref": "main", "repo": {"full_name": "example/app"}},
+                "merge_commit_sha": tip}
+        self.github_responses = [pull]
+        [candidate] = self.list()
+        self.assertEqual(self.remove(candidate["token"]), {"status": "removed"})
+        self.assertFalse(path.exists())
+
+    def test_squash_of_an_unrelated_pr_head_proves_nothing(self):
+        path = self.worktree("early")
+        self.commit(path)
+        other = self.home / "other"
+        self.git(self.repo, "worktree", "add", "-q", "--detach", str(other), "main")
+        (other / "src/code").write_text("unrelated\n")
+        self.git(other, "commit", "-qam", "unrelated")
+        pr_head = self.git(other, "rev-parse", "HEAD").decode().strip()
+        self.git(self.repo, "worktree", "remove", "--force", str(other))
+        self.git(self.repo, "merge", "--squash", pr_head)
+        self.git(self.repo, "commit", "-qm", "squashed")
+        tip = self.git(self.repo, "rev-parse", "HEAD").decode().strip()
+        self.push()
+        self.github_responses = [{"head": {"sha": pr_head}, "merged_at": "2026-11-04T00:00:00Z",
+                                  "base": {"ref": "main", "repo": {"full_name": "example/app"}},
+                                  "merge_commit_sha": tip}]
+        self.assertEqual(self.list(), [])
+        self.assertTrue(path.exists())
+
     def test_healthy_disk_and_unknown_token_do_not_contact_origin(self):
         self.worktree("candidate")
         with mock.patch.object(WORKER, "pressure", return_value=False), \
@@ -870,10 +912,34 @@ class RetireTests(Fixture):
         for file in (old, other):
             os.utime(file, (ancient, ancient))
         self.retire_list()
-        self.assertTrue(old.exists())  # a preview (--list) never deletes an archive
-        self.retire_remove("0" * 64)  # a removal run expires them, even when its token matches nothing
+        self.retire_remove("0" * 64)
+        self.assertTrue(old.exists())  # listing and removal never expire archives
+        # Its own mode, which the driver sends on applying runs whether or not anything is eligible.
+        self.assertEqual(WORKER.expire_archives(self.home, self.uid, self.home.stat().st_dev), 1)
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists() and other.exists())
+
+    def test_expiry_skips_a_directory_on_another_disk(self):
+        mounted = self.archives.parent / "backup"
+        mounted.mkdir(parents=True)
+        old = mounted / "wt-01234567-0123456789ab-20260101T000000Z.tar.gz"
+        old.write_text("x")
+        ancient = time.time() - 200 * 86400
+        os.utime(old, (ancient, ancient))
+        real_fstat = os.fstat
+        inode = mounted.stat().st_ino
+
+        def other_disk(fd):
+            info = real_fstat(fd)
+            if info.st_ino == inode:  # the mounted directory reports another device
+                values = list(info)
+                values[2] = info.st_dev + 1
+                return os.stat_result(values)
+            return info
+
+        with mock.patch.object(WORKER.os, "fstat", other_disk):
+            self.assertEqual(WORKER.expire_archives(self.home, self.uid, self.home.stat().st_dev), 0)
+        self.assertTrue(old.exists())
 
     def test_a_change_after_archiving_keeps_the_worktree(self):
         path = self.pushed("feature")
@@ -983,11 +1049,60 @@ class RetireTests(Fixture):
                 mock.patch.object(WORKER.os, "chown", refuse), mock.patch.object(WORKER.os, "fchown", refuse), \
                 mock.patch.object(WORKER, "run", lambda *a, **k: self.fail("a command ran during the archive")):
             # The archive step alone, as the root-run worker calls it.
-            checked(self.home, self.uid, self.home.stat().st_dev, self.repo, path,
-                    "0" * 40, [".scratch", "app.local"], time.monotonic() + 60)
+            archived, _ = checked(self.home, self.uid, self.home.stat().st_dev, self.repo, path,
+                                  "0" * 40, [".scratch", "app.local"], time.monotonic() + 60)
+        self.assertTrue(archived.exists())
         self.assertEqual(calls[:3], [("setgroups", [5678]), ("setegid", 5678), ("seteuid", 1234)])
         self.assertEqual(calls[3:], [("seteuid", 0), ("setegid", 0), ("setgroups", [0])])
         self.assertEqual(len(self.archived()), 1)
+
+    def test_a_write_just_before_removal_keeps_the_worktree(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        [candidate] = self.retire_list()
+        real = WORKER.archive_ignored
+
+        def then_write(*args):
+            result = real(*args)
+            # Same size and the old mtime put back: only ctime shows the write.
+            note = path / ".scratch/notes.md"
+            before = note.stat()
+            note.write_text("KEEP ME\n")
+            os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
+            return result
+
+        with mock.patch.object(WORKER, "archive_ignored", then_write):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertEqual((path / ".scratch/notes.md").read_text(), "KEEP ME\n")
+
+    def test_a_file_that_grows_past_the_limit_while_copying_stops_the_archive(self):
+        path = self.pushed("feature")
+        self.scratch(path)
+        (path / ".scratch/grow.bin").write_bytes(b"a" * 100)
+        [candidate] = self.retire_list()
+        real = WORKER.fingerprint
+        calls = []
+
+        def grow(*args):
+            result = real(*args)
+            calls.append(1)
+            if len(calls) == 1:  # after the size check, before the copy
+                (path / ".scratch/grow.bin").write_bytes(b"a" * 5000)
+            return result
+
+        copied = []
+        real_read = WORKER.Hashing.read
+
+        def count(self_, size=-1):
+            data = real_read(self_, size)
+            copied.append(len(data))
+            return data
+
+        with mock.patch.object(WORKER, "ARCHIVE_LIMIT", 1024), mock.patch.object(WORKER, "fingerprint", grow), \
+                mock.patch.object(WORKER.Hashing, "read", count):
+            self.assertEqual(self.retire_remove(candidate["token"]), {"status": "skipped"})
+        self.assertLessEqual(sum(copied), 1024)
+        self.assertTrue(path.exists())
 
     def test_retire_is_refused_with_a_build_pass(self):
         with mock.patch.object(WORKER.sys, "argv", ["worker", "--builds", "--retire"]), \
