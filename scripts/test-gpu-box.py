@@ -48,6 +48,29 @@ class GpuBoxTests(unittest.TestCase):
     tf = source('gpu-box.tf')
     script = source('scripts/gpu-box.sh')
 
+    def test_dlami_boxes_install_security_updates_after_ready_and_keep_the_gpu_stack(self):
+        updates = re.search(r"(?ms)^  gbox_security_updates = <<-SEC\n(.*?)^  SEC$", self.tf).group(1)
+        hold = re.search(r"(?ms)^  gbox_hold_gpu_stack = <<-HOLD\n(.*?)^  HOLD$", self.tf).group(1)
+        self.assertIn("${local.pbox_security_updates}", updates)
+        self.assertLess(updates.index("apt-get -o DPkg::Lock::Timeout=300 update"), updates.index("${local.pbox_security_updates}"),
+                        "unattended-upgrade never fetches package lists itself")
+        self.assertIn("renice -n 19 -p $BASHPID", updates)
+        self.assertTrue(updates.rstrip().endswith(") < /dev/null"), "no child may read the rest of the boot script")
+        self.assertIn('package lists: $lists" > /etc/gpu-box-updated', updates, "the marker says whether the lists came")
+        self.assertIn("/etc/gpu-box-updated", self.script, "gbox status shows when the updates are done")
+        held = re.search(r"Package-Blacklist \{([^}]*)\}", hold).group(1)
+        for name in ('"linux-"', '"nvidia-"', '"libnvidia-"', '"cuda-"'):
+            self.assertIn(name, held)
+        for text in (self.tf, source("member-gbox.tf")):
+            init = text[text.index("base64encode(<<-INIT"):]
+            self.assertLess(init.index("${local.gbox_hold_gpu_stack}"), init.index("${local.linux_ip_options_bootstrap}"),
+                            "the hold comes before anything else in the boot")
+            ready = text.index('echo "nvidia-smi failed" > /etc/gpu-box-ready')
+            run = text.index("${local.gbox_security_updates}")
+            self.assertLess(ready, run, "the updates must not delay the ready marker gbox up waits for")
+        self.assertEqual(self.tf.count("${local.gbox_security_updates}"), 1, "the native box builds its own driver")
+        self.assertIn('"ami-0b87420e2a817294d" # 20261113 build', self.tf)
+
     def test_script_lists_match_terraform(self):
         types = hcl_list(self.tf, 'gpu_box_types')
         subnets = hcl_list(self.tf, 'gpu_box_subnets')

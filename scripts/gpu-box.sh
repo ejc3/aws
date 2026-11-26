@@ -207,6 +207,7 @@ case "$CMD" in
       if [ -n "$IP" ] && ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$IP" \
            'test -s /etc/gpu-box-ready' 2>/dev/null; then
         say "Ready at $IP: $(ssh "${SSH_OPTS[@]}" -o BatchMode=yes "ubuntu@$IP" cat /etc/gpu-box-ready 2>/dev/null)"
+        [ "${SLOT:-}" = native ] || say "    security updates are installing at low priority; \`$SELF status$SUF\` shows when they are done"
         exit 0
       fi
       [ $((i % 6)) -eq 0 ] && say "    still booting (${i}0s)..."
@@ -243,7 +244,7 @@ case "$CMD" in
         || echo "  (running, but SSH not answering yet)"
     else
     ssh "${SSH_OPTS[@]}" -o ConnectTimeout=5 -o BatchMode=yes "ubuntu@$IP" \
-      'echo "  gpu:    $(cat /etc/gpu-box-ready 2>/dev/null)"; echo "  up:     $(uptime -p)"; E=$(sed -n "s/^USEC=//p" /run/systemd/shutdown/scheduled 2>/dev/null | head -1); if [ -n "$E" ]; then echo "  timer:  on-box shutdown at $(date -u -d @$((E/1000000)) +%H:%M) UTC"; else echo "  timer:  on-box shutdown NOT ARMED (the watchdog lifetime still applies)"; fi' 2>/dev/null \
+      'echo "  gpu:    $(cat /etc/gpu-box-ready 2>/dev/null)"; echo "  updates: $(cat /etc/gpu-box-updated 2>/dev/null || echo "security updates still installing (low priority)")"; echo "  up:     $(uptime -p)"; E=$(sed -n "s/^USEC=//p" /run/systemd/shutdown/scheduled 2>/dev/null | head -1); if [ -n "$E" ]; then echo "  timer:  on-box shutdown at $(date -u -d @$((E/1000000)) +%H:%M) UTC"; else echo "  timer:  on-box shutdown NOT ARMED (the watchdog lifetime still applies)"; fi' 2>/dev/null \
       || echo "  (running, but SSH not answering yet)"
     fi
     ;;

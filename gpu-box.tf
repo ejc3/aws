@@ -43,7 +43,7 @@
 variable "gpu_box_ami" {
   description = "AWS Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04), x86_64, us-west-2. The NVIDIA driver is preinstalled."
   type        = string
-  default     = "ami-04f7da1c787a89267" # 20260918 build
+  default     = "ami-0b87420e2a817294d" # 20261113 build
 }
 
 variable "gpu_box_max_hours" {
@@ -75,6 +75,32 @@ data "aws_ami" "gpu_box_native" {
     name   = "root-device-type"
     values = ["ebs"]
   }
+}
+
+locals {
+  # Security updates on every GPU box built from the Deep Learning AMI (pbox_security_updates, the security pocket only,
+  # never a reboot), run AFTER the box reports ready so `gbox up`'s wait is unchanged. The image's kernel and its
+  # NVIDIA/CUDA stack stay as the image ships them: a new kernel would need the driver module rebuilt, so kernel fixes
+  # arrive by bumping var.gpu_box_ami. A 2-month-old image raised 2,279 Inspector findings on one box (2026-11-26).
+  # The hold is written first thing at boot, before the image's own apt timers can run.
+  gbox_hold_gpu_stack = <<-HOLD
+printf '%s\n' 'Unattended-Upgrade::Package-Blacklist { "linux-"; "nvidia-"; "libnvidia-"; "cuda-"; "libcudnn"; "libnccl"; "datacenter-gpu-manager"; };' > /etc/apt/apt.conf.d/52gbox-hold-gpu-stack
+  HOLD
+  # Fresh package lists first (unattended-upgrade never fetches them), in a subshell at nice 19 (and the idle I/O class,
+  # where the disk's scheduler honours one) so the first minutes of work on the box are not slowed. Its stdin is
+  # /dev/null, so no child can read the rest of the boot script. /etc/gpu-box-updated says when it finished and whether
+  # the package lists could be fetched (gbox status shows it).
+  gbox_security_updates = <<-SEC
+export DEBIAN_FRONTEND=noninteractive
+(
+  renice -n 19 -p $BASHPID >/dev/null
+  ionice -c3 -p $BASHPID 2>/dev/null || true
+  lists=ok
+  apt-get -o DPkg::Lock::Timeout=300 update || lists=FAILED
+${local.pbox_security_updates}
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) package lists: $lists" > /etc/gpu-box-updated
+) < /dev/null
+  SEC
 }
 
 locals {
@@ -267,6 +293,9 @@ resource "aws_launch_template" "gpu_box" {
     #!/bin/bash
     set -uxo pipefail
 
+    # Before anything else (gpu-box.tf local.gbox_hold_gpu_stack).
+    ${local.gbox_hold_gpu_stack}
+
     ${local.linux_ip_options_bootstrap}
 
     # The box's own copy of the hard lifetime, armed first so nothing below can delay it.
@@ -287,6 +316,9 @@ resource "aws_launch_template" "gpu_box" {
     # Proof the GPU is there, where gbox status can read it.
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader > /etc/gpu-box-ready 2>&1 || \
       echo "nvidia-smi failed" > /etc/gpu-box-ready
+
+    # Ready first, then the security updates (gpu-box.tf local.gbox_security_updates).
+    ${local.gbox_security_updates}
   INIT
   )
 }
