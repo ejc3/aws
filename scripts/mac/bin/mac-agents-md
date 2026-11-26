@@ -1,6 +1,6 @@
 #!/bin/zsh
 # mac-agents-md -- writes ~/AGENTS.md on a Mac: the template ejc3/aws scripts/mac-setup.sh installed for
-# it (~/.local/share/mac-setup/AGENTS.template.md: mini-AGENTS.md or mac-AGENTS.md) and what is on the
+# it (~/.local/share/mac-setup/AGENTS.template.md: mini-AGENTS.md, mac-AGENTS.md or member-mac-AGENTS.md) and what is on the
 # machine now: the attached devices and, on the mini (MAC_AGENTS_HOST=mini), the iOS toolchain's
 # versions and the development-signing keychains made for agents. ~/CLAUDE.md
 # points at it, so Claude and Codex sessions here read the same file. Run by setup and hourly by its

@@ -15,6 +15,9 @@ change `scripts/mac/mac-AGENTS.md` in ejc3/aws.
 - **Signing:** run the signing step through `mac-gui [--timeout S] -- CMD`, which reaches the login
   keychain; plain SSH gets `errSecInternalComponent`.
 - Act only in windows you opened; change no account, payment or setting the owner did not ask for.
+- **Peekaboo 4:** screenshot with `peekaboo see --no-elements --path FILE` (`image` was removed), keys with
+  `peekaboo press cmd+n --app NAME --foreground` (`hotkey` was removed); app switches and raw key presses are refused
+  without `--foreground`.
 
 ## Testing on the attached iPhone
 

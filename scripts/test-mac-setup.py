@@ -811,13 +811,15 @@ class Files(unittest.TestCase):
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
+            member = desktop - {"mac-AGENTS.md"} | {"member-mac-AGENTS.md"}
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
                 (["mini"], build | mini, "--build-only"),
                 ([], build | desktop | cleaner, ""),
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
-                (["colton-mac", "--update-peekaboo"], build | desktop, "--update-peekaboo"),
+                (["colton-mac", "--update-peekaboo"], build | member, "--update-peekaboo"),
+                (["colin-mac"], build | member, ""),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
                 with tarfile.open(dest / "files.tar") as archive:
@@ -958,6 +960,13 @@ class IosToolchain(unittest.TestCase):
         self.assertIn('"$bin/mac-agents-md"', install)
         self.assertIn('agents_md mini "$src/mini-AGENTS.md"', install)
         self.assertIn('agents_md mac "$src/mac-AGENTS.md"', install)
+        self.assertIn('agents_md member "$src/member-mac-AGENTS.md"', install)
+
+    def test_a_family_members_mac_is_not_told_it_is_the_owners(self):
+        member = (ROOT / "scripts" / "mac" / "member-mac-AGENTS.md").read_text()
+        self.assertNotIn("owner's own desktop Mac", member)
+        for needle in ("environment **Local**", "/login", "--foreground", "peekaboo see --no-elements"):
+            self.assertIn(needle, member)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, buffer=True)

@@ -92,7 +92,20 @@ if git fetch -q origin '+refs/heads/main:refs/remotes/origin/main' 2>/dev/null; 
       { [ -z "$age" ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
       problems+=("The background drift check of ${main_sha:0:7} failed (exit $bg_rc) after its last result. See $state/background.log; the next stop retries it.")
     fi
-    if [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ] || [ "$state/background.rc" -nt "$tflog" ]; then
+    # A merge the PR watch has not applied yet (an `unapplied` entry with no `applied_at`, added in the last
+    # 24 hours) is drift by definition, and its own apply and follow-up plan are about to take the run lock:
+    # a full check now would only report it and hold the lock in front of that apply (owner, 2026-11-26).
+    # An entry older than a day no longer suppresses it, so a forgotten one cannot switch the check off.
+    pending_apply=""
+    watch_state="${XDG_STATE_HOME:-$HOME/.local/state}/pr-watch/state.json"
+    if [ -r "$watch_state" ] && jq -e --arg since "$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)" \
+      '[.unapplied[]? | select(.applied_at == null and (.added // "") >= $since)] | length > 0' \
+      "$watch_state" >/dev/null 2>&1; then
+      pending_apply=1
+      echo "verify-consistent: a merged pull request is waiting for its apply; no drift check until it is applied" >&2
+    fi
+    if [ -z "$pending_apply" ] &&
+      { [ -z "$age" ] || [ "$age" -gt "$refresh_after" ] || [ "$last_rc" -ne 0 ] || [ "$state/background.rc" -nt "$tflog" ]; }; then
       mkdir -p "$state"
       setsid -f flock -n -o "$state/background.lock" bash -c 'cd "$1" || exit 0; rc=0
         { if [ -d .terraform ]; then TF_RUN_LOCK_NOWAIT=1 terraform init -input=false -lockfile=readonly >/dev/null; fi &&

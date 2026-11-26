@@ -48,7 +48,10 @@ elif [[ $alias_ = mini ]]; then
   mode=--build-only
   files+=(ios-toolchain.zsh mini-AGENTS.md bin/mac-agents-md)
 else
-  files+=(peekaboo-install.sh bin/mac-gui bin/mac-lease bin/peekaboo bin/mac-agents-md mac-AGENTS.md)
+  # The owner's Mac gets its own instructions; every other alias is a family member's Mac.
+  agents=member-mac-AGENTS.md
+  [[ $alias_ = mac ]] && agents=mac-AGENTS.md
+  files+=(peekaboo-install.sh bin/mac-gui bin/mac-lease bin/peekaboo bin/mac-agents-md "$agents")
 fi
 if [[ $alias_ = mac ]]; then
   files+=(install-artifact-cleaner.py bin/mac-artifact-clean)
