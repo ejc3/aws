@@ -2222,6 +2222,16 @@ pbox ssh [N]
 pbox down [N] --instance i-...   # terminate that instance; keep that box's /mnt/work (the id is required)
 ```
 
+**`/mnt/work` is cleaned hourly and after boot** (`pbox-work-clean.tf`, `scripts/pbox-work-clean.py`). Build caches
+(`node_modules`, `.next`, `.open-next`, `__pycache__`, `.venv`, pnpm and npm caches, a Cargo `target` or anything with
+a `CACHEDIR.TAG`) go after 2 days unused, top-level task directories (`/mnt/work/*`) after 7, and while the volume is
+over 85% full the oldest idle task directories go until it is under 70%. A directory with a process in it (cwd, open
+file, mapping, loop device, bind mount), anything changed in the last 24 hours, or anything with a `.pbox-keep` file
+anywhere inside it is never touched. **Put a `.pbox-keep` in any directory you need for longer than 7 days**
+(`touch /mnt/work/<dir>/.pbox-keep`). Each run's removals and freed bytes are in the journal (`journalctl -u
+pbox-work-clean`) and its summary in `/mnt/work/.pbox-clean.log`; `sudo pbox-work-clean` (no `--apply`) lists what
+the next run would remove.
+
 `up` needs a flavor (`pbox-flavors.tf`), and with none it prints the menu and launches nothing. A flavor is a shape and
 a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` (8 GiB, memory-bound work), `storage`
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and

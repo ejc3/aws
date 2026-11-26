@@ -515,6 +515,9 @@ jobs:
       - name: "pbox up needs a flavor; each flavor tries only its own types; IAM allows exactly the flavors' types (pbox-flavors.tf)"
         run: python3 -S -B scripts/test-pbox-flavors.py
 
+      - name: "pbox /mnt/work cleaner: in-use, recent and .pbox-keep directories kept; idle caches, then task directories; pressure stops under 70% (pbox-work-clean.tf, offline)"
+        run: python3 -S -B scripts/test-pbox-work-clean.py
+
       - name: I/O box NFS admits only its client subnets (offline)
         run: python3 -S -B scripts/test-io-box-nfs.py
 
