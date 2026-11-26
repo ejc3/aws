@@ -658,8 +658,9 @@ only. Rules an agent must keep:
   and gboxes only: a member pbox is reached at its public address with SSH open to the internet (the Ohio pbox
   security group), so between members the boundary there is the per-member SSH key, not the network.
 - **Ports are per container**; the host reaches a dev server at `10.88.<uid-1000>.2:<port>`. Only the owner's
-  container has `ssh mac`; colton's and the owner's have `ssh colton-mac` (`local.nextjs_ct_mac_clients`: Cloudflare
-  Access with each account's own token, `mac-ssh-client.tf`); every other member's policy denies those tokens.
+  container has `ssh mac`; colton's and the owner's have `ssh colton-mac`, and colin's and the owner's `ssh colin-mac`
+  (`local.nextjs_ct_mac_clients`: Cloudflare Access with each account's own token, `mac-ssh-client.tf`); every other
+  member's policy denies those tokens, and the owner's are one pattern (`*-ssh-access-nextjs-ejc3-*`) denied to every member.
 - **Box-wide agent notes** (`scripts/nextjs-ct/ct/box-agents.md`): provision installs them as `/etc/claude-code/CLAUDE.md` in
   every container, so every account's Claude Code reads them on top of the person's own file (which stays theirs: the
   starter file is create-only). They say the claw-master `HTTPS_PROXY` is a forwarder, not a firewall (an agent unset it
@@ -1396,14 +1397,14 @@ ssh -i ~/.ssh/fcvm-ec2 ubuntu@<x86_dev_public_ip>
 
 ### Machines outside AWS: never a key of theirs on `ubuntu`
 
-The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh mini` and its VMs) is less
+The owner's rule (2026-10-20). A PC or Mac reached from the dev boxes (`ssh mac`, `ssh colton-mac`, `ssh colin-mac`, `ssh colin-pc`, `ssh mini` and its VMs) is less
 trusted than the boxes: it may be compromised. So:
 
 - **No key of such a machine is authorized for `ubuntu`** (or any account an agent runs as) on a dev box, except the
   owner's explicitly approved Mac Touch ID key for `ejc3` on the Next.js server (`local.nextjs_user_keys.ejc3`). Not for a
   reverse tunnel either: `restrict,port-forwarding,permitlisten=...` still allows remote Unix-socket forwards (OpenSSH has
   no per-key option against them), and a mistake in those options is a foothold on the box that holds the agents' AWS
-  role. The machines are reached outward, through their own Cloudflare route (`colin-pc-ssh.tf`, `colton-mac-ssh.tf`).
+  role. The machines are reached outward, through their own Cloudflare route (`colin-pc-ssh.tf`, `colton-mac-ssh.tf`, `colin-mac-ssh.tf`).
 - **If a reverse tunnel is ever needed**, it terminates on a dedicated account with no shell, locked down in
   `sshd_config` (`Match User <it>`: `AllowStreamLocalForwarding no`, `AllowTcpForwarding remote`, `PermitListen` its one
   port, `ForceCommand /bin/false`, `PermitTTY no`, `X11Forwarding no`, `AllowAgentForwarding no`), its key with an

@@ -15,8 +15,7 @@
 #
 # Each token opens only the Access gate; the Mac still wants that account's own key (~/.ssh/to-colin-mac, made on the box
 # by mac-ssh-client.tf as that account; its private half never leaves the box). The clients are mac-ssh-client.tf's
-# installer with alias colin-mac, switched on once the Mac's Remote Login host key is pinned there (it is read at the
-# Mac, so the first apply has the route and the tokens but no client yet).
+# installer with alias colin-mac (its Remote Login host key is pinned there, so the first apply installs them).
 #
 # The connector token's SECRET is administration-only, as Colton's Mac's is, and scripts/mac-ssh-connector-setup.sh
 # installs it on the Mac from a jumpbox, through ssh stdin. On the Mac it is a 0600 file of the account every client logs
@@ -193,26 +192,16 @@ resource "aws_secretsmanager_secret_policy" "colin_mac_ssh_access" {
   })
 }
 
-resource "aws_iam_role_policy" "dev_server_colin_mac_ssh" {
-  # Only while fcvm-arm exists: the grant names its instance.
-  count = var.enable_firecracker_instance ? 1 : 0
-  name  = "read-colin-mac-ssh"
-  role  = aws_iam_role.dev_server.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect   = "Allow"
-      Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn
-      # dev_server is fcvm-x86's role too: only credentials issued to fcvm-arm's own instance may read it.
-      Condition = { StringEquals = { "ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn } }
-    }]
-  })
-}
+# fcvm-arm's read of its token is a statement of assume-constellation-terraform (ReadTheMiniSshTokens in
+# constellation-account.tf, pinned to fcvm-arm's instance), not a policy of its own: dev-server-role's inline policies are
+# near IAM's 10,240-character total.
 
 resource "aws_iam_role_policy" "nextjs_dev_colin_mac_ssh" {
   name = "read-colin-mac-ssh"
   role = aws_iam_role.nextjs_dev.id
+  # Only once every member's session policy denies the tokens it does not own: without this the grant could land in the
+  # same apply before a member's policy update, and that member's container could read Colin's or the owner's token.
+  depends_on = [aws_iam_policy.nextjs_ct_member]
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{

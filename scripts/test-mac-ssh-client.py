@@ -483,17 +483,22 @@ class ColinMacCloudflare(unittest.TestCase):
         self.assertNotIn("nextjs_dev", admins)
         policy = self.resource("aws_secretsmanager_secret_policy", "colin_mac_ssh_tunnel")
         self.assertIn('"aws:PrincipalArn" = local.colin_mac_ssh_admins', policy)
-        for grant in ("dev_server_colin_mac_ssh", "nextjs_dev_colin_mac_ssh"):
-            self.assertNotIn("colin_mac_ssh_tunnel", self.resource("aws_iam_role_policy", grant))
+        self.assertNotIn("colin_mac_ssh_tunnel", self.resource("aws_iam_role_policy", "nextjs_dev_colin_mac_ssh"))
+        self.assertNotIn("colin_mac_ssh_tunnel", (ROOT / "constellation-account.tf").read_text())
 
     def test_each_access_secret_admits_administration_and_its_one_client(self):
         policy = self.resource("aws_secretsmanager_secret_policy", "colin_mac_ssh_access")
         self.assertIn('"aws:PrincipalArn" = concat(local.colin_mac_ssh_admins, [each.value.reader])', policy)
-        fcvm = self.resource("aws_iam_role_policy", "dev_server_colin_mac_ssh")
-        self.assertIn('Resource = aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn', fcvm)
-        self.assertIn('"ec2:SourceInstanceARN" = aws_instance.firecracker_dev[0].arn', fcvm)
+        # fcvm-arm's read is a statement of assume-constellation-terraform, pinned to its instance (dev-server-role's
+        # inline policies are near IAM's 10,240-character total, so no new policy of its own).
+        self.assertNotIn('resource "aws_iam_role_policy" "dev_server_colin_mac_ssh"', COLIN_MAC)
+        stmt = (ROOT / "constellation-account.tf").read_text().split('Sid    = "ReadTheMiniSshTokens"', 1)[1].split("}]", 1)[0]
+        self.assertIn('aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn', stmt)
+        self.assertIn('Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }', stmt)
         nextjs = self.resource("aws_iam_role_policy", "nextjs_dev_colin_mac_ssh")
         self.assertEqual(re.findall(r'colin_mac_ssh_access\["([\w-]+)"\]', nextjs), ["nextjs-colin", "nextjs-ejc3"])
+        # The containers' grant lands only after every member's session policy denies the tokens it does not own.
+        self.assertIn("depends_on = [aws_iam_policy.nextjs_ct_member]", nextjs)
 
     def test_the_dns_record_overrides_the_wildcard_for_the_tunnel(self):
         record = self.resource("cloudflare_dns_record", "colin_mac_ssh")
@@ -545,12 +550,65 @@ class MacPoolDefault(unittest.TestCase):
         text = self.SCRIPT.read_text()
         step = text[text.index('if [ -n "$DEFAULT" ]; then'):]
         self.assertIn("AGENT_LISTEN=127.0.0.1:8445", text)
-        self.assertIn("\\$HOME/.local/bin/claw-master agent install --listen $AGENT_LISTEN --open 127.0.0.1:$PORT "
-                      "--ca \\$HOME/.config/claude-master/ca.pem", step)
+        self.assertIn('on_mac "PORT=$PORT LISTEN=$AGENT_LISTEN bash -s" <<\'DEFAULTMAC\'', step)
+        self.assertIn('claw-master agent install --listen "$LISTEN" --open "127.0.0.1:$PORT" --ca "$D/ca.pem"', step)
         # It comes after the tunnel agent is loaded and the CA is installed, and never touches the Mac's login.
         self.assertLess(text.index("launchctl bootstrap \"gui/\\$uid\" \"\\$PLIST\""), text.index('if [ -n "$DEFAULT" ]; then'))
         self.assertNotIn("claude login", step)
         self.assertNotIn("--backup", step)
+
+    def run_on_mac(self, tunnel, agent):
+        """The script the Mac runs for --default, with curl, claw-master, plutil and sleep stubbed in ~/.local/bin."""
+        text = self.SCRIPT.read_text()
+        body = text.split("<<'DEFAULTMAC'\n", 1)[1].split("\nDEFAULTMAC\n", 1)[0]
+        with tempfile.TemporaryDirectory() as home:
+            bin_ = Path(home) / ".local" / "bin"
+            bin_.mkdir(parents=True)
+            log = Path(home) / "log"
+            stubs = {
+                # The tunnel check passes -x; the agent check passes the proxy only in the environment.
+                "curl": f'printf "curl %s | HTTPS_PROXY=%s\\n" "$*" "${{HTTPS_PROXY:-}}" >> {log}\n'
+                        f'case " $* " in *" -x "*) printf "%s" "{tunnel}";; *) printf "%s" "{agent}";; esac\n',
+                "claw-master": f'printf "claw-master %s\\n" "$*" >> {log}\n',
+                "plutil": 'printf "http://agent:s3cret-token@127.0.0.1:8445"\n',
+                "sleep": ":\n",
+            }
+            for name, code in stubs.items():
+                (bin_ / name).write_text("#!/bin/bash\n" + code)
+                (bin_ / name).chmod(0o755)
+            env = {"HOME": home, "PATH": "/usr/bin:/bin", "PORT": "8444", "LISTEN": "127.0.0.1:8445"}
+            r = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env, timeout=30)
+            return r, log.read_text() if log.exists() else ""
+
+    def test_default_installs_only_after_the_tunnel_answers_and_keeps_the_token_off_argv(self):
+        r, log = self.run_on_mac("200 401", "200 401")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = log.splitlines()
+        self.assertIn("-x http://127.0.0.1:8444", lines[0])
+        self.assertTrue(lines[1].startswith("claw-master agent install --listen 127.0.0.1:8445 --open 127.0.0.1:8444 --ca "), lines)
+        # The agent check: the proxy (with its token) in curl's environment, never on its command line, never printed.
+        self.assertTrue(lines[2].startswith("curl ") and "-x" not in lines[2].split(" | ")[0], lines)
+        self.assertTrue(lines[2].endswith("HTTPS_PROXY=http://agent:s3cret-token@127.0.0.1:8445"), lines)
+        self.assertNotIn("s3cret-token", "".join(l.split(" | ")[0] for l in lines))
+        self.assertNotIn("s3cret-token", r.stdout + r.stderr)
+        self.assertNotIn("uninstall", log)
+        self.assertIn("through the agent: CONNECT and HTTP status 200 401", r.stdout)
+
+    def test_default_never_installs_when_the_tunnel_does_not_answer(self):
+        for tunnel in ("200 502", "000 000"):
+            with self.subTest(tunnel=tunnel):
+                r, log = self.run_on_mac(tunnel, "200 401")
+                self.assertEqual(r.returncode, 1)
+                self.assertIn("the Mac was not switched over", r.stderr)
+                self.assertNotIn("claw-master", log)
+                self.assertEqual(log.count("curl "), 10)  # retried, then given up
+
+    def test_default_undoes_the_install_when_the_agent_does_not_reach_the_pool(self):
+        r, log = self.run_on_mac("200 401", "200 503")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("undoing the install", r.stderr)
+        self.assertEqual([l for l in log.splitlines() if l.startswith("claw-master")][-1], "claw-master agent uninstall")
+
 
 class ConnectorScript(unittest.TestCase):
     """scripts/mac-ssh-connector-setup.sh end to end, with ssh, aws and the macOS tools stubbed."""

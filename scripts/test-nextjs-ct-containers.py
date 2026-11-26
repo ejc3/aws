@@ -7,6 +7,7 @@ server, the router from `ndev` records to cloudflared ingress, the firewall and 
 from pathlib import Path
 import http.client
 import json
+import sys
 import os
 import pwd
 import re
@@ -22,6 +23,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 TF = (ROOT / "nextjs-ct-user-data.tf").read_text()
+ALL_TF = "\n".join(p.read_text() for p in sorted(ROOT.glob("*.tf")))
 HOST = ROOT / "scripts" / "nextjs-ct" / "host"
 CT = ROOT / "scripts" / "nextjs-ct" / "ct"
 SCRIPT = TF.split("nextjs_ct_user_data = <<-SCRIPT\n", 1)[1].split("\nSCRIPT\n", 1)[0]
@@ -94,9 +96,16 @@ class HostScriptTests(unittest.TestCase):
         self.assertIn("ssmmessages:*", host)
         self.assertIn("security_config.arn}/sessions/*", host)
         self.assertIn("aws_secretsmanager_secret.wbox_admin.arn", member)  # the owner's own wbox password
-        self.assertIn(":secret:macbook-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for the Mac
-        self.assertIn(":secret:colton-mac-ssh-access-nextjs-ejc3-*", member)  # the owner's Access token for Colton's Mac
-        self.assertIn(":secret:colin-mac-ssh-access-nextjs-ejc3-*", member)  # and for Colin's Mac
+        # Every one of the owner's Access tokens (MacBook, Colton's and Colin's Macs, the mini, its CI VM): one pattern.
+        self.assertIn(":secret:*-ssh-access-nextjs-ejc3-*\"", member)
+        owners = re.findall(r'name *= *"([a-z0-9-]+-ssh-access-nextjs-ejc3)"|secret *= *"([a-z0-9-]+-ssh-access-nextjs-ejc3)"', ALL_TF)
+        self.assertTrue(owners)
+        # ...and it matches no member's token: those end in -nextjs-<member>, and the pattern needs -nextjs-ejc3- after it.
+        members = sorted(set(re.findall(r'"([a-z0-9-]+-ssh-access-nextjs-(?!ejc3)[a-z0-9]+)"', ALL_TF)))
+        self.assertTrue(members)
+        pattern = re.compile(r"^.*-ssh-access-nextjs-ejc3-.*$")
+        for name in members:
+            self.assertIsNone(pattern.match(name + "-AbCdEf"), name)
         # The owner's `wbox run` output (security review of #502): the bucket (ListBucket) and its objects.
         out = member.split('Sid      = "OwnerOnlyWboxOutput"', 1)[1].split("},", 1)[0]
         self.assertIn('Action   = ["s3:GetObject", "s3:ListBucket"]', out)
@@ -189,11 +198,30 @@ class HostScriptTests(unittest.TestCase):
             {"Sid": "OwnerOnlySecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [arn.format("dev-hop-ssh-key"), arn.format("wbox/administrator-password"),
                           arn.format("google-docs-oauth-desktop"), arn.format("google-docs-oauth-token"),
-                          sp + "macbook-ssh-access-nextjs-ejc3-*", sp + "colton-mac-ssh-access-nextjs-ejc3-*",
-                          sp + "colin-mac-ssh-access-nextjs-ejc3-*"]},
+                          sp + "*-ssh-access-nextjs-ejc3-*"]},
             {"Sid": "OwnerOnlyWboxOutput", "Effect": "Deny", "Action": ["s3:GetObject", "s3:ListBucket"],
              "Resource": ["arn:aws:s3:::wbox-output-111111111111", "arn:aws:s3:::wbox-output-111111111111/*"]},
             {"Sid": "NoMemberNeedsThese", "Effect": "Deny", "Action": acts("NoMemberNeedsThese"), "Resource": "*"},
+            # What nextjs-dev-fcvm-parity.tf gives the owner's container, denied to members again: its real secrets,
+            # pointers, models and data, as the live policy carries them (#1083's review: the size check left these out).
+            {"Sid": "OwnerOnlyFcvmSecrets", "Effect": "Deny",
+             "Action": ["secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"],
+             "Resource": [arn.format(n) for n in ("turso/api-token", "claude-master/backup-api-key", "dolphin-browser/signup-token",
+                                                  "dolphin-maps/pems", "claude-master-dashboard/agent-access", "abliteration/api-key",
+                                                  "dolphin-films/nonprod/auth", "dolphin-films/nonprod/turso")]},
+            {"Sid": "OwnerOnlyApplyPointers", "Effect": "Deny", "Action": "ssm:GetParameter",
+             "Resource": [f"arn:aws:ssm:*:*:parameter/infra/{a}" for a in ("constellation", "astryx", "family")]},
+            {"Sid": "MemberModelsOnly", "Effect": "Deny",
+             "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:Converse", "bedrock:ConverseStream"],
+             "NotResource": ["arn:aws:bedrock:*:111111111111:inference-profile/us.anthropic.claude-haiku-5-5",
+                             "arn:aws:bedrock:*::foundation-model/anthropic.claude-haiku-5-5", "arn:aws:bedrock:*::foundation-model/deepseek.v3.2",
+                             "arn:aws:bedrock:*::foundation-model/deepseek.r1-v1:0", "arn:aws:bedrock:*:111111111111:inference-profile/us.deepseek.*"]},
+            {"Sid": "OwnerOnlyFcvmServices", "Effect": "Deny",
+             "Action": ["bedrock-mantle:*", "aws-marketplace:Subscribe", "ses:*", "codeartifact:*", "sts:GetServiceBearerToken"], "Resource": "*"},
+            {"Sid": "OwnerOnlyFcvmData", "Effect": "Deny", "Action": ["logs:*", "s3:*"],
+             "Resource": ["arn:aws:logs:us-west-1:111111111111:log-group:/claude-master/server",
+                          "arn:aws:logs:us-west-1:111111111111:log-group:/claude-master/server:*",
+                          "arn:aws:s3:::dolphin-maps-loop-111111111111", "arn:aws:s3:::dolphin-maps-loop-111111111111/*"]},
             {"Sid": "OtherMembersBoxSecrets", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
              "Resource": [sp + f"{k}-AbCdEf" for o in ("connor", "colin", "skevh") for k in (f"member-box/{o}/ssh-key", f"wbox-{o}/administrator-password")]},
             {"Sid": "TagOnlyAtLaunch", "Effect": "Deny", "Action": "ec2:CreateTags", "Resource": launched,
@@ -212,13 +240,15 @@ class HostScriptTests(unittest.TestCase):
         ]
         self.assertEqual(len(acts("Sid       = \"OwnBoxesOnly\"")), 6)
         size = len(json.dumps({"Version": "2012-10-17", "Statement": managed}, separators=(",", ":")))
-        self.assertLess(size, 5500, size)
+        self.assertLess(size, 6144 - 300, size)
         # Every other member also carries the deny on the members' own machine tokens (Colton's Mac, Colin's PC and Mac).
         other = managed + [{"Sid": "MemberMachineTokensOwnOnly", "Effect": "Deny", "Action": "secretsmanager:GetSecretValue",
                             "Resource": [sp + "colton-mac-ssh-access-nextjs-colton-*", sp + "colin-pc-ssh-access-nextjs-colin-*",
-                                         sp + "colin-mac-ssh-access-nextjs-colin-*"]}]
+                                         sp + "colin-mac-ssh-access-nextjs-colin-*", sp + "mac-vm-skevh-ssh-access-nextjs-skevh-*"]}]
         size = len(json.dumps({"Version": "2012-10-17", "Statement": other}, separators=(",", ":")))
-        self.assertLess(size, 5800, size)
+        # IAM refuses a managed policy over 6,144 characters; the largest member's (connor's) measured 6,132 live before
+        # #1083's wildcard. Keep a margin for the next machine or statement.
+        self.assertLess(size, 6144 - 100, size)
 
     def test_family_signing_identity_is_limited_to_the_owner_session(self):
         policy = (ROOT / "family-apple-signing.tf").read_text()

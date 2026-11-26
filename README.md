@@ -1653,7 +1653,9 @@ A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_s
 
 **First bring-up**, with a temporary reverse tunnel that ends on fcvm-arm's `pcboot` account, never on `ubuntu`
 ("Machines outside AWS" in AGENTS.md). The port is the first of colin-mac's block in fcvm-arm's port registry
-(`ports claim colin-mac`: 23440):
+(`ports claim colin-mac`: 23440). Use whichever port the live tunnel was allowed on: the first bring-up's is
+`127.0.0.1:2225` (allowed 2026-11-26, expires 2026-11-28 03:37 UTC), so pass `--bootstrap-port 2225` in step 4 while it
+lasts. `~/.ssh/to-colin-mac` is made only when missing, so a key already authorized on the Mac is kept:
 
 1. Apply. fcvm-arm's `fcvm-mac-ssh-clients` association makes `~/.ssh/to-colin-mac` and the `colin-mac` alias.
 2. On the Mac, System Settings > General > Sharing > Remote Login: on, for Colin's account only.
@@ -1665,7 +1667,8 @@ A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_s
 4. From a jumpbox: `scripts/mac-ssh-connector-setup.sh colin-mac --bootstrap-port 23440`. The connector token travels
    through ssh stdin only, from its administration-only secret.
 5. From a jumpbox: `scripts/claw-master-mac-setup.sh colin-mac --default`. That is the pool's tunnel and `claude-pool`,
-   then the pinned claw-master's own `agent install`: a launchd agent on `127.0.0.1:8445` and its proxy in Colin's
+   a request to Anthropic through that tunnel (it stops here, nothing switched, unless one answers), then the pinned
+   claw-master's own `agent install` and the same request through the agent (undone with `agent uninstall` if it fails): a launchd agent on `127.0.0.1:8445` and its proxy in Colin's
    `~/.claude/settings.json`, so plain `claude`, the desktop app's Code tab and the IDE extensions all use the pool. No
    fallback: while the pool is down, Claude's requests fail. `claw-master agent uninstall` on the Mac undoes it.
 6. Check `ssh colin-mac true` from each client, then retire the tunnel: `scripts/windows-pc-bootstrap.sh retire

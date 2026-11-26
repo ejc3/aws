@@ -204,11 +204,42 @@ ls -l "$HOME/.config/claude-master" | awk 'NR>1{print $1, $NF}'
 tail -3 "$HOME/Library/Logs/claude-master-tunnel.log" 2>/dev/null | cut -c1-160
 REMOTE
 if [ -n "$DEFAULT" ]; then
-  echo "7/7 every Claude Code on the Mac through the pool (claw-master agent install)"
-  # The pinned binary's own installer, against the open listener the tunnel agent above serves. Its port comes from
-  # the same secret as the tunnel's; nothing secret is on this command line.
-  on_mac "'\$HOME/.local/bin/claw-master agent install --listen $AGENT_LISTEN --open 127.0.0.1:$PORT --ca \$HOME/.config/claude-master/ca.pem'"
-  echo "done. On the Mac: claude (and the desktop app) use the pool; claw-master agent uninstall undoes it"
+  echo "7/7 every Claude Code on the Mac through the pool (claw-master agent install), checked before and after"
+  # The pinned binary's own installer, against the open listener the tunnel agent above serves; its port comes from the
+  # same secret as the tunnel's. There is no fallback once it is installed, so a request must reach Anthropic through the
+  # tunnel and the server BEFORE the Mac is switched over, and through the agent AFTER, else the install is undone.
+  # 127.0.0.1:PORT is cloudflared relaying to the server's open listener, a plain-HTTP CONNECT proxy, so curl uses it with
+  # -x and trusts the server's CA for the TLS inside it (--cacert; claw-master-windows-setup.sh steps 6-7). The proxy
+  # answers CONNECT 200 before it reaches Anthropic and a failed upstream request as 5xx, so the HTTP status must be
+  # Anthropic's own: 2xx or 4xx. The agent's proxy URL carries its token: it is read from settings.json into the
+  # environment only (plutil, which every Mac has), never onto an argument, and never printed.
+  on_mac "PORT=$PORT LISTEN=$AGENT_LISTEN bash -s" <<'DEFAULTMAC'
+set -u
+export PATH="$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+D="$HOME/.config/claude-master"
+answered() { [[ $1 =~ ^200\ [24][0-9][0-9]$ ]]; }
+out=none
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  out=$(curl -s -m 30 -o /dev/null -w '%{http_connect} %{http_code}' -x "http://127.0.0.1:$PORT" --cacert "$D/ca.pem" \
+    https://api.anthropic.com/v1/models) || out="curl exit $?"
+  answered "$out" && break
+  sleep 3
+done
+answered "$out" || { echo "the pool did not answer through the tunnel ($out); the Mac was not switched over" >&2; exit 1; }
+echo "through the pool: CONNECT and HTTP status $out"
+claw-master agent install --listen "$LISTEN" --open "127.0.0.1:$PORT" --ca "$D/ca.pem" || { echo "agent install failed" >&2; exit 1; }
+HTTPS_PROXY=$(plutil -extract env.HTTPS_PROXY raw -o - "$HOME/.claude/settings.json" 2>/dev/null) || HTTPS_PROXY=""
+export HTTPS_PROXY
+out=$(curl -s -m 30 -o /dev/null -w '%{http_connect} %{http_code}' --cacert "$D/ca.pem" https://api.anthropic.com/v1/models) || out="curl exit $?"
+unset HTTPS_PROXY
+if ! answered "$out"; then
+  echo "the agent did not reach the pool ($out); undoing the install" >&2
+  claw-master agent uninstall || true
+  exit 1
+fi
+echo "through the agent: CONNECT and HTTP status $out"
+DEFAULTMAC
+  echo "done. On the Mac: claude (and the desktop app, once restarted) use the pool; claw-master agent uninstall undoes it"
 else
   echo "done. On the Mac: claude-pool   (needs the shared server running and ca.pem installed)"
 fi

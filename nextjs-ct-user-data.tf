@@ -88,17 +88,14 @@ locals {
       Sid    = "OwnerOnlySecrets"
       Effect = "Deny"
       Action = "secretsmanager:GetSecretValue"
-      # The hop key, the Google Docs token, the owner's own wbox password and the owner's Cloudflare Access tokens
-      # for the MacBook and for Colton's Mac (by name: a secret ARN ends in a random suffix).
+      # The hop key, the Google Docs token, the owner's own wbox password and every Cloudflare Access token of the owner's
+      # container: one pattern for all of them (<machine>-ssh-access-nextjs-ejc3: the MacBook, Colton's and Colin's Macs,
+      # the mini and its CI VM), since this policy is near IAM's 6,144 characters. No member's token matches it: theirs end
+      # in -nextjs-<member>. By name: a secret ARN ends in a random suffix.
       Resource = concat(
         [aws_secretsmanager_secret.dev_hop.arn, aws_secretsmanager_secret.wbox_admin.arn],
         [for s in data.aws_secretsmanager_secret.nextjs_gdocs : s.arn],
-        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:macbook-ssh-access-nextjs-ejc3-*"],
-        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colton-mac-ssh-access-nextjs-ejc3-*"],
-        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:colin-mac-ssh-access-nextjs-ejc3-*"],
-        # The Mac mini and its CI VM (mini-ssh.tf, mac-vms.tf).
-        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mini-ssh-access-nextjs-ejc3-*"],
-        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:mac-vm-ci-ssh-access-nextjs-ejc3-*"],
+        ["arn:aws:secretsmanager:${var.aws_region}:${data.aws_caller_identity.current.account_id}:secret:*-ssh-access-nextjs-ejc3-*"],
       )
     },
     {
