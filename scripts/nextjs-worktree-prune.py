@@ -592,6 +592,18 @@ def _archive(home, uid, device, repo, path, head, roots, root_fd, end):
         os.close(dfd)
 
 
+def lone_zombie(proc, inode):
+    # Linux has released a zombie's files and cwd. A zombie leader can still
+    # have live threads, and a reused PID no longer describes the failed scan.
+    try:
+        lines = (proc / "status").read_bytes().splitlines()
+        fields = dict(line.split(b":", 1) for line in lines if b":" in line)
+        return (fields.get(b"State", b"").strip() == b"Z (zombie)"
+                and fields.get(b"Threads", b"").strip() == b"1" and proc.stat().st_ino == inode)
+    except OSError:
+        return False
+
+
 def protected_paths(home, uid, inspect_all=False, mapped=False):
     """Protect kernel paths and ndev registrations; production inspects every UID.
 
@@ -620,8 +632,14 @@ def protected_paths(home, uid, inspect_all=False, mapped=False):
                         owner = next((line.split()[1:3] for line in status if line.startswith("Uid:")), [])
                     if str(uid) not in owner:
                         continue
-                with os.scandir(proc / "fd") as descriptors:
-                    links = (proc / "cwd", *((proc / "exe",) if mapped else ()), *(Path(e.path) for e in descriptors))
+                try:
+                    with os.scandir(proc / "fd") as descriptors:
+                        links = (proc / "cwd", *((proc / "exe",) if mapped else ()),
+                                 *(Path(e.path) for e in descriptors))
+                except PermissionError:
+                    if lone_zombie(proc, entry.inode()):
+                        continue
+                    raise
                 for link in links:
                     try:
                         target = Path(os.readlink(link).removesuffix(" (deleted)"))
