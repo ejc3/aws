@@ -1828,7 +1828,15 @@ the build tools and a signing keychain in the guest, then registers each missing
 
 Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini-simulator]` for each
 job that boots an iOS simulator. A single runner executes one job at a time across all eligible
-repositories. General builds and archives can still use all four mini runners. Setup adds a missing
+repositories. Two listeners also share `ios-simulator`: `mini-4`, and `macbook-kidsports-1` in the MacBook's
+pool VM (`kidsports-ci`, 4 cores and 8 GB, Xcode 27.1 with the iOS 26.5, 27.0 and 27.1 runtimes, as its own `admin`;
+the owner, 2026-11-27: "MacBook Pro can be used for Mac testing"). A job that may run on either Mac's simulator asks
+for `[self-hosted, macOS, ios-pool, ios-simulator]` and takes whichever is free, so two such jobs run at once, one on
+each Mac; a job that needs the mini keeps `mini-simulator`. `scripts/simulator-listeners.sh` (an org-admin gh login,
+`--dry-run` to look first) keeps the label on exactly those two runners and on no other, through the runner-labels
+API only: it never registers a runner or mints a token. Re-registering a runner (`config.sh --replace`) resets its
+labels, so run it again after one; `mac-vm-setup.sh --runners` gives `mini-4` the label itself, and the MacBook's
+runner is registered by kid-sports-highlights' `scripts/ci-vm.sh`. General builds and archives can still use all four mini runners. Setup adds a missing
 simulator label to the existing registration through GitHub, preserving its other labels and active job.
 
 Jobs that call `xcodebuild test` or `test-without-building` through PATH share two

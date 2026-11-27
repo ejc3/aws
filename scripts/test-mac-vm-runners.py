@@ -127,7 +127,7 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertIn("test: installed CI test slots", result.stdout)
         self.assertEqual(calls, [
             "mini-1 gww-ios,mini,ios-pool", "mini-2 gww-ios,mini,ios-pool",
-            "mini-3 gww-ios,mini,ios-pool", "mini-4 gww-ios,mini,ios-pool,mini-simulator",
+            "mini-3 gww-ios,mini,ios-pool", "mini-4 gww-ios,mini,ios-pool,mini-simulator,ios-simulator",
         ])
 
     def test_rust_alone_needs_no_registration_slots_or_vm_setup(self):
