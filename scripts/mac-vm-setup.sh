@@ -42,6 +42,9 @@ CI_LABELS=gww-ios,mini,ios-pool
 CI_COUNT=4
 SIMULATOR_RUNNER=mini-4
 SIMULATOR_LABEL=mini-simulator
+# Shared with the MacBook's listener: jobs that may run on either Mac's simulator ask for it. Its holders are kept by
+# scripts/simulator-listeners.sh; a registration here gives it to mini-4 too, so a rebuilt guest keeps it.
+SHARED_SIMULATOR_LABEL=ios-simulator
 # Rust in ci, as dolphin-labs' ci-vm.sh installs it on the MacBook's VM: rustup's own installer, pinned (its version and
 # the SHA-256 rust-lang publishes for its aarch64-apple-darwin build), and the channel dolphin-labs' rust-toolchain.toml
 # pins (keep in step; a build on another pin still has rustup fetch it). The targets are the device, the simulator and
@@ -313,7 +316,7 @@ for i in $(seq 1 "$CI_COUNT"); do
   name="mini-$i"
   labels=$CI_LABELS
   if [[ $name == "$SIMULATOR_RUNNER" ]]; then
-    labels+=",$SIMULATOR_LABEL"
+    labels+=",$SIMULATOR_LABEL,$SHARED_SIMULATOR_LABEL"
     # One listener must serve every simulator-testing job across repositories. Refuse a conflicting
     # assignment rather than modifying another operator's runner.
     slot=$(gh api --paginate "orgs/$CI_ORG/actions/runners?per_page=100" --jq "

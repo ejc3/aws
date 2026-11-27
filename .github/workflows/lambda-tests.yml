@@ -252,6 +252,8 @@ jobs:
           python3 -S -B scripts/test-mac-artifact-clean.py
       - name: Mac mini simulator runner routing
         run: python3 -S -B scripts/test-mac-vm-runners.py
+      - name: The shared ios-simulator label on exactly the two Macs' listeners (offline)
+        run: python3 -S -B scripts/test-simulator-listeners.py
       - name: Mac mini CI VM disk cleaner (stale simulators erased, old caches aged out, never during a mac-build job; offline)
         run: python3 -S -B scripts/test-ci-disk-clean.py
       - name: Mac mini CI VM coreaudiod check (a hung coreaudiod restarted once no job runs or after 30 minutes, at most every 15; offline)
