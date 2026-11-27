@@ -55,7 +55,7 @@ CFD_VERSION=2026.9.3
 CFD_SHA256_DARWIN_ARM64_TGZ=587c2cfb1c230fe36c7fa7727da78be459dae028cabe8c001291999350f07095
 CFD_SHA256_DARWIN_ARM64_BIN=5472c1a01c84bc31b3021056a73b4e5774ddddefc572124ea8fdf6c340639f32
 
-usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT | --lan SSH_DEST]   (ALIAS: mac, colton-mac, colin-mac, mini)" >&2; exit 2; }
+usage() { echo "usage: mac-ssh-connector-setup.sh ALIAS [--bootstrap-port PORT | --lan SSH_DEST]   (ALIAS: mac, air, colton-mac, colin-mac, mini)" >&2; exit 2; }
 ALIAS=${1:-}
 shift || true
 BOOTSTRAP_PORT=""
@@ -96,6 +96,13 @@ case "$ALIAS" in
     LABEL=com.ccgames.colin-mac-ssh.cloudflared
     TOKEN_FILE=.cloudflared/colin-mac-ssh.token
     LOG_FILE=Library/Logs/colin-mac-ssh-cloudflared.log
+    ;;
+  air)
+    TUNNEL_SECRET=air-ssh-tunnel-token
+    CLIENTS="fcvm:ubuntu nextjs:ejc3"
+    LABEL=com.ejcampbell.air-ssh.cloudflared
+    TOKEN_FILE=.cloudflared/air-ssh.token
+    LOG_FILE=Library/Logs/air-ssh-cloudflared.log
     ;;
   mini)
     TUNNEL_SECRET=mini-ssh-tunnel-token

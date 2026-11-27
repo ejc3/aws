@@ -296,14 +296,15 @@ resource "aws_iam_policy" "dev_server_constellation_terraform" {
         }
       }
       }, {
-      # fcvm-arm ubuntu's Cloudflare Access tokens for `ssh mini`, `ssh ci-mac` and `ssh colin-mac` (mini-ssh.tf, mac-vms.tf,
-      # colin-mac-ssh.tf), its instance only. Here rather than in a policy of their own: dev-server-role's inline policies
+      # fcvm-arm ubuntu's Cloudflare Access tokens for `ssh mini`, `ssh ci-mac`, `ssh colin-mac` and `ssh air` (mini-ssh.tf,
+      # mac-vms.tf, colin-mac-ssh.tf, air-ssh.tf), its instance only. Here rather than in a policy of their own: dev-server-role's inline policies
       # are near IAM's 10,240 characters in all.
       Sid    = "ReadTheMiniSshTokens"
       Effect = "Allow"
       Action = "secretsmanager:GetSecretValue"
       Resource = concat(
-        [aws_secretsmanager_secret.mini_ssh_access["fcvm"].arn, aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn],
+        [aws_secretsmanager_secret.mini_ssh_access["fcvm"].arn, aws_secretsmanager_secret.colin_mac_ssh_access["fcvm"].arn,
+        aws_secretsmanager_secret.air_ssh_access["fcvm"].arn],
         [for k, c in local.mac_vm_ssh_clients : aws_secretsmanager_secret.mac_vm_ssh_access[k].arn if c.box == "fcvm"],
       )
       Condition = { StringEquals = { "ec2:SourceInstanceARN" = local.constellation_applier_instance_arn } }

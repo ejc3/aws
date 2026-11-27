@@ -78,6 +78,15 @@ locals {
       host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGWKTmLcLRso4diFUNj+TKt/bMaEyRKCm1UWNCSDEmX"
       make_key       = true
     }
+    # EJ's MacBook Air (air-ssh.tf), the owner's second Mac: Remote Login's host key, read at the Mac by the owner
+    # on 2026-11-27.
+    air = {
+      hostname       = "air-ssh.cc-games.dev"
+      user           = "ejcampbell"
+      host_key_alias = "air"
+      host_key       = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6WPhY+fY3rXS9ax+hrdB6VUDEOzjEhG4GYT15FCtS2"
+      make_key       = true
+    }
     # Colin's Windows PC: OpenSSH Server's host key (C:\ProgramData\ssh\ssh_host_ed25519_key.pub, read on the PC).
     colin-pc = {
       hostname       = "colin-pc-ssh.cc-games.dev"
@@ -293,7 +302,7 @@ else
 fi
 PCBOOT
 
-  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh colin-mac` (once pinned), `ssh mini` and `ssh ci-mac`, each with fcvm-arm's own service token, and the pcboot
+  # fcvm-arm's ubuntu: `ssh mac`, `ssh colton-mac`, `ssh colin-pc`, `ssh colin-mac` and `ssh air` (once pinned), `ssh mini` and `ssh ci-mac`, each with fcvm-arm's own service token, and the pcboot
   # account above. The arm setup script runs it at boot (dev-user-data.tf) and the association below runs it on the running
   # box, daily.
   fcvm_mac_ssh_clients = <<-FCVMMACS
@@ -312,6 +321,11 @@ ${local.mac_ssh_client_setup}
 %{if contains(local.mac_ssh_pinned, "colin-mac")~}
 MAC_ALIAS=colin-mac
 MAC_SECRET=colin-mac-ssh-access-fcvm
+${local.mac_ssh_client_setup}
+%{endif~}
+%{if contains(local.mac_ssh_pinned, "air")~}
+MAC_ALIAS=air
+MAC_SECRET=air-ssh-access-fcvm
 ${local.mac_ssh_client_setup}
 %{endif~}
 MAC_ALIAS=mini

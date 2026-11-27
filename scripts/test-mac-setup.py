@@ -812,6 +812,7 @@ class Files(unittest.TestCase):
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
             member = desktop - {"mac-AGENTS.md"} | {"member-mac-AGENTS.md"}
+            air = desktop - {"mac-AGENTS.md"} | {"air-AGENTS.md"}
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
@@ -820,6 +821,7 @@ class Files(unittest.TestCase):
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
                 (["colton-mac", "--update-peekaboo"], build | member, "--update-peekaboo"),
                 (["colin-mac"], build | member, ""),
+                (["air"], build | air, ""),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
                 with tarfile.open(dest / "files.tar") as archive:

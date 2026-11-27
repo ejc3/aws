@@ -48,9 +48,11 @@ elif [[ $alias_ = mini ]]; then
   mode=--build-only
   files+=(ios-toolchain.zsh mini-AGENTS.md bin/mac-agents-md)
 else
-  # The owner's Mac gets its own instructions; every other alias is a family member's Mac.
+  # The owner's Macs get their own instructions (the MacBook Pro `mac`, the MacBook Air `air`); every other alias is a
+  # family member's Mac.
   agents=member-mac-AGENTS.md
   [[ $alias_ = mac ]] && agents=mac-AGENTS.md
+  [[ $alias_ = air ]] && agents=air-AGENTS.md
   files+=(peekaboo-install.sh bin/mac-gui bin/mac-lease bin/peekaboo bin/mac-agents-md "$agents")
 fi
 if [[ $alias_ = mac ]]; then
