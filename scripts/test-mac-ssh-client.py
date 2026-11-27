@@ -20,6 +20,8 @@ TUNNEL = (ROOT / "macbook-ssh.tf").read_text()
 COLTON = (ROOT / "colton-mac-ssh.tf").read_text()
 COLIN_PC = (ROOT / "colin-pc-ssh.tf").read_text()
 COLIN_MAC = (ROOT / "colin-mac-ssh.tf").read_text()
+AIR = (ROOT / "air-ssh.tf").read_text()
+AIR_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH6WPhY+fY3rXS9ax+hrdB6VUDEOzjEhG4GYT15FCtS2"
 COLIN_MAC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDGWKTmLcLRso4diFUNj+TKt/bMaEyRKCm1UWNCSDEmX"
 COLIN_PC_HOST_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILoueLCDZs2ZUj+FBJcE++RvLicN7v0rY9Nxvr9lEmp4"
 CONNECTOR = ROOT / "scripts" / "mac-ssh-connector-setup.sh"
@@ -273,10 +275,14 @@ class MacSshClient(unittest.TestCase):
 class Wiring(unittest.TestCase):
     def test_the_map_pins_the_macs_the_mini_its_vms_and_colins_pc(self):
         macs = mac_map()
-        self.assertEqual(sorted(macs), ["ci-mac", "colin-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
+        self.assertEqual(sorted(macs), ["air", "ci-mac", "colin-mac", "colin-pc", "colton-mac", "mac", "mini", "skevh-mac"])
         self.assertEqual(macs["colin-mac"], {"hostname": "colin-mac-ssh.cc-games.dev", "user": "colincampbell",
                                              "host_key_alias": "colin-mac", "host_key": COLIN_MAC_HOST_KEY, "make_key": True})
         self.assertIn('colin_mac_ssh_hostname = "colin-mac-ssh.cc-games.dev"', COLIN_MAC)
+        # The owner's MacBook Air logs in as the owner's own account, like `mac`, with a key made on each client.
+        self.assertEqual(macs["air"], {"hostname": "air-ssh.cc-games.dev", "user": "ejcampbell",
+                                       "host_key_alias": "air", "host_key": AIR_HOST_KEY, "make_key": True})
+        self.assertIn('air_ssh_hostname = "air-ssh.cc-games.dev"', AIR)
         self.assertEqual(macs["mac"], {"hostname": "macbook-ssh.cc-games.dev", "user": "ejcampbell",
                                        "host_key_alias": "ejs-macbook-pro-via-fcvm",
                                        "host_key": f"ssh-ed25519 {REMOTE_LOGIN_KEY}", "make_key": False})
@@ -312,6 +318,9 @@ class Wiring(unittest.TestCase):
                                   "MAC_ALIAS=colin-pc\nMAC_SECRET=colin-pc-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   '%{if contains(local.mac_ssh_pinned, "colin-mac")~}\n'
                                   "MAC_ALIAS=colin-mac\nMAC_SECRET=colin-mac-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
+                                  "%{endif~}\n"
+                                  '%{if contains(local.mac_ssh_pinned, "air")~}\n'
+                                  "MAC_ALIAS=air\nMAC_SECRET=air-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   "%{endif~}\n"
                                   "MAC_ALIAS=mini\nMAC_SECRET=mini-ssh-access-fcvm\n${local.mac_ssh_client_setup}\n"
                                   "MAC_ALIAS=ci-mac\nMAC_SECRET=mac-vm-ci-ssh-access-fcvm\n${local.mac_ssh_client_setup}")
@@ -506,6 +515,57 @@ class ColinMacCloudflare(unittest.TestCase):
         self.assertIn('content = "${cloudflare_zero_trust_tunnel_cloudflared.colin_mac_ssh.id}.cfargotunnel.com"', record)
 
 
+
+
+class AirCloudflare(unittest.TestCase):
+    """The owner's MacBook Air (air-ssh.tf): Colin's Mac's shape, with the owner's two clients only."""
+
+    def resource(self, kind, name):
+        return re.search(rf'resource "{kind}" "{name}" \{{(.*?)\n\}}', AIR, re.S).group(1)
+
+    def test_two_clients_each_with_its_own_token_and_secret(self):
+        body = re.search(r"air_ssh_clients = \{\n(.*?)\n  \}", AIR, re.S).group(1)
+        clients = {k: dict(re.findall(r'(\w+) = ("[^"]*"|[\w.]+)', v))
+                   for k, v in re.findall(r"^    ([\w-]+)\s+= \{ (.*) \}$", body, re.M)}
+        self.assertEqual({k: (c["secret"], c["reader"]) for k, c in clients.items()}, {
+            "fcvm": ('"air-ssh-access-fcvm"', "aws_iam_role.dev_server.arn"),
+            "nextjs-ejc3": ('"air-ssh-access-nextjs-ejc3"', "aws_iam_role.nextjs_dev.arn"),
+        })
+        # The owner's container token is denied to every member by the owner's one name pattern.
+        owner_only = (ROOT / "nextjs-ct-user-data.tf").read_text()
+        self.assertIn("secret:*-ssh-access-nextjs-ejc3-*", owner_only)
+        self.assertTrue(clients["nextjs-ejc3"]["secret"].strip('"').endswith("-ssh-access-nextjs-ejc3"))
+
+    def test_the_route_ends_at_remote_login_and_access_admits_only_the_tokens_and_the_owner(self):
+        config = self.resource("cloudflare_zero_trust_tunnel_cloudflared_config", "air_ssh")
+        self.assertEqual(re.findall(r'service\s*=\s*"([^"]+)"', config), ["ssh://127.0.0.1:22", "http_status:404"])
+        self.assertIn("required  = true", config)
+        self.assertIn("aud_tag   = [cloudflare_zero_trust_access_application.air_ssh.aud]", config)
+        policy = self.resource("cloudflare_zero_trust_access_policy", "air_ssh_clients")
+        self.assertIn('decision         = "non_identity"', policy)
+        self.assertNotRegex(policy, r"email|group|everyone|ip\s*=")
+        app = self.resource("cloudflare_zero_trust_access_application", "air_ssh")
+        self.assertEqual(re.findall(r"id\s+= cloudflare_zero_trust_access_policy\.(\w+)\.id\n\s+precedence = (\d)", app),
+                         [("browser_manager_owner", "1"), ("air_ssh_clients", "2")])
+
+    def test_the_tokens_reach_only_administration_and_each_client(self):
+        admins = re.search(r"air_ssh_admins = \[(.*?)\n  \]", AIR, re.S).group(1)
+        self.assertNotIn("dev_server", admins)
+        self.assertNotIn("nextjs_dev", admins)
+        self.assertIn('"aws:PrincipalArn" = local.air_ssh_admins', self.resource("aws_secretsmanager_secret_policy", "air_ssh_tunnel"))
+        nextjs = self.resource("aws_iam_role_policy", "nextjs_dev_air_ssh")
+        self.assertEqual(re.findall(r'air_ssh_access\["([\w-]+)"\]', nextjs), ["nextjs-ejc3"])
+        self.assertNotIn("air_ssh_tunnel", nextjs)
+        self.assertIn("depends_on = [aws_iam_policy.nextjs_ct_member]", nextjs)
+        stmt = (ROOT / "constellation-account.tf").read_text().split('Sid    = "ReadTheMiniSshTokens"', 1)[1].split("}]", 1)[0]
+        self.assertIn('aws_secretsmanager_secret.air_ssh_access["fcvm"].arn', stmt)
+        self.assertNotIn("air_ssh_tunnel", stmt)
+
+    def test_the_connector_setup_knows_the_air_and_its_two_clients(self):
+        text = CONNECTOR.read_text()
+        block = text[text.index("  air)\n"):text.index("    ;;", text.index("  air)\n"))]
+        self.assertIn("TUNNEL_SECRET=air-ssh-tunnel-token", block)
+        self.assertIn('CLIENTS="fcvm:ubuntu nextjs:ejc3"', block)
 
 
 class ColinMacConnector(unittest.TestCase):

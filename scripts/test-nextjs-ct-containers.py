@@ -781,6 +781,7 @@ class MacTests(unittest.TestCase):
                       '      mac        = "macbook-ssh-access-nextjs-ejc3"\n'
                       '      colton-mac = "colton-mac-ssh-access-nextjs-ejc3"\n'
                       '      colin-mac  = "colin-mac-ssh-access-nextjs-ejc3"\n'
+                      '      air        = "air-ssh-access-nextjs-ejc3"\n'
                       '      mini       = "mini-ssh-access-nextjs-ejc3"\n'
                       '      ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"\n'
                       '    }\n', clients)

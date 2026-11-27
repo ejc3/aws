@@ -318,6 +318,7 @@ locals {
       mac        = "macbook-ssh-access-nextjs-ejc3"
       colton-mac = "colton-mac-ssh-access-nextjs-ejc3"
       colin-mac  = "colin-mac-ssh-access-nextjs-ejc3"
+      air        = "air-ssh-access-nextjs-ejc3"
       mini       = "mini-ssh-access-nextjs-ejc3"
       ci-mac     = "mac-vm-ci-ssh-access-nextjs-ejc3"
     }

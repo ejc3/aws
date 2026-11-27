@@ -1680,6 +1680,16 @@ A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_s
    from `scripts/mac/member-mac-AGENTS.md`, the family-member template; only alias `mac` gets the owner's), then grant
    Peekaboo Screen Recording, Accessibility and Event Synthesizing at the Mac (`peekaboo permissions status`).
 
+### SSH to the MacBook Air, and the pool on it: `ssh air`
+
+EJ's second Mac (MacBook Air M2, macOS 27, set up 2026-11-27), built like Colin's (above): Cloudflare Access in front of
+its Remote Login at `air-ssh.cc-games.dev` (`air-ssh.tf`), a connector LaunchAgent on the Mac, and the `mac-ssh-client.tf`
+installer with alias `air` (user `ejcampbell`, its host key read at the Mac). Clients, each with its own token, are the
+owner's only: fcvm-arm `ubuntu` (`air-ssh-access-fcvm`) and the owner's container (`air-ssh-access-nextjs-ejc3`, denied
+to every member's by the owner's one pattern). Bring-up is Colin's steps 1 to 7 with `air` for `colin-mac` and the port
+from `ports claim air`; step 7 installs `scripts/mac/air-AGENTS.md`, the owner's laptop instructions (builds go to the
+mini; no scratch drive and no attached phone, unlike `mac`).
+
 ### SSH to Colin's PC, and its screen: `ssh colin-pc`, Windows-MCP
 
 Colton's Mac's shape on a Windows PC (owner, 2026-10-20): Cloudflare Access in front of the PC's OpenSSH Server at

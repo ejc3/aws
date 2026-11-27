@@ -124,9 +124,11 @@ else
   /bin/sh "$src/peekaboo-install.sh"
 fi
 
-# mac-setup.sh sends exactly one of the two desktop templates: the owner's Mac, or a family member's.
+# mac-setup.sh sends exactly one of the desktop templates: the owner's MacBook Pro or MacBook Air, or a family member's.
 if [ -f "$src/member-mac-AGENTS.md" ]; then
   agents_md member "$src/member-mac-AGENTS.md"
+elif [ -f "$src/air-AGENTS.md" ]; then
+  agents_md mac "$src/air-AGENTS.md"
 else
   agents_md mac "$src/mac-AGENTS.md"
 fi
