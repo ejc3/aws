@@ -126,6 +126,49 @@ class Fixture(unittest.TestCase):
 
 
 class WorktreePruneTests(Fixture):
+    def test_inaccessible_fd_only_allows_a_single_thread_zombie(self):
+        tree = self.worktree("eligible")
+        proc = self.proc / "2147483647"
+        proc.mkdir()
+        scandir = os.scandir
+
+        def deny_fds(path):
+            if path == proc / "fd":
+                raise PermissionError(13, "inaccessible fd")
+            return scandir(path)
+
+        with mock.patch.object(os, "scandir", side_effect=deny_fds):
+            # A missing status file supplies no proof about the failed PID.
+            with self.assertRaises(PermissionError):
+                WORKER.prune(self.home, self.uid, inspect_all=True)
+            for state, threads in (("S (sleeping)", "1"), ("Z (zombie)", "2"), ("Z (zombie)", "")):
+                with self.subTest(state=state, threads=threads):
+                    (proc / "status").write_text(f"State:\t{state}\nThreads:\t{threads}\n")
+                    with self.assertRaises(PermissionError):
+                        WORKER.prune(self.home, self.uid, inspect_all=True)
+            (proc / "status").write_text("State:\tZ (zombie)\nThreads:\t1\n")
+            [candidate] = WORKER.prune(self.home, self.uid, inspect_all=True)["candidates"]
+            self.assertEqual(WORKER.prune(self.home, self.uid, candidate["token"], inspect_all=True),
+                             {"status": "removed"})
+        self.assertFalse(tree.exists())
+
+    def test_replaced_pid_with_zombie_status_cannot_excuse_inaccessible_fd(self):
+        self.worktree("eligible")
+        proc = self.proc / "2147483647"
+        proc.mkdir()
+        scandir = os.scandir
+
+        def replace_pid(path):
+            if path == proc / "fd":
+                proc.rename(self.base / "old-pid")
+                proc.mkdir()
+                (proc / "status").write_text("State:\tZ (zombie)\nThreads:\t1\n")
+                raise PermissionError(13, "inaccessible fd")
+            return scandir(path)
+
+        with mock.patch.object(os, "scandir", side_effect=replace_pid), self.assertRaises(PermissionError):
+            WORKER.prune(self.home, self.uid, inspect_all=True)
+
     def test_oldest_clean_merged_candidate_removed_without_deleting_ref(self):
         newer = self.worktree("newer")
         older = self.worktree("older")
