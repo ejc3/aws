@@ -448,8 +448,11 @@ class FakeGitHub:
     def __init__(self, runs=(), jobs=None, runners=(), runners_error=False,
                  delete_error=False, recheck=None, journal=None, runners_total=None,
                  omit_runners_total=False, runner_payloads=None,
-                 registration_error=False, registration_payload=None):
+                 registration_error=False, registration_payload=None, run_records=None):
         self.runs = list(runs)
+        # What GET /actions/runs/{id} answers: {run_id: record, or None to fail}. A run not
+        # listed is a push to ejc3/fcvm main, the run the reuse path trusts.
+        self.run_records = run_records or {}
         self.jobs = jobs or {}
         self.runners = list(runners)
         # Every /actions/runners call raises: a PAT that lost its scope, a 5xx, a
@@ -536,6 +539,15 @@ class FakeGitHub:
             jobs = self.jobs.get(int(jobs_match.group(1)), [])
             window = jobs[(page - 1) * per_page: page * per_page]
             return {"total_count": len(jobs), "jobs": window}
+        one_run = re.search(r"/actions/runs/(\d+)$", url)
+        if one_run:
+            run_id = int(one_run.group(1))
+            record = self.run_records.get(run_id, "unset")
+            if record == "unset":
+                record = trusted_run_record(run_id)
+            if record is None:
+                raise OSError("GitHub is unreachable")
+            return record
         status_match = re.search(r"[?&]status=(\w+)", url)
         if not status_match:
             # Fail LOUDLY: the Lambdas wrap GitHub calls in broad except blocks,
@@ -690,6 +702,11 @@ def instance(instance_id, instance_type, state, age_minutes, arch="x86_64", tags
 
 def run(run_id, status):
     return {"id": run_id, "status": status}
+
+
+def trusted_run_record(run_id, event="push", head_branch="main", head_repository="ejc3/fcvm"):
+    return {"id": run_id, "event": event, "head_branch": head_branch,
+            "head_repository": {"full_name": head_repository}}
 
 
 def job(status, arch, name="job"):
@@ -1965,11 +1982,14 @@ def stream_item(dynamodb, instance_id=WARM):
     return dynamodb.items[instance_arn(instance_id)]
 
 
+COMPLETED_RUN = 4001
+
+
 def completed_event(instance_id=WARM, arch="arm64", runner_id=77, conclusion="success",
-                    completed_seconds_ago=10, runner_name=None):
+                    completed_seconds_ago=10, runner_name=None, run_id=COMPLETED_RUN):
     labels = ["self-hosted", "Linux", "X64" if arch == "x86_64" else "ARM64"]
     return {"body": json.dumps({"action": "completed", "workflow_job": {
-        "runner_name": runner_name or f"runner-{instance_id}", "runner_id": runner_id,
+        "runner_name": runner_name or f"runner-{instance_id}", "runner_id": runner_id, "run_id": run_id,
         "labels": labels, "conclusion": conclusion,
         "completed_at": (NOW - timedelta(seconds=completed_seconds_ago)).isoformat()}})}
 
@@ -2054,7 +2074,7 @@ def case_the_webhook_hands_a_completed_job_on_without_reading_anything():
     assert (ec2.calls, dynamodb.calls, github.requests, ssm.journal) == ([], [], [], []), \
         (ec2.calls, dynamodb.calls, github.requests, ssm.journal)
     assert json.loads(front.calls[0]["Payload"]) == {"workflow_job": {
-        "runner_name": f"runner-{WARM}", "runner_id": 77,
+        "runner_name": f"runner-{WARM}", "runner_id": 77, "run_id": COMPLETED_RUN,
         "labels": ["self-hosted", "Linux", "ARM64"], "conclusion": "success",
         "completed_at": (NOW - timedelta(seconds=10)).isoformat()}}, front.calls
     for event in (completed_event(conclusion="failure"), completed_event(runner_name="GitHub Actions 12")):
@@ -2119,6 +2139,52 @@ def case_a_completed_event_hands_out_nothing_it_cannot_prove():
         assert "ClaimedAt" not in stream_item(dynamodb), (label, stream_item(dynamodb))
 
 
+def case_a_host_that_ran_anything_but_main_is_never_offered_again():
+    """#1102: a host that ran a pull request's code powers off; the next job starts clean.
+
+    Its /mnt/fcvm-btrfs, ~/.cargo and ~/.rustup outlive the job, and the job had passwordless
+    sudo, so only a host whose run GitHub records as ejc3/fcvm main is offered again.
+    """
+    untrusted = [
+        ("a pull request", {COMPLETED_RUN: trusted_run_record(COMPLETED_RUN, event="pull_request",
+                                                              head_branch="feature")}),
+        ("a pull request from a branch named main", {COMPLETED_RUN: trusted_run_record(
+            COMPLETED_RUN, event="pull_request")}),
+        ("pull_request_target", {COMPLETED_RUN: trusted_run_record(COMPLETED_RUN, event="pull_request_target")}),
+        ("a push to another branch", {COMPLETED_RUN: trusted_run_record(COMPLETED_RUN, head_branch="deps/update")}),
+        ("a dispatch on another branch", {COMPLETED_RUN: trusted_run_record(
+            COMPLETED_RUN, event="workflow_dispatch", head_branch="experiment")}),
+        ("main of a fork", {COMPLETED_RUN: trusted_run_record(COMPLETED_RUN, head_repository="someone/fcvm")}),
+        ("a run record with no head repository", {COMPLETED_RUN: {"id": COMPLETED_RUN, "event": "push",
+                                                                  "head_branch": "main"}}),
+        ("another run's record", {COMPLETED_RUN: trusted_run_record(COMPLETED_RUN + 1)}),
+        ("a run that cannot be read", {COMPLETED_RUN: None}),
+    ]
+    variants = [(label, {"run_records": records}, completed_event()) for label, records in untrusted]
+    variants.append(("a job that names no run", {}, completed_event(run_id=None)))
+    for label, github_kw, event in variants:
+        dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+        result = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
+                       github=FakeGitHub(**queue_of(queued=3), **github_kw), lambda_client=back)["reuse_handler"](
+                           as_handoff(event), None)
+        assert result["statusCode"] == 200 and result["body"].startswith(f"Not reusing runner-{WARM}"), (label, result)
+        assert back.calls == [], (label, back.calls)
+        assert "AvailableUntil" not in stream_item(dynamodb), (label, stream_item(dynamodb))
+
+    no_token = reuse(FakeEC2([stream_host()]), ssm=FakeSSM(pat="placeholder"),
+                     dynamodb=FakeDynamoDB([stream_row()]), github=FakeGitHub(**queue_of(queued=3)))[
+                         "reuse_handler"](as_handoff(completed_event()), None)
+    assert no_token["body"] == f"Not reusing runner-{WARM}: no GitHub token to read its workflow run", no_token
+
+    for event in ("push", "schedule", "workflow_dispatch"):
+        dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
+        result = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb, lambda_client=back,
+                       github=FakeGitHub(**queue_of(queued=3), run_records={
+                           COMPLETED_RUN: trusted_run_record(COMPLETED_RUN, event=event)}))["reuse_handler"](
+                           as_handoff(completed_event()), None)
+        assert result["statusCode"] == 202 and len(back.calls) == 1, (event, result, back.calls)
+
+
 def case_a_queue_check_that_cannot_finish_hands_out_nothing():
     dynamodb, back = FakeDynamoDB([stream_row()]), FakeLambdaClient()
     module = reuse(FakeEC2([stream_host()]), dynamodb=dynamodb,
@@ -2126,7 +2192,8 @@ def case_a_queue_check_that_cannot_finish_hands_out_nothing():
     answered = module["github_get"]
 
     def runs_unreachable(pat, url):
-        if "/actions/runs" in url:
+        # The queue listings, not the one run the completed job came from.
+        if "/actions/runs?" in url or url.endswith("/jobs?filter=latest&per_page=100"):
             raise OSError("GitHub is unreachable")
         return answered(pat, url)
 

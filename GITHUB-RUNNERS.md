@@ -369,7 +369,12 @@ leaked VMs, D-state processes or a full disk behind (before `--ephemeral`, one b
 `runner-i-0ea78b39da373fcca` on 2026-08-06, failed every job it picked up), so a host whose
 job failed, or was cancelled or timed out, gets no credential and powers off when its wait
 ends. The host's `after` step cannot see the job's conclusion, only its runner's exit, so this
-filter lives in the controller. It acts only on a
+filter lives in the controller. So does a host whose job did not run `ejc3/fcvm`'s own `main` (#1102): the reuse function reads
+the job's workflow run from GitHub and offers the host again only when its event is `push`, `schedule` or
+`workflow_dispatch`, its head branch is `main` and its head repository is `ejc3/fcvm`. A pull request's job ran unreviewed
+code with passwordless sudo on a host whose `/mnt/fcvm-btrfs`, `~/.cargo` and `~/.rustup` outlive it, and the next job
+may hold `contents: write` (`kernels.yml`) or an environment's secrets, so that host powers off and every job after it
+starts on a fresh one. A run that cannot be read, or a job that names none, counts as not `main`. It acts only on a
 running `ddb-v2` instance of the job's architecture younger than `MAX_REUSE_AGE_HOURS` (12,
 the soft cap), and only while `completed_at` plus `REUSE_WINDOW_SECONDS` (120) still leaves
 `CLAIM_MARGIN_SECONDS` (30). There one conditional `UpdateItem` sets `AvailableUntil` on the
