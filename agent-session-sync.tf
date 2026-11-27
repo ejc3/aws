@@ -72,7 +72,9 @@ chmod 644 /etc/systemd/system/agent-session-sync@ubuntu.service.d/policy.conf.ne
 systemctl daemon-reload
 systemctl enable agent-session-sync@ubuntu.service >/dev/null 2>&1 || true
 # Starting a stopped watcher is safe; a running one is left alone so a re-run never resets it.
-systemctl is-active --quiet agent-session-sync@ubuntu.service || systemctl start agent-session-sync@ubuntu.service || true
+# --no-block: on a dev box this runs inside dev-selfupdate's start job, which the watcher is
+# ordered after, so a blocking start would wait on itself until dev-selfupdate timed out.
+systemctl is-active --quiet agent-session-sync@ubuntu.service || systemctl start --no-block agent-session-sync@ubuntu.service || true
 ENABLE
 
   agent_session_sync_enable_admin = replace(

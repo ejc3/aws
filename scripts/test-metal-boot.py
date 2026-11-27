@@ -345,5 +345,82 @@ class ArmNetworkInterfaceTests(unittest.TestCase):
         self.assertIn("depends_on = [terraform_data.firecracker_dev_host_ipv6]", inst)
 
 
+UNIT_HEREDOC = re.compile(r"cat > /etc/systemd/system/([\w@.-]+\.service) <<-?\s*'?(\w+)'?\n(.*?)\n\2\n", re.S)
+STARTS = {"start", "restart", "try-restart", "reload-or-restart"}
+
+
+def unit_name(token):
+    """agent-session-sync@ubuntu.service, agent-session-sync@$u.service and agent-session-sync@%i.service are one template."""
+    token = token.strip("\"'")
+    return re.sub(r"@[^.]*\.service$", "@.service", token)
+
+
+def unit_orderings():
+    """Every unit the Terraform writes, with the units its After= names: from the heredocs and from scripts/*.service."""
+    units = {}
+    bodies = [(m.group(1), m.group(3)) for tf in ROOT.glob("*.tf") for m in UNIT_HEREDOC.finditer(tf.read_text())]
+    bodies += [(f.name, f.read_text()) for f in (ROOT / "scripts").glob("*.service")]
+    for name, body in bodies:
+        after = units.setdefault(unit_name(name), set())
+        for line in body.splitlines():
+            if line.startswith("After="):
+                after.update(unit_name(u) for u in line[len("After="):].split())
+    return units
+
+
+def ordered_after(target, units):
+    later, grew = set(), True
+    while grew:
+        grew = False
+        for name, after in units.items():
+            if name not in later and (target in after or after & later):
+                later.add(name)
+                grew = True
+    return later
+
+
+def blocking_starts(text, units):
+    """Lines that start one of `units` and wait for it: start/restart, or enable --now, without --no-block."""
+    found = []
+    for n, line in enumerate(text.splitlines(), 1):
+        if line.lstrip().startswith("#"):
+            continue
+        for cmd in re.findall(r"systemctl\s+([^|;&]*)", line):
+            words = cmd.split()
+            starts = STARTS & set(words) or ("enable" in words and "--now" in words)
+            if starts and "--no-block" not in words and any(unit_name(w) in units for w in words):
+                found.append((n, line.strip()))
+    return found
+
+
+class BootOrderTests(unittest.TestCase):
+    """At boot dev-selfupdate may install a new launcher and a new agent-active-dirs. The launchers that read the
+    picker wait for it, and the script it runs never waits for a unit ordered after it (that start would wait on
+    the self-update's own job until its timeout)."""
+
+    def test_both_readers_of_the_picker_wait_for_the_self_update_themselves(self):
+        # Directly, not through each other: an ordering through fcvm-claude-rc holds only when that unit has a job.
+        units = unit_orderings()
+        for reader in ("fcvm-claude-rc.service", "agent-session-sync@.service"):
+            self.assertIn("dev-selfupdate.service", units[reader], reader)
+
+    def test_no_script_waits_on_a_unit_ordered_after_the_self_update(self):
+        later = ordered_after("dev-selfupdate.service", unit_orderings())
+        bad = [(tf.name, n, line) for tf in sorted(ROOT.glob("*.tf")) for n, line in blocking_starts(tf.read_text(), later)]
+        self.assertEqual(bad, [])
+
+    def test_the_scan_finds_a_blocking_start(self):
+        later = {"fcvm-claude-rc.service", "agent-session-sync@.service"}
+        text = textwrap.dedent("""\
+            systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
+            systemctl is-active --quiet agent-session-sync@ubuntu.service || systemctl start agent-session-sync@ubuntu.service || true
+            systemctl start --no-block "agent-session-sync@$u.service"
+            systemctl enable fcvm-claude-rc.service
+            # systemctl start fcvm-claude-rc.service
+            systemctl start codex-rc@ubuntu.service
+            """)
+        self.assertEqual([n for n, _ in blocking_starts(text, later)], [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main(buffer=True)

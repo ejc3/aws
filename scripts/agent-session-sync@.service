@@ -1,7 +1,8 @@
 [Unit]
 Description=Start Claude Code and Codex sessions for new repositories of %i within seconds
-# After the boot launchers, so the user's tmux server (which this never starts or owns) exists first.
-After=network-online.target claude-rc@%i.service fcvm-claude-rc.service
+# After the boot launchers, so the user's tmux server (which this never starts or owns) exists first, and
+# after dev-selfupdate, so its reboot pass reads the agent-active-dirs that update installs.
+After=network-online.target claude-rc@%i.service fcvm-claude-rc.service dev-selfupdate.service
 Wants=network-online.target
 
 [Service]
