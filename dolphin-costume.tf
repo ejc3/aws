@@ -65,6 +65,9 @@ resource "cloudflare_zero_trust_access_application" "costume_stage_public" {
   domain       = local.costume_stage.hostname
   destinations = [{ type = "public", uri = local.costume_stage.hostname }]
   policies     = [{ id = cloudflare_zero_trust_access_policy.costume_stage_public.id, precedence = 1 }]
+  # The public bypass only after the hostname's own record: before it, the name still falls to the `*` record and
+  # the previews tunnel, which must never be public (dolphin-labs-zone.tf), as dolphin_maps_public and astryx_join_public.
+  depends_on = [cloudflare_dns_record.costume_stage]
 }
 
 resource "cloudflare_zero_trust_tunnel_cloudflared" "dolphin_costume" {
@@ -112,7 +115,6 @@ resource "cloudflare_dns_record" "costume_stage" {
   # The URL exists only after its Access applications and the tunnel's rules do.
   depends_on = [
     cloudflare_zero_trust_access_application.costume_stage_login,
-    cloudflare_zero_trust_access_application.costume_stage_public,
     cloudflare_zero_trust_tunnel_cloudflared_config.dolphin_costume,
   ]
 }

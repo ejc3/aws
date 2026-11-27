@@ -79,10 +79,15 @@ class CostumeStageTests(unittest.TestCase):
     def test_the_hostname_appears_only_after_access_and_the_rules(self):
         dns = block('resource "cloudflare_dns_record" "costume_stage"')
         for dep in ("cloudflare_zero_trust_access_application.costume_stage_login,",
-                    "cloudflare_zero_trust_access_application.costume_stage_public,",
                     "cloudflare_zero_trust_tunnel_cloudflared_config.dolphin_costume,"):
             self.assertIn(dep, dns)
         self.assertIn("proxied = true", dns)
+
+    def test_the_public_bypass_waits_for_the_hostnames_own_record(self):
+        # Before the record, the name falls to the `*` record and the previews tunnel, which must never be public.
+        public = block('resource "cloudflare_zero_trust_access_application" "costume_stage_public"')
+        self.assertIn("depends_on = [cloudflare_dns_record.costume_stage]", public)
+        self.assertNotIn("costume_stage_public", block('resource "cloudflare_dns_record" "costume_stage"'))
 
     def test_the_token_and_the_hosts_values_go_to_the_dolphin_account_only(self):
         for header in ('resource "aws_secretsmanager_secret" "dolphin_costume_tunnel"',
