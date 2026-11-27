@@ -24,13 +24,17 @@ locals {
   runner_app_sizes = {
     xl = ["c7a.16xlarge", "c7i.16xlarge", "c8i.16xlarge", "c6a.16xlarge", "c6i.16xlarge"]
     l  = ["c7a.8xlarge", "c7i.8xlarge", "c8i.8xlarge", "c6a.8xlarge", "c6i.8xlarge"]
+    # `l` for a merge queue's batch jobs alone (dolphin-labs' pooled queue): a runner of this
+    # size carries the label `lq`, not `l`, so it takes only those jobs, and the controller
+    # launches for them ahead of every other queued job (PRIORITY_SIZES in app_runner.py).
+    lq = ["c7a.8xlarge", "c7i.8xlarge", "c8i.8xlarge", "c6a.8xlarge", "c6i.8xlarge"]
     s  = ["c7a.2xlarge", "c7i.2xlarge", "c8i.2xlarge", "c6a.2xlarge", "c6i.2xlarge"]
   }
 
   # vCPUs of one host of each size. Every type listed under a size has this many: these are all
   # 4 vCPUs per "xlarge", which the controller's precondition below checks by each type's name.
   # The one map the controller counts vCPUs by (each repo's `vcpus`, and each host's Vcpus tag).
-  runner_app_size_vcpus = { xl = 64, l = 32, s = 8 }
+  runner_app_size_vcpus = { xl = 64, l = 32, lq = 32, s = 8 }
 
   # One entry per served repo. `max` bounds that repo's concurrent hosts; it is separate from
   # fcvm's per-architecture caps, so these repos can never take fcvm's metal.

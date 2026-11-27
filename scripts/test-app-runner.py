@@ -36,9 +36,10 @@ REPOS_TF = (ROOT / "runner-repos.tf").read_text()
 COLTON, DOLPHIN = "CoderColton/colton-games", "dolphin-labs-hq/dolphin-labs"
 # ejc3/imagine shares its owner with ejc3/fcvm (the metal runners), so its separation from fcvm is tested by repository.
 IMAGINE, FCVM = "ejc3/imagine", "ejc3/fcvm"
-SIZES = {"xl": ["c7a.16xlarge", "c7i.16xlarge"], "l": ["c7a.8xlarge", "c7i.8xlarge"], "s": ["c7a.2xlarge"]}
+SIZES = {"xl": ["c7a.16xlarge", "c7i.16xlarge"], "l": ["c7a.8xlarge", "c7i.8xlarge"],
+         "lq": ["c7a.8xlarge", "c7i.8xlarge"], "s": ["c7a.2xlarge"]}
 # runner-app.tf's runner_app_size_vcpus, which every repo's config carries as `vcpus`.
-VCPUS = {"xl": 64, "l": 32, "s": 8}
+VCPUS = {"xl": 64, "l": 32, "lq": 32, "s": 8}
 # Every repo's config carries `vcpus` and `max_vcpus` as Terraform passes them (null: no vCPU cap). These three have none;
 # VcpuCapTests gives Imagine its vCPU cap.
 REPOS = {
@@ -735,6 +736,27 @@ class LaunchTests(unittest.TestCase):
         jobs = [int(j) for j, _ in app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT")]
         self.assertIn(0, jobs, "the oldest run (last page) must be reached")
         self.assertEqual(jobs[:3], [0, 1, 2], "oldest first")
+
+    def test_a_merge_queue_batch_job_is_launched_for_ahead_of_older_jobs(self):
+        # dolphin-labs' batch jobs ask for `lq`: found after three older `l` runs, they still come first,
+        # each class oldest first, so at the cap the next free host goes to the batch.
+        app, *_ = load_app()
+        def github(method, path, pat, body=None):
+            if "/jobs" in path:
+                run = int(path.split("/runs/")[1].split("/")[0])
+                size = "lq" if run >= 10 else "l"
+                return {"jobs": [{"id": run, "status": "queued", "labels": ["self-hosted", "dolphin", size]}]}
+            if "status=queued" not in path:
+                return {"total_count": 0, "workflow_runs": []}
+            return {"total_count": 5, "workflow_runs": [
+                {"id": run, "created_at": f"2026-11-27T1{n}:00:00Z"} for n, run in enumerate([1, 2, 3, 10, 11])]}
+        app.github = github
+        jobs = app.queued_jobs(DOLPHIN, REPOS[DOLPHIN], "PAT")
+        self.assertEqual(jobs, [("10", "lq"), ("11", "lq"), ("1", "l"), ("2", "l"), ("3", "l")])
+        # And only a priority size moves: without one, oldest first as before.
+        self.assertEqual(app.job_size(REPOS[DOLPHIN], ["self-hosted", "dolphin", "lq"]), "lq")
+        self.assertIsNone(app.job_size(REPOS[DOLPHIN], ["self-hosted", "dolphin", "l", "lq"]),
+                          "a job asking for two sizes is no one's")
 
     def test_a_single_job_whose_host_died_is_relaunched_without_waiting_out_its_claim(self):
         app, ec2, *_ = load_app()

@@ -807,6 +807,10 @@ controller (Pattern B) is untouched; these repos have their own (`runner-app.tf`
 - **Labels.** A job is served only if every label it asks for is one these runners carry:
   `self-hosted`, `linux`, `x64`, the repo label (`cc-games`, `dolphin`, `imagine` or `constellation`) and one size
   (`s` 2xlarge, `l` 8xlarge, `xl` 16xlarge). So `runs-on: [self-hosted, dolphin, l]`.
+  One more size, `lq`, is `l` for a merge queue's batch jobs alone (dolphin-labs' pooled queue, its
+  `MERGE_QUEUE_RUNNER_SIZE` variable): its runners carry `lq`, not `l`, so they take only those jobs, and the
+  controller launches for `lq` jobs first, ahead of older jobs of every other size (`PRIORITY_SIZES`), so a batch,
+  which is what lands on main, does not wait behind PR runs at the repo's cap.
   `dolphin-films` (a downstream of `dolphin-labs`), `dolphin-maps` and `dolphin-family` use the `dolphin` label too.
   With the Dolphin organization pool disabled, runners register per repo and hosts are counted by their `Repo` tag;
   in that mode the shared label shares no runner, cap or token. `ejc3/imagine` asks for

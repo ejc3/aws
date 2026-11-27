@@ -766,6 +766,12 @@ def runs_oldest_first(repo, status, pat, budget, after=None, complete=None):
         complete[0] = True
 
 
+# Sizes whose queued jobs are launched for first, ahead of older jobs of other sizes: `lq`, a
+# merge queue's batch jobs. A batch tests what lands on main, so landing should not wait behind
+# PR runs. A runner registers with its own size's label, so an `lq` host takes only `lq` jobs.
+PRIORITY_SIZES = frozenset({'lq'})
+
+
 def queued_jobs(repo, cfg, pat, running_on=None):
     """[(job_id, size)] for this repo's queued jobs that ask for our labels.
 
@@ -790,6 +796,7 @@ def queued_jobs(repo, cfg, pat, running_on=None):
     found, seen, runs_seen, budget = [], set(), set(), [SCAN_CALL_BUDGET]
     cursor, ages, runs, done, ended = scan_cursor(repo), {}, {}, {}, {}
     group = cfg.get('budget_group')
+    reserved = 0
     if group and len(group_repos(group, repos := config()[0])) > 1 and not out_of_time():
         waiter = active_group_wait(group, repos)
         if waiter and waiter['repo']['S'] == repo and not out_of_time():
@@ -803,6 +810,7 @@ def queued_jobs(repo, cfg, pat, running_on=None):
             cap = int(budget_groups()[group]['throttled_vcpus'])
             if size and min(size_vcpus(cfg, size), cap) == int(waiter['vcpus']['N']):
                 found.append((job_id, size))
+                reserved = 1
                 ages[job_id] = queued_age(job)
             else:
                 # Definitive status or label change. Do not let a stale workflow listing
@@ -839,7 +847,9 @@ def queued_jobs(repo, cfg, pat, running_on=None):
         ended[status] = complete[0] and every_run
         found += [(job_id, size) for _, job_id, size in sorted(batch, key=lambda b: b[0])]
     SCANNED[repo] = {'read': cursor, 'ages': ages, 'runs': runs, 'done': done, 'ended': ended}
-    return found
+    # A priority size's jobs first, oldest first among them; then the rest, oldest first. The group's reserved
+    # waiter keeps its place at the front: its reservation is the turn a throttled group promised it.
+    return found[:reserved] + sorted(found[reserved:], key=lambda job: job[1] not in PRIORITY_SIZES)
 
 
 def next_cursor(scanned, waiting):
