@@ -1825,6 +1825,9 @@ UDIDs out of this repository.
 the build tools and a signing keychain in the guest, then registers each missing runner with the
 `dolphin-labs-hq` organization. GitHub supplies `self-hosted`, `macOS` and `ARM64`. The script adds
 `ios-pool`, `mini` and the legacy `gww-ios` label. Registration uses the operator's org-admin GitHub login.
+`mini-3` is kept for dolphin-labs' merge queue batches: it carries `mini` and `ios-queue`, not `ios-pool` or
+`gww-ios`, so no PR job (they ask for `ios-pool`) takes it, and a batch's swift test (it asks for `mini`) runs there or
+on any free mini. An already-registered `mini-3` is relabelled by the same script.
 
 Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini-simulator]` for each
 job that boots an iOS simulator. A single runner executes one job at a time across all eligible

@@ -40,6 +40,11 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 CI_ORG=dolphin-labs-hq
 CI_LABELS=gww-ios,mini,ios-pool
 CI_COUNT=4
+# One runner kept for dolphin-labs' merge queue batches: it carries mini and ios-queue, not ios-pool or gww-ios, so no
+# PR job (they ask for ios-pool) can take it. A batch's swift test asks for mini, so it runs here, or on any free mini,
+# and never waits behind PR jobs for every Mac (dolphin-labs docs/MERGE_QUEUE.md, "Runners: batches first").
+QUEUE_RUNNER=mini-3
+QUEUE_LABELS=mini,ios-queue
 SIMULATOR_RUNNER=mini-4
 SIMULATOR_LABEL=mini-simulator
 # Shared with the MacBook's listener: jobs that may run on either Mac's simulator ask for it. Its holders are kept by
@@ -315,6 +320,7 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
 for i in $(seq 1 "$CI_COUNT"); do
   name="mini-$i"
   labels=$CI_LABELS
+  [[ $name == "$QUEUE_RUNNER" ]] && labels=$QUEUE_LABELS
   if [[ $name == "$SIMULATOR_RUNNER" ]]; then
     labels+=",$SIMULATOR_LABEL,$SHARED_SIMULATOR_LABEL"
     # One listener must serve every simulator-testing job across repositories. Refuse a conflicting
@@ -332,6 +338,12 @@ for i in $(seq 1 "$CI_COUNT"); do
   registered=$(in_ci "if test -f '$registration'; then echo yes; else echo no; fi")
   case "$registered" in yes|no) ;; *) echo "could not check $name's registration" >&2; exit 1 ;; esac
   if [[ $registered == yes ]]; then
+    if [[ $name == "$QUEUE_RUNNER" ]]; then
+      # Relabelled after every runner is checked, so a conflict found later changes nothing.
+      queue_runner_id=$(on_host "\$HOME/.local/bin/tart exec $VM cat $registration" |
+        python3 -c 'import json, sys; print(json.load(sys.stdin.buffer)["agentId"])')
+      [[ $queue_runner_id =~ ^[1-9][0-9]*$ ]] || { echo "no runner id in $registration" >&2; exit 1; }
+    fi
     if [[ $name == "$SIMULATOR_RUNNER" ]]; then
       # The runner's JSON may start with a UTF-8 BOM. Use its actual id even after a rebuild.
       runner_id=$(on_host "\$HOME/.local/bin/tart exec $VM cat $registration" |
@@ -367,3 +379,20 @@ for i in $(seq 1 "$CI_COUNT"); do
   unset token
   echo "   $name: registered at $CI_ORG ($labels)"
 done
+
+# The queue's runner, registered before it was kept for batches: its labels made what QUEUE_LABELS says, by the API
+# (a registration is not redone). Only the labels it should not have are removed, and only the missing one added.
+if [[ -n ${queue_runner_id:-} ]]; then
+  current=$(gh api "orgs/$CI_ORG/actions/runners/$queue_runner_id" --jq '[.labels[].name] | join(",")')
+  for label in ${CI_LABELS//,/ }; do
+    [[ ,$QUEUE_LABELS, == *,$label,* ]] && continue
+    if [[ ,$current, == *,$label,* ]]; then
+      gh api -X DELETE "orgs/$CI_ORG/actions/runners/$queue_runner_id/labels/$label" --silent
+    fi
+  done
+  for label in ${QUEUE_LABELS//,/ }; do
+    [[ ,$current, == *,$label,* ]] && continue
+    gh api -X POST "orgs/$CI_ORG/actions/runners/$queue_runner_id/labels" -f "labels[]=$label" --silent
+  done
+  echo "   $QUEUE_RUNNER: labels $QUEUE_LABELS"
+fi
