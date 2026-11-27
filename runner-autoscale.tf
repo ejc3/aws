@@ -288,6 +288,13 @@ data "archive_file" "runner_webhook" {
       # cheaper mistake. A host whose job ended any other way gets no credential
       # and powers off when its wait ends.
       REUSABLE_CONCLUSIONS = ('success',)
+      # Only a host whose finished job ran this repository's own main is offered another job (#1102).
+      # A job from a pull request, or from any other branch, ran code nobody has reviewed, with
+      # passwordless sudo, on a host whose /mnt/fcvm-btrfs, ~/.cargo and ~/.rustup the next job
+      # inherits; the next one may hold contents: write (kernels.yml) or an environment's secrets.
+      # Such a host powers itself off when its wait ends, so every job after it starts clean.
+      TRUSTED_RUN_EVENTS = ('push', 'schedule', 'workflow_dispatch')
+      TRUSTED_BRANCH = 'main'
       # The completed handler has no queue view of its own. It asks GitHub for at
       # most this long, and a look it did not finish hands out nothing.
       QUEUE_CHECK_BUDGET_SECONDS = 8
@@ -1492,7 +1499,8 @@ data "archive_file" "runner_webhook" {
                   < datetime.now(timezone.utc).timestamp() + CLAIM_MARGIN_SECONDS):
               return {'statusCode': 200, 'body': f'Not reusing {name}: its reuse window has closed'}
           handoff = {'workflow_job': {key: job.get(key) for key in
-                                      ('runner_name', 'runner_id', 'labels', 'conclusion', 'completed_at')}}
+                                      ('runner_name', 'runner_id', 'run_id', 'labels', 'conclusion',
+                                       'completed_at')}}
           try:
               lambda_client.invoke(FunctionName=os.environ.get('REUSE_FUNCTION', ''),
                                    InvocationType='Event', Payload=json.dumps(handoff))
@@ -1500,6 +1508,31 @@ data "archive_file" "runner_webhook" {
               print(f'Could not hand {name} to the reuse function: {type(e).__name__}')
               return {'statusCode': 503, 'body': f'Not reusing {name}: the reuse function is unavailable'}
           return {'statusCode': 202, 'body': f'Checking {name} for reuse'}
+
+      def trusted_run(pat, run_id):
+          """None when run_id ran REPO's own TRUSTED_BRANCH from a TRUSTED_RUN_EVENTS event, else why not.
+
+          Read from GitHub's run record, never from the delivery, and every failure is a no:
+          a host is offered again only on proof that the job it ran was not someone's branch.
+          """
+          if not isinstance(run_id, int) or isinstance(run_id, bool) or run_id <= 0:
+              return 'the job names no workflow run'
+          if not pat:
+              return 'no GitHub token to read its workflow run'
+          try:
+              run = github_get(pat, f'https://api.github.com/repos/{REPO}/actions/runs/{run_id}')
+          except Exception as e:
+              return f'its workflow run could not be read ({type(e).__name__})'
+          run = run if isinstance(run, dict) else {}
+          head_repository = run.get('head_repository')
+          head_repository = head_repository if isinstance(head_repository, dict) else {}
+          if run.get('id') != run_id:
+              return 'its workflow run could not be read (another run answered)'
+          if run.get('event') not in TRUSTED_RUN_EVENTS:
+              return f'its run came from a {run.get("event")!r} event'
+          if run.get('head_branch') != TRUSTED_BRANCH or head_repository.get('full_name') != REPO:
+              return f'its run was not {REPO} {TRUSTED_BRANCH}'
+          return None
 
       def reuse_handler(event, context):
           """Entry point of github-runner-reuse, which runs this same source."""
@@ -1571,6 +1604,11 @@ data "archive_file" "runner_webhook" {
               return {'statusCode': 200, 'body': (f'Not reusing {name}: not a running {arch} '
                                                   f'{STREAM_PROTOCOL} host under {MAX_REUSE_AGE_HOURS}h')}
 
+          pat = get_github_pat()
+          untrusted = trusted_run(pat, job.get('run_id'))
+          if untrusted:
+              return {'statusCode': 200, 'body': f'Not reusing {name}: {untrusted}'}
+
           if not open_reuse_window(instance_id, runner_id, until):
               return {'statusCode': 200,
                       'body': f'Not reusing {name}: its registration moved on or is already held'}
@@ -1581,7 +1619,6 @@ data "archive_file" "runner_webhook" {
           on_demand_host = get_tag(host, 'Market') == 'on-demand'
           wanted = None
           if not capacity['degraded'] and capacity['counted'] < max_runners:
-              pat = get_github_pat()
               if pat:
                   wanted = queued_jobs_at_least(pat, arch, absorbable + 1, on_demand_host)
           if wanted is not True:
