@@ -2096,6 +2096,17 @@ the apex MX, SPF TXT and Cloudflare's DKIM key stay Email Routing's.
   `aws sesv2 put-account-details --production-access-enabled ...` in an OrganizationAccountAccessRole session there; AWS
   reviews it), then the Gmail setting. Until then the account is in the SES sandbox and sends only to verified addresses.
 
+### Costume Party's staging host (dolphin-costume.tf here, costume.tf in dolphin-aws)
+
+Costume Party moved into dolphin-labs (dolphin-labs#2503); its server runs in the Dolphin account as one Fargate task
+(dolphin-aws `costume.tf`) whose connector dials out. Here: the tunnel `dolphin-costume`, the hostname
+`costume-stage.dolphin-labs.dev`, and Access. `/lattice/native/login` (the path every phone build signs in at) is behind
+Access for the owner alone and checked again at the connector; `^/(lattice/v1/costume(/|$)|healthz$)` goes to the server
+on 127.0.0.1:8081 with its own token; everything else is a 404 (the server's task-local handover route is never routed).
+The connector token goes to the Dolphin account as `costume/nonprod/tunnel` (key `TUNNEL_TOKEN`), and the host's values
+(the Access team and audience tag, no credential) to its `/costume/stage` parameter. `scripts/test-dolphin-costume.py`
+pins all of it.
+
 ### The Dolphin Redis (dolphin-redis.tf here, redis.tf in dolphin-aws)
 
 dolphin-labs' Redis moved off the Vercel Marketplace (an Upstash store on the retired dolphin-labs Vercel team, which
