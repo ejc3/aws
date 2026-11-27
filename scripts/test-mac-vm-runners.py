@@ -23,7 +23,10 @@ config = json.loads(os.environ["FAKE_RUNNERS"])
 args = sys.argv[1:]
 if Path(sys.argv[0]).name == "ssh":
     cmd = args[-1].replace("\\", "")
-    if "install-ci-sim-slots.sh" in cmd:
+    if "rustup toolchain install" in cmd:
+        assert "rustup-init" in cmd and "shasum -a 256 -c" in cmd and ".cargo/bin" in cmd
+        print("test: installed Rust " + re.search(r"toolchain install '?([0-9.]+)", cmd)[1])
+    elif "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
             assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
                                                          "ci/ci-coreaudio-check", "ci/swift-test-shim",
@@ -126,6 +129,24 @@ class MiniRunnerRouting(unittest.TestCase):
             "mini-1 gww-ios,mini,ios-pool", "mini-2 gww-ios,mini,ios-pool",
             "mini-3 gww-ios,mini,ios-pool", "mini-4 gww-ios,mini,ios-pool,mini-simulator",
         ])
+
+    def test_rust_alone_needs_no_registration_slots_or_vm_setup(self):
+        result, calls = self.run_setup(mode="--rust")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "test: installed Rust 1.99.1")
+        self.assertEqual(calls, [])
+
+    def test_provisioning_the_runners_installs_rust_too(self):
+        result, _ = self.run_setup(fresh=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("test: installed Rust 1.99.1", result.stdout)
+
+    def test_one_mode_at_a_time_and_rust_only_for_ci(self):
+        for argv in (["ci", "--lan", "test", "--rust", "--runners"], ["ci", "--lan", "test", "--rust", "--simulator-slots"],
+                     ["skevh", "--lan", "test", "--rust"]):
+            result = subprocess.run(["bash", SCRIPT, *argv], capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 2, argv)
+            self.assertIn("usage:", result.stderr)
 
     def test_slot_update_needs_no_registration_or_vm_setup(self):
         result, calls = self.run_setup(mode="--simulator-slots")

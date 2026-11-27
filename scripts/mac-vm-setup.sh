@@ -13,6 +13,9 @@
 # repository can select any runner in the shared iOS pool or require the mini using its host label.
 # To install only the test slots and the hourly disk cleaner (ci-disk-clean) on a running CI VM:
 #   scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots
+# To install only Rust (dolphin-labs' pinned channel with the Apple targets, for jobs that build a crate as an Apple
+# static library), which is safe while the runners build (it adds to the guest's ~/.cargo and nothing else):
+#   scripts/mac-vm-setup.sh ci --lan mini-lan --rust
 # Registration tokens are minted with this Mac's gh login (it needs the admin:org scope: gh auth refresh -s admin:org)
 # and reach the VM on stdin only. Existing services keep running while GitHub reconciles the simulator label.
 #
@@ -39,27 +42,38 @@ CI_LABELS=gww-ios,mini,ios-pool
 CI_COUNT=4
 SIMULATOR_RUNNER=mini-4
 SIMULATOR_LABEL=mini-simulator
+# Rust in ci, as dolphin-labs' ci-vm.sh installs it on the MacBook's VM: rustup's own installer, pinned (its version and
+# the SHA-256 rust-lang publishes for its aarch64-apple-darwin build), and the channel dolphin-labs' rust-toolchain.toml
+# pins (keep in step; a build on another pin still has rustup fetch it). The targets are the device, the simulator and
+# the Mac, both architectures, and wasm.
+RUST_CHANNEL=1.99.1
+RUSTUP_VERSION=1.29.3
+RUSTUP_SHA256=63752a1919a3a4793173ec70f8f212621a7ce38ba6a246095984482f4de20f9f
+RUST_TARGETS=aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-apple-darwin,x86_64-apple-darwin,wasm32-unknown-unknown
 # The runner, pinned: dolphin-labs' ci-vm.sh's version and the SHA-256 GitHub publishes for it.
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
 
-usage() { echo "usage: mac-vm-setup.sh ci|skevh --lan SSH_DEST [--runners|--simulator-slots]" >&2; exit 2; }
+usage() { echo "usage: mac-vm-setup.sh ci|skevh --lan SSH_DEST [--runners|--simulator-slots|--rust]" >&2; exit 2; }
 VM=${1:-}
 shift || true
 LAN=""
 RUNNERS=""
 SLOTS_ONLY=""
+RUST_ONLY=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --lan) [ $# -ge 2 ] || usage; LAN=$2; shift 2 ;;
     --runners) RUNNERS=1; shift ;;
     --simulator-slots) SLOTS_ONLY=1; shift ;;
+    --rust) RUST_ONLY=1; shift ;;
     *) usage ;;
   esac
 done
 [[ $LAN =~ ^[A-Za-z0-9][A-Za-z0-9.@_-]*$ ]] || usage
-[ -z "$RUNNERS$SLOTS_ONLY" ] || [ "$VM" = ci ] || usage
-[ -z "$RUNNERS" ] || [ -z "$SLOTS_ONLY" ] || usage
+[ -z "$RUNNERS$SLOTS_ONLY$RUST_ONLY" ] || [ "$VM" = ci ] || usage
+# At most one of the three modes.
+[ $(( ${#RUNNERS} + ${#SLOTS_ONLY} + ${#RUST_ONLY} )) -le 1 ] || usage
 case "$VM" in
   # The two guests' RAM stays resident on the host (a guest fills it with its own cache), so together they must
   # leave macOS room beside its ~7 GB wired: at 36 + 16 of 64 GB the host ran out and hung (2026-11-22, #999).
@@ -84,6 +98,29 @@ install_sim_slots() {
 }
 if [ -n "$SLOTS_ONLY" ]; then
   install_sim_slots
+  exit 0
+fi
+
+# rustup into the guest's ~/.cargo (where rustup expects itself: one installed elsewhere exits 1 after a toolchain
+# install), the pinned channel and targets, and ~/.cargo/bin in .zprofile, where the runners take their PATH.
+install_rust() {
+  on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
+    set -e
+    if [ ! -x \$HOME/.cargo/bin/rustup ]; then
+      curl -fsSL -o /tmp/rustup-init https://static.rust-lang.org/rustup/archive/$RUSTUP_VERSION/aarch64-apple-darwin/rustup-init
+      echo '$RUSTUP_SHA256  /tmp/rustup-init' | shasum -a 256 -c - >/dev/null
+      chmod +x /tmp/rustup-init
+      /tmp/rustup-init -y --profile minimal --default-toolchain none --no-modify-path >/dev/null
+      rm /tmp/rustup-init
+    fi
+    grep -q '.cargo/bin' ~/.zprofile 2>/dev/null || echo 'export PATH=\"\$HOME/.cargo/bin:\$PATH\"' >> ~/.zprofile
+    export PATH=\"\$HOME/.cargo/bin:\$PATH\"
+    rustup toolchain install '$RUST_CHANNEL' --profile minimal --component rustfmt,clippy --target $RUST_TARGETS >/dev/null
+    echo \"   \$(rustup run '$RUST_CHANNEL' rustc --version)\"
+  ")"
+}
+if [ -n "$RUST_ONLY" ]; then
+  install_rust
   exit 0
 fi
 
@@ -239,6 +276,7 @@ in_ci "
   export PATH=\"/opt/homebrew/opt/node@22/bin:\$PATH\"
   echo \"   node \$(node --version), \$(python3.12 --version), xcodegen \$(xcodegen --version | tail -1), pod \$(pod --version)\"
 "
+install_rust
 # A keychain of the builds' own: the runners run without a login session's unlocked keychain, so signing would ask a
 # person ("User interaction is not allowed"). Its password is made here and kept only in the VM.
 in_ci "

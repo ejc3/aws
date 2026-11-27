@@ -1845,6 +1845,13 @@ shows the test slot holders. To update the shim on a running CI VM without touch
 registrations or restarting listeners, run `scripts/mac-vm-setup.sh ci --lan mini-lan --simulator-slots`
 from the Mac on its LAN. The runners already search `/usr/local/bin` ahead of `/usr/bin`.
 
+**The CI VM has Rust** (rustup 1.29.3, pinned by its SHA-256, into `admin`'s `~/.cargo`, with dolphin-labs'
+pinned channel and the Apple targets), so a job building a crate as an Apple static library (dolphin-labs' `costume-apple`)
+downloads no toolchain. `--runners` installs it; to add it to a running VM without touching anything else, run
+`scripts/mac-vm-setup.sh ci --lan mini-lan --rust` from the Mac on its LAN. Keep `RUST_CHANNEL` in step with
+dolphin-labs' `rust-toolchain.toml` (a build on another pin still has rustup fetch that one). The MacBook's VM gets the
+same from dolphin-labs' `apps/native/scripts/ci-vm.sh rust`.
+
 **The CI VM cleans its own disk** (#1021). On 2026-11-23 its 200 GB data volume had 1.6 GB free and iOS builds
 failed with "No space left on device": 44 runner simulators held 64 GB, DerivedData 7.3 GB and the temp folders
 7.7 GB, and nothing in the VM cleaned any of it. The same install as the test slots (`--runners` or
