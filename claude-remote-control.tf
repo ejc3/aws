@@ -258,7 +258,11 @@ chmod 755 /usr/local/bin/fcvm-claude-active-repos
 cat > /etc/systemd/system/fcvm-claude-rc.service <<'UNIT'
 [Unit]
 Description=Claude Code remote control for active FCVM repositories
-After=network-online.target
+# After dev-selfupdate: at boot it may install a new launcher and a new agent-active-dirs.
+# Without this ordering the two ran side by side, and on 2026-11-26 the launcher read the
+# old picker's folder list two minutes before the new one was installed, reopening 32 idle
+# sessions the new picker leaves out. A no-change self-update takes seconds; an apply, minutes.
+After=network-online.target dev-selfupdate.service
 Wants=network-online.target
 
 [Service]
@@ -296,7 +300,10 @@ UNIT
 systemctl daemon-reload
 # Enable even before the personal Claude login exists. ExecCondition skips cleanly while
 # auth is absent/expired, and a later boot retries without another provisioning pass.
-systemctl enable --now fcvm-claude-rc.service >/dev/null 2>&1 || true
+# --no-block: this script runs inside dev-selfupdate's start job, which the unit is ordered
+# after, so a blocking start would wait on itself until dev-selfupdate timed out.
+systemctl enable fcvm-claude-rc.service >/dev/null 2>&1 || true
+systemctl start --no-block fcvm-claude-rc.service >/dev/null 2>&1 || true
 
 # Nothing automatic restarts this box's sessions. After unattended-upgrades updates a library,
 # needrestart restarts every service that still maps the old copy. This unit holds ubuntu's
