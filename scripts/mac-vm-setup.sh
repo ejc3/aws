@@ -68,7 +68,7 @@ RUST_TARGETS=aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios,aarch64-ap
 RUNNER_VERSION=2.338.0
 RUNNER_SHA256=df4cebda25c86a886ed204e49fee63f5c2e7cec5f447b5c98440a826bbdf9df2
 
-usage() { echo "usage: mac-vm-setup.sh ci|skevh --lan SSH_DEST [--runners|--simulator-slots|--rust]" >&2; exit 2; }
+usage() { echo "usage: mac-vm-setup.sh ci|skevh|air-ci --lan SSH_DEST [--runners|--simulator-slots|--rust]" >&2; exit 2; }
 VM=${1:-}
 shift || true
 LAN=""
@@ -85,7 +85,9 @@ while [ $# -gt 0 ]; do
   esac
 done
 [[ $LAN =~ ^[A-Za-z0-9][A-Za-z0-9.@_-]*$ ]] || usage
-[ -z "$RUNNERS$SLOTS_ONLY$RUST_ONLY" ] || [ "$VM" = ci ] || usage
+# The CI VMs: ci on the Mac mini, air-ci on the MacBook Air.
+ci_vm() { [ "$VM" = ci ] || [ "$VM" = air-ci ]; }
+[ -z "$RUNNERS$SLOTS_ONLY$RUST_ONLY" ] || ci_vm || usage
 # At most one of the three modes.
 [ $(( ${#RUNNERS} + ${#SLOTS_ONLY} + ${#RUST_ONLY} )) -le 1 ] || usage
 case "$VM" in
@@ -93,6 +95,17 @@ case "$VM" in
   # leave macOS room beside its ~7 GB wired: at 36 + 16 of 64 GB the host ran out and hung (2026-11-22, #999).
   ci) CPU=9 MEMORY_MB=28672 DISK_GB=200 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro' ;;
   skevh) CPU=4 MEMORY_MB=16384 DISK_GB=100 DIRS='' ;;
+  # The MacBook Air (M2: 4 performance and 4 efficiency cores, 24 GB, 228 GB with about 83 GB free; owner,
+  # 2026-11-28: "not a personal machine"): one VM, one runner. 6 cores and 18 GB leave the host 2 cores and 6 GB.
+  # One runner, not two: a swift test wants every core it can get, and this VM is two thirds of the mini's ci.
+  air-ci) CPU=6 MEMORY_MB=18432 DISK_GB=120 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro'
+    CI_RUNNERS="air-1"
+    # The VM was first set up by hand with dolphin-labs' apps/native/scripts/ci-vm.sh (2026-11-27), which registered
+    # air-ci-1 with ios-pool alone: retired for air-1.
+    RETIRED_RUNNERS="air-ci-1"
+    QUEUE_RUNNER=""
+    SIMULATOR_RUNNER=""
+    ;;
   *) usage ;;
 esac
 on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "$@"; }
@@ -161,7 +174,7 @@ command -v tart >/dev/null || { echo "no tart in ~/.local/bin on the mini (READM
 if tart get "$VM" >/dev/null 2>&1; then
   echo "$VM exists; kept as it is"
 else
-  [ "$VM" != ci ] || [ -d "\$HOME/Applications/Xcode.app" ] || { echo "ci needs ~/Applications/Xcode.app on the mini" >&2; exit 1; }
+  [ -z "$DIRS" ] || [ -d "\$HOME/Applications/Xcode.app" ] || { echo "$VM needs ~/Applications/Xcode.app on $LAN" >&2; exit 1; }
   tart clone "$BASE" "$VM"
   tart set "$VM" --cpu $CPU --memory $MEMORY_MB --disk-size $DISK_GB
   echo "$VM cloned: $CPU cores, $MEMORY_MB MB, $DISK_GB GB"
@@ -173,6 +186,12 @@ on_host bash -s <<REMOTE
 set -euo pipefail
 LABEL=com.ejcampbell.tart.$VM
 PLIST=\$HOME/Library/LaunchAgents/\$LABEL.plist
+# A VM first set up by dolphin-labs' ci-vm.sh (air-ci) already runs under its LaunchAgent: kept, so the VM and the job
+# on its runner are not restarted, and never a second agent running the same VM.
+if [ -f "\$HOME/Library/LaunchAgents/com.gamesworthwatching.ci-vm.$VM.plist" ] && [ ! -f "\$PLIST" ]; then
+  echo "kept: com.gamesworthwatching.ci-vm.$VM (dolphin-labs' ci-vm.sh) already runs $VM"
+  exit 0
+fi
 mkdir -p "\$HOME/Library/LaunchAgents" "\$HOME/Library/Logs"
 DIRS="$DIRS"
 DIRS=\${DIRS:+<string>\$(eval echo "\$DIRS")</string>}

@@ -1830,6 +1830,12 @@ with the `games-worth-watching/app-store-connect` key, and `POST /v1/devices` if
 signing (`-allowProvisioningUpdates`) adds a registered phone to the development profile on the next build. Keep
 UDIDs out of this repository.
 
+**The MacBook Air** (owner, 2026-11-28: "not a personal machine") is CI capacity too: its Tart VM `air-ci` (6
+cores, 18 GB, the Air's own copy of Xcode mounted read-only) runs one runner, `air-1`, with the shared pool's
+labels (`ios-pool`, `mini`, `gww-ios`) and `ios-queue`. Keep it with `scripts/mac-vm-setup.sh air-ci --lan air --runners`;
+it retires `air-ci-1`, which dolphin-labs' `ci-vm.sh` registered by hand, and keeps that script's LaunchAgent for the
+VM rather than adding a second. `--simulator-slots` installs the guest's disk cleaner there as on the mini.
+
 **The CI VM's runners** are `mini-3` and `mini-4` (owner, 2026-11-28: two, not four; `mini-1` and `mini-2` are
 retired, and the script deregisters them). To rebuild them, run
 `scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
