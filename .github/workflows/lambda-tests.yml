@@ -438,6 +438,8 @@ jobs:
 
       - name: "app accounts (modules/app-account) and the Family account: guardrails, one exact apply role, Access on the sign-in path only, the API's paths exactly (family-account.tf)"
         run: python3 -S -B scripts/test-app-account.py
+      - name: Family staging image promotion, retry recovery and CI permissions (offline)
+        run: python3 -S -B scripts/test-family-stage-api.py
       - name: "Costume Party's staging host: Access on the sign-in path only, the server's paths exactly, the token to the Dolphin account (dolphin-costume.tf)"
         run: python3 -S -B scripts/test-dolphin-costume.py
 
