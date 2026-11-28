@@ -31,10 +31,11 @@ import {
 }
 
 data "archive_file" "runner_loss" {
-  count       = var.enable_github_runner ? 1 : 0
-  type        = "zip"
-  source_file = "${path.module}/runner-loss/collector.py"
-  output_path = "${path.module}/.terraform/runner-loss.zip"
+  count            = var.enable_github_runner ? 1 : 0
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/runner-loss/collector.py"
+  output_path      = "${path.module}/.terraform/runner-loss.zip"
 }
 
 resource "aws_iam_role" "runner_loss" {

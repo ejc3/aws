@@ -245,9 +245,10 @@ resource "aws_iam_role_policy" "fcvm_coordinator_release_fleet" {
 }
 
 data "archive_file" "fcvm_coordinator_release" {
-  type        = "zip"
-  source_dir  = "${path.module}/fcvm-coordinator-release"
-  output_path = "${path.module}/.terraform/fcvm-coordinator-release.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_dir       = "${path.module}/fcvm-coordinator-release"
+  output_path      = "${path.module}/.terraform/fcvm-coordinator-release.zip"
 }
 
 resource "aws_lambda_function" "fcvm_coordinator_release" {

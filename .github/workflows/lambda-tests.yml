@@ -277,6 +277,9 @@ jobs:
       - name: Boot secrets stay out of traces, readable logs and command lines (offline)
         run: python3 -S -B scripts/test-boot-secret-hygiene.py
 
+      - name: File-based Lambda zips pin their file mode (offline)
+        run: python3 -S -B scripts/test-archive-file-mode.py
+
       - name: Games multiplayer engine sweeper (offline)
         run: python3 -S -B scripts/test-games-mp-sweeper.py
 

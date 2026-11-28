@@ -203,9 +203,10 @@ resource "aws_apigatewayv2_route" "pc_enroll" {
 # ---------------------------------------------------------------------------------------------------------------------
 
 data "archive_file" "pc_enroll" {
-  type        = "zip"
-  source_file = "${path.module}/scripts/pc-enroll.mjs"
-  output_path = "${path.module}/.terraform/pc-enroll.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/scripts/pc-enroll.mjs"
+  output_path      = "${path.module}/.terraform/pc-enroll.zip"
 }
 
 resource "aws_cloudwatch_log_group" "pc_enroll" {
