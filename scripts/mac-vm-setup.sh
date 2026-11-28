@@ -41,7 +41,11 @@ CI_ORG=dolphin-labs-hq
 # ios-queue is on every mini: dolphin-labs' merge queue batches ask for it (docs/MERGE_QUEUE.md, "Runners: batches
 # first"), so a batch runs on any free mini.
 CI_LABELS=gww-ios,mini,ios-pool,ios-queue
-CI_COUNT=4
+# Two runners in this VM (owner, 2026-11-28), not four: four jobs at once on one VM made a 28-minute swift test run
+# past its 2-hour limit (dolphin-labs batch #2689). mini-3 takes queue batches alone; mini-4 is the shared runner and
+# the one simulator. mini-1 and mini-2 are retired: deregistered, their service and directory removed.
+CI_RUNNERS="mini-3 mini-4"
+RETIRED_RUNNERS="mini-1 mini-2"
 # One runner kept for those batches alone: it carries ios-queue and nothing else of ours. Not ios-pool, so no
 # dolphin-labs PR job takes it; not mini, so no dolphin-maps job (they ask for mini) takes it; not gww-ios. A batch never
 # waits behind other jobs for every Mac.
@@ -320,8 +324,7 @@ on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
   fi
 ")"
 registered_ids=""
-for i in $(seq 1 "$CI_COUNT"); do
-  name="mini-$i"
+for name in $CI_RUNNERS; do
   labels=$CI_LABELS
   [[ $name == "$QUEUE_RUNNER" ]] && labels=$QUEUE_LABELS
   if [[ $name == "$SIMULATOR_RUNNER" ]]; then
@@ -403,3 +406,41 @@ for entry in $registered_ids; do
   done
   if [[ $name == "$QUEUE_RUNNER" ]]; then echo "   $name: labels $QUEUE_LABELS"; fi
 done
+
+# Retired runners: deregistered cleanly, so no job is offered to a runner that is gone and no label is left with only a
+# dead holder (every label a workflow asks for stays on mini-3, mini-4 or the MacBook). One running a job is left for a
+# re-run once it ends.
+retire_pending=""
+for name in $RETIRED_RUNNERS; do
+  registration="/Users/admin/runners/$name/.runner"
+  present=$(in_ci "if test -f '$registration'; then echo yes; else echo no; fi")
+  case "$present" in yes|no) ;; *) echo "could not check $name's registration" >&2; exit 1 ;; esac
+  if [[ $present == no ]]; then echo "   $name: retired"; continue; fi
+  id=$(on_host "\$HOME/.local/bin/tart exec $VM cat $registration" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin.buffer)["agentId"])')
+  [[ $id =~ ^[1-9][0-9]*$ ]] || { echo "no runner id in $registration" >&2; exit 1; }
+  if [[ $(gh api "orgs/$CI_ORG/actions/runners/$id" --jq .busy 2>/dev/null || echo gone) == true ]]; then
+    echo "   $name: running a job; run this again to retire it once that ends" >&2
+    retire_pending=1
+    continue
+  fi
+  token=$(gh api -X POST "orgs/$CI_ORG/actions/runners/remove-token" --jq .token) && [ -n "$token" ] ||
+    { echo "no removal token for $CI_ORG: gh needs the admin:org scope" >&2; exit 1; }
+  printf '%s' "$token" |
+    on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
+      set -e
+      token=\$(cat)
+      cd ~/runners/$name
+      ./svc.sh stop >/dev/null 2>&1 || true
+      ./svc.sh uninstall >/dev/null 2>&1 || true
+      ./config.sh remove --token \"\$token\" >/dev/null
+      cd .. && rm -rf $name
+    ")"
+  unset token
+  # A registration config.sh could not remove (GitHub unreachable from the guest): removed from here.
+  if gh api "orgs/$CI_ORG/actions/runners/$id" --jq .id >/dev/null 2>&1; then
+    gh api -X DELETE "orgs/$CI_ORG/actions/runners/$id" --silent
+  fi
+  echo "   $name: retired"
+done
+[[ -z $retire_pending ]] || exit 4
