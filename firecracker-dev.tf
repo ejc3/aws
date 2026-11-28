@@ -406,13 +406,13 @@ resource "aws_ssm_association" "firecracker_dev_secondary_ipv4" {
 }
 
 # fcvm's arm64 host kernel (ejc3/fcvm#659). An L1 guest kernel newer than its L0 host wedges L2,
-# so the box that runs nested arm64 guests takes the host kernel fcvm pins before fcvm's
-# guests move to 7.3. Runs once per change of the pinned commit (no schedule); installs and
+# so the box that runs nested arm64 guests takes the host kernel fcvm pins no later than
+# fcvm's guests move to a release. Runs once per change of the pinned commit (no schedule); installs and
 # selects the kernel, and leaves the reboot to the owner, since the box is shared.
 variable "fcvm_host_kernel_commit" {
   description = "ejc3/fcvm commit whose [kernel_profiles.nested.arm64.host_kernel] the dev box installs"
   type        = string
-  default     = "624220f8707472cf01e0c02ceb46101e60e4f600"
+  default     = "5b748c39c7fcc800cb43e158037d48e8a9af1bfb"
 
   validation {
     condition     = can(regex("^[0-9a-f]{40}$", var.fcvm_host_kernel_commit))
