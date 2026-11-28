@@ -1,9 +1,11 @@
 """Promote one immutable commit image and roll only the Family staging service."""
 import os
 import re
+import time
 
 REPO = "family/api"
 STAGE_TAG = "family-stage"
+ECS_PROPAGATION_SECONDS = 300
 SERVICE = {"cluster": "family", "service": "family"}
 
 
@@ -14,7 +16,7 @@ def primary(service):
     return deployments[0]
 
 
-def release(event, ecr, ecs, receipts, repo_uri):
+def release(event, ecr, ecs, receipts, repo_uri, *, now=time.time, sleep=time.sleep):
     if not isinstance(event, dict) or event.keys() != {"commit", "digest", "run_number"}:
         raise ValueError("Expected only commit, digest and run_number")
     commit, digest, run_number = event["commit"], event["digest"], event["run_number"]
@@ -43,12 +45,17 @@ def release(event, ecr, ecs, receipts, repo_uri):
     if source["imageId"]["imageDigest"] != digest:
         raise ValueError("The requested digest does not match the immutable commit tag")
     previous_digest = image(STAGE_TAG)["imageId"]["imageDigest"]
-    result = ecs.describe_services(cluster=SERVICE["cluster"], services=[SERVICE["service"]])
-    if result.get("failures") or len(result["services"]) != 1:
-        raise ValueError("Could not find the Family staging service")
-    service = result["services"][0]
-    if service["status"] != "ACTIVE" or service["desiredCount"] != 1:
-        raise ValueError("Family staging must be active with one desired task")
+
+    def service_state():
+        result = ecs.describe_services(cluster=SERVICE["cluster"], services=[SERVICE["service"]])
+        if result.get("failures") or len(result["services"]) != 1:
+            raise ValueError("Could not find the Family staging service")
+        service = result["services"][0]
+        if service["status"] != "ACTIVE" or service["desiredCount"] != 1:
+            raise ValueError("Family staging must be active with one desired task")
+        return service
+
+    service = service_state()
     definition = ecs.describe_task_definition(taskDefinition=service["taskDefinition"])["taskDefinition"]
     api_images = [c["image"] for c in definition["containerDefinitions"] if c["name"] == "api"]
     if definition["family"] != "family" or api_images != [f"{repo_uri}:{STAGE_TAG}"]:
@@ -69,21 +76,36 @@ def release(event, ecr, ecs, receipts, repo_uri):
         # A retry, or another run for the same live image, needs no new deployment.
         record["deployment_id"] = current["id"]
     else:
+        resuming = "baseline" in prior and prior["digest"] == digest and (same_run or previous_digest == digest)
         if not same_run:
-            receipts.put_item(Item=record)
+            # A newer run for the same image adopts an ambiguous earlier submission.
+            # Fence the earlier run while keeping its persisted observation window.
+            pending = {k: prior[k] for k in ("baseline", "attempted_at")} if resuming else {}
+            receipts.put_item(Item={**record, **pending})
         if previous_digest != digest:
-            if same_run and "baseline" in prior:
+            if resuming:
                 raise ValueError("The staging tag moved during the release; run the latest main workflow")
             ecr.put_image(repositoryName=REPO, imageTag=STAGE_TAG, imageDigest=digest,
                           imageManifest=source["imageManifest"], imageManifestMediaType=source["imageManifestMediaType"])
 
-        # Persist the previous deployment before the non-idempotent ECS call. If its
-        # acknowledgement is lost, a retry can recognize the new primary deployment.
-        baseline = prior.get("baseline") if same_run else None
-        if baseline is None or current.get("rolloutState") == "FAILED":
+        # UpdateService has no idempotency token and DescribeServices is eventually
+        # consistent. Reconcile an unacknowledged submission before considering a
+        # second force deployment, including after a Lambda timeout or restart.
+        baseline = prior["baseline"] if resuming else current["id"]
+        if resuming and current["id"] == baseline:
+            for delay in (1, 2, 4):
+                sleep(delay)
+                observed = service_state()
+                if observed["taskDefinition"] != service["taskDefinition"]:
+                    raise RuntimeError("The staging task definition changed during reconciliation; retry")
+                current = primary(observed)
+                if current["id"] != baseline:
+                    break
+            if current["id"] == baseline and now() - prior["attempted_at"] < ECS_PROPAGATION_SECONDS:
+                raise RuntimeError("The ECS submission is uncertain; retry after its five-minute propagation window")
+        if current["id"] == baseline or current.get("rolloutState") == "FAILED":
             baseline = current["id"]
-            receipts.put_item(Item={**record, "baseline": baseline})
-        if current["id"] == baseline:
+            receipts.put_item(Item={**record, "baseline": baseline, "attempted_at": int(now())})
             started = ecs.update_service(**SERVICE, forceNewDeployment=True)["service"]
             current = primary(started)
             if current["id"] == baseline:

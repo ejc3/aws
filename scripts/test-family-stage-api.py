@@ -23,6 +23,8 @@ class StageRelease(unittest.TestCase):
         self.deployment = "ecs-svc/100"
         self.rollout = "COMPLETED"
         self.running_image = REPO + ":family-stage"
+        self.now = 1000
+        self.delays = []
         self.event = {"commit": COMMIT, "digest": DIGEST, "run_number": 20}
         self.ecr, self.ecs, self.table = Mock(), Mock(), Mock()
         self.table.get_item.side_effect = self.read
@@ -72,8 +74,13 @@ class StageRelease(unittest.TestCase):
         self.rollout = "IN_PROGRESS"
         return {"service": self.service("family", ["family"])["services"][0]}
 
+    def wait(self, seconds):
+        self.delays.append(seconds)
+        self.now += seconds
+
     def invoke(self, event=None):
-        return module.release(self.event if event is None else event, self.ecr, self.ecs, self.table, REPO)
+        return module.release(self.event if event is None else event, self.ecr, self.ecs, self.table, REPO,
+                              now=lambda: self.now, sleep=self.wait)
 
     def test_commit_promoted_and_only_the_single_service_rolled(self):
         result = self.invoke()
@@ -92,6 +99,8 @@ class StageRelease(unittest.TestCase):
         with self.assertRaises(TimeoutError):
             self.invoke()
         self.assertEqual(self.record["baseline"], "ecs-svc/100")
+        self.now += 301
+
         def lost_result(**args):
             self.update(**args)
             raise TimeoutError("lost acknowledgement")
@@ -102,6 +111,32 @@ class StageRelease(unittest.TestCase):
         self.assertEqual(self.invoke()["deployment_id"], "ecs-svc/101")
         self.ecs.update_service.assert_not_called()
         self.ecr.put_image.assert_called_once()
+
+    def test_lost_response_and_a_stale_primary_are_reconciled_without_another_roll(self):
+        stale = self.service("family", ["family"])
+        def lost_reply(**args):
+            self.update(**args)
+            raise TimeoutError("accepted, response lost")
+        self.ecs.update_service.side_effect = lost_reply
+        with self.assertRaises(TimeoutError):
+            self.invoke()
+        fresh = self.service("family", ["family"])
+        self.ecs.describe_services.side_effect = [stale, stale, fresh]
+        self.assertEqual(self.invoke()["deployment_id"], "ecs-svc/101")
+        self.ecs.update_service.assert_called_once()
+        self.assertEqual(len(self.delays), 2)
+
+    def test_ambiguous_roll_is_not_sent_again_on_stale_reads_inside_the_grace_period(self):
+        self.ecs.update_service.side_effect = TimeoutError("no response")
+        with self.assertRaises(TimeoutError):
+            self.invoke()
+        # A newer manual run for the same image must also reconcile the old submission.
+        with self.assertRaisesRegex(RuntimeError, "uncertain"):
+            self.invoke({**self.event, "run_number": 21})
+        self.ecs.update_service.assert_called_once()
+        self.assertEqual(self.record["run_number"], 21)
+        self.assertTrue(self.delays)
+        self.assertLess(sum(self.delays), 30)
 
     def test_retag_failure_does_not_roll_and_can_be_retried(self):
         self.ecr.put_image.side_effect = TimeoutError()
