@@ -33,6 +33,18 @@ class TokenTests(unittest.TestCase):
         self.assertNotIn("write", code(tok).lower())
 
 
+class LifecycleTests(unittest.TestCase):
+    def test_only_the_provider_call_log_expires(self):
+        rules = block("cloudflare_r2_bucket_lifecycle", "dolphin_labs_live_logs")
+        self.assertIn("bucket_name = cloudflare_r2_bucket.dolphin_labs_live_logs.name", rules)
+        # One expiry, on the provider-call log's prefix: the capture's logs under live/ are kept.
+        self.assertEqual(re.findall(r"delete_objects_transition", rules), ["delete_objects_transition"])
+        self.assertEqual(re.findall(r'conditions = \{ prefix = "([^"]*)" \}', rules), ["", "provider-calls/"])
+        self.assertIn("max_age = 400 * 24 * 3600", rules)
+        # R2's default rule, which a managed lifecycle would otherwise remove.
+        self.assertIn("abort_multipart_uploads_transition", rules)
+
+
 class SecretTests(unittest.TestCase):
     def test_value_goes_only_to_the_dolphin_accounts_container(self):
         ver = block("aws_secretsmanager_secret_version", "dolphin_labs_live_logs_read")
