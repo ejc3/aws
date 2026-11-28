@@ -5,6 +5,9 @@
 # work volume, so eight parallel jobs can run at once.
 #
 #   pbox flavors      the menu: each flavor's vCPU, memory, local disk, what it is for, rough price
+#   pbox mac status|quote|up|ssh|workspace
+#                     use the shared EC2 Mac. Check status and quote first. A new host needs the
+#                     owner's approval for the 24-hour minimum. See 'pbox mac up --help'.
 #   pbox up [N] FLAVOR
 #                     launch box 1 (or N, 1-8) in the home AZ as FLAVOR (also --flavor FLAVOR).
 #                     A FLAVOR IS REQUIRED: pick the smallest that fits the work's shape (CPU-,
@@ -120,6 +123,10 @@
 # person's own key (fetched once into ~/.ssh/member-box from Secrets Manager).
 set -uo pipefail
 
+if [[ ${1:-} == mac ]]; then
+  shift
+  exec macpbox "$@"
+fi
 
 # THE FLAVOR MENU (pbox-flavors.tf has the same lists, which IAM allows exactly; scripts/test-pbox-flavors.py keeps the
 # two equal). One line per flavor: name, vCPU, memory GiB, local NVMe (TB, at least; "-" for none promised), an
@@ -227,6 +234,7 @@ print_menu() {
   done < <(flavor_lines)
   say ""
   say "  Prices are approximate (us-east-2c, 2026-10); each launch prints the live spot price of the type it tries."
+  say "  macOS builds: $SELF mac status for the shared EC2 Mac, $SELF mac quote for the 24-hour minimum cost."
 }
 # Which key reaches the box, by what the caller actually holds:
 #   - a dev box holds dev_hop and nothing else that reaches another host (dev-hop-key.tf);

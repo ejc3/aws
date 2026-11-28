@@ -514,8 +514,8 @@ terraform apply
 ```
 
 Then confirm the SNS email subscription. Do not leave placeholder secret/parameter values
-in a live account. Temporary EC2 Mac builds use the owner-approved `macpbox` lease below;
-an ordinary Terraform apply never allocates a billed Mac host.
+in a live account. Ordinary Terraform applies provision the Mac launch template. Temporary EC2
+Mac builds use the owner-approved `pbox mac` lease below.
 
 ## Fleet
 
@@ -800,7 +800,7 @@ also lists the copy in `windows_host_amis`.
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number (`pbox up FLAVOR`: any flavor but kvm). Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. At most eight healthy ARM64 and four x86 runners; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
-| `macpbox` | `us-west-2b`, owner-approved `mac-m4pro.metal` Dedicated Host | Disposable 200 GB encrypted gp3 root and local SSD scratch | Shared temporary macOS build host. Terraform owns its launch template and cleanup; only an explicitly approved admin launcher allocates a 24-hour lease. |
+| `pbox mac` | `us-west-2b`, owner-approved `mac-m4pro.metal` Dedicated Host | Disposable 200 GB encrypted gp3 root and local SSD scratch | Shared temporary macOS build host. Terraform owns its launch template and cleanup; only an explicitly approved admin launcher allocates a 24-hour lease. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
 the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
@@ -1187,28 +1187,37 @@ launching it and running browser trials can incur charges.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
-`macpbox status` discovers the shared build host and `macpbox quote` reads current AWS
-Dedicated Host pricing. The CLI is installed on both jumpboxes, ARM, x86, and the Next.js
-host and containers. `/infra/macpbox` in `us-west-1` holds public discovery metadata; no
+Run `pbox mac status` to see whether the shared Oregon M4 Pro is already allocated, and
+`pbox mac quote` for the current hourly rate and 24-hour minimum. The `pbox mac` commands
+call the existing `macpbox` launcher. Both spellings work on the jumpboxes, ARM, x86 and the
+Next.js host and containers. `/infra/macpbox` in `us-west-1` holds public discovery metadata; no
 Terraform state, credentials, or personal Mac login is needed to discover it.
 
-Reuse an active lease: `macpbox ssh` opens it, and `macpbox workspace NAME` creates a
-validated directory for that agent's work. Dev roles can inspect pricing and connect with
-their existing `~/.ssh/dev_hop` key; they cannot allocate a host, launch a Mac, pass a role,
+To reuse a running Mac, create a workspace with a unique task name and connect to it.
+
+```sh
+pbox mac workspace ios-build-123
+pbox mac ssh
+# In the Mac shell, load the task's environment and enter its workspace.
+source /Users/ec2-user/work/ios-build-123/env
+cd /Users/ec2-user/work/ios-build-123/repos
+```
+
+Dev roles can inspect pricing and connect with their existing `~/.ssh/dev_hop` key; they cannot allocate a host, launch a Mac, pass a role,
 or ask the jumpbox to execute a command. A stopped or missing Mac is reported, never
 silently allocated or restarted by a status, SSH, or workspace command.
 Installing the CLI does not grant a member account the owner's dev-hop key; an account
 without an authorized SSH identity can still inspect status and pricing.
 SSH is admitted only from the managed IPv4 addresses of those five AWS hosts;
 Next.js containers use their host address. From a personal device, use an
-existing SSH route to one of the AWS clients and run `macpbox ssh` there.
+existing SSH route to one of the AWS clients and run `pbox mac ssh` there.
 
 Every **new** lease needs the owner's direct approval in the current conversation, after
 showing the quote and minimum charge. The current Oregon M4 Pro host price is **$1.97/hour,
 with a $47.28 minimum for 24 hours**, plus the 200 GB EBS root, public IPv4, and any data
 transfer. Refresh the quote before seeking approval. Billing starts when `AllocateHosts`
 succeeds, including if macOS fails to boot. Stopping or terminating the instance does not
-release the host. The admin-only `macpbox up` helper is the explicit ephemeral-compute
+release the host. The admin-only `pbox mac up` command is the explicit ephemeral-compute
 exception: Terraform manages the durable template, networking, minimal instance profile,
 and cleanup, without managing an allocated host, instance, or EIP. An ordinary apply
 therefore cannot recreate a paid lease or reap one in use. No automatic renewal and no
@@ -1216,7 +1225,7 @@ separate host per agent.
 
 After that direct approval, run the launcher on the **primary `jumpbox`** using its
 instance-role session, with both explicit flags:
-`macpbox up --approved-minimum-24h --approved-usd-hour CAP`, replacing `CAP` with the
+`pbox mac up --approved-minimum-24h --approved-usd-hour CAP`, replacing `CAP` with the
 approved current hourly price. A higher live quote is refused. These flags record the
 operator's decision; they never substitute for the owner's conversation approval.
 The primary is the only paid launch executor, so separate agents or admin boxes cannot
@@ -1226,7 +1235,7 @@ if the primary is unavailable, recover it before starting another lease.
 The cleanup checks every ten minutes. Its deadline is the host's actual allocation time
 plus 24 hours, not a boot timestamp. It terminates the leased instance and retries host
 release while AWS scrubs the Mac; scrubbing can take up to 4.5 hours. A pending cleanup
-is not a confirmed release: check `macpbox status` until AWS reports the host released.
+is not a confirmed release: check `pbox mac status` until AWS reports the host released.
 Run that check on the primary jumpbox while AWS still retains the released host: the
 admin CLI records the exact host/account/region release observation in its existing
 local lease journal. That proof remains usable after AWS's recent-host history expires.
@@ -2236,6 +2245,9 @@ just the narrow wake command. The root EBS volume survives the stop; `/mnt/io` d
 not.
 
 ## On-demand parallel compute
+
+For an EC2 Mac, start with `pbox mac status` and `pbox mac quote`. See the
+[Mac lease and workspace instructions](#temporary-ec2-mac-builds-macpbox).
 
 Eight independent boxes (`parallel-box`, `parallel-box-2` .. `parallel-box-8`), each with its own
 persistent work volume (300 GB for box 1, 100 GB for the others), so eight jobs can run at once.

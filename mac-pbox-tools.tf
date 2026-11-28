@@ -55,6 +55,27 @@ locals {
     if ! cmp -s "$tmp" /usr/local/bin/macpbox; then
       mv -f "$tmp" /usr/local/bin/macpbox
     fi
+    # The admin hosts have no Linux pbox. Publish a regular launcher without replacing
+    # a dev installer that wins the race, including one that installs pbox as a symlink.
+    if [ ! -e /usr/local/bin/pbox ] && [ ! -L /usr/local/bin/pbox ]; then
+      (
+        shim=$(mktemp /usr/local/bin/.pbox-mac.XXXXXXXX)
+        trap 'rm -f "$shim"' EXIT
+        cat > "$shim" <<'PBOX'
+    #!/bin/sh
+    if [ "$1" = mac ]; then
+      shift
+      exec /usr/local/bin/macpbox "$@"
+    fi
+    echo 'usage: pbox mac <command> [args...]' >&2
+    exit 2
+    PBOX
+        chmod 755 "$shim"
+        if ! ln -T "$shim" /usr/local/bin/pbox; then
+          [ -e /usr/local/bin/pbox ] || [ -L /usr/local/bin/pbox ]
+        fi
+      )
+    fi
     # The existing read-only /opt/nextjs-ct bind exposes this file to all containers.
     # Run ln INSIDE a running container's namespace; never follow a container-controlled
     # /usr/local/bin from host root. Cold containers get the same link from provision.
