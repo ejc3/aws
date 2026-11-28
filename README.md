@@ -107,6 +107,28 @@ Terraform writes a mandatory state backup. Do not repeat the command once state 
 `ejc3/cloudflare`, and never apply a plan made before the migration. The reverse command
 is required when the stack eventually returns to the upstream provider namespace.
 
+### Family API staging releases
+
+Merging `ejc3/constellation` main runs its Family API deployment. The GitHub
+`family-stage` environment supplies `FAMILY_STAGE_DEPLOY_ROLE_ARN`. AWS verifies
+the GitHub-issued environment subject, repository identity and main branch before
+issuing short-lived credentials in the Family account. The ECR push permission
+covers tags in `family/api`, including the rolling tag. The workflow publishes
+an ARM64 image tagged with its full commit SHA to `family/api` and invokes
+`family-stage-api-release` with the commit, image digest and GitHub workflow run number.
+
+The release function checks the commit tag against that digest, moves the
+`family-stage` tag, and requests a fresh deployment of the existing
+`family/family` ECS service. A durable receipt records which deployment the run
+started and rejects stale retries. Its response acknowledges the roll request.
+The workflow verifies the commit and Family route on the public staging hostname.
+
+For the initial cutover, seed the rolling tag from the running API task's image
+digest. Apply the Family app stack from constellation to make only that ECR tag
+mutable and point the staging task at it. The release function refuses to roll
+a task that still uses the old fixed tag. To roll back after a failed smoke
+check, revert the change on main and deploy that commit through the same workflow.
+
 ### PatchDoctor: autonomous critical security patches
 
 The owner authorizes PatchDoctor to investigate verified **CRITICAL CVEs**, apply
@@ -395,6 +417,10 @@ populate it with `put-secret-value` on stdin after applying. Tools fetch it when
 `STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
 The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
 
+The Meshy AI key (build-time 3D models and textures, from text or an image) is `games/meshy-api-key` in the same
+region, on exactly Stability's terms: the same two dev roles, populated on stdin with `put-secret-value`, fetched when
+needed as `MESHY_API_KEY`, never written into shell profiles, apps or state.
+
 The run.cloud key (cloud iOS simulators, the fallback when the Macs are busy) is
 `run-cloud/api-key` in the same region, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same two
 dev-role readers. Terraform creates its empty container; populate it on stdin after applying:
@@ -510,8 +536,8 @@ terraform apply
 ```
 
 Then confirm the SNS email subscription. Do not leave placeholder secret/parameter values
-in a live account. Temporary EC2 Mac builds use the owner-approved `macpbox` lease below;
-an ordinary Terraform apply never allocates a billed Mac host.
+in a live account. Ordinary Terraform applies provision the Mac launch template. Temporary EC2
+Mac builds use the owner-approved `pbox mac` lease below.
 
 ## Fleet
 
@@ -790,13 +816,13 @@ also lists the copy in `windows_host_amis`.
 | `jumpbox-2` | `us-west-1`, on-demand `t4g.micro` | Protected 20 GB encrypted root | Fully Terraform-bootstrapable backup admin host with the same IAM reach. |
 | `fcvm-metal-arm` | `us-west-1a`, persistent Spot `m8gd.metal-24xl` | 1,000 GiB backed-up EBS root, including `/home/ubuntu`; local NVMe is ephemeral | 96-vCPU ARM64 Firecracker/KVM and nested-virtualization work. Uses the 12-hour idle-stop policy. |
 | `fcvm-metal-x86` | `us-west-1`, persistent Spot `c5d.metal` | 300 GB EBS root; 3.6 TB local NVMe is ephemeral | x86 Firecracker/KVM work. Uses the 12-hour idle-stop policy. |
-| `nextjs-dev` | `us-west-1`, on-demand `m7g.2xlarge` (8 vCPU / 32 GiB) | 900 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup; 16 GiB host swap | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
+| `nextjs-dev` | `us-west-1`, on-demand `m7g.2xlarge` (8 vCPU / 32 GiB) | 1,100 GiB encrypted EBS root (including Dolphin's `/home/ejc3`), protected by AWS Backup; 16 GiB host swap | Always-on shared development box. Deliberately not Spot and not idle-stopped. |
 | `io-box` | `us-west-2d`, persistent Spot `i8ge.large` | 20 GB EBS root; 1.25 TB shared NVMe is ephemeral | Private NFS bulk scratch at `/mnt/io`. Uses a 12-hour multi-metric idle policy and returns with an empty scratch disk after every stop. |
 | `parallel-box`, `parallel-box-2` .. `parallel-box-8` | `us-east-2c` (`/infra/parallel-box`), one-time Spot, 32 to 192 vCPU by the flavor `pbox up` must name (`pbox-flavors.tf`) | Protected EBS each (300 GB for `parallel-box`, 100 GB for `parallel-box-2` .. `parallel-box-8`) at `/mnt/work`; roots are disposable | Temporary fan-out compute, eight independent boxes so eight jobs can run at once; the us-east-2 spot quota (3,072 vCPU, `ohio-pbox.tf`) fits all eight at 192 vCPU beside the runners and members' boxes. Each terminates after 30 idle minutes; `pbox` recreates them. When the home AZ has no capacity, `pbox up N FLAVOR --fallback` (or `--regions r1,r2`) launches in another US AZ (`pbox-fallback.tf`: us-east-1, us-east-2, us-west-1, us-west-2) with a FRESH, empty `/mnt/work` deleted with the box and no `/srv/io`. |
 | `gpu-box`, `gpu-box-2` .. `gpu-box-4` | `us-west-2` (any AZ), on-demand `g4dn.xlarge` or the next small NVIDIA size | None; disposable 100 GB root | Browser-game performance tests on a real GPU (dev boxes render WebGL in software). Four independent slots, launched from `nextjs-dev` with `gbox up [1-4]`; each terminates after 30 idle minutes or 4 hours, whichever comes first. |
 | `wbox-<member>`, `pbox-<member>`, `gbox-<member>` | per member (`member-boxes.tf`: colton, connor, colin, skevh): one-time Spot `g4dn.xlarge` Windows in `us-west-1a`; one-time Spot Graviton in `us-east-2c`; on-demand small NVIDIA in `us-west-2a` | Protected 50 GB `D:` per wbox (Roblox and its caches) and 100 GB `/mnt/work` per pbox; the rest is disposable | Each member's own three boxes, each with a fixed private IP. The member runs the same `wbox` / `pbox` / `gbox` commands from their own account, with no slot number (`pbox up FLAVOR`: any flavor but kvm). Reaped when idle (wbox 1h below 15%, the others 30 minutes) and at 6h (wbox, pbox) or 4h (gbox) from launch. |
 | GitHub runners | `us-west-1`, one-time Spot metal | Disposable | Webhook-launched ARM64/x86 runners. At most eight healthy ARM64 and four x86 runners; idle, expired, and wedged runners terminate. Maximum instance lifetime 13h30m (drains from 12h). |
-| `macpbox` | `us-west-2b`, owner-approved `mac-m4pro.metal` Dedicated Host | Disposable 200 GB encrypted gp3 root and local SSD scratch | Shared temporary macOS build host. Terraform owns its launch template and cleanup; only an explicitly approved admin launcher allocates a 24-hour lease. |
+| `pbox mac` | `us-west-2b`, owner-approved `mac-m4pro.metal` Dedicated Host | Disposable 200 GB encrypted gp3 root and local SSD scratch | Shared temporary macOS build host. Terraform owns its launch template and cleanup; only an explicitly approved admin launcher allocates a 24-hour lease. |
 
 The primary VPC is `10.0.0.0/16` in `us-west-1`. A private inter-region VPC peer reaches
 the `172.31.0.0/16` default VPC in `us-west-2`; NFS is never exposed publicly. Only the dev
@@ -1183,28 +1209,37 @@ launching it and running browser trials can incur charges.
 
 ### Temporary EC2 Mac builds: `macpbox`
 
-`macpbox status` discovers the shared build host and `macpbox quote` reads current AWS
-Dedicated Host pricing. The CLI is installed on both jumpboxes, ARM, x86, and the Next.js
-host and containers. `/infra/macpbox` in `us-west-1` holds public discovery metadata; no
+Run `pbox mac status` to see whether the shared Oregon M4 Pro is already allocated, and
+`pbox mac quote` for the current hourly rate and 24-hour minimum. The `pbox mac` commands
+call the existing `macpbox` launcher. Both spellings work on the jumpboxes, ARM, x86 and the
+Next.js host and containers. `/infra/macpbox` in `us-west-1` holds public discovery metadata; no
 Terraform state, credentials, or personal Mac login is needed to discover it.
 
-Reuse an active lease: `macpbox ssh` opens it, and `macpbox workspace NAME` creates a
-validated directory for that agent's work. Dev roles can inspect pricing and connect with
-their existing `~/.ssh/dev_hop` key; they cannot allocate a host, launch a Mac, pass a role,
+To reuse a running Mac, create a workspace with a unique task name and connect to it.
+
+```sh
+pbox mac workspace ios-build-123
+pbox mac ssh
+# In the Mac shell, load the task's environment and enter its workspace.
+source /Users/ec2-user/work/ios-build-123/env
+cd /Users/ec2-user/work/ios-build-123/repos
+```
+
+Dev roles can inspect pricing and connect with their existing `~/.ssh/dev_hop` key; they cannot allocate a host, launch a Mac, pass a role,
 or ask the jumpbox to execute a command. A stopped or missing Mac is reported, never
 silently allocated or restarted by a status, SSH, or workspace command.
 Installing the CLI does not grant a member account the owner's dev-hop key; an account
 without an authorized SSH identity can still inspect status and pricing.
 SSH is admitted only from the managed IPv4 addresses of those five AWS hosts;
 Next.js containers use their host address. From a personal device, use an
-existing SSH route to one of the AWS clients and run `macpbox ssh` there.
+existing SSH route to one of the AWS clients and run `pbox mac ssh` there.
 
 Every **new** lease needs the owner's direct approval in the current conversation, after
 showing the quote and minimum charge. The current Oregon M4 Pro host price is **$1.97/hour,
 with a $47.28 minimum for 24 hours**, plus the 200 GB EBS root, public IPv4, and any data
 transfer. Refresh the quote before seeking approval. Billing starts when `AllocateHosts`
 succeeds, including if macOS fails to boot. Stopping or terminating the instance does not
-release the host. The admin-only `macpbox up` helper is the explicit ephemeral-compute
+release the host. The admin-only `pbox mac up` command is the explicit ephemeral-compute
 exception: Terraform manages the durable template, networking, minimal instance profile,
 and cleanup, without managing an allocated host, instance, or EIP. An ordinary apply
 therefore cannot recreate a paid lease or reap one in use. No automatic renewal and no
@@ -1212,7 +1247,7 @@ separate host per agent.
 
 After that direct approval, run the launcher on the **primary `jumpbox`** using its
 instance-role session, with both explicit flags:
-`macpbox up --approved-minimum-24h --approved-usd-hour CAP`, replacing `CAP` with the
+`pbox mac up --approved-minimum-24h --approved-usd-hour CAP`, replacing `CAP` with the
 approved current hourly price. A higher live quote is refused. These flags record the
 operator's decision; they never substitute for the owner's conversation approval.
 The primary is the only paid launch executor, so separate agents or admin boxes cannot
@@ -1222,7 +1257,7 @@ if the primary is unavailable, recover it before starting another lease.
 The cleanup checks every ten minutes. Its deadline is the host's actual allocation time
 plus 24 hours, not a boot timestamp. It terminates the leased instance and retries host
 release while AWS scrubs the Mac; scrubbing can take up to 4.5 hours. A pending cleanup
-is not a confirmed release: check `macpbox status` until AWS reports the host released.
+is not a confirmed release: check `pbox mac status` until AWS reports the host released.
 Run that check on the primary jumpbox while AWS still retains the released host: the
 admin CLI records the exact host/account/region release observation in its existing
 local lease journal. That proof remains usable after AWS's recent-host history expires.
@@ -1727,7 +1762,12 @@ missed a key-up (Win+L, an elevated window in front), refusing every tool until 
 `scripts/windows-pc-setup.sh colin-pc`, run on a jumpbox, puts the PC on the route and installs Windows-MCP: OpenSSH keys
 only and on loopback only with its inbound firewall rule off, the clients' keys in a managed block of
 `administrators_authorized_keys`, the pinned `cloudflared` (verified on the PC), the token through ssh stdin, the
-connector task, and Windows-MCP. A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
+connector task, and Windows-MCP. It also installs Google's `agy` CLI and the fleet's always-on model guide
+for Antigravity, Claude Code and Codex in Colin's Windows profile. The `antigravity-colin-pc` association retries hourly
+through fcvm-arm's existing SSH route, so an offline PC receives them when both machines are reachable. Colin signs in
+with his own Google account. From an already-open Windows shell with an older PATH, use
+`& "$env:LOCALAPPDATA\agy\bin\agy.exe"` in PowerShell. A fresh Windows login picks up `agy` by name.
+A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
 since it ends the sessions through it.
 
 **Never a key of the PC's on `ubuntu`** (AGENTS.md, "Machines outside AWS"). The first-contact reverse tunnel below ends
@@ -1926,11 +1966,20 @@ any answer counts as alive, and a probe that fails is logged once and never caus
 running, since a job that touches audio is already stuck. It restarts at most once every 15 minutes, then asks again.
 It logs outcomes and minutes only, to `/Library/Logs/ci-coreaudio-check.log`.
 
+**The CI VM keeps its clock right and its runners running** (#1148). On 2026-11-28 the Air's `air-ci` VM was 17
+minutes behind after the host slept. Every token its runner signed had already expired, GitHub answered with its generic
+"registration has been deleted", and the runner stopped for good (`no retry needed`), its LaunchAgent loaded but not
+running, for seven hours. The same install puts `ci-runner-keepalive` beside the others and loads the root LaunchDaemon
+`com.ejcampbell.ci-runner-keepalive`, every 5 minutes and at load. Each run sets the clock from `time.apple.com` with
+`sntp -sS`, then kickstarts each of the CI user's `actions.runner.*` LaunchAgents that launchd has loaded but is not
+running, at most once every 15 minutes per runner. A runner stopped on purpose (`svc.sh stop` unloads it) is left
+alone. It logs corrections of 5 seconds or more and each kickstart, to `/Library/Logs/ci-runner-keepalive.log`.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
-require the mini. The Default runner group allows three private repositories, `dolphin-labs`,
-`dolphin-films` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
+require the mini. The Default runner group allows four private repositories, `dolphin-labs`,
+`dolphin-films`, `dolphin-maps` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
 match. An organization runner administrator can grant access with
 `gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
 `gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
@@ -2065,6 +2114,25 @@ Kept so the next machine goes faster.
   `launchctl` fell through to the real one and booted out the real `com.ejcampbell.macbook-ssh.cloudflared`. The test
   now pins `launchctl` to its stub. If it happens again: `launchctl bootstrap gui/$(id -u)
   ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`.
+
+## Google Antigravity CLI
+
+`agy` is installed in `~/.local/bin` for `ubuntu` on both jumpboxes and both metal
+boxes, and in the `ejc3`, `colton`, `connor` and `colin` Next.js containers. The Mac setup installs it for
+`mac`, `air`, `mini`, `colton-mac` and `colin-mac`. Run `agy --version` in the account that will use it.
+While fcvm-arm is running it checks those five Macs hourly through their existing SSH routes, so a sleeping
+laptop can receive the install when it wakes. Each account manages its Google sign-in separately. The CLI
+updates itself on use.
+
+The operator installs the reviewed model guide manually on both administration hosts. The other selected
+accounts receive it through provisioning. Codex and Claude use their global instruction files even when a
+repository has its own root. Antigravity reads its own global rule in `~/.gemini/config/rules/`.
+
+On first installation in a development profile with no CLI settings file, the installer creates
+`~/.gemini/antigravity-cli/settings.json` with `toolPermission` set to `always-proceed`. A normal `agy` session then runs
+tools without an approval prompt, subject to the account's ask and deny rules. Choose another
+Tool Permission in `/config` to change it. Later installs preserve that choice. On an administration
+host, set the preference in the account directly after reviewing it.
 
 ## Start a Codex session
 
@@ -2240,6 +2308,9 @@ not.
 
 ## On-demand parallel compute
 
+For an EC2 Mac, start with `pbox mac status` and `pbox mac quote`. See the
+[Mac lease and workspace instructions](#temporary-ec2-mac-builds-macpbox).
+
 Eight independent boxes (`parallel-box`, `parallel-box-2` .. `parallel-box-8`), each with its own
 persistent work volume (300 GB for box 1, 100 GB for the others), so eight jobs can run at once.
 From ARM or x86:
@@ -2249,6 +2320,8 @@ pbox flavors               # the menu: vCPU, memory, local disk, what each is fo
 pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
+pbox capacity 3 kvm-64     # score Spot locations for a 64-core KVM host without launching
+pbox up 3 kvm-64 --regions us-east-1,us-west-2  # try home first, then these regions with disposable storage
 pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
 pbox up 3 kvm-192 --local-nvme  # the same on 192 vCPU
 pbox up 3 kvm-96 --local-nvme --min-memory 384  # of those, only the types with at least 384 GiB
@@ -2273,8 +2346,14 @@ the next run would remove.
 `up` needs a flavor (`pbox-flavors.tf`), and with none it prints the menu and launches nothing. A flavor is a shape and
 a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` (8 GiB, memory-bound work), `storage`
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and
-`kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
+`kvm-64`, `kvm-96` and `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often.
+
+For a single VM or a test lane, `kvm-64` tries `c7g.metal` (128 GiB), `m7g.metal` (256 GiB), then
+`r7g.metal` (512 GiB). All three use Graviton3 and EBS scratch. The fifth candidate for `kvm-96`, `r8g.metal-24xl`, also uses EBS
+and has 768 GiB of RAM. CPU KVM launches try the home AZ first, where the slot keeps its persistent `/mnt/work`.
+Pass `--fallback` to try all configured fallback regions, or `--regions` to limit that search. A fallback box gets a
+fresh `/mnt/work` that is deleted with the box. Copy results out before termination.
 
 Use `--local-nvme` with `pbox up N kvm-96` or `pbox up N kvm-192` when a workload needs both KVM and disposable local
 disks. With kvm-96 the flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; with kvm-192 only `c8gd.metal-48xl`,

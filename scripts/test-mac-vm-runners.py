@@ -29,7 +29,7 @@ if Path(sys.argv[0]).name == "ssh":
     elif "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
             assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
-                                                         "ci/ci-coreaudio-check", "ci/swift-test-shim",
+                                                         "ci/ci-coreaudio-check", "ci/ci-runner-keepalive", "ci/swift-test-shim",
                                                          "install-ci-sim-slots.sh"}
         print("test: installed CI test slots")
     elif "Print :CFBundleShortVersionString" in cmd:
@@ -40,13 +40,16 @@ if Path(sys.argv[0]).name == "ssh":
         name = re.search(r"/runners/(mini-[1-4]|air-1|air-ci-1)/", cmd)[1]
         if config.get("ssh_failed") and name == "mini-4":
             sys.exit(255)
-        print("no" if config.get("fresh") else "yes")
+        print("no" if config.get("fresh") or name in config.get("absent", []) else "yes")
     elif "cat /Users/admin/runners/" in cmd:
         name = re.search(r"/runners/(mini-[1-4]|air-1|air-ci-1)/", cmd)[1]
         agent = {"mini-4": 717, "air-1": 801, "air-ci-1": 12709}.get(name) or 700 + int(name[-1])
         sys.stdout.buffer.write(b'\xef\xbb\xbf' + json.dumps({"agentId": agent}).encode())
     elif "./config.sh remove" in cmd:
-        print("retire", re.search(r"runners/(mini-[1-4]|air-ci-1)", cmd)[1], file=open(os.environ["CALLS"], "a"))
+        name = re.search(r"runners/(mini-[1-4]|air-ci-1)", cmd)[1]
+        print("retire", name, file=open(os.environ["CALLS"], "a"))
+        if name in config.get("remove_fails", []):
+            sys.exit(1)
     elif "./config.sh --unattended" in cmd:
         print(*re.search(r"--name (mini-[1-4]|air-1) --labels ([a-z0-9,-]+)", cmd).groups(),
               file=open(os.environ["CALLS"], "a"))
@@ -217,19 +220,31 @@ class MiniRunnerRouting(unittest.TestCase):
         result, calls = self.run_setup(vm="air-ci", labels={"801": "gww-ios,mini,ios-pool,ios-queue"})
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["retire air-ci-1"])
+        # air-ci-1 still holds a job: air-1 is neither registered nor started beside it in the same VM (#1120).
+        result, calls = self.run_setup(vm="air-ci", absent=["air-1"], busy={"12709": "true"})
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("air-ci-1: running a job; run this again once it ends (its replacement is not registered yet)",
+                      result.stderr)
         self.assertNotIn("mini-", "\n".join(calls))
 
     def test_retired_runners_are_deregistered_and_a_busy_one_waits_for_a_rerun(self):
         done = dict(slot="717\tmini-4\tonline\ttrue\ttrue", labels=self.DONE)
-        # mini-1 is running a job: left registered, mini-2 retired, and the run says to come back (exit 4).
+        # mini-1 is running a job: the run stops before anything changes and says to come back (exit 4).
         result, calls = self.run_setup(busy={"701": "true"}, **done)
         self.assertEqual(result.returncode, 4)
-        self.assertEqual(calls, ["retire mini-2"])
-        self.assertIn("mini-1: running a job; run this again", result.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("mini-1: running a job; run this again once it ends", result.stderr)
         # A registration config.sh could not remove is deleted through the API.
         result, calls = self.run_setup(stuck=["702"], **done)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["retire mini-1", "retire mini-2", "deregister orgs/dolphin-labs-hq/actions/runners/702"])
+        # config.sh remove failing in the guest stops nothing: the host deletes that registration and still retires the
+        # other runner.
+        result, calls = self.run_setup(remove_fails=["mini-1"], stuck=["701"], **done)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["retire mini-1", "deregister orgs/dolphin-labs-hq/actions/runners/701", "retire mini-2"])
+        self.assertIn("mini-1: config.sh remove failed in the guest", result.stderr)
         # Already retired (no registration left in the guest): nothing to do.
         result, calls = self.run_setup(fresh=True)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -315,21 +330,32 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(daemon["ProgramArguments"], [str(check)])
         self.assertEqual((daemon["StartInterval"], daemon["RunAtLoad"], daemon["ProcessType"]), (300, True, "Standard"))
         self.assertNotIn("UserName", daemon)  # root: restarting coreaudiod needs it
+        keep = self.daemons / "com.ejcampbell.ci-runner-keepalive.plist"
+        with keep.open("rb") as f:
+            keeper = plistlib.load(f)
+        keepalive = self.mac_build.with_name("ci-runner-keepalive")
+        self.assertTrue(os.access(keepalive, os.X_OK))
+        self.assertEqual(keeper["ProgramArguments"], [str(keepalive)])
+        self.assertEqual((keeper["StartInterval"], keeper["RunAtLoad"]), (300, True))
+        self.assertEqual(keeper["EnvironmentVariables"], {"CI_KEEPALIVE_USER": pwd.getpwuid(uid).pw_name})
+        self.assertNotIn("UserName", keeper)  # root: setting the clock needs it
         self.assertEqual([c for c in self.launchctl() if not c.startswith("print")],
                          ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}",
+                          "bootout system/com.ejcampbell.ci-runner-keepalive", f"bootstrap system {keep}",
                           f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
         # Unchanged and loaded: nothing is reloaded.
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Disk cleaner unchanged and loaded", result.stdout)
         self.assertIn("coreaudiod check unchanged and loaded", result.stdout)
-        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
+        self.assertIn("Runner keepalive unchanged and loaded", result.stdout)
+        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 3)
         # A changed plist is replaced and reloaded once more, after the old instance has finished exiting.
         plist.write_text(plist.read_text().replace("3600", "60"))
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(c.startswith("bootstrap gui") for c in self.launchctl()), 2)
-        self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 1)
+        self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 2)
         # A changed daemon plist is replaced and reloaded too, after its old instance has gone.
         audio.write_text(audio.read_text().replace("300", "60"))
         before = len(self.launchctl())
@@ -580,6 +606,15 @@ class SimulatorSlots(unittest.TestCase):
                 data = subprocess.check_output(cmd, env=self.env, text=True, timeout=5)
                 self.assertEqual(json.loads(data), ["1", "1", ["test"]])
 
+
+
+class SigningKeychain(unittest.TestCase):
+    def test_the_keychain_is_unlocked_before_its_settings_change(self):
+        # A locked keychain's settings change waits on a password dialog nobody answers (2026-11-28).
+        script = SCRIPT.read_text()
+        self.assertIn("security unlock-keychain -p", script)
+        unlock = script.index('security unlock-keychain -p \\"\\$(cat \\$HOME/.ci-keychain-password)\\" \\$kc')
+        self.assertLess(unlock, script.index("security set-keychain-settings -lut 21600"))
 
 if __name__ == "__main__":
     unittest.main(buffer=True)

@@ -1063,7 +1063,7 @@ class TerraformTests(unittest.TestCase):
         self.launcher_policy = tf_block(GAMES, "aws_iam_role_policy", "games_mp_launcher")
 
     def test_one_function_per_environment_each_serialized_on_its_own(self):
-        self.assertIn('source_file = "${path.module}/games-multiplayer/launch.py"', GAMES)
+        self.assertRegex(GAMES, r'source_file\s+= "\$\{path\.module\}/games\-multiplayer/launch\.py"')
         self.assertRegex(self.fn, r'handler\s*=\s*"launch\.lambda_handler"')
         self.assertIn("for_each = local.games_mp_launch_environments\n", self.fn)
         self.assertRegex(self.fn, r'function_name\s*=\s*"games-mp-launch-\$\{each\.key\}"')

@@ -386,6 +386,15 @@ Set-Content -Path $marker -Value $McpCommit -Encoding ascii
 'windows-mcp: listening on 127.0.0.1:8000, refusing requests without its key'
 PS
 )"
+# Install in Colin's own profile through the existing PowerShell channel. A failed optional download must not
+# interrupt first-time connector setup. The hourly antigravity-colin-pc association retries the same installer.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+installer=$(base64 -w0 < "$script_dir/windows/antigravity-install.ps1")
+model_guide=$(base64 -w0 < "$script_dir/antigravity-models.md")
+if ! on_pc "$(cat "$script_dir/windows/antigravity-stdin.ps1")" <<< "$installer"$'\n'"$model_guide"; then
+  echo "WARNING: Antigravity install failed; the hourly colin-pc setup will retry it." >&2
+fi
+
 # Last: restarting the connector ends every session through it, so nothing may follow it.
 echo "7/7 the connector: SYSTEM task 'cloudflared $ALIAS', at boot"
 on_pc "$(ps_vars Alias "$ALIAS" CfdSha "$CFD_SHA256_WINDOWS_AMD64")

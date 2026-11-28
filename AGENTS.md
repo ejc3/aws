@@ -313,7 +313,7 @@ from a snapshot copy of each work volume (no fresh snapshot, as the owner accept
 the old volumes, the move snapshots, the launch templates and the security group are deleted, so the Ohio volumes are the
 only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `/infra/parallel-box`, published from
 `local.parallel_box_region`. `pbox up N FLAVOR` needs a flavor (`pbox-flavors.tf`: compute, general, memory or storage at 32,
-48, 96 or 192 vCPU, kvm-96/kvm-192, kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
+48, 96 or 192 vCPU, kvm-64/kvm-96/kvm-192, kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
 only the fallback sites offer (a GPU flavor implies `--fallback`: every region that offers the type), or kvm-gpu-96, an x86 g4dn.metal with eight T4, at home: the one x86
 type, launched with `--image-id` set to the site's x86_64 build of the same Ubuntu image (published in `/infra/parallel-box`,
 pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=on iommu=pt` and reboots once
@@ -321,7 +321,8 @@ pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=o
 us-west-2 and us-east-1; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
 after their instance is gone (`ec2:CancelSpotInstanceRequests` in `pbox-flavor-types`, never the persistent boxes') and retries once; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
 test keeps them equal); with none it exits 2 and prints the menu. An agent picks the smallest flavor that fits the work's
-shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
+shape and size. For a single nested VM or a unit-test lane, `kvm-64` offers three diskless Graviton3 pools with EBS
+scratch. Use `pbox capacity N kvm-64` to score that pool without launching. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
 --fallback` (or `--regions us-east-1,us-west-2`) then launches at a fallback site (`pbox-fallback.tf`: one per US region,
 every AZ but the home one, best spot placement score first) **with a fresh, empty work volume** that is deleted with the
 box, and no NFS scratch. `pbox capacity FLAVOR` shows the scores; `ip`, `ssh`, `status` and `down` find a box wherever it runs.
@@ -539,8 +540,9 @@ The function serializes against this backend's DynamoDB lock and changes only th
 coordinator image. CI owns that code and therefore its fleet-only runtime capabilities;
 the fleet account still has no path into this account.
 
-**EC2 Mac leases require direct owner approval**: use `macpbox status` / `quote` / `ssh` /
-`workspace` to inspect and reuse the one shared host. Every NEW allocation requires approval
+**EC2 Mac leases require direct owner approval.** Use `pbox mac status` to find the shared
+host and `pbox mac quote` for the current price. On a running Mac, create your task's directory
+with `pbox mac workspace NAME`, then connect with `pbox mac ssh`. Every NEW allocation requires approval
 in the current owner conversation after presenting its current price and 24-hour minimum
 (Oregon M4 Pro currently $1.97/hour, $47.28 minimum, plus EBS, IPv4 and transfer). Billing
 begins at successful host allocation even if instance launch fails; stopping is not release.
@@ -1525,6 +1527,10 @@ Available if a task needs them; neither needs a key on disk.
   generating assets as `STABILITY_API_KEY`; no key in app bundles, profiles or logs.
   Terraform owns only the container and grants. Pricing and capabilities must come from
   the current official API documentation; the web subscription and API credits differ.
+- **Meshy AI** (build-time 3D models and textures, from text or an image; meshy.ai). `games/meshy-api-key` in
+  us-west-1 has the same admin/dev-role read boundary as Stability. Fetch it only when generating assets as
+  `MESHY_API_KEY`, sent to curl on stdin (`-H @-`), never on a command line; no key in app bundles, profiles or logs.
+  Generation spends credits: check the current API docs for prices, and ship the finished assets, not the key.
 
 - **run.cloud** (cloud iOS simulators: create one, install a simulator build, tap, type,
   screenshot, read the pasteboard). The fallback when every Mac simulator is busy.
@@ -2073,6 +2079,11 @@ ejc3/constellation's `infra/apps/family` (from its `infra/modules/app`), applied
   connector's Access rule miss. Family: `family-sync-stage.dolphin-labs.dev`, sign-in at `/family/native/login` for the
   family allowlist, `^/(family/(v1|native)/|healthz$)` to the API on :8081, zero-cache on :4848; the API's `/family/zero/*`
   (zero-cache's calls on the task's localhost) is never routed.
+- **Sending domain (optional, `email.tf`):** an SES domain identity in the app's account with Easy DKIM and a custom MAIL
+  FROM (`bounce.<domain>`), their records in the zone, and the From address in the pointer (`email`). Nothing here can
+  send: the app's repository grants its task role `ses:SendEmail` on that identity, From that address only. Family:
+  `family-mail.dolphin-labs.dev`, its sign-in codes (constellation docs/FAMILY.md, "Family's own sign-in"). Once, by
+  hand: SES production access for the app's account in its region, as for the work address below.
 - **First apply** of a new account: the account first (`-target=module.<app>_account.aws_organizations_account.this`), then
   everything, as for every account.
 - **Tests:** `scripts/test-app-account.py` (offline) pins the module and Family's call, including Family's regexes against

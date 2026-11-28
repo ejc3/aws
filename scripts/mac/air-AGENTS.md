@@ -12,7 +12,8 @@ in ejc3/aws.
 
 - **CI comes first.** The `air-ci` VM and its runner hold most of this Mac's cores and memory: leave them running, and
   never stop, resize or re-clone the VM by hand (the script above does that). Heavy builds of your own go to the Mac
-  mini (`ssh mini`) or a pbox, not here.
+  mini (`ssh mini`) or a pbox, not here. Host Xcode's licence is not accepted, so host `xcodebuild` and host `python3`
+  (the Xcode stub) do not work.
 - **Disk:** a 228 GB disk with no scratch drive, most of it the VM. Put anything you build outside the home directory
   (under `/Users/Shared/agent-work/<task>`), and delete it when you are done. Inside the VM, `ci-disk-clean` keeps the
   runner's caches in check.
@@ -20,10 +21,10 @@ in ejc3/aws.
   `peekaboo` waits while another session holds it. Another agent may be using the screen: look before you take it.
 - **Signing:** run the signing step through `mac-gui [--timeout S] -- CMD`, which reaches the login keychain; plain SSH
   gets `errSecInternalComponent`.
-- Act only in windows you opened; change no account, payment or setting the owner did not ask for.
+- Act only in windows you opened; change no account, payment or setting nobody asked for.
 - **Peekaboo 4:** screenshot with `peekaboo see --no-elements --path FILE` (`image` was removed), keys with
   `peekaboo press cmd+n --app NAME --foreground` (`hotkey` was removed); app switches and raw key presses are refused
   without `--foreground`.
 - **Claude here uses the shared pool** (the `claw-master` agent on `127.0.0.1:8445`, set in `~/.claude/settings.json`).
   The desktop app's Code tab uses it only in a **Local** environment; a cloud environment runs on Anthropic's servers on
-  the owner's own limits.
+  its own limits.

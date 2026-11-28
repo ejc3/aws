@@ -349,9 +349,25 @@ class InstallationTests(unittest.TestCase):
         self.assertIn('systemd-run --machine="$user"', source)
         self.assertIn('/bin/ln -sfn /opt/nextjs-ct/macpbox /usr/local/bin/macpbox', source)
 
-    def test_real_installer_checks_hash_before_atomic_replacement_and_cleans_failure(self):
+    def run_installer(self, root, payload, correct=True):
+        binary = root / "bin"
+        fake = root / "fake"
+        fake.mkdir(exist_ok=True)
+        (fake / "chown").write_text("#!/bin/sh\nexit 0\n")
+        (fake / "chown").chmod(0o755)
         source = (ROOT / "mac-pbox-tools.tf").read_text()
         script = textwrap.dedent(re.search(r'macpbox_tool_install = <<-SH\n(.*?)\n  SH', source, re.S)[1])
+        digest = hashlib.sha256(payload).hexdigest() if correct else "0" * 64
+        rendered = script.replace('${base64encode(file("${path.module}/scripts/macpbox.py"))}', base64.b64encode(payload).decode())
+        rendered = rendered.replace('${substr(filesha256("${path.module}/scripts/macpbox.py"), 0, 12)}', digest[:12])
+        rendered = rendered.replace('${filesha256("${path.module}/scripts/macpbox.py")}', digest)
+        rendered = rendered.replace('${join(" ", local.nextjs_users)}', "")
+        rendered = rendered.replace("/usr/local/bin", str(binary)).replace("/var/lib/nextjs-ct/shared", str(root / "absent-shared"))
+        self.assertNotIn("${", rendered)
+        environment = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ["PATH"])
+        return subprocess.run(["/bin/sh", "-s"], input=rendered, text=True, capture_output=True, env=environment)
+
+    def test_real_installer_checks_hash_before_atomic_replacement_and_cleans_failure(self):
         payload = (ROOT / "scripts/macpbox.py").read_bytes()
         for correct in (False, True):
             with self.subTest(correct=correct), tempfile.TemporaryDirectory() as location:
@@ -360,22 +376,56 @@ class InstallationTests(unittest.TestCase):
                 binary.mkdir()
                 target = binary / "macpbox"
                 target.write_text("previous executable\n")
-                fake = root / "fake"
-                fake.mkdir()
-                (fake / "chown").write_text("#!/bin/sh\nexit 0\n")
-                (fake / "chown").chmod(0o755)
-                digest = hashlib.sha256(payload).hexdigest() if correct else "0" * 64
-                rendered = script.replace('${base64encode(file("${path.module}/scripts/macpbox.py"))}', base64.b64encode(payload).decode())
-                rendered = rendered.replace('${substr(filesha256("${path.module}/scripts/macpbox.py"), 0, 12)}', digest[:12])
-                rendered = rendered.replace('${filesha256("${path.module}/scripts/macpbox.py")}', digest)
-                rendered = rendered.replace('${join(" ", local.nextjs_users)}', "")
-                rendered = rendered.replace("/usr/local/bin", str(binary)).replace("/var/lib/nextjs-ct/shared", str(root / "absent-shared"))
-                self.assertNotIn("${", rendered)
-                environment = dict(os.environ, PATH=str(fake) + os.pathsep + os.environ["PATH"])
-                run = subprocess.run(["/bin/sh", "-s"], input=rendered, text=True, capture_output=True, env=environment)
-                self.assertEqual(run.returncode == 0, correct)
+                run = self.run_installer(root, payload, correct)
+                self.assertEqual(run.returncode == 0, correct, run.stderr)
                 self.assertEqual(target.read_bytes(), payload if correct else b"previous executable\n")
+                self.assertEqual((binary / "pbox").exists(), correct)
                 self.assertEqual(list(binary.glob(".macpbox.*")), [])
+
+    def test_admin_launcher_preserves_mac_arguments_and_dev_installer_can_take_it_over(self):
+        with tempfile.TemporaryDirectory() as location:
+            root = Path(location)
+            payload = b"#!/usr/bin/env python3\nimport sys, json\nprint(json.dumps(sys.argv[1:]))\nsys.exit(37)\n"
+            install = self.run_installer(root, payload)
+            self.assertEqual(install.returncode, 0, install.stderr)
+            launcher = root / "bin/pbox"
+            self.assertFalse(launcher.is_symlink())
+            args = ["ssh", "--", "two words", "", "$PATH", "; echo unexpected", "*"]
+            result = subprocess.run([launcher, "mac", *args], text=True, capture_output=True)
+            self.assertEqual(result.returncode, 37, result.stderr)
+            self.assertEqual(json.loads(result.stdout), args)
+            for invalid in ([], ["up"]):
+                result = subprocess.run([launcher, *invalid], text=True, capture_output=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("pbox mac", result.stderr)
+            launcher.write_text("existing Linux pbox\n")
+            install = self.run_installer(root, payload)
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(launcher.read_text(), "existing Linux pbox\n")
+            self.assertEqual((root / "bin/macpbox").read_bytes(), payload)
+            self.assertEqual(list((root / "bin").glob(".pbox-mac.*")), [])
+
+    def test_installer_preserves_dangling_launcher_and_directory_link_created_during_install(self):
+        with tempfile.TemporaryDirectory() as location:
+            root = Path(location)
+            binary = root / "bin"
+            binary.mkdir()
+            launcher = binary / "pbox"
+            launcher.symlink_to("not-installed-yet")
+            install = self.run_installer(root, b"backend")
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(launcher.readlink(), Path("not-installed-yet"))
+            launcher.unlink()
+            winner = root / "concurrent"
+            winner.mkdir()
+            race = root / "fake/ln"
+            race.write_text(f'#!/bin/sh\n/bin/ln -s "{winner}" "{launcher}" || exit 1\nexec /bin/ln "$@"\n')
+            race.chmod(0o755)
+            install = self.run_installer(root, b"backend")
+            self.assertEqual(install.returncode, 0, install.stderr)
+            self.assertEqual(launcher.readlink(), winner)
+            self.assertEqual(list(winner.iterdir()), [])
+            self.assertEqual(list(binary.glob(".pbox-mac.*")), [])
 
 
 if __name__ == "__main__":

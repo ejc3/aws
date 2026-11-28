@@ -7,7 +7,14 @@
 set -eu
 f=${1:?usage: set-zshenv.sh FILE [--build-only]}
 mini_xcode=''
+mini_nice=''
 if [ "${2:-}" = --build-only ]; then
+  # The mini's CI VMs are started by launchd at nice 0 and their vCPUs are host threads, so agents' host builds
+  # (cargo, xcodebuild, swift over SSH) took CPU from the CI runners (owner, 2026-11-28: "the mini is CPU
+  # overloaded"). Work an SSH session starts runs at nice 10; the VMs and the desktop are untouched.
+  mini_nice='
+# Work started over SSH (agents'"'"' host builds) runs at nice 10, so the CI VMs keep their CPU when both want it.
+if [[ -n ${SSH_CONNECTION:-} ]]; then /usr/bin/renice 10 -p $$ >/dev/null 2>&1; fi'
   contents="$HOME/Applications/Xcode.app/Contents"
   developer="$contents/Developer"
   build="$developer/usr/bin/xcodebuild"
@@ -36,7 +43,7 @@ end='# <<< mac-setup <<<'
 block="$begin (ejc3/aws scripts/mac-setup.sh; rewritten on every run, keep it last)
 typeset -U path
 path=(\"\$HOME/.local/bin\" \$path)
-export PATH$mini_xcode
+export PATH$mini_xcode$mini_nice
 # Temporary files (build products, a test run's DerivedData) on the disk named in
 # ~/.config/mac-setup/tmpdir, when that file exists and the disk is mounted; else the system default.
 if [[ -r \$HOME/.config/mac-setup/tmpdir ]]; then

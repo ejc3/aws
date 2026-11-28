@@ -68,9 +68,12 @@ elif "describe-availability-zones" in a:
            "us-west-2": "usw2-az2\tus-west-2a\nusw2-az1\tus-west-2b",
            "us-east-2": "use2-az3\tus-east-2c"}.get(region, ""))
 elif "describe-instance-type-offerings" in a:
-    # every type asked for, except in the AZs FAKE_NONE_OFFERED names ("region/az"), which offer none of them
+    # Advertise the requested types available in this AZ, independently of present Spot capacity.
     az = [f for f in args if f.startswith("Name=location,Values=")][0].split("=", 2)[2]
     asked = [f for f in args if f.startswith("Name=instance-type,Values=")][0].split("=", 2)[2].split(",")
+    offered = os.environ.get("FAKE_OFFERED_TYPES")
+    if offered:
+        asked = [t for t in asked if t in offered.split()]
     if region + "/" + az not in os.environ.get("FAKE_NONE_OFFERED", "").split():
         print("\t".join(asked))
 elif "describe-spot-instance-requests" in a:
@@ -158,12 +161,14 @@ class FallbackScript(unittest.TestCase):
         return [c for c in map(json.loads, self.log.read_text().splitlines()) if word in c]
 
     def test_plain_up_stays_home_and_exits_3_naming_the_fallback(self):
-        rc, out, err = self.pbox("up", "4", "compute-192", capacity="us-west-2/us-west-2b")
-        self.assertEqual(rc, 3, err)
-        self.assertIn("pbox up 4 compute-192 --fallback", err.replace("parallel-box.sh", "pbox"))
-        self.assertIn("EMPTY work volume", err)
-        self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
-        self.assertEqual(out, "")
+        for flavor in ("compute-192", "kvm-64"):
+            with self.subTest(flavor=flavor):
+                rc, out, err = self.pbox("up", "4", flavor, capacity="us-west-2/us-west-2b")
+                self.assertEqual(rc, 3, err)
+                self.assertIn(f"pbox up 4 {flavor} --fallback", err.replace("parallel-box.sh", "pbox"))
+                self.assertIn("EMPTY work volume", err)
+                self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
+                self.assertEqual(out, "")
 
     def test_fallback_tries_the_best_scored_az_first_with_a_fresh_disk(self):
         rc, out, err = self.pbox("up", "4", "compute-192", "--fallback", capacity="us-west-2/us-west-2b us-east-1/us-east-1a")
@@ -191,6 +196,33 @@ class FallbackScript(unittest.TestCase):
         self.assertIn("type=c8gd.metal-24xl", out)
         self.assertEqual([c[c.index("--instance-type") + 1] for c in self.calls("run-instances")],
                          ["c8gd.metal-24xl", "m8gd.metal-24xl", "c8gd.metal-24xl"])
+
+    def test_kvm64_tries_its_three_home_types_then_only_the_requested_regions_offerings(self):
+        rc, out, err = self.pbox("up", "4", "kvm-64", "--regions", "us-east-1",
+                                 capacity="us-west-2/us-west-2b us-east-1/us-east-1a", FAKE_OFFERED_TYPES="m7g.metal")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("region=us-east-1 az=us-east-1a type=m7g.metal", out)
+        self.assertIn("work=fresh", out)
+        self.assertIn("/dev/kvm present", err)
+        runs = self.calls("run-instances")
+        self.assertEqual([(c[c.index("--region") + 1], c[c.index("--instance-type") + 1]) for c in runs],
+                         [("us-east-2", "c7g.metal"), ("us-east-2", "m7g.metal"), ("us-east-2", "r7g.metal"),
+                          ("us-east-1", "m7g.metal")])
+        self.assertFalse(any("--image-id" in c for c in runs))
+        self.assertEqual(self.calls("attach-volume"), [])
+
+    def test_kvm96_can_reach_the_diskless_r8g_pool_on_explicit_fallback(self):
+        rc, out, err = self.pbox("up", "4", "kvm-96", "--fallback", capacity="us-west-2/us-west-2b",
+                                 FAKE_OFFERED_TYPES="r8g.metal-24xl")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("region=us-west-2 az=us-west-2b type=r8g.metal-24xl", out)
+        runs = self.calls("run-instances")
+        self.assertEqual([c[c.index("--instance-type") + 1] for c in runs],
+                         ["c8g.metal-24xl", "c8gd.metal-24xl", "m8g.metal-24xl", "m8gd.metal-24xl",
+                          "r8g.metal-24xl", "r8g.metal-24xl"])
+        self.assertEqual([c[c.index("--subnet-id") + 1] for c in runs if "--subnet-id" in c], ["subnet-w2b"])
+        self.assertIn("/dev/kvm present", err)
+        self.assertEqual(self.calls("attach-volume"), [])
 
     def test_an_x86_gpu_flavor_launches_with_each_sites_x86_image_and_waits_out_its_reboot(self):
         p = self.tmp / "ssh"
@@ -320,10 +352,12 @@ class FallbackScript(unittest.TestCase):
         self.assertEqual(w2b, flavor)
 
     def test_a_real_error_at_home_is_not_a_capacity_failure(self):
-        rc, _, err = self.pbox("up", "1", "compute-192", "--fallback", home_error=True, capacity="us-west-2/us-west-2b")
-        self.assertEqual(rc, 1)
-        self.assertIn("UnauthorizedOperation", err)
-        self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
+        for flavor in ("compute-192", "kvm-64"):
+            with self.subTest(flavor=flavor):
+                rc, _, err = self.pbox("up", "1", flavor, "--fallback", home_error=True, capacity="us-west-2/us-west-2b")
+                self.assertEqual(rc, 1)
+                self.assertIn("UnauthorizedOperation", err)
+                self.assertEqual([c for c in self.calls("run-instances") if "--subnet-id" in c], [])
 
     def test_ip_status_down_find_the_box_where_it_runs(self):
         rc, out, _ = self.pbox("ip", "4", launched="us-west-2 us-west-2b")

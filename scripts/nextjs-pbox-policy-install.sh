@@ -19,9 +19,14 @@ ready() {
     awk -v home="/home/$account" '$5 == home {found = 1} END {exit !found}' "/proc/$leader/mountinfo"
 }
 
-policy=$(base64 -w0 "$directory/nextjs-pbox-policy.md")
+pbox_policy=$(base64 -w0 "$directory/nextjs-pbox-policy.md")
+member_policy=$({ cat "$directory/nextjs-pbox-policy.md"; echo; cat "$directory/antigravity-models.md"; } | base64 -w0)
 rc=0
 for account in "$@"; do
+    case "$account" in
+        colton|connor|colin) policy=$member_policy ;;
+        *) policy=$pbox_policy ;;
+    esac
     if ! [[ "$account" =~ ^[a-z][a-z0-9_-]*$ ]] || ! ready "$account"; then
         printf 'Expected Next.js guest or home is not ready: %s\n' "$account" >&2
         rc=1

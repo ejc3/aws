@@ -12,10 +12,12 @@
 #   kvm       bare metal, for /dev/kvm (fcvm, firecracker); the owner's slots only, never a member's
 #   kvm-gpu   bare metal with NVIDIA GPUs bound to vfio-pci, for GPU passthrough into fcvm microVMs; the owner's only
 #
-# Sizes are 32, 48, 96 and 192 vCPU. No Graviton c, m or r type has 24 vCPU (there is no 6xlarge), so 32 is the smallest
-# and nothing is under the 24-vCPU floor. Everything is Graviton (arm64), the launch templates' AMI, except kvm-gpu-96.
-# Every type but g5g.metal is offered in us-east-2c, the home AZ (checked 2026-10-19 with describe-instance-type-offerings);
-# a fallback AZ that does not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
+# Compute, general, memory and storage sizes are 32, 48, 96 and 192 vCPU. No Graviton c, m or r type has 24 vCPU
+# (there is no 6xlarge), so 32 is the smallest. Everything is Graviton (arm64), the launch templates' AMI, except kvm-gpu-96.
+# A fallback AZ that does not offer a type skips it (us-west-1 has no i8g, i8ge or i4g and no 9th-generation types).
+#
+# The CPU KVM sizes are 64, 96 and 192 vCPU. The 64-vCPU Graviton3 metal types and r8g.metal-24xl are EBS-only;
+# all four are offered in the home AZ (us-east-2c) and 13 fallback AZs (checked 2026-11-28).
 #
 # kvm-gpu-64 is g5g.metal alone: 64 vCPU, 128 GiB, two NVIDIA T4G, and the only Graviton metal type with a GPU. It is not
 # offered in us-east-2 at all (us-west-2a/b/c and us-east-1a-d offer it, checked 2026-10-22), so it launches only at a
@@ -55,7 +57,8 @@ locals {
     "storage-48"  = ["i8g.12xlarge", "i8ge.12xlarge"]
     "storage-96"  = ["i8g.24xlarge", "i8ge.24xlarge"]
     "storage-192" = ["i8g.48xlarge", "i8ge.48xlarge"]
-    "kvm-96"      = ["c8g.metal-24xl", "c8gd.metal-24xl", "m8g.metal-24xl", "m8gd.metal-24xl"]
+    "kvm-64"      = ["c7g.metal", "m7g.metal", "r7g.metal"]
+    "kvm-96"      = ["c8g.metal-24xl", "c8gd.metal-24xl", "m8g.metal-24xl", "m8gd.metal-24xl", "r8g.metal-24xl"]
     "kvm-192"     = ["c8g.metal-48xl", "c8gd.metal-48xl", "c9g.metal-48xl", "c9gd.metal-48xl", "m8g.metal-48xl", "m8gd.metal-48xl"]
     "kvm-gpu-64"  = ["g5g.metal"]
     "kvm-gpu-96"  = ["g4dn.metal"]

@@ -1,0 +1,28 @@
+name: Windows Antigravity installer
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows-antigravity.yml'
+      - 'antigravity-windows.tf'
+      - 'scripts/windows-pc-setup.sh'
+      - 'scripts/windows/antigravity-reconcile.sh'
+      - 'scripts/antigravity-models.md'
+      - 'scripts/windows/antigravity-install.ps1'
+      - 'scripts/windows/antigravity-stdin.ps1'
+      - 'scripts/windows/test-antigravity-install.py'
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Check installation and upgrades with Windows PowerShell 5.1
+        shell: cmd
+        run: python -B scripts/windows/test-antigravity-install.py

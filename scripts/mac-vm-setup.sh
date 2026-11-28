@@ -116,7 +116,7 @@ on_host() { ssh -o BatchMode=yes -o ConnectTimeout=10 "$LAN" "$@"; }
 # The same install loads (or reloads, when it changed) the admin's hourly disk cleaner LaunchAgent and the
 # root coreaudiod check LaunchDaemon.
 install_sim_slots() {
-  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim ci/swift-test-shim ci/ci-disk-clean ci/ci-coreaudio-check install-ci-sim-slots.sh |
+  tar -C "$ROOT/scripts/mac" -cf - bin/mac-build ci/sim-slot-shim ci/swift-test-shim ci/ci-disk-clean ci/ci-coreaudio-check ci/ci-runner-keepalive install-ci-sim-slots.sh |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' '
       set -e
       d=$(mktemp -d)
@@ -322,6 +322,9 @@ in_ci "
     openssl rand -hex 24 > \$HOME/.ci-keychain-password
     security create-keychain -p \"\$(cat \$HOME/.ci-keychain-password)\" ci.keychain
   fi
+  # Unlocked first: changing a locked keychain's settings asks for its password in a dialog nobody answers, and
+  # tart exec waited on it until killed (2026-11-28, the keychain having locked after its 6 hours).
+  security unlock-keychain -p \"\$(cat \$HOME/.ci-keychain-password)\" \$kc
   security set-keychain-settings -lut 21600 \$kc
   security list-keychains -d user -s \$kc \$(security list-keychains -d user | tr -d '\"' | grep -v ci.keychain)
   security default-keychain -d user -s \$kc
@@ -329,6 +332,22 @@ in_ci "
 "
 
 install_sim_slots
+
+# A retired runner still holding a job stops the run here, before anything registers (#1120): its replacement must not
+# start beside it in the same VM. Read-only; the retirement itself runs after the registrations' checks, below.
+for name in $RETIRED_RUNNERS; do
+  registration="/Users/admin/runners/$name/.runner"
+  present=$(in_ci "if test -f '$registration'; then echo yes; else echo no; fi")
+  case "$present" in yes|no) ;; *) echo "could not check $name's registration" >&2; exit 1 ;; esac
+  [[ $present == yes ]] || continue
+  id=$(on_host "\$HOME/.local/bin/tart exec $VM cat $registration" |
+    python3 -c 'import json, sys; print(json.load(sys.stdin.buffer)["agentId"])')
+  [[ $id =~ ^[1-9][0-9]*$ ]] || { echo "no runner id in $registration" >&2; exit 1; }
+  if [[ $(gh api "orgs/$CI_ORG/actions/runners/$id" --jq .busy 2>/dev/null || echo gone) == true ]]; then
+    echo "   $name: running a job; run this again once it ends (its replacement is not registered yet)" >&2
+    exit 4
+  fi
+done
 
 echo "runners 2/2 registrations"
 on_host "\$HOME/.local/bin/tart exec $VM /bin/zsh -lc $(printf '%q' "
@@ -448,18 +467,25 @@ for name in $RETIRED_RUNNERS; do
   fi
   token=$(gh api -X POST "orgs/$CI_ORG/actions/runners/remove-token" --jq .token) && [ -n "$token" ] ||
     { echo "no removal token for $CI_ORG: gh needs the admin:org scope" >&2; exit 1; }
-  printf '%s' "$token" |
+  # A failed removal in the guest (GitHub unreachable from it) must not stop the run: the registration is then deleted
+  # from here, and the other retired runner is still handled. The directory goes either way, so a later run does not
+  # retry a removal that already happened.
+  if ! printf '%s' "$token" |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
       set -e
       token=\$(cat)
       cd ~/runners/$name
       ./svc.sh stop >/dev/null 2>&1 || true
       ./svc.sh uninstall >/dev/null 2>&1 || true
-      ./config.sh remove --token \"\$token\" >/dev/null
+      rc=0
+      ./config.sh remove --token \"\$token\" >/dev/null || rc=\$?
       cd .. && rm -rf $name
-    ")"
+      exit \$rc
+    ")"; then
+    echo "   $name: config.sh remove failed in the guest; deregistering from the host" >&2
+  fi
   unset token
-  # A registration config.sh could not remove (GitHub unreachable from the guest): removed from here.
+  # A registration config.sh could not remove: removed from here.
   if gh api "orgs/$CI_ORG/actions/runners/$id" --jq .id >/dev/null 2>&1; then
     gh api -X DELETE "orgs/$CI_ORG/actions/runners/$id" --silent
   fi

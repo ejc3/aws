@@ -93,7 +93,7 @@ class AccessTests(unittest.TestCase):
         self.assertIn("ignore_changes = [filename, source_code_hash, s3_bucket, s3_key, s3_object_version]", fn)
         self.assertRegex(fn, r'handler\s+= "index.handler"')
         self.assertIn("reserved_concurrent_executions = 1", fn)
-        self.assertIn('source_file = "${path.module}/dolphin-maps-loop/index.mjs"', block("archive_file", "dolphin_maps_loop_placeholder"))
+        self.assertRegex(block("archive_file", "dolphin_maps_loop_placeholder"), r'source_file\s+= "\$\{path\.module\}/dolphin\-maps\-loop/index\.mjs"')
 
     def test_the_deploy_role_cannot_change_the_functions_configuration(self):
         deploy = block("aws_iam_role_policy", "dolphin_maps_loop_deploy")

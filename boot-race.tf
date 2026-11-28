@@ -457,9 +457,10 @@ resource "aws_lambda_function_url" "boot_race" {
 # task definitions and Fargate network (dedicated subnet, boot-race group, no public IP). The driver may invoke the
 # function but cannot change its code, configuration or role.
 data "archive_file" "boot_race_launcher" {
-  type        = "zip"
-  source_file = "${path.module}/boot-race/launcher.py"
-  output_path = "${path.module}/.terraform/boot-race-launcher.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/boot-race/launcher.py"
+  output_path      = "${path.module}/.terraform/boot-race-launcher.zip"
 }
 
 resource "aws_cloudwatch_log_group" "boot_race_launcher" {
@@ -575,9 +576,10 @@ resource "aws_lambda_function" "boot_race_launcher" {
 # 3 hours ago, stop any boot-race task older than 1 hour, and remove Project=boot-race images and snapshots older than
 # a day. The campaign cleans up after itself; this bounds what a failed or interrupted one leaves billing.
 data "archive_file" "boot_race_reaper" {
-  type        = "zip"
-  source_file = "${path.module}/boot-race/reaper.py"
-  output_path = "${path.module}/.terraform/boot-race-reaper.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/boot-race/reaper.py"
+  output_path      = "${path.module}/.terraform/boot-race-reaper.zip"
 }
 
 resource "aws_cloudwatch_log_group" "boot_race_reaper" {

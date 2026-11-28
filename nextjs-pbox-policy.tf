@@ -5,6 +5,7 @@ locals {
     "nextjs-pbox-policy-install.sh",
     "nextjs-pbox-policy.py",
     "nextjs-pbox-policy.md",
+    "antigravity-models.md",
   ]
   nextjs_pbox_policy_install = <<-SH
     set -eu

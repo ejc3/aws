@@ -451,6 +451,21 @@ esac
         self.set_("--build-only")
         self.assertEqual(self.selected_developer(), "unset")
 
+    def nice_of_a_shell(self, **env):
+        shell_env = {"HOME": str(self.temp), "ZDOTDIR": str(self.temp), "PATH": "/usr/bin:/bin", **env}
+        return int(subprocess.check_output(["zsh", "-c", "ps -o nice= -p $$"], env=shell_env, text=True))
+
+    def test_on_the_mini_work_started_over_ssh_runs_at_nice_10_and_nothing_else_changes(self):
+        base = int(subprocess.check_output(["ps", "-o", "nice=", "-p", str(os.getpid())], text=True))
+        if base > 10:
+            self.skipTest("the test runner itself runs above nice 10")
+        self.set_("--build-only")
+        self.assertEqual(self.nice_of_a_shell(SSH_CONNECTION="198.51.100.7 50000 192.0.2.1 22"), 10)
+        self.assertEqual(self.nice_of_a_shell(), base, "a shell not started over SSH (launchd, the desktop) keeps its priority")
+        self.set_()
+        self.assertNotIn("renice", self.zshenv.read_text(), "only the mini lowers its SSH work")
+        self.assertEqual(self.nice_of_a_shell(SSH_CONNECTION="198.51.100.7 50000 192.0.2.1 22"), base)
+
     def resolved(self):
         # As an SSH command runs: non-interactive, non-login zsh, which reads only ~/.zshenv.
         env = {"HOME": str(self.temp), "PATH": f"{self.system}:/usr/bin:/bin", "ZDOTDIR": str(self.temp)}
@@ -808,6 +823,7 @@ class Files(unittest.TestCase):
             ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$OUT/args"\ncat > "$OUT/files.tar"\n')
             ssh.chmod(0o755)
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
+            agy = {"antigravity-install.sh", "antigravity-models.md", "antigravity-owner-models.pl"}
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
@@ -816,12 +832,13 @@ class Files(unittest.TestCase):
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
-                (["mini"], build | mini, "--build-only"),
-                ([], build | desktop | cleaner, ""),
+                (["mini"], build | mini | agy, "--build-only"),
+                ([], build | desktop | cleaner | agy, ""),
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
-                (["colton-mac", "--update-peekaboo"], build | member, "--update-peekaboo"),
-                (["colin-mac"], build | member, ""),
-                (["air"], build | air, ""),
+                (["colton-mac", "--update-peekaboo"], build | member | agy, "--update-peekaboo"),
+                (["colin-mac"], build | member | agy, ""),
+                (["air"], build | air | agy, ""),
+                (["skevh-mac"], build | member, ""),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
                 with tarfile.open(dest / "files.tar") as archive:
@@ -910,6 +927,15 @@ class AgentsMd(Base):
         self.assertIn("None physical right now.", text)
         self.assertIn("None: device builds cannot be signed here yet.", text)
 
+    def test_installed_antigravity_guidance_reaches_agent_instructions_without_rule_frontmatter(self):
+        rule = self.temp / ".gemini/config/rules/ejc3-antigravity-models.md"
+        rule.parent.mkdir(parents=True)
+        guide = (ROOT / "scripts/antigravity-models.md").read_text()
+        rule.write_text("---\ntrigger: always_on\n---\n" + guide)
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn(guide, self.out.read_text())
+        self.assertNotIn("trigger: always_on", self.out.read_text())
+
     def test_on_a_desktop_mac_lists_the_devices_and_no_mini_sections(self):
         self.env["MAC_AGENTS_HOST"] = "mac"
         kc = self.temp / "agent-work" / "signing"
@@ -975,6 +1001,13 @@ class IosToolchain(unittest.TestCase):
         for name in ("node_version", "pnpm_version", "xcodegen_version", "micromamba_version", "cocoapods_version"):
             self.assertRegex(self.script, r"(?m)^%s=[0-9][0-9.\-]*$" % name)
         self.assertEqual(self.script.count('fetch "https://'), 3)
+
+    def test_installs_tmux_from_conda_forge_and_links_it_onto_path(self):
+        self.assertRegex(self.script, r"(?m)^tmux_spec='tmux>=3\.5,<4'$")
+        self.assertIn('create -y -q -p "$root/tmux" -c conda-forge "$tmux_spec"', self.script)
+        install = (ROOT / "scripts" / "mac" / "install.zsh").read_text()
+        self.assertIn('ln -sfn "$HOME/agent-tools/tmux/bin/tmux" "$bin/tmux"', install)
+        self.assertLess(install.index('/bin/zsh "$src/ios-toolchain.zsh"'), install.index('"$bin/tmux"'))
 
     def test_refuses_a_download_whose_hash_is_not_the_pinned_one(self):
         fetch = re.search(r"(?ms)^fetch\(\) \{.*?^\}", self.script).group(0)

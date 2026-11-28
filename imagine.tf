@@ -643,9 +643,10 @@ resource "aws_ecs_service" "imagine" {
 # can run more than that. Reserved concurrency 1 runs the actions one at a time.
 
 data "archive_file" "imagine_scale" {
-  type        = "zip"
-  source_file = "${path.module}/imagine/scale.py"
-  output_path = "${path.module}/.terraform/imagine-scale.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/imagine/scale.py"
+  output_path      = "${path.module}/.terraform/imagine-scale.zip"
 }
 
 resource "aws_cloudwatch_log_group" "imagine_scale" {

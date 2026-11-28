@@ -151,9 +151,10 @@ resource "aws_launch_template" "benchmark_worker" {
 }
 
 data "archive_file" "benchmark_worker" {
-  type        = "zip"
-  source_file = "${path.module}/benchmark-worker/control.py"
-  output_path = "${path.module}/.terraform/benchmark-worker.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/benchmark-worker/control.py"
+  output_path      = "${path.module}/.terraform/benchmark-worker.zip"
 }
 
 resource "aws_cloudwatch_log_group" "benchmark_worker" {

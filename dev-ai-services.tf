@@ -49,6 +49,11 @@ data "aws_iam_policy_document" "elevenlabs_read" {
     resources = [aws_secretsmanager_secret.stability_api_key.arn]
   }
   statement {
+    sid       = "ReadTheMeshyKey"
+    actions   = ["secretsmanager:GetSecretValue"]
+    resources = [aws_secretsmanager_secret.meshy_api_key.arn]
+  }
+  statement {
     sid       = "ReadTheSunoSessionCookie"
     actions   = ["secretsmanager:GetSecretValue"]
     resources = [aws_secretsmanager_secret.suno_cookie.arn]
@@ -120,6 +125,32 @@ resource "aws_secretsmanager_secret_policy" "stability_api_key" {
       Principal = "*"
       Action    = "secretsmanager:GetSecretValue"
       Resource  = aws_secretsmanager_secret.stability_api_key.arn
+      Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
+    }]
+  })
+}
+
+# Meshy (meshy.ai) generates build-time 3D models and textures, from text or an image. Owner, 2026-11-28: "we have a
+# meshy ai key". The Stability boundary exactly: only the container and its read policy here, the value supplied
+# out of band (put-secret-value on stdin), the same administration and two dev-role readers, and finished assets,
+# never this key, go into apps.
+resource "aws_secretsmanager_secret" "meshy_api_key" {
+  name                    = "games/meshy-api-key"
+  description             = "Meshy AI API key for build-time 3D assets; value supplied out of band."
+  recovery_window_in_days = 7
+  tags                    = { Name = "games/meshy-api-key", Project = "games" }
+}
+
+resource "aws_secretsmanager_secret_policy" "meshy_api_key" {
+  secret_arn = aws_secretsmanager_secret.meshy_api_key.arn
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "OnlyAdministrationAndTheDevBoxesCanRead"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "secretsmanager:GetSecretValue"
+      Resource  = aws_secretsmanager_secret.meshy_api_key.arn
       Condition = { ArnNotLike = { "aws:PrincipalArn" = concat(local.games_mp_admin_principals, local.elevenlabs_readers) } }
     }]
   })

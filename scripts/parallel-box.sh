@@ -5,12 +5,17 @@
 # work volume, so eight parallel jobs can run at once.
 #
 #   pbox flavors      the menu: each flavor's vCPU, memory, local disk, what it is for, rough price
+#   pbox mac status|quote|up|ssh|workspace
+#                     use the shared EC2 Mac. Check status and quote first. A new host needs the
+#                     owner's approval for the 24-hour minimum. See 'pbox mac up --help'.
 #   pbox up [N] FLAVOR
 #                     launch box 1 (or N, 1-8) in the home AZ as FLAVOR (also --flavor FLAVOR).
 #                     A FLAVOR IS REQUIRED: pick the smallest that fits the work's shape (CPU-,
 #                     memory- or local-disk-bound, or general) and size, e.g. compute-48. It tries
-#                     that flavor's instance types in turn. kvm-96 / kvm-192 are bare metal with
-#                     /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
+#                     that flavor's instance types in turn. kvm-64 / kvm-96 / kvm-192 are bare metal
+#                     with /dev/kvm for hypervisors (fcvm/firecracker) and boot in many minutes.
+#                     kvm-64 uses diskless Graviton3 hosts. Pass --fallback or --regions to try
+#                     other AZs with fresh work volumes after the home AZ runs out of capacity.
 #                     kvm-gpu-64 is the same plus two NVIDIA T4G bound to vfio-pci, for GPU
 #                     passthrough; the home AZ does not offer it.
 #                     kvm-gpu-96 is an x86 g4dn.metal with eight NVIDIA T4 (about $4/hr spot), launched
@@ -120,10 +125,14 @@
 # person's own key (fetched once into ~/.ssh/member-box from Secrets Manager).
 set -uo pipefail
 
+if [[ ${1:-} == mac ]]; then
+  shift
+  exec macpbox "$@"
+fi
 
 # THE FLAVOR MENU (pbox-flavors.tf has the same lists, which IAM allows exactly; scripts/test-pbox-flavors.py keeps the
 # two equal). One line per flavor: name, vCPU, memory GiB, local NVMe (TB, at least; "-" for none promised), an
-# approximate spot $/hr in us-east-2c (measured 2026-10-19: the launch prints each type's live price), then the
+# approximate spot $/hr in us-east-2c (2026-10-19; kvm-64 measured 2026-11-28), then the
 # instance types, tried in that order. Spot capacity differs from type to type, so each flavor has several, all with
 # the flavor's vCPU and memory. All Graviton (arm64, as the launch templates' AMI is) but g4dn.metal (type_arch), all
 # offered in us-east-2c but g5g.metal; a fallback AZ skips the types it does not offer. No Graviton c, m or r type has 24
@@ -148,7 +157,8 @@ storage-32   32   256  7.5  0.55 i8g.8xlarge i4g.8xlarge
 storage-48   48   384  11   0.85 i8g.12xlarge i8ge.12xlarge
 storage-96   96   768  22   1.70 i8g.24xlarge i8ge.24xlarge
 storage-192  192  1536 45   2.00 i8g.48xlarge i8ge.48xlarge
-kvm-96       96   192+ -    0.70 c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl
+kvm-64       64   128+ -    0.70 c7g.metal m7g.metal r7g.metal
+kvm-96       96   192+ -    0.70 c8g.metal-24xl c8gd.metal-24xl m8g.metal-24xl m8gd.metal-24xl r8g.metal-24xl
 kvm-192      192  384+ -    1.20 c8g.metal-48xl c8gd.metal-48xl c9g.metal-48xl c9gd.metal-48xl m8g.metal-48xl m8gd.metal-48xl
 kvm-gpu-64   64   128  -    0.60 g5g.metal
 kvm-gpu-96   96   384  -    4.12 g4dn.metal
@@ -161,7 +171,7 @@ flavor_use() {
     general) echo "mixed work that needs more memory than compute gives: 4 GiB per vCPU" ;;
     memory)  echo "memory-bound work (big in-memory data, large links, caches): 8 GiB per vCPU" ;;
     storage) echo "local-disk-bound work: fast local NVMe at /mnt/nvme (gone with the box) and 8 GiB per vCPU" ;;
-    kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; not for members" ;;
+    kvm)     echo "hypervisors (fcvm, firecracker): bare metal with /dev/kvm; boots in many minutes; kvm-64 is diskless. Use --fallback to try other AZs with a fresh work volume; not for members" ;;
     kvm-gpu) echo "GPU passthrough into fcvm: kvm plus NVIDIA GPUs on vfio-pci. kvm-gpu-64: 2x T4G, arm64, not in the home AZ (its price is us-west-2's). kvm-gpu-96: 8x T4, x86_64, reboots once at first boot. Both search every fallback region on their own (an implied --fallback)" ;;
   esac
 }
@@ -226,7 +236,8 @@ print_menu() {
     [ "${1:-}" = "all" ] && say "                 types, in order: $rest"
   done < <(flavor_lines)
   say ""
-  say "  Prices are approximate (us-east-2c, 2026-10); each launch prints the live spot price of the type it tries."
+  say "  Prices are approximate (us-east-2c, Oct–Nov 2026, except where noted); home attempts print the live price."
+  say "  macOS builds: $SELF mac status for the shared EC2 Mac, $SELF mac quote for the 24-hour minimum cost."
 }
 # Which key reaches the box, by what the caller actually holds:
 #   - a dev box holds dev_hop and nothing else that reaches another host (dev-hop-key.tf);
@@ -288,7 +299,7 @@ OWNER_ARG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     1|2|3|4|5|6|7|8) BOX="$1" ;;
-    kvm) say "kvm is a flavor now: kvm-96 or kvm-192 (pbox flavors)"; exit 2 ;;
+    kvm) say "choose a KVM flavor: kvm-64, kvm-96 or kvm-192 (pbox flavors)"; exit 2 ;;
     --flavor)
       shift
       [ -n "${1:-}" ] || { say "--flavor needs a name (pbox flavors)"; exit 2; }

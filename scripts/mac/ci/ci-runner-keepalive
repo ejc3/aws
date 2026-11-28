@@ -1,0 +1,132 @@
+#!/usr/bin/python3
+"""Keep a CI VM's clock right and its runners running (ejc3/aws#1148).
+
+Runs every 5 minutes as root from the LaunchDaemon com.ejcampbell.ci-runner-keepalive, which
+scripts/mac/install-ci-sim-slots.sh installs. On 2026-11-28 the Air's air-ci VM was down from 04:20 to 11:24 UTC: its
+clock had fallen about 17 minutes behind (the host slept or the VM was paused, and the guest had no time server set),
+every token the runner signed had already expired, GitHub answered with its generic "registration has been deleted",
+and the runner stopped for good ("no retry needed"). Its LaunchAgent stayed loaded and not running until a person
+kickstarted it. Each run:
+
+  1. sets the clock from time.apple.com with sntp (it steps or slews as needed). A failure is logged, never fatal;
+  2. for each runner LaunchAgent of the CI user (~/Library/LaunchAgents/actions.runner.*.plist) that launchd has
+     loaded but is not running, kickstarts it, at most once in 15 minutes per runner. A runner stopped on purpose
+     (svc.sh stop unloads it) is not loaded and is left alone.
+
+The log carries outcomes only. Python 3.9 (Xcode's /usr/bin/python3).
+"""
+
+import datetime
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import time
+
+USER = os.environ.get("CI_KEEPALIVE_USER", "admin")
+SNTP = os.environ.get("CI_KEEPALIVE_SNTP", "/usr/bin/sntp")
+LAUNCHCTL = os.environ.get("CI_KEEPALIVE_LAUNCHCTL", "/bin/launchctl")
+TIME_SERVER = "time.apple.com"
+STATE = Path(os.environ.get("CI_KEEPALIVE_STATE", "/var/db/ci-runner-keepalive.json"))
+KICK_GAP = 15 * 60
+LABEL = re.compile(r"^actions\.runner\.[A-Za-z0-9_.-]+$")
+
+
+def log(message):
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    print(f"{stamp} ci-runner-keepalive: {message}", flush=True)
+
+
+def sync_clock():
+    try:
+        r = subprocess.run([SNTP, "-sS", TIME_SERVER], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"clock: sntp did not run ({type(e).__name__})")
+        return
+    if r.returncode != 0:
+        log(f"clock: sntp exited {r.returncode}")
+        return
+    first = (r.stdout.strip().split() or ["?"])[0]
+    try:
+        offset = float(first)
+    except ValueError:
+        return
+    if abs(offset) >= 5:
+        log(f"clock: corrected by {offset:+.1f} s")
+
+
+def runner_labels(home):
+    agents = Path(home) / "Library" / "LaunchAgents"
+    try:
+        names = sorted(p.stem for p in agents.glob("actions.runner.*.plist"))
+    except OSError:
+        return []
+    return [n for n in names if LABEL.match(n)]
+
+
+def state_of(domain, label):
+    """'running', 'stopped' (loaded, not running) or None (not loaded, or launchctl failed)."""
+    try:
+        r = subprocess.run([LAUNCHCTL, "print", f"{domain}/{label}"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    m = re.search(r"^\s*state = (\S+)", r.stdout, re.M)
+    if not m:
+        return None
+    return "running" if m.group(1) == "running" else "stopped"
+
+
+def load_state():
+    try:
+        data = json.loads(STATE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(data):
+    tmp = STATE.with_name(STATE.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, STATE)
+    except OSError as e:
+        log(f"state not saved ({type(e).__name__})")
+
+
+def keep_runners(now=None):
+    now = time.time() if now is None else now
+    try:
+        user = pwd.getpwnam(USER)
+    except KeyError:
+        log(f"no user {USER}")
+        return
+    domain = f"gui/{user.pw_uid}"
+    kicked = load_state()
+    for label in runner_labels(user.pw_dir):
+        if state_of(domain, label) != "stopped":
+            continue
+        if now - float(kicked.get(label, 0)) < KICK_GAP:
+            continue
+        try:
+            ok = subprocess.run([LAUNCHCTL, "kickstart", f"{domain}/{label}"], capture_output=True, text=True,
+                                timeout=60).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            ok = False
+        kicked[label] = now
+        log(f"{label}: loaded but not running; kickstart {'ok' if ok else 'failed'}")
+    save_state(kicked)
+
+
+def main():
+    sync_clock()
+    keep_runners()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -68,6 +68,10 @@ done
 # ~/.local/bin first on PATH in every zsh, non-interactive SSH sessions included: a managed block at the
 # end of ~/.zshenv, whatever else the file does to PATH (otherwise /usr/bin/swift would bypass the cap).
 /bin/sh "$src/set-zshenv.sh" "$HOME/.zshenv" "$mode"
+if [[ -f "$src/antigravity-install.sh" ]]; then
+  /bin/bash "$src/antigravity-install.sh"
+  /usr/bin/perl "$src/antigravity-owner-models.pl"
+fi
 for t in swift xcodebuild xcrun; do
   got=$(env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/zsh -c "command -v $t")
   [ "$got" = "$bin/$t" ] || { echo "mac-setup: a non-interactive zsh finds $t at $got, not $bin/$t" >&2; exit 1; }
@@ -78,6 +82,12 @@ if [[ $mode = --build-only ]]; then
   # template from this repository and what is on the machine now, rewritten hourly by a LaunchAgent so
   # the attached devices it lists stay current.
   /bin/zsh "$src/ios-toolchain.zsh"
+  # tmux for agents' long-running sessions on the host: the toolchain's copy, first on PATH like the other tools.
+  if [ -e "$bin/tmux" ] && [ ! -L "$bin/tmux" ]; then
+    echo "mac-setup: $bin/tmux exists and is not our link; leaving it" >&2
+  else
+    ln -sfn "$HOME/agent-tools/tmux/bin/tmux" "$bin/tmux"
+  fi
   agents_md mini "$src/mini-AGENTS.md"
   echo "mac-setup: ~/AGENTS.md written (and hourly); the iOS toolchain is in ~/agent-tools (source ~/agent-tools/env.zsh)"
   echo "mac-setup: build tools ready in $bin; create each workspace with mktemp -d ~/agent-work/task.XXXXXXXX"

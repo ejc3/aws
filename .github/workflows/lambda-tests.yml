@@ -258,6 +258,9 @@ jobs:
         run: python3 -S -B scripts/test-ci-disk-clean.py
       - name: Mac mini CI VM coreaudiod check (a hung coreaudiod restarted once no job runs or after 30 minutes, at most every 15; offline)
         run: python3 -S -B scripts/test-ci-coreaudio-check.py
+
+      - name: CI VM clock and runner keepalive (clock from time.apple.com; a loaded, stopped runner kickstarted at most every 15 minutes; offline)
+        run: python3 -S -B scripts/test-ci-runner-keepalive.py
       - name: Mac pbox explicit paid-lease approval, discovery and isolated workspaces (offline)
         run: python3 -S -B scripts/test-macpbox.py
       - name: Mac pbox 24-hour minimum and periodic safe host release (offline)
@@ -276,6 +279,9 @@ jobs:
 
       - name: Boot secrets stay out of traces, readable logs and command lines (offline)
         run: python3 -S -B scripts/test-boot-secret-hygiene.py
+
+      - name: File-based Lambda zips pin their file mode (offline)
+        run: python3 -S -B scripts/test-archive-file-mode.py
 
       - name: Games multiplayer engine sweeper (offline)
         run: python3 -S -B scripts/test-games-mp-sweeper.py
@@ -360,6 +366,8 @@ jobs:
         run: python3 -S -B scripts/test-codex-restart.py
       - name: Codex refresh on the ubuntu boxes (weekly SSM association)
         run: python3 -S -B scripts/test-codex-update.py
+      - name: Antigravity CLI account selection and verified per-user installation
+        run: python3 -S -B scripts/test-antigravity-install.py
       - name: Daily Claude Code update on the ubuntu boxes (offline)
         run: python3 -S -B scripts/test-claude-update.py
       - name: Shared claude-master server (private, pinned, idle until its logins exist)
@@ -438,6 +446,8 @@ jobs:
 
       - name: "app accounts (modules/app-account) and the Family account: guardrails, one exact apply role, Access on the sign-in path only, the API's paths exactly (family-account.tf)"
         run: python3 -S -B scripts/test-app-account.py
+      - name: Family staging image promotion, retry recovery and CI permissions (offline)
+        run: python3 -S -B scripts/test-family-stage-api.py
       - name: "Costume Party's staging host: Access on the sign-in path only, the server's paths exactly, the token to the Dolphin account (dolphin-costume.tf)"
         run: python3 -S -B scripts/test-dolphin-costume.py
 
