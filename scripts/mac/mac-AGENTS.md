@@ -22,9 +22,19 @@ change `scripts/mac/mac-AGENTS.md` in ejc3/aws.
 ## Testing on the attached iPhone
 
 The phone below is on USB with Developer Mode on, signed in to the owner's account. **UI Automation
-is off** on it (checked 2026-11-25, ejc3/aws#1062): a UI test times out "enabling automation mode" until
-the owner turns on Settings › Developer › Enable UI Automation. Say so once and stop; do not change the
-setting. A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
+is on** (the owner turned on Settings › Developer › Enable UI Automation on 2026-11-27; ejc3/aws#1062), so UI
+tests run on it. It **lapses now and then**: the owner has had to turn it off and on again, and Apple documents
+no reason. When it has lapsed, `xcodebuild test` fails about a minute in with "Timed out while enabling
+automation mode" and runs no test. Say so to the owner once and stop; do not change the setting yourself. A
+LaunchAgent on this Mac (`dev.dolphinlabs.uia-watch`) runs one short UI test every 2.5 hours. It logs each run
+to `/Volumes/Scratch/dolphin-maps/uia-watch/status.log` and adds a line to `ALERT` beside it when the setting
+lapses, so read that log before blaming a failure on your own test.
+
+The phone refuses to remove apps ("Uninstall prohibited"): `devicectl device uninstall app` fails. Don't count
+on removing what you install. A development build of an app replaces the TestFlight build with the same bundle
+id until TestFlight installs it again.
+
+A check that needs a real device (a universal link tapped, a sign-in sheet, push, the
 camera) is yours to run: never hand the owner a step this phone can do. The Mac mini has phones
 too; its `~/AGENTS.md` says how to build and sign there.
 
