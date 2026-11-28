@@ -3,7 +3,8 @@
 # Family's own AWS account (ejc3/constellation docs/APP-ACCOUNTS.md: one account per app, Family
 # first), from modules/app-account: the account and its OU, guardrails (us-west-1 only, no leaving
 # the organization, no IAM users or keys), its state bucket and apply role `family-terraform`, a
-# budget, the /infra/family pointer, and its staging host. What runs in the account is
+# budget, the /infra/family pointer, its staging host, and the SES sending domain for its sign-in codes.
+# What runs in the account is
 # ejc3/constellation's (infra/apps/family, from infra/modules/app), applied there with that role.
 #
 # First apply, as for every account: the provider alias below needs the account id, so apply the
@@ -58,6 +59,13 @@ module "family_account" {
     login_path       = "/family/native/login"
     api_path_regex   = "^/(family/(v1|native)/|healthz$)"
     login_policy_ids = [cloudflare_zero_trust_access_policy.cc_games_allowed.id]
+  }
+  # Family's sign-in codes (constellation docs/FAMILY.md, "Family's own sign-in"): sent through SES in
+  # the Family account from sign-in@ this subdomain; its task role may send from that address only.
+  email_sender = {
+    zone_id         = var.dolphin_zone_id
+    domain          = "family-mail.dolphin-labs.dev"
+    from_local_part = "sign-in"
   }
 }
 
