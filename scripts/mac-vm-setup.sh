@@ -426,18 +426,25 @@ for name in $RETIRED_RUNNERS; do
   fi
   token=$(gh api -X POST "orgs/$CI_ORG/actions/runners/remove-token" --jq .token) && [ -n "$token" ] ||
     { echo "no removal token for $CI_ORG: gh needs the admin:org scope" >&2; exit 1; }
-  printf '%s' "$token" |
+  # A failed removal in the guest (GitHub unreachable from it) must not stop the run: the registration is then deleted
+  # from here, and the other retired runner is still handled. The directory goes either way, so a later run does not
+  # retry a removal that already happened.
+  if ! printf '%s' "$token" |
     on_host "\$HOME/.local/bin/tart exec -i $VM /bin/zsh -lc $(printf '%q' "
       set -e
       token=\$(cat)
       cd ~/runners/$name
       ./svc.sh stop >/dev/null 2>&1 || true
       ./svc.sh uninstall >/dev/null 2>&1 || true
-      ./config.sh remove --token \"\$token\" >/dev/null
+      rc=0
+      ./config.sh remove --token \"\$token\" >/dev/null || rc=\$?
       cd .. && rm -rf $name
-    ")"
+      exit \$rc
+    ")"; then
+    echo "   $name: config.sh remove failed in the guest; deregistering from the host" >&2
+  fi
   unset token
-  # A registration config.sh could not remove (GitHub unreachable from the guest): removed from here.
+  # A registration config.sh could not remove: removed from here.
   if gh api "orgs/$CI_ORG/actions/runners/$id" --jq .id >/dev/null 2>&1; then
     gh api -X DELETE "orgs/$CI_ORG/actions/runners/$id" --silent
   fi

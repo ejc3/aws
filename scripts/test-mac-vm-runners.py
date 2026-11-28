@@ -46,7 +46,10 @@ if Path(sys.argv[0]).name == "ssh":
         agent = 717 if name == "mini-4" else 700 + int(name[-1])
         sys.stdout.buffer.write(b'\xef\xbb\xbf' + json.dumps({"agentId": agent}).encode())
     elif "./config.sh remove" in cmd:
-        print("retire", re.search(r"runners/(mini-[1-4])", cmd)[1], file=open(os.environ["CALLS"], "a"))
+        name = re.search(r"runners/(mini-[1-4])", cmd)[1]
+        print("retire", name, file=open(os.environ["CALLS"], "a"))
+        if name in config.get("remove_fails", []):
+            sys.exit(1)
     elif "./config.sh --unattended" in cmd:
         print(*re.search(r"--name (mini-[1-4]) --labels ([a-z0-9,-]+)", cmd).groups(),
               file=open(os.environ["CALLS"], "a"))
@@ -218,6 +221,12 @@ class MiniRunnerRouting(unittest.TestCase):
         result, calls = self.run_setup(stuck=["702"], **done)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["retire mini-1", "retire mini-2", "deregister orgs/dolphin-labs-hq/actions/runners/702"])
+        # config.sh remove failing in the guest stops nothing: the host deletes that registration and still retires the
+        # other runner.
+        result, calls = self.run_setup(remove_fails=["mini-1"], stuck=["701"], **done)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["retire mini-1", "deregister orgs/dolphin-labs-hq/actions/runners/701", "retire mini-2"])
+        self.assertIn("mini-1: config.sh remove failed in the guest", result.stderr)
         # Already retired (no registration left in the guest): nothing to do.
         result, calls = self.run_setup(fresh=True)
         self.assertEqual(result.returncode, 0, result.stderr)
