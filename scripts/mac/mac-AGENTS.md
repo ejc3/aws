@@ -23,9 +23,12 @@ change `scripts/mac/mac-AGENTS.md` in ejc3/aws.
 
 The phone below is on USB with Developer Mode on, signed in to the owner's account. **UI Automation
 is on** (the owner turned on Settings › Developer › Enable UI Automation on 2026-11-27; ejc3/aws#1062), so UI
-tests run on it. It **lapses now and then**: the owner has had to turn it off and on again, and Apple documents
-no reason. When it has lapsed, `xcodebuild test` fails about a minute in with "Timed out while enabling
-automation mode" and runs no test. Say so to the owner once and stop; do not change the setting yourself. A
+tests run on it. It **lapses whenever the phone passcode-locks**, Auto-Lock included (three cycles seen on
+2026-11-27): the phone then shows "Enter iPhone Passcode for 'XCTest' — Enable UI Automation", and unlocking the
+phone does not bring it back; only typing the passcode at that prompt does. While it is lapsed, `xcodebuild test`
+fails about a minute in with "Timed out while enabling automation mode" and runs no test. Say so to the owner
+once and stop; do not change the setting yourself. Never lock the phone yourself (Device Hub's Controls › Lock
+does): only the owner can unlock it. A
 LaunchAgent on this Mac (`dev.dolphinlabs.uia-watch`) runs one short UI test every 2.5 hours. It logs each run
 to `/Volumes/Scratch/dolphin-maps/uia-watch/status.log` and adds a line to `ALERT` beside it when the setting
 lapses, so read that log before blaming a failure on your own test.
