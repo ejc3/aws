@@ -45,6 +45,11 @@ if Path(sys.argv[0]).name == "ssh":
         name = re.search(r"/runners/(mini-[1-4])/", cmd)[1]
         agent = 717 if name == "mini-4" else 700 + int(name[-1])
         sys.stdout.buffer.write(b'\xef\xbb\xbf' + json.dumps({"agentId": agent}).encode())
+    elif "./config.sh remove" in cmd:
+        name = re.search(r"runners/(mini-[1-4])", cmd)[1]
+        print("retire", name, file=open(os.environ["CALLS"], "a"))
+        if name in config.get("remove_fails", []):
+            sys.exit(1)
     elif "./config.sh --unattended" in cmd:
         print(*re.search(r"--name (mini-[1-4]) --labels ([a-z0-9,-]+)", cmd).groups(),
               file=open(os.environ["CALLS"], "a"))
@@ -55,6 +60,8 @@ else:
         print(config.get("slot", "" if config.get("fresh") else "717\tmini-4\tonline\ttrue\tfalse"))
     elif endpoint.endswith("/registration-token"):
         print("test-registration")
+    elif endpoint.endswith("/remove-token"):
+        print("test-removal")
     elif endpoint.endswith("/labels"):
         assert args[args.index("-X") + 1] == "POST"
         label = args[args.index("-f") + 1]
@@ -62,6 +69,17 @@ else:
     elif "/labels/" in endpoint:
         assert args[args.index("-X") + 1] == "DELETE"
         print("remove", endpoint, file=open(os.environ["CALLS"], "a"))
+    elif re.search(r"/runners/[0-9]+$", endpoint) and "-X" in args:
+        assert args[args.index("-X") + 1] == "DELETE"
+        print("deregister", endpoint, file=open(os.environ["CALLS"], "a"))
+    elif re.search(r"/runners/[0-9]+$", endpoint) and ".busy" in args:
+        print(config.get("busy", {}).get(endpoint.rsplit("/", 1)[1], "false"))
+    elif re.search(r"/runners/[0-9]+$", endpoint) and ".id" in args:
+        # Still registered after config.sh remove only when the test says so.
+        runner = endpoint.rsplit("/", 1)[1]
+        if runner not in config.get("stuck", []):
+            sys.exit(1)
+        print(runner)
     elif re.search(r"/runners/[0-9]+$", endpoint):
         # Each runner's labels now: the pool's before this change unless the test says otherwise.
         runner = endpoint.rsplit("/", 1)[1]
@@ -131,12 +149,11 @@ class MiniRunnerRouting(unittest.TestCase):
                                     env=env, capture_output=True, text=True, timeout=30)
             return result, calls.read_text().splitlines()
 
-    def test_fresh_labels_keep_mini_3_for_queue_batches_and_the_rest_for_general_jobs(self):
+    def test_fresh_registers_two_runners_mini_3_for_queue_batches_and_mini_4_for_the_rest(self):
         result, calls = self.run_setup(fresh=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("test: installed CI test slots", result.stdout)
         self.assertEqual(calls, [
-            "mini-1 gww-ios,mini,ios-pool,ios-queue", "mini-2 gww-ios,mini,ios-pool,ios-queue",
             "mini-3 ios-queue", "mini-4 gww-ios,mini,ios-pool,ios-queue,mini-simulator,ios-simulator",
         ])
 
@@ -165,16 +182,16 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertEqual(calls, [])
 
     # Every runner already relabelled: what each carries once this script has run.
-    DONE = {"701": "gww-ios,mini,ios-pool,ios-queue", "702": "gww-ios,mini,ios-pool,ios-queue", "703": "ios-queue",
-            "717": "gww-ios,mini,ios-pool,ios-queue,mini-simulator,ios-simulator"}
+    DONE = {"703": "ios-queue", "717": "gww-ios,mini,ios-pool,ios-queue,mini-simulator,ios-simulator"}
+    RETIRE = ["retire mini-1", "retire mini-2"]
 
     def test_existing_label_is_added_to_the_registered_id_without_replacing_it(self):
         result, calls = self.run_setup(labels=self.DONE)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, ["add orgs/dolphin-labs-hq/actions/runners/717/labels"])
+        self.assertEqual(calls, ["add orgs/dolphin-labs-hq/actions/runners/717/labels", *self.RETIRE])
         result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", labels=self.DONE)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, [])
+        self.assertEqual(calls, self.RETIRE)
 
     def test_registered_runners_are_relabelled_after_every_check(self):
         # Every runner with the pool's old labels: each mini gains ios-queue, and mini-3 keeps it alone (gww-ios, mini
@@ -183,16 +200,37 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         r = "add orgs/dolphin-labs-hq/actions/runners/{}/labels labels[]=ios-queue"
         self.assertEqual(calls, [
-            r.format(701), r.format(702),
             "remove orgs/dolphin-labs-hq/actions/runners/703/labels/gww-ios",
             "remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini",
             "remove orgs/dolphin-labs-hq/actions/runners/703/labels/ios-pool",
-            r.format(703), r.format(717),
+            r.format(703), r.format(717), *self.RETIRE,
         ])
         self.assertIn("mini-3: labels ios-queue", result.stdout)
         # mini-3 as #1109 left it (mini and ios-queue): only mini removed; the others already right.
         result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", labels={**self.DONE, "703": "mini,ios-queue"})
-        self.assertEqual(calls, ["remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini"])
+        self.assertEqual(calls, ["remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini", *self.RETIRE])
+
+    def test_retired_runners_are_deregistered_and_a_busy_one_waits_for_a_rerun(self):
+        done = dict(slot="717\tmini-4\tonline\ttrue\ttrue", labels=self.DONE)
+        # mini-1 is running a job: left registered, mini-2 retired, and the run says to come back (exit 4).
+        result, calls = self.run_setup(busy={"701": "true"}, **done)
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(calls, ["retire mini-2"])
+        self.assertIn("mini-1: running a job; run this again", result.stderr)
+        # A registration config.sh could not remove is deleted through the API.
+        result, calls = self.run_setup(stuck=["702"], **done)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["retire mini-1", "retire mini-2", "deregister orgs/dolphin-labs-hq/actions/runners/702"])
+        # config.sh remove failing in the guest stops nothing: the host deletes that registration and still retires the
+        # other runner.
+        result, calls = self.run_setup(remove_fails=["mini-1"], stuck=["701"], **done)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["retire mini-1", "deregister orgs/dolphin-labs-hq/actions/runners/701", "retire mini-2"])
+        self.assertIn("mini-1: config.sh remove failed in the guest", result.stderr)
+        # Already retired (no registration left in the guest): nothing to do.
+        result, calls = self.run_setup(fresh=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("retire mini-1", calls)
 
     def test_conflicts_dont_mutate_the_existing_runners(self):
         for case in (dict(slot="81\tother\tonline\tfalse\ttrue"), dict(slot=""),

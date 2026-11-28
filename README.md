@@ -1834,14 +1834,15 @@ with the `games-worth-watching/app-store-connect` key, and `POST /v1/devices` if
 signing (`-allowProvisioningUpdates`) adds a registered phone to the development profile on the next build. Keep
 UDIDs out of this repository.
 
-**The CI VM's runners** are `mini-1` through `mini-4`. To rebuild them, run
+**The CI VM's runners** are `mini-3` and `mini-4` (owner, 2026-11-28: two, not four; `mini-1` and `mini-2` are
+retired, and the script deregisters them). To rebuild them, run
 `scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
 the build tools and a signing keychain in the guest, then registers each missing runner with the
 `dolphin-labs-hq` organization. GitHub supplies `self-hosted`, `macOS` and `ARM64`. The script adds
 `ios-pool`, `mini` and the legacy `gww-ios` label. Registration uses the operator's org-admin GitHub login.
-Every mini also carries `ios-queue`, which dolphin-labs' merge queue batches ask for, and `mini-3` carries only
+`mini-4` also carries `ios-queue`, which dolphin-labs' merge queue batches ask for, and `mini-3` carries only
 `ios-queue`: no dolphin-labs PR job (they ask for `ios-pool`) and no dolphin-maps job (they ask for `mini`) takes it,
-so a batch's swift test runs there or on any free mini. Already-registered runners are relabelled by the same script.
+so a batch's swift test runs there or on `mini-4`. Already-registered runners are relabelled by the same script.
 
 Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini-simulator]` for each
 job that boots an iOS simulator. A single runner executes one job at a time across all eligible
