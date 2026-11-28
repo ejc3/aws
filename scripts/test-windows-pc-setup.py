@@ -36,6 +36,46 @@ def pin(text, name):
     return re.search(r"^%s=(\S+)$" % name, text, re.M).group(1)
 
 
+class AntigravityOnReturn(unittest.TestCase):
+    def test_manual_and_hourly_paths_use_the_same_installer_and_guide(self):
+        hourly = (ROOT / "antigravity-windows.tf").read_text()
+        self.assertIn('textencodebase64(file("${path.module}/scripts/windows/antigravity-stdin.ps1"), "UTF-16LE")', hourly)
+        self.assertIn('filebase64("${path.module}/scripts/antigravity-models.md")', hourly)
+        self.assertIn('filebase64("${path.module}/scripts/windows/antigravity-install.ps1")', hourly)
+        self.assertIn('file("${path.module}/scripts/antigravity-tunnel-status.sh")', hourly)
+        self.assertIn('on_pc "$(cat "$script_dir/windows/antigravity-stdin.ps1")"', SETUP)
+        self.assertIn('base64 -w0 < "$script_dir/windows/antigravity-install.ps1"', SETUP)
+        self.assertIn('base64 -w0 < "$script_dir/antigravity-models.md"', SETUP)
+        self.assertIn('runuser -u ubuntu', hourly)
+        self.assertIn('aws_instance.firecracker_dev[0].id', hourly)
+        self.assertNotIn('iam:', hourly)
+
+    def test_only_a_disconnected_tunnel_defers_a_handshake_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            ssh = Path(d) / "ssh"
+            ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$SSH_ERROR" >&2\nexit "$SSH_RC"\n')
+            ssh.chmod(0o755)
+            launcher = (ROOT / "scripts/windows/antigravity-reconcile.sh").read_text()
+            helper = 'antigravity_tunnel_down() { echo "probe:$1"; return "$PROBE_RC"; }\n'
+            for rc, error, offline, expected, probed in (
+                (0, "", False, 0, False),
+                (255, "websocket: bad handshake", True, 0, True),
+                (255, "websocket: bad handshake", False, 255, True),
+                (255, "Host key verification failed.", True, 255, False),
+                (255, "Permission denied (publickey).", True, 255, False),
+                (1, "installer failed", True, 1, False),
+            ):
+                with self.subTest(error=error, offline=offline):
+                    env = dict(os.environ, PATH=d+":"+os.environ["PATH"], SSH_RC=str(rc),
+                               SSH_ERROR=error, PROBE_RC="0" if offline else "1")
+                    run = subprocess.run(["bash", "-c", helper + launcher, "bash", "dispatcher", "installer", "guide"],
+                                         capture_output=True, text=True, env=env, timeout=3)
+                    self.assertEqual(run.returncode, expected, run.stderr)
+                    self.assertEqual("probe:colin-pc" in run.stdout, probed)
+                    if expected:
+                        self.assertIn(error, run.stderr)
+
+
 class Route(unittest.TestCase):
     def test_built_like_coltons_mac_with_an_admin_only_connector_token(self):
         self.assertIn('colin_pc_ssh_hostname = "colin-pc-ssh.cc-games.dev"', TF)
