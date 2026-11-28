@@ -313,7 +313,7 @@ from a snapshot copy of each work volume (no fresh snapshot, as the owner accept
 the old volumes, the move snapshots, the launch templates and the security group are deleted, so the Ohio volumes are the
 only copy (`prevent_destroy`). `scripts/parallel-box.sh` reads the region from `/infra/parallel-box`, published from
 `local.parallel_box_region`. `pbox up N FLAVOR` needs a flavor (`pbox-flavors.tf`: compute, general, memory or storage at 32,
-48, 96 or 192 vCPU, kvm-96/kvm-192, kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
+48, 96 or 192 vCPU, kvm-64/kvm-96/kvm-192, kvm-gpu-64, a g5g.metal with its two T4G GPUs on vfio-pci for passthrough, which
 only the fallback sites offer (a GPU flavor implies `--fallback`: every region that offers the type), or kvm-gpu-96, an x86 g4dn.metal with eight T4, at home: the one x86
 type, launched with `--image-id` set to the site's x86_64 build of the same Ubuntu image (published in `/infra/parallel-box`,
 pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=on iommu=pt` and reboots once
@@ -321,7 +321,8 @@ pinned by exact ARN in both launch grants), whose first boot adds `intel_iommu=o
 us-west-2 and us-east-1; a quota refusal names its limit and value, and pbox cancels that region's spot requests still open or active
 after their instance is gone (`ec2:CancelSpotInstanceRequests` in `pbox-flavor-types`, never the persistent boxes') and retries once; the script's FLAVORS and the IAM deny `pbox-flavor-types` follow that one menu, and a
 test keeps them equal); with none it exits 2 and prints the menu. An agent picks the smallest flavor that fits the work's
-shape and size. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
+shape and size. For a single nested VM or a unit-test lane, `kvm-64` offers three diskless Graviton3 pools with EBS
+scratch. Use `pbox capacity N kvm-64` to score that pool without launching. When the home AZ has no capacity, `pbox up N FLAVOR` exits 3 and names `--fallback`; `pbox up N FLAVOR
 --fallback` (or `--regions us-east-1,us-west-2`) then launches at a fallback site (`pbox-fallback.tf`: one per US region,
 every AZ but the home one, best spot placement score first) **with a fresh, empty work volume** that is deleted with the
 box, and no NFS scratch. `pbox capacity FLAVOR` shows the scores; `ip`, `ssh`, `status` and `down` find a box wherever it runs.
