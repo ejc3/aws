@@ -70,7 +70,7 @@ function Read-Rule($path) {
   if ([IO.File]::Exists($path)) { return $utf8.GetString([IO.File]::ReadAllBytes($path)) }
   return ''
 }
-function Write-Rule($path, $old, $content) {
+function Write-Rule($path, $old, $content, $requireNew = $false) {
   if ($old -ceq $content) { return }
   $dir = [IO.Path]::GetDirectoryName($path)
   [IO.Directory]::CreateDirectory($dir) | Out-Null
@@ -81,7 +81,7 @@ function Write-Rule($path, $old, $content) {
   try {
     [IO.File]::WriteAllBytes($tmp, $utf8.GetBytes($content))
     if ((Read-Rule $path) -cne $old) { throw "Concurrent edit to $path; retry later." }
-    Publish-File $tmp $path
+    if ($requireNew) { [IO.File]::Move($tmp, $path) } else { Publish-File $tmp $path }
   } finally { if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) } }
 }
 $body = $guide.TrimEnd("`r","`n") + "`n"
@@ -118,4 +118,49 @@ if ([string]::IsNullOrWhiteSpace($text.TrimStart([char]0xfeff))) {
   $path = Join-Path $codex 'AGENTS.md'
 }
 Set-ModelSection $path
+
+# The CLI can remove the permission key when a user selects its review default.
+# Mark the first successful seed so an hourly run never restores an unwanted value.
+function Set-InitialToolPermission {
+  $dir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
+  [IO.Directory]::CreateDirectory($dir) | Out-Null
+  $marker = Join-Path $dir '.fleet-permission-default-v1'
+  if ((Test-Path -LiteralPath $marker) -and ((Get-Item -Force -LiteralPath $marker).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw "Preference marker is linked; preserving $marker."
+  }
+  $seed = [IO.File]::Open($marker, 'OpenOrCreate', 'ReadWrite', 'None')
+  try {
+    $done = [Text.Encoding]::ASCII.GetBytes("done`n")
+    $saved = New-Object byte[] $done.Length
+    if ($seed.Length -eq $done.Length -and $seed.Read($saved, 0, $saved.Length) -eq $saved.Length -and
+        [Text.Encoding]::ASCII.GetString($saved) -ceq "done`n") { return }
+
+    $path = Join-Path $dir 'settings.json'
+    $exists = [IO.File]::Exists($path)
+    $old = Read-Rule $path
+    $source = if ($exists) { $old } else { '{}' }
+    # Read top-level names only. Insert into the original UTF-8 text, retaining
+    # personal rules, number precision, escaping, formatting and any BOM.
+    try {
+      Add-Type -AssemblyName System.Runtime.Serialization
+      $bytes = $utf8.GetBytes($source.TrimStart([char]0xfeff))
+      $reader = [Runtime.Serialization.Json.JsonReaderWriterFactory]::CreateJsonReader($bytes, [Xml.XmlDictionaryReaderQuotas]::Max)
+      $document = New-Object Xml.XmlDocument
+      try { $document.Load($reader) } finally { $reader.Dispose() }
+      $object = $document.DocumentElement
+      if ($object.GetAttribute('type') -ne 'object') { throw 'Not an object.' }
+    } catch { throw 'Expected a valid JSON object in the Antigravity CLI settings; preserving the file.' }
+    $members = @($object.SelectNodes('*') | ForEach-Object { $_.get_LocalName() })
+    if ($members -notcontains 'toolPermission') {
+      $entry = '"toolPermission":"always-proceed"'
+      if ($members.Count -gt 0) { $entry += ',' }
+      Write-Rule $path $old ($source.Insert($source.IndexOf('{') + 1, $entry)) (!$exists)
+    }
+    $seed.Position = 0
+    $seed.SetLength(0)
+    $seed.Write($done, 0, $done.Length)
+    $seed.Flush($true)
+  } finally { $seed.Dispose() }
+}
+Set-InitialToolPermission
 "Antigravity $version and model guides installed for $env:USERNAME"

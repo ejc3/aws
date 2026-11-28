@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the per-account installer offline with a tiny release archive and real hash checks."""
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -47,6 +48,33 @@ cp "$HOME/release.tgz" "$2"''')
 
     def run_installer(self):
         return subprocess.run(["/bin/bash", "-s"], input=self.script, text=True, env=self.env, capture_output=True)
+
+    def test_seeds_native_permission_once_and_preserves_nested_settings(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        path.parent.mkdir(parents=True)
+        original = {"agentMode": "plan", "permissions": {"deny": ["command(touch)"]},
+                    "unknown": [False, {"answer": 42}]}
+        path.write_text(json.dumps(original))
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(path.read_text()), dict(original, toolPermission="always-proceed"))
+        # Resetting the native preference to request-review removes its key.
+        path.write_text(json.dumps(original))
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_text(), json.dumps(original))
+
+    def test_existing_explicit_permission_and_malformed_json(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        path.parent.mkdir(parents=True)
+        path.write_text("[unfinished")
+        self.assertNotEqual(self.run_installer().returncode, 0)
+        self.assertEqual(path.read_text(), "[unfinished")
+        explicit = '{"toolPermission":"strict"}'
+        path.write_text(explicit)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_text(), explicit)
 
     def test_all_platforms_and_noninteractive_zsh(self):
         for platform, package in [
