@@ -21,7 +21,7 @@ symlinks into `fcvm/kernel/patches/`, so a fix there lands on both architectures
 deliberately excludes it, so the host takes a strict subset.
 
 **The host must not be older than the L1 guest kernel** (ejc3/fcvm#659): a 6.19 or later L1
-on a 6.18 host wedges L2. fcvm pins the arm64 host at 7.3.3, built from its own
+on a 6.18 host wedges L2. fcvm pins the arm64 host at 7.3.6, built from its own
 `kernel/patches-arm64-host`, ahead of its guests. On fcvm-metal-arm the SSM association
 `fcvm-arm-host-kernel` (firecracker-dev.tf) installs the host kernel of
 `var.fcvm_host_kernel_commit` and selects it for the next boot, once per commit change. It
