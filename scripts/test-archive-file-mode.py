@@ -9,7 +9,6 @@ already deployed. Archives built only from inline `source { content }` blocks ar
 already get a fixed mode, so they never drifted, and pinning them would change their hashes for nothing.
 """
 import re
-import sys
 import unittest
 from pathlib import Path
 
@@ -44,4 +43,4 @@ class ArchiveFileMode(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    sys.exit(unittest.main())
+    unittest.main(buffer=True)
