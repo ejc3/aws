@@ -360,6 +360,8 @@ jobs:
         run: python3 -S -B scripts/test-codex-restart.py
       - name: Codex refresh on the ubuntu boxes (weekly SSM association)
         run: python3 -S -B scripts/test-codex-update.py
+      - name: Antigravity CLI account selection and verified per-user installation
+        run: python3 -S -B scripts/test-antigravity-install.py
       - name: Daily Claude Code update on the ubuntu boxes (offline)
         run: python3 -S -B scripts/test-claude-update.py
       - name: Shared claude-master server (private, pinned, idle until its logins exist)

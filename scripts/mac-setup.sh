@@ -6,6 +6,7 @@
 #   mac-lease    the desktop lease: who is driving the screen right now (advisory)
 #   mac-build    at most two heavy builds at once; swift/xcodebuild/xcrun shims route builds through it
 #   peekaboo     the Peekaboo CLI through the app's Bridge, waiting while another session holds the lease
+#   agy          Google Antigravity for the owner's, Colton's and Colin's Macs
 #   mac-artifact-clean  old Xcode artifacts under pressure on the MacBook Scratch volume; hourly (mac only)
 #   Peekaboo     the pinned app and CLI release (scripts/mac/peekaboo-install.sh) and the LaunchAgent that opens it
 #
@@ -62,5 +63,9 @@ for f in "${files[@]}"; do
   [ -f "$here/$f" ] || { echo "mac-setup: missing $here/$f" >&2; exit 1; }
 done
 # One SSH session: the files as a tar stream on stdin, unpacked into a private temporary directory.
+case "$alias_:$cleaner_only" in
+  mac:|air:|mini:|colton-mac:|colin-mac:)
+    files+=(-C "$here/.." antigravity-install.sh antigravity-models.md antigravity-owner-models.pl) ;;
+esac
 tar -C "$here" -cf - "${files[@]}" | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
   '/bin/zsh -c '\''d=$(mktemp -d /tmp/mac-setup.XXXXXXXX) && tar -C "$d" -xf - && '"$entry"' "$d" '"$mode"'; rc=$?; rm -rf "$d"; exit $rc'\'''
