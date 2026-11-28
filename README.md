@@ -129,6 +129,14 @@ mutable and point the staging task at it. The release function refuses to roll
 a task that still uses the old fixed tag. To roll back after a failed smoke
 check, revert the change on main and deploy that commit through the same workflow.
 
+**Moving into `dolphin-labs-hq/dolphin-labs`** (its `docs/MONOREPO-MOVE.md`, phases 5 to 8). During the
+cutover `family-stage-api-ci` trusts two workflows, each on `main` in its repository's `family-stage`
+environment and pinned by `job_workflow_ref`: constellation's `deploy-family-api.yml` and dolphin-labs'
+`family-deploy-api.yml`. Both repositories have the main-only `family-stage` environment with
+`FAMILY_STAGE_DEPLOY_ROLE_ARN` (`family-stage-github.tf`). dolphin-labs sends `run_number + 1000` to the
+release function, because run numbers count per workflow. Phase 6 disables constellation's workflow before
+the first deploy from dolphin-labs. Phase 8 removes constellation's subject and environment.
+
 ### PatchDoctor: autonomous critical security patches
 
 The owner authorizes PatchDoctor to investigate verified **CRITICAL CVEs**, apply

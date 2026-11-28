@@ -208,9 +208,28 @@ class PermissionBoundary(unittest.TestCase):
         text = (ROOT / "family-stage-api.tf").read_text()
         trust = text.split('resource "aws_iam_role" "family_stage_api_ci" {')[1].split('\n}')[0]
         self.assertIn('aws_iam_openid_connect_provider.family_github.arn', trust)
-        self.assertIn('"token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"', trust)
-        self.assertIn('"token.actions.githubusercontent.com:ref" = "refs/heads/main"', trust)
-        self.assertIn('"repo:ejc3@1694850/constellation@1427792887:environment:family-stage"', trust)
+        code = "\n".join(l for l in trust.splitlines() if not l.lstrip().startswith("#"))
+        self.assertNotIn("StringLike", code)
+        self.assertNotIn('"*"', code)
+        # One statement per repository: its subject is admitted only with its own workflow file, on main.
+        statements = code.split("Sid       = ")[1:]
+        self.assertEqual(len(statements), 2)
+        expected = {
+            '"ConstellationDeployFamilyApi"': (
+                "repo:ejc3@1694850/constellation@1427792887:environment:family-stage",
+                "ejc3/constellation/.github/workflows/deploy-family-api.yml@refs/heads/main"),
+            '"DolphinLabsFamilyDeployApi"': (
+                "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:environment:family-stage",
+                "dolphin-labs-hq/dolphin-labs/.github/workflows/family-deploy-api.yml@refs/heads/main"),
+        }
+        for statement in statements:
+            sid = statement.split("\n")[0].strip()
+            sub, workflow = expected.pop(sid)
+            conditions = dict(re.findall(r'"token\.actions\.githubusercontent\.com:(\w+)"\s*=\s*"([^"]+)"', statement))
+            self.assertEqual(conditions, {"aud": "sts.amazonaws.com", "sub": sub, "ref": "refs/heads/main",
+                                          "job_workflow_ref": workflow}, sid)
+            self.assertEqual(statement.count("StringEquals"), 1)
+        self.assertEqual(expected, {})
         policy = text.split('resource "aws_iam_role_policy" "family_stage_api_ci" {')[1].split('\n}')[0]
         self.assertEqual(set(re.findall(r'"([a-zA-Z0-9]+:[A-Za-z*]+)"', policy)), {
             "ecr:GetAuthorizationToken", "ecr:BatchCheckLayerAvailability", "ecr:InitiateLayerUpload",
@@ -220,6 +239,29 @@ class PermissionBoundary(unittest.TestCase):
         self.assertRegex(policy, r'Action = "ecr:GetAuthorizationToken", Resource = "\*"')
         self.assertEqual(policy.count('Resource = "*"'), 1)
         self.assertRegex(text, r'reserved_concurrent_executions\s*= 1\b')
+
+
+class GitHubEnvironments(unittest.TestCase):
+    def test_family_stage_is_main_only_in_both_repositories_and_holds_the_role(self):
+        text = (ROOT / "family-stage-github.tf").read_text()
+        for name, provider, repository in (
+            ("family_stage_api", "github.agents_md", '"constellation"'),
+            ("dolphin_labs_family_stage_api", "github.dolphin_labs_ci", "local.dolphin_labs_ci_repository"),
+        ):
+            with self.subTest(environment=name):
+                env = text.split(f'resource "github_repository_environment" "{name}" {{')[1].split("\n}")[0]
+                self.assertRegex(env, rf"provider\s*= {re.escape(provider)}\n")
+                self.assertRegex(env, rf"repository\s*= {re.escape(repository)}\n")
+                self.assertRegex(env, r'environment\s*= "family-stage"')
+                self.assertRegex(env, r"protected_branches\s*= false")
+                self.assertRegex(env, r"custom_branch_policies\s*= true")
+                policy = text.split(f'resource "github_repository_environment_deployment_policy" "{name}_main" {{')[1].split("\n}")[0]
+                self.assertIn(f"github_repository_environment.{name}.environment", policy)
+                self.assertRegex(policy, r'branch_pattern\s*= "main"')
+                var = text.split(f'resource "github_actions_environment_variable" "{name}_role" {{')[1].split("\n}")[0]
+                self.assertIn(f"github_repository_environment.{name}.environment", var)
+                self.assertRegex(var, r'variable_name\s*= "FAMILY_STAGE_DEPLOY_ROLE_ARN"')
+                self.assertRegex(var, r"value\s*= aws_iam_role\.family_stage_api_ci\.arn")
 
 if __name__ == "__main__":
     unittest.main(buffer=True)
