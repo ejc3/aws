@@ -15,21 +15,21 @@ def primary(service):
 
 
 def release(event, ecr, ecs, receipts, repo_uri):
-    if not isinstance(event, dict) or event.keys() != {"commit", "digest", "run_id"}:
-        raise ValueError("Expected only commit, digest and run_id")
-    commit, digest, run_id = event["commit"], event["digest"], event["run_id"]
+    if not isinstance(event, dict) or event.keys() != {"commit", "digest", "run_number"}:
+        raise ValueError("Expected only commit, digest and run_number")
+    commit, digest, run_number = event["commit"], event["digest"], event["run_number"]
     if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Expected a full Git commit SHA")
     if not isinstance(digest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("Expected a SHA-256 image digest")
-    if type(run_id) is not int or not 0 < run_id < 2**63:
-        raise ValueError("Expected a positive GitHub run ID")
+    if type(run_number) is not int or not 0 < run_number < 2**63:
+        raise ValueError("Expected a positive GitHub workflow run number")
 
     key = {"stage": "family"}
     prior = receipts.get_item(Key=key, ConsistentRead=True).get("Item", {})
-    if run_id < prior.get("run_id", 0):
+    if run_number < prior.get("run_number", 0):
         raise ValueError("A newer workflow run has already claimed this staging service")
-    same_run = run_id == prior.get("run_id")
+    same_run = run_number == prior.get("run_number")
     if same_run and (commit != prior["commit"] or digest != prior["digest"]):
         raise ValueError("The same workflow run cannot change its image")
 

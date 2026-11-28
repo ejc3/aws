@@ -115,7 +115,7 @@ the GitHub-issued environment subject, repository identity and main branch befor
 issuing short-lived credentials in the Family account. The ECR push permission
 covers tags in `family/api`, including the rolling tag. The workflow publishes
 an ARM64 image tagged with its full commit SHA to `family/api` and invokes
-`family-stage-api-release` with the commit, image digest and GitHub run ID.
+`family-stage-api-release` with the commit, image digest and GitHub workflow run number.
 
 The release function checks the commit tag against that digest, moves the
 `family-stage` tag, and requests a fresh deployment of the existing

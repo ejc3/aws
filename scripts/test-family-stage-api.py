@@ -23,7 +23,7 @@ class StageRelease(unittest.TestCase):
         self.deployment = "ecs-svc/100"
         self.rollout = "COMPLETED"
         self.running_image = REPO + ":family-stage"
-        self.event = {"commit": COMMIT, "digest": DIGEST, "run_id": 20}
+        self.event = {"commit": COMMIT, "digest": DIGEST, "run_number": 20}
         self.ecr, self.ecs, self.table = Mock(), Mock(), Mock()
         self.table.get_item.side_effect = self.read
         self.table.put_item.side_effect = self.write
@@ -81,9 +81,9 @@ class StageRelease(unittest.TestCase):
         self.assertEqual(self.record, {**result, "stage": "family"})
         self.assertEqual(self.invoke(), result)
         # Manual dispatch of the already-deployed commit still fences older runs.
-        self.assertEqual(self.invoke({**self.event, "run_id": 22})["deployment_id"], self.deployment)
+        self.assertEqual(self.invoke({**self.event, "run_number": 22})["deployment_id"], self.deployment)
         with self.assertRaisesRegex(ValueError, "newer workflow"):
-            self.invoke({**self.event, "run_id": 21})
+            self.invoke({**self.event, "run_number": 21})
         self.ecs.update_service.assert_called_once()
         self.ecr.put_image.assert_called_once()
 
@@ -136,7 +136,7 @@ class StageRelease(unittest.TestCase):
         self.ecs.update_service.assert_not_called()
         self.table.put_item.assert_not_called()
 
-    def test_receipt_rejects_reused_id_with_changed_image(self):
+    def test_receipt_rejects_reused_number_with_changed_image(self):
         self.invoke()
         with self.assertRaisesRegex(ValueError, "same workflow run"):
             self.invoke({**self.event, "commit": OLD, "digest": OLD_DIGEST})
@@ -161,7 +161,7 @@ class StageRelease(unittest.TestCase):
         self.assertEqual(self.ecs.update_service.call_count, 2)
 
     def test_invalid_contract_has_no_aws_calls(self):
-        for override in ({"commit": "main"}, {"digest": "latest"}, {"run_id": -1}, {"run_id": True}, {"cluster": "prod"}):
+        for override in ({"commit": "main"}, {"digest": "latest"}, {"run_number": -1}, {"run_number": True}, {"cluster": "prod"}):
             with self.subTest(override=override), self.assertRaises(ValueError):
                 self.invoke({**self.event, **override})
         self.table.get_item.assert_not_called()
@@ -187,4 +187,4 @@ class PermissionBoundary(unittest.TestCase):
         self.assertRegex(text, r'reserved_concurrent_executions\s*= 1\b')
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(buffer=True)
