@@ -72,7 +72,7 @@ class Origin(unittest.TestCase):
         fn = block(TF, 'resource "aws_lambda_function" "pc_enroll"')
         self.assertIn('handler                        = "pc-enroll.handler"', fn)
         self.assertIn('runtime                        = "nodejs22.x"', fn)
-        self.assertIn('source_file = "${path.module}/scripts/pc-enroll.mjs"', TF)
+        self.assertRegex(TF, r'source_file\s+= "\$\{path\.module\}/scripts/pc\-enroll\.mjs"')
         self.assertIn("export const handler", LAMBDA)
         imports = re.findall(r"^import .* from '([^']+)';$", LAMBDA, re.M)
         self.assertEqual(imports, ["node:crypto"])  # nothing the zip would not carry
