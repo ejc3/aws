@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parent.parent
 MOD = ROOT / "modules" / "app-account"
 ACCOUNT = (MOD / "account.tf").read_text()
 STAGE = (MOD / "stage.tf").read_text()
+EMAIL = (MOD / "email.tf").read_text()
 VARS = (MOD / "variables.tf").read_text()
 OUT = (MOD / "outputs.tf").read_text()
 FAMILY = (ROOT / "family-account.tf").read_text()
@@ -125,9 +126,11 @@ class StateAndPointerTests(unittest.TestCase):
     def test_the_pointer_holds_no_credential(self):
         pointer = block("pointer = {", ACCOUNT)
         keys = set(re.findall(r"^\s+(\w+)\s+=", pointer, re.M))
-        self.assertEqual(keys, {"account_id", "region", "state_bucket", "terraform_role", "stage"})
+        self.assertEqual(keys, {"account_id", "region", "state_bucket", "terraform_role", "stage", "email"})
         stage = block("stage_pointer = local.stage_on ? {", STAGE)
         self.assertEqual(set(re.findall(r"^\s+(\w+)\s+=", stage, re.M)), {"hostname", "access_team_domain", "access_aud", "tunnel_secret_name"})
+        email = block("email_pointer = local.email_on ? {", EMAIL)
+        self.assertEqual(set(re.findall(r"^\s+(\w+)\s+=", email, re.M)), {"identity_arn", "from"})
 
 
 class StageTests(unittest.TestCase):
@@ -166,7 +169,11 @@ class StageTests(unittest.TestCase):
         for path in ("/family/v1/native/token", "/healthz", "/", "/x/family/native/login"):
             self.assertFalse(login.search(path), path)
         # The API's routes the app calls (ejc3/constellation apps/api/src/family/http.ts, FamilySession.swift).
-        for path in ("/family/v1/native/token", "/family/v1/refresh", "/family/v1/sign-out", "/family/native/login", "/healthz"):
+        for path in ("/family/v1/native/token", "/family/v1/refresh", "/family/v1/sign-out", "/family/native/login", "/healthz",
+                     # Family's own sign-in (Sign in with Apple, email codes, adding a way, Apple's notifications).
+                     "/family/v1/native/apple", "/family/v1/native/email/start", "/family/v1/native/email/verify",
+                     "/family/v1/native/methods", "/family/v1/native/methods/email/verify",
+                     "/family/v1/native/apple/notifications"):
             self.assertTrue(api.search(path), path)
         # zero-cache's own calls to the API, the lobby's routes, and anything else, never reach the API from outside.
         for path in ("/family/zero/query", "/family/zero/mutate", "/zero/query", "/me", "/family", "/healthzx", "/",
@@ -187,6 +194,36 @@ class StageTests(unittest.TestCase):
         self.assertIn("provider      = aws.app", version)
         self.assertEqual(STAGE.count("cloudflared_token.stage[0].token"), 1)
         self.assertNotIn("token", OUT)
+
+
+class EmailTests(unittest.TestCase):
+    def test_the_identity_is_in_the_apps_account_with_dkim_and_its_own_mail_from(self):
+        identity = block('resource "aws_sesv2_email_identity" "sender"', EMAIL)
+        self.assertIn("provider       = aws.app", identity)
+        self.assertIn("email_identity = var.email_sender.domain", identity)
+        mail_from = block('resource "aws_sesv2_email_identity_mail_from_attributes" "sender"', EMAIL)
+        self.assertIn("provider               = aws.app", mail_from)
+        self.assertIn('local.email_on ? "bounce.${var.email_sender.domain}" : null', EMAIL)
+        dkim = block('resource "cloudflare_dns_record" "sender_dkim"', EMAIL)
+        self.assertIn("count   = local.email_on ? 3 : 0", dkim)
+        self.assertIn("proxied = false", dkim)
+        self.assertIn('content  = "feedback-smtp.${var.region}.amazonses.com"', block('resource "cloudflare_dns_record" "sender_mail_from_mx"', EMAIL))
+        self.assertIn('include:amazonses.com', block('resource "cloudflare_dns_record" "sender_mail_from_spf"', EMAIL))
+
+    def test_nothing_here_can_send_or_holds_a_credential(self):
+        # Sending is granted in the app's repository, to its task role; no user, key or SMTP password here.
+        code = "\n".join(line for line in EMAIL.splitlines() if not line.lstrip().startswith("#"))
+        for word in ("aws_iam_user", "aws_iam_access_key", "aws_iam_role", "ses:Send", "smtp_password", "secret"):
+            self.assertNotIn(word, code)
+
+    def test_family_sends_from_its_own_subdomain_never_the_apex(self):
+        sender = block("email_sender = {", FAMILY)
+        domain = re.search(r'domain\s+= "([^"]+)"', sender).group(1)
+        self.assertTrue(domain.endswith(".dolphin-labs.dev"), domain)
+        # The apex is the work address's SES identity in the Dolphin account (dolphin-labs-email-send.tf).
+        self.assertNotEqual(domain, "dolphin-labs.dev")
+        self.assertIn("zone_id         = var.dolphin_zone_id", sender)
+        self.assertRegex(sender, r'from_local_part = "[a-z0-9.+-]+"')
 
 
 if __name__ == "__main__":

@@ -210,6 +210,7 @@ locals {
     state_bucket   = aws_s3_bucket.state.bucket
     terraform_role = aws_iam_role.terraform.arn
     stage          = var.stage == null ? null : local.stage_pointer
+    email          = local.email_pointer
   }
 }
 #   aws ssm get-parameter --region <region> --name /infra/<app> --query Parameter.Value --output text

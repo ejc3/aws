@@ -71,3 +71,23 @@ variable "stage" {
     error_message = "stage.login_path is a plain path: /, letters, digits, _ and -."
   }
 }
+
+# The app's sending domain (optional, email.tf): an SES identity in the app's account for `domain` (a
+# subdomain of the zone, with no mail of its own), DKIM and MAIL FROM records in the zone, and the
+# address the app sends from, `from_local_part`@`domain`, in the pointer. DMARC is the zone's own.
+variable "email_sender" {
+  type = object({
+    zone_id         = string
+    domain          = string
+    from_local_part = string
+  })
+  default = null
+  validation {
+    condition     = var.email_sender == null || can(regex("^[a-z0-9-]+(\\.[a-z0-9-]+)+$", var.email_sender.domain))
+    error_message = "email_sender.domain is a lowercase domain name."
+  }
+  validation {
+    condition     = var.email_sender == null || can(regex("^[a-z0-9][a-z0-9.+-]{0,63}$", var.email_sender.from_local_part))
+    error_message = "email_sender.from_local_part is a plain local part (lowercase letters, digits, . + -)."
+  }
+}

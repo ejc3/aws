@@ -2079,6 +2079,11 @@ ejc3/constellation's `infra/apps/family` (from its `infra/modules/app`), applied
   connector's Access rule miss. Family: `family-sync-stage.dolphin-labs.dev`, sign-in at `/family/native/login` for the
   family allowlist, `^/(family/(v1|native)/|healthz$)` to the API on :8081, zero-cache on :4848; the API's `/family/zero/*`
   (zero-cache's calls on the task's localhost) is never routed.
+- **Sending domain (optional, `email.tf`):** an SES domain identity in the app's account with Easy DKIM and a custom MAIL
+  FROM (`bounce.<domain>`), their records in the zone, and the From address in the pointer (`email`). Nothing here can
+  send: the app's repository grants its task role `ses:SendEmail` on that identity, From that address only. Family:
+  `family-mail.dolphin-labs.dev`, its sign-in codes (constellation docs/FAMILY.md, "Family's own sign-in"). Once, by
+  hand: SES production access for the app's account in its region, as for the work address below.
 - **First apply** of a new account: the account first (`-target=module.<app>_account.aws_organizations_account.this`), then
   everything, as for every account.
 - **Tests:** `scripts/test-app-account.py` (offline) pins the module and Family's call, including Family's regexes against
