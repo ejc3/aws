@@ -26,6 +26,16 @@ What each action must first establish, without waiting:
   - a temp entry: nothing more than its own checks, repeated just before it goes: untouched for 24 hours and
     open in no process. No job picks up a day-old temp entry.
 
+Below 15 GiB free (an emergency: the volume filled at 2.9 GiB free on 2026-11-28, #1112, with all four runners
+busy around the clock, so the guards above never let anything go), two more things may go, each on the evidence that
+no running job can be using it, because no job runs longer than JOB_CAP (the longest timeout-minutes of a job
+on these runners, 265: dolphin-maps' scheduled iOS run; every Mac job in dolphin-labs and dolphin-maps sets one):
+
+  - a Shutdown simulator untouched for SIM_AGE (6 hours, past any job's start) whose UDID no running process names,
+    even while its runner is busy, checked again just before the erase;
+  - a DerivedData entry untouched for EMERGENCY_CACHE_AGE (5 hours) and open in no process, without the mac-build
+    locks, the open-file check repeated from a listing at most 10 seconds old, as for a temp entry.
+
 Nothing under ~/runners is visited. The log carries counts and bytes only. Python 3.9 (Xcode's /usr/bin/python3).
 """
 
@@ -48,6 +58,12 @@ MIN_FREE = 30 * GIB
 MAX_USED = 0.85
 SIM_AGE = 6 * 3600
 CACHE_AGE = 24 * 3600
+# The emergency tier: under EMERGENCY_FREE, what no running job can be using goes without the job guards. JOB_CAP is the
+# longest any job here runs: dolphin-maps ios.yml's scheduled run, 265 minutes (dolphin-labs' longest is 240). Both ages
+# are past it. A new Mac job with a longer timeout-minutes raises it.
+EMERGENCY_FREE = 15 * GIB
+JOB_CAP = 265 * 60
+EMERGENCY_CACHE_AGE = 5 * 3600
 VOLUME = "/System/Volumes/Data"
 XCRUN = "/usr/bin/xcrun"
 LSOF = "/usr/sbin/lsof"
@@ -177,6 +193,18 @@ def device_states():
             for runtime in listing["devices"].values() for d in runtime}
 
 
+def named_by_a_process(udid):
+    """Whether any running process's command line names this UDID. An unreadable process list counts as yes."""
+    try:
+        out = subprocess.run([PS, "-axww", "-o", "command="], stdin=subprocess.DEVNULL, capture_output=True,
+                             text=True, errors="replace", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if out.returncode != 0 or not out.stdout.strip():
+        return True
+    return udid in out.stdout or udid.lower() in out.stdout
+
+
 def runner_of(home, name):
     """The runner a simulator belongs to, when its name names one that is known to run here."""
     match = RUNNER.search(name)
@@ -196,9 +224,9 @@ def stale(devices, udid, cutoff):
     return stat.S_ISREG(s.st_mode) and s.st_mtime <= cutoff
 
 
-def erase_simulators(home, device, now, apply, stats, short):
+def erase_simulators(home, device, now, apply, stats, short, urgent=lambda: False):
     devices = home / "Library/Developer/CoreSimulator/Devices"
-    cutoff = now - SIM_AGE
+    cutoff = now - SIM_AGE  # past JOB_CAP: no running job has touched a device this old
     found = []
     for udid, (state, name) in device_states().items():
         if isinstance(udid, str) and UDID.match(udid) and state == "Shutdown" and stale(devices, udid, cutoff):
@@ -215,12 +243,18 @@ def erase_simulators(home, device, now, apply, stats, short):
             stats.add("simulators", before)
             continue
         runner = runner_of(home, name)
+        # The emergency tier needs no job guard: the device is older than any running job, and no process names it.
+        emergency = urgent() and not named_by_a_process(udid)
         try:
-            with guard(home, runner):
+            with (contextlib.nullcontext() if emergency else guard(home, runner)):
                 # Checked again under the guard: a job may have booted or used it since the listing.
                 if device_states().get(udid, (None,))[0] != "Shutdown" or not stale(devices, udid, cutoff):
                     continue
-                if runner and runner_state(home, runner) != "idle":
+                if emergency:
+                    if named_by_a_process(udid):
+                        continue  # a job picked it up since: checked last, just before the erase
+                    stats.emergency += 1
+                elif runner and runner_state(home, runner) != "idle":
                     raise RunnerBusy()  # a job started since: checked last, just before the erase
                 if simctl("erase", udid, check=False).returncode != 0:
                     stats.failed += 1
@@ -237,6 +271,13 @@ def erase_simulators(home, device, now, apply, stats, short):
             left = 0  # CoreSimulator recreates data/ when the device next boots
         stats.add("simulators", before - left)
     return False
+
+
+def found_newest(path, device):
+    try:
+        return tree(path, device)[1]
+    except FileNotFoundError:
+        return float("inf")
 
 
 def temp_dir():
@@ -280,8 +321,12 @@ def cache_roots(home):
         yield kind, root, s.st_dev
 
 
-def age_out_caches(home, now, apply, stats, short):
-    cutoff = now - CACHE_AGE
+def age_out_caches(home, now, apply, stats, short, urgent=lambda: False):
+    # In an emergency DerivedData's age is EMERGENCY_CACHE_AGE, past any running job's start; temp keeps CACHE_AGE.
+    def cutoff_for(kind):
+        return now - (EMERGENCY_CACHE_AGE if kind == "derived_data" and urgent() else CACHE_AGE)
+
+    cutoff = now - min(CACHE_AGE, EMERGENCY_CACHE_AGE)  # the scan keeps any candidate; each is judged again below
     found = []
     for kind, root, device in cache_roots(home):
         with os.scandir(root) as entries:
@@ -306,6 +351,8 @@ def age_out_caches(home, now, apply, stats, short):
     for _, kind, path, device, size in sorted(found):
         if not short():
             return True
+        if found_newest(path, device) > cutoff_for(kind):
+            continue  # not past the age that applies to it now
         if listed is None or time.monotonic() - listed > 60:
             opened, listed = open_paths(), time.monotonic()
         if in_use(path, opened):
@@ -313,10 +360,12 @@ def age_out_caches(home, now, apply, stats, short):
         if not apply:
             stats.add(kind, size)
             continue
-        # A temp entry needs only its own checks, repeated here; DerivedData waits for no job at all.
+        # A temp entry needs only its own checks, repeated here; DerivedData waits for no job at all, except in an
+        # emergency, when it is older than any running job and gets the temp entry's checks instead.
+        emergency = kind == "derived_data" and urgent()
         try:
-            with (no_jobs(home) if kind == "derived_data" else contextlib.nullcontext()):
-                if kind != "derived_data":
+            with (no_jobs(home) if kind == "derived_data" and not emergency else contextlib.nullcontext()):
+                if kind != "derived_data" or emergency:
                     # Without the locks, the open-file check is repeated, from a listing at most 10 seconds old.
                     if time.monotonic() - listed > 10:
                         opened, listed = open_paths(), time.monotonic()
@@ -326,8 +375,10 @@ def age_out_caches(home, now, apply, stats, short):
                     size, newest = tree(path, device)
                 except FileNotFoundError:
                     continue
-                if newest > cutoff:
+                if newest > cutoff_for(kind):
                     continue
+                if emergency:
+                    stats.emergency += 1
                 if os.path.isdir(path) and not os.path.islink(path):
                     shutil.rmtree(path, ignore_errors=True)
                 else:
@@ -347,6 +398,7 @@ def age_out_caches(home, now, apply, stats, short):
 class Stats:
     def __init__(self):
         self.counts, self.bytes, self.failed, self.busy, self.waiting, self.estimate = {}, {}, 0, 0, 0, 0
+        self.emergency = 0  # removals the emergency tier made
 
     def add(self, kind, freed):
         self.counts[kind] = self.counts.get(kind, 0) + 1
@@ -369,10 +421,15 @@ def clean(home, apply, now=None):
         result["free_after"] = current
         return pressure(total, current)
 
+    def urgent():
+        # Read again for each candidate: once the volume is back over EMERGENCY_FREE the guards apply again.
+        current = usage(VOLUME)[1] if apply else free + stats.estimate
+        return current < EMERGENCY_FREE
+
     home_device = os.lstat(home).st_dev
-    if erase_simulators(home, home_device, now, apply, stats, short):
+    if erase_simulators(home, home_device, now, apply, stats, short, urgent):
         result["status"] = "enough room"
-    elif age_out_caches(home, now, apply, stats, short):
+    elif age_out_caches(home, now, apply, stats, short, urgent):
         result["status"] = "enough room"
     elif not short():
         result["status"] = "enough room"
@@ -402,6 +459,8 @@ def report(result, dry_run):
         parts.append(f"{stats.failed} erases refused")
     if stats.busy:
         parts.append(f"{stats.busy} simulators of busy runners skipped")
+    if stats.emergency:
+        parts.append(f"{stats.emergency} by the emergency tier (under {EMERGENCY_FREE / GIB:.0f} GiB free)")
     used = (total - result["free_after"]) / total * 100 if total else 0
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(
