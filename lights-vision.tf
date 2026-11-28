@@ -78,6 +78,9 @@ resource "aws_secretsmanager_secret_version" "lights_vision_worker" {
     LIGHTS_TOKEN_KEY   = random_bytes.lights_token_key.hex
     ACCESS_TEAM_DOMAIN = local.browser_manager_issuer
     ACCESS_AUD         = cloudflare_zero_trust_access_application.lights_stage_smoke.aud
+    # The agent token route (POST /api/v1/token): the remote MCP Worker presents this shared secret for a
+    # token for the person it signed in (constellation-mcp-stage.tf holds the other side).
+    LIGHTS_SERVICE_SECRET = random_password.constellation_lights_service.result
   })
 
   lifecycle {

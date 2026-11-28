@@ -102,6 +102,15 @@ resource "random_password" "constellation_lattice_service" {
   special = false
 }
 
+# The Lights site's agent token route (constellation config/secrets.json lights-service): the Worker presents it to
+# the Lights staging Worker's POST /api/v1/token for a token for the person it signed in, their own houses only.
+# Both sides are written here (this Worker's container below, the Lights Worker's in lights-vision.tf), so rotating is
+# one -replace and a reload of both Workers' secrets.
+resource "random_password" "constellation_lights_service" {
+  length  = 48
+  special = false
+}
+
 # The Worker's runtime secrets (JSON: variable name -> value), loaded into it with scripts/workers-stage-secrets.sh, as
 # for the other staging Workers. Unlike theirs, every value here comes from a resource in this file, so Terraform writes
 # the version (in state, as the tunnel token is); administration only may read it.
@@ -138,6 +147,8 @@ resource "aws_secretsmanager_secret_version" "constellation_mcp_stage" {
     ACCESS_ISSUER            = local.constellation_mcp_oidc_base
     ORBIT_API                = "https://${local.lattice_stage_hostname}"
     LATTICE_SERVICE_SECRET   = random_password.constellation_lattice_service.result
+    LIGHTS_API               = "https://${local.lights_stage_hostname}"
+    LIGHTS_SERVICE_SECRET    = random_password.constellation_lights_service.result
   })
 }
 
