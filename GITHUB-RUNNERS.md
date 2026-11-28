@@ -1063,6 +1063,35 @@ the `dolphin-labs-hq` organization runner group `dolphin-linux`. These repositor
 capacity. Each VM takes one job and terminates. The Mac runner group and the Linux runners
 belonging to other GitHub owners continue on their existing paths.
 
+#### Investigate a queued Dolphin job
+
+For a job labelled `[self-hosted, dolphin, l]`, read the app controller's decisions with
+the dev box's AWS credentials. On Next.js, use the default profile in the Dolphin workspace.
+The same commands work from the metal dev boxes. This path uses CloudWatch in the fleet
+account and requires no GitHub organization token.
+
+```sh
+aws logs tail /aws/lambda/github-app-runner --region us-west-1 --since 1h \
+  --filter-pattern '"dolphin-labs-hq/dolphin-labs"'
+aws logs tail /aws/lambda/github-app-runner --region us-west-1 --since 1h \
+  --filter-pattern '"budget dolphin"'
+```
+
+The first command shows that repository's queue scans and launch decisions. Substitute a
+sibling repository's full name when investigating one of its jobs. The second shows the
+shared Dolphin budget and whether the controller is throttling launches. This metric shows
+how long the oldest queued job had waited without a covering host in each five-minute interval.
+
+```sh
+aws cloudwatch get-metric-statistics --region us-west-1 --namespace GitHubAppRunner \
+  --metric-name OldestQueuedSeconds --dimensions Name=Label,Value=dolphin \
+  --start-time "$(date -u -d '1 hour ago' +%FT%TZ)" --end-time "$(date -u +%FT%TZ)" \
+  --period 300 --statistics Maximum --query 'sort_by(Datapoints,&Timestamp)[].[Timestamp,Maximum]' --output table
+```
+
+`GitHubAppRunner/LiveRunners` and `LiveVcpus` use the `Repo` dimension.
+`GitHubRunners/ScaleUpStarved` measures the separate fcvm metal pool by architecture.
+
 **Sizing.** Across 4,032 matched five-minute CloudWatch samples from November 2 to November 16, 2026,
 the existing Dolphin Linux runners used at most **18 hosts and 608 vCPUs**; p95 was **5 hosts and 168
 vCPUs**, and 66% of samples had no hosts. These are live host counts in `GitHubAppRunner`, including

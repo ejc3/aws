@@ -389,6 +389,7 @@ In a new installation, enable the Dolphin runner webhooks with
 Enable the pool after the dedicated runners App can read the `dolphin-linux` group and its
 three selected repositories and issue a single-job registration.
 See the [Dolphin Linux pool rollout](GITHUB-RUNNERS.md#dolphin-organization-linux-pool).
+If a `dolphin` job is stuck, [read the controller's decisions and queue age from a dev box](GITHUB-RUNNERS.md#investigate-a-queued-dolphin-job).
 
 The runners for `CoderColton/colton-games`, `dolphin-labs-hq/dolphin-labs`, `dolphin-labs-hq/dolphin-films`,
 `dolphin-labs-hq/dolphin-maps`, `ejc3/imagine` and `ejc3/constellation` also need one controller token each, in Secrets Manager `github-runner/repo-pat/<owner>/<repo>` (the
