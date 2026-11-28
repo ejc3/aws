@@ -101,6 +101,8 @@ jobs:
         run: python3 -S -B scripts/test-dolphin-relay.py
       - name: dolphin-family (deploy token in a main-only environment, runners behind a closed gate)
         run: python3 -S -B scripts/test-dolphin-family.py
+      - name: Family TestFlight role
+        run: python3 -S -B scripts/test-constellation-family-testflight.py
       - name: dolphin-labs' post-deploy log token reads logs only, from a main-only environment
         run: python3 -S -B scripts/test-dolphin-labs-ci-logs.py
       - name: Dolphin Labs staging check token is scoped to the canonical hostname and main-only deploy environment

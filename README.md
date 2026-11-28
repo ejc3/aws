@@ -1984,6 +1984,16 @@ match. An organization runner administrator can grant access with
 `gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
 `gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
 
+**Family's TestFlight job (`ejc3/constellation`, `testflight-family.yml`).** It asks for
+`[self-hosted, macOS, ios-pool]` and signs with the CI VM's build keychain, but `ejc3/constellation` is a
+user-owned repository: the organization's runner group (`dolphin-labs-hq`) cannot serve it, and it has no
+self-hosted runner of its own. Before the first run, the operator registers a repository-level runner for it in
+the CI VM (a registration token from `gh api -X POST repos/ejc3/constellation/actions/runners/registration-token`,
+labels `self-hosted,macOS,ARM64,ios-pool`), and the owner creates the GitHub environment `testflight-family` in
+`ejc3/constellation` (deployment branches: `main` only) with the variable `AWS_TESTFLIGHT_ROLE_ARN` from the
+output `constellation_family_testflight` (`constellation-family-testflight.tf`), plus `FAMILY_BUNDLE_ID`,
+`FAMILY_API` and `FAMILY_ZERO_URL`. A runner of that repository takes only its jobs.
+
 #### Agent builds on the physical mini
 
 Use `ssh mini` from fcvm-arm as `ubuntu` or the Next.js `ejc3` container for new macOS CLI builds,
