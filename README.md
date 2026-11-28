@@ -1764,7 +1764,8 @@ only and on loopback only with its inbound firewall rule off, the clients' keys 
 connector task, and Windows-MCP. It also installs Google's `agy` CLI and the fleet's always-on model guide
 for Antigravity, Claude Code and Codex in Colin's Windows profile. The `antigravity-colin-pc` association retries hourly
 through fcvm-arm's existing SSH route, so an offline PC receives them when both machines are reachable. Colin signs in
-with his own Google account.
+with his own Google account. From an already-open Windows shell with an older PATH, use
+`& "$env:LOCALAPPDATA\agy\bin\agy.exe"` in PowerShell. A fresh Windows login picks up `agy` by name.
 A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
 since it ends the sessions through it.
 

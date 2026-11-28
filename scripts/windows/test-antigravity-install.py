@@ -1,6 +1,7 @@
 """Exercise the installer in a disposable Windows account without signing in."""
 
 import base64
+import codecs
 import os
 from pathlib import Path
 import subprocess
@@ -63,7 +64,20 @@ class WindowsInstallTest(unittest.TestCase):
 
         self.install()
         executable = self.local / "agy/bin/agy.exe"
-        version = subprocess.check_output([executable, "--version"], env=self.env, text=True, timeout=30)
+        fresh_shell = r"""
+            $ErrorActionPreference = 'Stop'
+            $user = [Environment]::ExpandEnvironmentVariables([Environment]::GetEnvironmentVariable('Path', 'User'))
+            if (($user -split ';') -notcontains (Join-Path $env:AGY_TEST_TOOLS 'bin')) { throw 'Lost personal PATH' }
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + $user
+            $resolved = (Get-Command agy -CommandType Application).Source
+            if ($resolved -ne (Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe')) { throw 'Wrong agy on PATH' }
+            agy --version
+            exit $LASTEXITCODE
+        """
+        version = subprocess.check_output(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", fresh_shell],
+            env=self.env, text=True, timeout=30,
+        )
         self.assertRegex(version.strip(), r"^\d+\.\d+\.\d+([+-][\w.+-]+)?$")
         agy_rule = rules / RULE_NAME
         claude_rule = claude / "rules" / RULE_NAME
@@ -91,10 +105,11 @@ class WindowsInstallTest(unittest.TestCase):
         inactive.write_bytes(b"Inactive instructions\r\n")
         override = external / "AGENTS.override.md"
         after = b"\r\nPersonal footer after the managed block\r\n"
-        override.write_bytes(default_content + after)
+        begin = b"<!-- BEGIN ejc3-antigravity-models (managed) -->"
+        override.write_bytes(codecs.BOM_UTF8 + default_content[default_content.index(begin):] + after)
         next_guide = GUIDE.rstrip() + "\n\nUpdated smoke-test guidance.\n"
         self.install(next_guide)
-        self.assertTrue(override.read_bytes().startswith(before))
+        self.assertTrue(override.read_bytes().startswith(codecs.BOM_UTF8 + begin))
         self.assertTrue(override.read_bytes().endswith(after))
         self.assertEqual(override.read_text(encoding="utf-8").count(next_guide.rstrip()), 1)
         self.assertEqual(override.read_text(encoding="utf-8").count(GUIDE.rstrip()), 1)

@@ -54,6 +54,14 @@ try {
     $kind = if ($envKey.GetValueNames() -contains 'Path') { $envKey.GetValueKind('Path') } else { 'ExpandString' }
     $newPath = if ($userPath) { "$bin;$userPath" } else { $bin }
     $envKey.SetValue('Path', $newPath, [Microsoft.Win32.RegistryValueKind]$kind)
+    # Notify desktop applications in this Windows session that future children can use the new PATH.
+    Add-Type -Namespace Ejc3 -Name EnvironmentChange -MemberDefinition @'
+[DllImport("user32.dll", CharSet = CharSet.Unicode)]
+public static extern IntPtr SendMessageTimeout(IntPtr hwnd, uint message, UIntPtr wParam,
+    string lParam, uint flags, uint timeout, out UIntPtr result);
+'@
+    $result = [UIntPtr]::Zero
+    [void][Ejc3.EnvironmentChange]::SendMessageTimeout([IntPtr]0xffff, 0x1a, [UIntPtr]::Zero, 'Environment', 2, 1000, [ref]$result)
   }
 } finally { $envKey.Dispose() }
 # Keep UTF-8 BOMs, personal text and line endings intact in existing user instruction files.
@@ -92,10 +100,10 @@ function Set-ModelSection($path) {
   } else {
     $startCount = [regex]::Matches($text, [regex]::Escape($begin)).Count
     $endCount = [regex]::Matches($text, [regex]::Escape($end)).Count
-    $pattern = '(?ms)^' + [regex]::Escape($begin) + '\r?\n.*?^' + [regex]::Escape($end) + '(?=\r?$)'
+    $pattern = '(?ms)^(\uFEFF?)' + [regex]::Escape($begin) + '\r?\n.*?^' + [regex]::Escape($end) + '(?=\r?$)'
     $match = [regex]::Match($text, $pattern)
     if ($startCount -ne 1 -or $endCount -ne 1 -or !$match.Success) { throw "Ambiguous managed section in $path; preserving personal instructions." }
-    $new = $text.Remove($match.Index, $match.Length).Insert($match.Index, $block)
+    $new = $text.Remove($match.Index, $match.Length).Insert($match.Index, $match.Groups[1].Value + $block)
   }
   Write-Rule $path $text $new
 }
