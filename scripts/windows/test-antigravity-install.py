@@ -2,6 +2,7 @@
 
 import base64
 import codecs
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -37,14 +38,48 @@ class WindowsInstallTest(unittest.TestCase):
             self.addCleanup(winreg.SetValueEx, self.key, "Path", 0, kind, value)
         winreg.SetValueEx(self.key, "Path", 0, winreg.REG_EXPAND_SZ, USER_TOOLS)
 
-    def install(self, guide=GUIDE):
+    def install(self, guide=GUIDE, *, capture_output=False):
         dispatcher = (HERE / "antigravity-stdin.ps1").read_text(encoding="utf-8")
         encoded = base64.b64encode(dispatcher.encode("utf-16le")).decode("ascii")
         command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
         installer = base64.b64encode((HERE / "antigravity-install.ps1").read_bytes())
         payload = installer + b"\n" + base64.b64encode(guide.encode("utf-8"))
-        result = subprocess.run(command, input=payload, env=self.env, timeout=240)
-        self.assertEqual(result.returncode, 0, "PowerShell installer failed")
+        subprocess.run(command, input=payload, env=self.env, timeout=240, check=True, capture_output=capture_output)
+
+    def test_concurrent_install_retries_without_partially_provisioning(self):
+        cli = self.profile / ".gemini/antigravity-cli"
+        cli.mkdir(parents=True)
+        lock = cli / ".fleet-install.lock"
+        # An outstanding handle prevents a second process from acquiring FileShare.None.
+        with lock.open("w+b"), self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.install(capture_output=True)
+        self.assertIn(b"Another Antigravity installer", failure.exception.stderr)
+        self.assertEqual(list(cli.iterdir()), [lock])
+        executable = self.local / "agy/bin/agy.exe"
+        self.assertFalse(executable.exists())
+        self.install()
+        self.assertTrue(executable.is_file())
+        self.assertTrue((cli / "settings.json").is_file())
+        self.assertTrue((cli / ".fleet-permission-default-v1").is_file())
+
+    def test_first_install_preserves_personal_settings(self):
+        settings = self.profile / ".gemini/antigravity-cli/settings.json"
+        settings.parent.mkdir(parents=True)
+        personal = {
+            "permissions": {"deny": ["command(touch)"], "ask": ["command(git push)"]},
+            "nested": {"personal": [True, "café", None, 2**55 + 1]},
+        }
+        for original in (json.dumps(personal, indent=2, ensure_ascii=False).encode("utf-8"),
+                         b'{"unfinished":'):
+            with self.subTest(original=original):
+                settings.write_bytes(original)
+                os.utime(settings, (1_000_000_000, 1_000_000_000))
+                self.install()
+                self.assertEqual(settings.read_bytes(), original)
+                self.assertEqual(settings.stat().st_mtime, 1_000_000_000)
+                # Start the next fixture as a fresh profile.
+                (self.local / "agy/bin/agy.exe").unlink()
+                (settings.parent / ".fleet-permission-default-v1").unlink()
 
     def test_native_install_rerun_and_instruction_precedence(self):
         rules = self.profile / ".gemini/config/rules"
@@ -64,6 +99,10 @@ class WindowsInstallTest(unittest.TestCase):
 
         self.install()
         executable = self.local / "agy/bin/agy.exe"
+        cli_preferences = self.profile / ".gemini/antigravity-cli/settings.json"
+        marker = cli_preferences.parent / ".fleet-permission-default-v1"
+        self.assertTrue(marker.is_file())
+        self.assertEqual(json.loads(cli_preferences.read_bytes()), {"toolPermission": "always-proceed"})
         fresh_shell = r"""
             $ErrorActionPreference = 'Stop'
             $user = [Environment]::ExpandEnvironmentVariables([Environment]::GetEnvironmentVariable('Path', 'User'))
@@ -92,7 +131,11 @@ class WindowsInstallTest(unittest.TestCase):
         for path in (executable, agy_rule):
             os.utime(path, (1_000_000_000, 1_000_000_000))
         default_content = codex.read_bytes()
+        marker.unlink()  # Simulate upgrading a profile from before the marker existed.
+        cli_preferences.unlink()
         self.install()
+        self.assertFalse(cli_preferences.exists(), "Reconciliation recreated user-deleted preferences")
+        self.assertTrue(marker.is_file())
         for path in (executable, agy_rule):
             self.assertEqual(path.stat().st_mtime, 1_000_000_000)
         self.assertEqual(codex.read_bytes(), default_content)
@@ -108,7 +151,10 @@ class WindowsInstallTest(unittest.TestCase):
         begin = b"<!-- BEGIN ejc3-antigravity-models (managed) -->"
         override.write_bytes(codecs.BOM_UTF8 + default_content[default_content.index(begin):] + after)
         next_guide = GUIDE.rstrip() + "\n\nUpdated smoke-test guidance.\n"
+        executable.unlink()
         self.install(next_guide)
+        self.assertTrue(executable.is_file())
+        self.assertFalse(cli_preferences.exists(), "Binary reinstall recreated user-deleted preferences")
         self.assertTrue(override.read_bytes().startswith(codecs.BOM_UTF8 + begin))
         self.assertTrue(override.read_bytes().endswith(after))
         self.assertEqual(override.read_text(encoding="utf-8").count(next_guide.rstrip()), 1)

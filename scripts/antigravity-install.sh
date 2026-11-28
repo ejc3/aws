@@ -30,6 +30,7 @@ case "$(uname -sm)" in
   *) echo "Antigravity does not have a pinned build for $(uname -sm)." >&2; exit 1 ;;
 esac
 
+stage=""
 installed=$("$bin/agy" --version 2>/dev/null) || installed=""
 if [[ ! $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?$ ]]; then
   mkdir -p "$bin"
@@ -46,6 +47,40 @@ if [[ ! $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?$ ]]; then
   chmod 700 "$stage/agy"
   installed=$("$stage/agy" --version)
   [[ $installed = "$version" ]] || { echo "Expected Antigravity $version, got $installed." >&2; exit 1; }
+fi
+
+# Only bootstrap a new settings file. The live CLI can atomically replace it
+# from /config, including when the user returns to the stricter review default.
+if [[ ${1:-} != --binary-only ]]; then
+  (
+    umask 077
+    dir=$HOME/.gemini/antigravity-cli
+    mkdir -p "$dir"
+    cd "$dir"
+    # The hourly installer and a manual install can overlap on Macs.
+    perl - "$stage" "$bin/agy" <<'SEED'
+use strict;
+use warnings;
+use Errno qw(EEXIST);
+use Fcntl qw(:flock :DEFAULT O_NOFOLLOW);
+use File::Temp qw(tempfile);
+sysopen(my $lock, '.fleet-permission.lock', O_WRONLY | O_CREAT | O_NOFOLLOW, 0600) or die "Open preferences lock: $!";
+flock($lock, LOCK_EX) or die "Lock preferences: $!";
+my $stamp = '.fleet-permission-default-v1';
+exit 0 if -e $stamp || -l $stamp;
+my ($stage, $binary) = @ARGV;
+if (length($stage) && !-e $binary && !-l $binary && !-e 'settings.json' && !-l 'settings.json') {
+    my ($out, $tmp) = tempfile('.agy-settings-XXXXXXXX', DIR => '.', UNLINK => 1);
+    print {$out} qq({"toolPermission":"always-proceed"}\n) or die "Write settings: $!";
+    close($out) or die "Finish settings: $!";
+    link($tmp, 'settings.json') or $! == EEXIST or die "Publish settings: $!";
+}
+sysopen(my $done, $stamp, O_WRONLY | O_CREAT | O_EXCL, 0600) or die "Record provisioned profile: $!";
+SEED
+  )
+fi
+
+if [[ -n $stage ]]; then
   mv -f "$stage/agy" "$bin/agy"
 fi
 

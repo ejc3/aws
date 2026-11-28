@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Exercise the per-account installer offline with a tiny release archive and real hash checks."""
+import fcntl
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import tarfile
 import tempfile
@@ -47,6 +50,83 @@ cp "$HOME/release.tgz" "$2"''')
 
     def run_installer(self):
         return subprocess.run(["/bin/bash", "-s"], input=self.script, text=True, env=self.env, capture_output=True)
+
+    def test_new_settings_are_seeded_once(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(path.read_bytes()), {"toolPermission": "always-proceed"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        path.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+        self.cli.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
+
+    def test_existing_install_remembers_user_profile_without_seeding(self):
+        self.cli.parent.mkdir(parents=True)
+        self.tool(".local/bin/agy", "echo 1.5.18")
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.cli.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / ".gemini/antigravity-cli/settings.json").exists())
+
+    def test_preserves_existing_settings_file(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        path.parent.mkdir(parents=True)
+        original = b'{"agentMode":"plan","permissions":{"deny":["command(touch)"]}}'
+        path.write_bytes(original)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_preserves_concurrent_user_settings_save(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        path.parent.mkdir(parents=True)
+        self.tool("perl", 'echo entering-lock; exec /usr/bin/perl "$@"')
+        with (path.parent / ".fleet-permission.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen(["/bin/bash", "-s"], env=self.env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as installer:
+                try:
+                    installer.stdin.write(self.script)
+                    installer.stdin.close()
+                    self.assertTrue(select.select([installer.stdout], [], [], 120)[0], "installer never reached preferences lock")
+                    self.assertEqual(installer.stdout.readline(), "entering-lock\n")
+                    path.write_bytes(b"user-saved")
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(installer.wait(timeout=20), 0, installer.stderr.read())
+        self.assertEqual(path.read_bytes(), b"user-saved")
+
+    def test_user_save_wins_during_atomic_publication(self):
+        # Interpose at the syscall boundary so the writer lands after the existence check.
+        module = self.home / "ConcurrentSave.pm"
+        module.write_text(textwrap.dedent('''\
+            package ConcurrentSave;
+            BEGIN {
+                *CORE::GLOBAL::link = sub ($$) {
+                    my ($source, $target) = @_;
+                    if ($target eq 'settings.json') {
+                        open(my $file, '>', $target) or die $!;
+                        print {$file} 'personal settings';
+                        close($file) or die $!;
+                    }
+                    return CORE::link($source, $target);
+                };
+            }
+            1;
+        '''))
+        self.env["PERL5OPT"] = f"-I{self.home} -MConcurrentSave"
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        self.assertEqual(path.read_bytes(), b"personal settings")
 
     def test_all_platforms_and_noninteractive_zsh(self):
         for platform, package in [
@@ -108,10 +188,9 @@ cp "$HOME/release.tgz" "$2"''')
         tf = (ROOT / "antigravity.tf").read_text()
         self.assertIn('startswith(each.key, "jumpbox") ? "--binary-only" : ""', tf)
         self.assertIn('each.key == "fcvm-metal-x86" ? local.antigravity_owner_models : ""', tf)
-        self.cli.parent.mkdir(parents=True)
-        self.tool(".local/bin/agy", "echo 1.5.18")
         subprocess.run(["/bin/bash", "-s", "--", "--binary-only"], input=self.script, text=True, env=self.env,
                        capture_output=True, check=True)
+        self.assertEqual(subprocess.check_output([str(self.cli), "--version"], text=True).strip(), "1.5.18")
         self.assertFalse((self.home / ".gemini").exists())
 
     def test_global_guidance_preserves_private_files_and_respects_codex_override(self):
