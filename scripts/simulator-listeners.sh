@@ -10,7 +10,9 @@
 #   mini-4               the Mac mini's CI VM `ci` (scripts/mac-vm-setup.sh), which also keeps `mini-simulator`
 #   macbook-kidsports-1  the MacBook's pool VM `kidsports-ci` (kid-sports-highlights scripts/ci-vm.sh, under
 #                        TART_HOME=/Volumes/Scratch/.tart-kidsports), its own user `admin`, never the owner's session
-# Each runner runs one job at a time, so two listeners take two simulator jobs at once, one on each Mac.
+#   air-ci-1             the MacBook Air's VM `air-ci` (dolphin-labs apps/native/scripts/ci-vm.sh, GWW_CI_VM=air-ci,
+#                        6 cores / 18 GB; owner, 2026-11-27: the Air is not used by anyone, so the VM takes most of it)
+# Each runner runs one job at a time, so three listeners take three simulator jobs at once, one on each Mac.
 #
 # It only labels: it never registers, replaces or removes a runner, and needs no registration token. A listener that
 # is not registered stops it with an error (register it where its VM is made). Re-registering a runner with
@@ -20,7 +22,7 @@ set -euo pipefail
 
 CI_ORG=dolphin-labs-hq
 LABEL=ios-simulator
-LISTENERS=(mini-4 macbook-kidsports-1)
+LISTENERS=(mini-4 macbook-kidsports-1 air-ci-1)
 
 DRY=""
 case "${1:-}" in

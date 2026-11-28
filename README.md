@@ -1841,12 +1841,14 @@ on any free mini. An already-registered `mini-3` is relabelled by the same scrip
 
 Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini-simulator]` for each
 job that boots an iOS simulator. A single runner executes one job at a time across all eligible
-repositories. Two listeners also share `ios-simulator`: `mini-4`, and `macbook-kidsports-1` in the MacBook's
+repositories. Three listeners also share `ios-simulator`: `mini-4`, `macbook-kidsports-1` in the MacBook's
 pool VM (`kidsports-ci`, 4 cores and 8 GB, Xcode 27.1 with the iOS 26.5, 27.0 and 27.1 runtimes, as its own `admin`;
-the owner, 2026-11-27: "MacBook Pro can be used for Mac testing"). A job that may run on either Mac's simulator asks
-for `[self-hosted, macOS, ios-pool, ios-simulator]` and takes whichever is free, so two such jobs run at once, one on
+the owner, 2026-11-27: "MacBook Pro can be used for Mac testing"), and `air-ci-1` in the MacBook Air's VM (`air-ci`,
+6 cores and 18 GB, Xcode 27.2, made by dolphin-labs' `apps/native/scripts/ci-vm.sh` with `GWW_CI_VM=air-ci`; the Air
+is used by nobody, owner 2026-11-27). A job that may run on any Mac's simulator asks
+for `[self-hosted, macOS, ios-pool, ios-simulator]` and takes whichever is free, so three such jobs run at once, one on
 each Mac; a job that needs the mini keeps `mini-simulator`. `scripts/simulator-listeners.sh` (an org-admin gh login,
-`--dry-run` to look first) keeps the label on exactly those two runners and on no other, through the runner-labels
+`--dry-run` to look first) keeps the label on exactly those three runners and on no other, through the runner-labels
 API only: it never registers a runner or mints a token. Re-registering a runner (`config.sh --replace`) resets its
 labels, so run it again after one; `mac-vm-setup.sh --runners` gives `mini-4` the label itself, and the MacBook's
 runner is registered by kid-sports-highlights' `scripts/ci-vm.sh`. General builds and archives can still use all four mini runners. Setup adds a missing
