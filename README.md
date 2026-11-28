@@ -1761,7 +1761,11 @@ missed a key-up (Win+L, an elevated window in front), refusing every tool until 
 `scripts/windows-pc-setup.sh colin-pc`, run on a jumpbox, puts the PC on the route and installs Windows-MCP: OpenSSH keys
 only and on loopback only with its inbound firewall rule off, the clients' keys in a managed block of
 `administrators_authorized_keys`, the pinned `cloudflared` (verified on the PC), the token through ssh stdin, the
-connector task, and Windows-MCP. A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
+connector task, and Windows-MCP. It also installs Google's `agy` CLI and the fleet's always-on model guide
+for Antigravity, Claude Code and Codex in Colin's Windows profile. The `antigravity-colin-pc` association retries hourly
+through fcvm-arm's existing SSH route, so an offline PC receives them when both machines are reachable. Colin signs in
+with his own Google account.
+A re-run changes only what differs; a connector restart runs from a one-off SYSTEM task,
 since it ends the sessions through it.
 
 **Never a key of the PC's on `ubuntu`** (AGENTS.md, "Machines outside AWS"). The first-contact reverse tunnel below ends
