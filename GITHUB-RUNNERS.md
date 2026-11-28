@@ -1699,6 +1699,12 @@ operator addresses; `too-many-app-runners-<label>` alarms per repo at its cap.
 
 ## Operating it
 
+On Next.js and the ARM and x86 dev boxes, read the app runner controller's recent log entries with the dev role:
+
+```sh
+aws logs tail /aws/lambda/github-app-runner --region us-west-1 --since 1h
+```
+
 ### Temporary runner credential-boundary acceptance
 
 This source removes the September 12 temporary IAM fixtures and their fixture-only

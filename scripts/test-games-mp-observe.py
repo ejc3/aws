@@ -109,12 +109,14 @@ class ObserveGrantTests(unittest.TestCase):
                 self.assertIn(sid, STAR_OK, "%s grants on every resource" % sid)
         self.assertRegex(statements()["ListGamesTasks"], r'variable\s*=\s*"ecs:cluster"')
 
-    def test_logs_are_the_pipelines_own_groups_only(self):
+    def test_log_reads_cover_only_games_and_the_app_runner_controller(self):
         body = statements()["ReadGamesLogs"]
         groups = set(re.findall(r"aws_cloudwatch_log_group\.(\w+)", body))
         self.assertEqual(groups, {
             "games_mp_codebuild", "games_mp_codebuild_preview", "games_mp_migrate", "games_mp_poller",
-            "games_mp_release", "games_mp_sweeper", "games_mp_router", "games_engines", "games_mp_launch"})
+            "games_mp_release", "games_mp_sweeper", "games_mp_router", "games_engines", "games_mp_launch", "runner_app"})
+        self.assertIn("aws_cloudwatch_log_group.runner_app[*].arn", body)
+        self.assertEqual(set(actions(body)), {"logs:FilterLogEvents", "logs:GetLogEvents", "logs:DescribeLogStreams"})
         self.assertNotIn("games_play_waf", body, "WAF logs hold players' addresses")
 
     def test_both_dev_roles_get_it_and_nothing_else_does(self):
