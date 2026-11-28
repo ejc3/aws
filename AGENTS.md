@@ -539,8 +539,9 @@ The function serializes against this backend's DynamoDB lock and changes only th
 coordinator image. CI owns that code and therefore its fleet-only runtime capabilities;
 the fleet account still has no path into this account.
 
-**EC2 Mac leases require direct owner approval**: use `macpbox status` / `quote` / `ssh` /
-`workspace` to inspect and reuse the one shared host. Every NEW allocation requires approval
+**EC2 Mac leases require direct owner approval.** Use `pbox mac status` to find the shared
+host and `pbox mac quote` for the current price. On a running Mac, create your task's directory
+with `pbox mac workspace NAME`, then connect with `pbox mac ssh`. Every NEW allocation requires approval
 in the current owner conversation after presenting its current price and 24-hour minimum
 (Oregon M4 Pro currently $1.97/hour, $47.28 minimum, plus EBS, IPv4 and transfer). Billing
 begins at successful host allocation even if instance launch fails; stopping is not release.

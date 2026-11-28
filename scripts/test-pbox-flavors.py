@@ -801,6 +801,18 @@ class ScriptRuns(unittest.TestCase):
     def launched_types(self):
         return [c[c.index("--instance-type") + 1] for c in self.calls() if "run-instances" in c]
 
+    def test_mac_delegates_arguments_and_exit_status_before_linux_discovery(self):
+        helper = self.tmp / "macpbox"
+        helper.write_text('#!/bin/sh\nfor arg do printf "%s\\0" "$arg"; done\nexit 23\n')
+        helper.chmod(0o755)
+        for user, args in (("ejc3", ()), ("colton", ("workspace", "agent with spaces")),
+                           ("ejc3", ("up", "--approved-minimum-24h", "--approved-usd-hour", "1.97"))):
+            with self.subTest(user=user, args=args):
+                rc, out, err = self.pbox("mac", *args, user=user)
+                self.assertEqual(rc, 23, err)
+                self.assertEqual(out, "".join(arg + "\0" for arg in args))
+                self.assertEqual(self.calls(), [])
+
     def test_up_without_a_flavor_fails_prints_the_menu_and_calls_nothing(self):
         for args in (("up",), ("up", "3"), ("up", "3", "--fallback"), ("capacity",)):
             with self.subTest(args=args):
