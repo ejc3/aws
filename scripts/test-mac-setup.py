@@ -451,6 +451,21 @@ esac
         self.set_("--build-only")
         self.assertEqual(self.selected_developer(), "unset")
 
+    def nice_of_a_shell(self, **env):
+        shell_env = {"HOME": str(self.temp), "ZDOTDIR": str(self.temp), "PATH": "/usr/bin:/bin", **env}
+        return int(subprocess.check_output(["zsh", "-c", "ps -o nice= -p $$"], env=shell_env, text=True))
+
+    def test_on_the_mini_work_started_over_ssh_runs_at_nice_10_and_nothing_else_changes(self):
+        base = int(subprocess.check_output(["ps", "-o", "nice=", "-p", str(os.getpid())], text=True))
+        if base > 10:
+            self.skipTest("the test runner itself runs above nice 10")
+        self.set_("--build-only")
+        self.assertEqual(self.nice_of_a_shell(SSH_CONNECTION="198.51.100.7 50000 192.0.2.1 22"), 10)
+        self.assertEqual(self.nice_of_a_shell(), base, "a shell not started over SSH (launchd, the desktop) keeps its priority")
+        self.set_()
+        self.assertNotIn("renice", self.zshenv.read_text(), "only the mini lowers its SSH work")
+        self.assertEqual(self.nice_of_a_shell(SSH_CONNECTION="198.51.100.7 50000 192.0.2.1 22"), base)
+
     def resolved(self):
         # As an SSH command runs: non-interactive, non-login zsh, which reads only ~/.zshenv.
         env = {"HOME": str(self.temp), "PATH": f"{self.system}:/usr/bin:/bin", "ZDOTDIR": str(self.temp)}

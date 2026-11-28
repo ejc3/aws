@@ -10,7 +10,11 @@ file by hand: change `scripts/mac/mini-AGENTS.md` in ejc3/aws.
 - **A workspace of your own per task:** `(umask 077; mktemp -d ~/agent-work/task.XXXXXXXX)`. Copy
   the exact revision in; copy results out; remove only what you made.
 - **Heavy builds take a slot:** `mac-build --status` shows the two. `swift`, `xcodebuild` and
-  `xcrun` in `~/.local/bin` take one automatically.
+  `xcrun` in `~/.local/bin` take one automatically; run anything else heavy through it yourself
+  (`mac-build cargo build --release ...`), since a toolchain of your own on PATH skips the shims.
+- **The CI runners come first.** They are VMs on this machine's cores, so everything you start over
+  SSH runs at nice 10 and yields to them. Do not raise it back, and do not run two heavy builds of
+  your own at once.
 - **No keys or tokens are copied here.** An App Store Connect key stays on the box that holds it:
   make provisioning profiles there (through the API) and send only the profile.
 - Other agents' directories under `~/agent-work` are theirs: read them for how something was done,
