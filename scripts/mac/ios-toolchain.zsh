@@ -8,6 +8,8 @@
 #   ruby     Ruby 3.3 from conda-forge, through a pinned micromamba (SHA-256 pinned); the system
 #            Ruby (2.6) is too old for CocoaPods' dependencies
 #   pod      CocoaPods, a pinned gem in that Ruby
+#   tmux     tmux 3.x from conda-forge through the same micromamba (owner, 2026-11-28: "install tmux on
+#            the machine"); install.zsh links it into ~/.local/bin so every shell finds it
 #
 # and ~/agent-tools/env.zsh, which a build shell sources to put them first on PATH. Idempotent: a
 # tool already at its pinned version is left alone. Nothing outside ~/agent-tools is changed, and
@@ -25,6 +27,7 @@ micromamba_version=2.10.0-0
 micromamba_sha256=c547639f5caf742236641c362746abb4a3505774753ecd08fe341643670c4c01
 ruby_spec='ruby>=3.3,<3.4'
 cocoapods_version=1.17.0
+tmux_spec='tmux>=3.5,<4'
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/ios-toolchain.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
@@ -63,6 +66,9 @@ fi
 if ! "$root/ruby/bin/ruby" -e 'exit(RUBY_VERSION.start_with?("3.3") ? 0 : 1)' 2>/dev/null; then
   MAMBA_ROOT_PREFIX="$root/mamba" "$root/micromamba" create -y -q -p "$root/ruby" -c conda-forge "$ruby_spec" >/dev/null
 fi
+if ! "$root/tmux/bin/tmux" -V 2>/dev/null | grep -q '^tmux 3\.'; then
+  MAMBA_ROOT_PREFIX="$root/mamba" "$root/micromamba" create -y -q -p "$root/tmux" -c conda-forge "$tmux_spec" >/dev/null
+fi
 gems=$root/ruby/share/rubygems
 if [ "$(GEM_HOME=$gems GEM_PATH=$gems "$root/ruby/bin/ruby" "$gems/bin/pod" --version 2>/dev/null)" != "$cocoapods_version" ]; then
   GEM_HOME=$gems GEM_PATH=$gems "$root/ruby/bin/gem" install cocoapods -v "$cocoapods_version" --no-document >/dev/null
@@ -78,4 +84,4 @@ EOF
 mv -f "$root/env.zsh.new" "$root/env.zsh"
 
 source "$root/env.zsh"
-echo "ios-toolchain: node $(node -v), pnpm $(pnpm -v), $(xcodegen --version | tail -1 | tr 'V' 'v'), ruby $(ruby -e 'print RUBY_VERSION'), pod $(pod --version)"
+echo "ios-toolchain: node $(node -v), pnpm $(pnpm -v), $(xcodegen --version | tail -1 | tr 'V' 'v'), ruby $(ruby -e 'print RUBY_VERSION'), pod $(pod --version), $("$root/tmux/bin/tmux" -V)"

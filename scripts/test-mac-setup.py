@@ -976,6 +976,13 @@ class IosToolchain(unittest.TestCase):
             self.assertRegex(self.script, r"(?m)^%s=[0-9][0-9.\-]*$" % name)
         self.assertEqual(self.script.count('fetch "https://'), 3)
 
+    def test_installs_tmux_from_conda_forge_and_links_it_onto_path(self):
+        self.assertRegex(self.script, r"(?m)^tmux_spec='tmux>=3\.5,<4'$")
+        self.assertIn('create -y -q -p "$root/tmux" -c conda-forge "$tmux_spec"', self.script)
+        install = (ROOT / "scripts" / "mac" / "install.zsh").read_text()
+        self.assertIn('ln -sfn "$HOME/agent-tools/tmux/bin/tmux" "$bin/tmux"', install)
+        self.assertLess(install.index('/bin/zsh "$src/ios-toolchain.zsh"'), install.index('"$bin/tmux"'))
+
     def test_refuses_a_download_whose_hash_is_not_the_pinned_one(self):
         fetch = re.search(r"(?ms)^fetch\(\) \{.*?^\}", self.script).group(0)
         self.assertIn('[ "$got" = "$3" ] || {', fetch)
