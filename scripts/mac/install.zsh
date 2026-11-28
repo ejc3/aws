@@ -78,6 +78,12 @@ if [[ $mode = --build-only ]]; then
   # template from this repository and what is on the machine now, rewritten hourly by a LaunchAgent so
   # the attached devices it lists stay current.
   /bin/zsh "$src/ios-toolchain.zsh"
+  # tmux for agents' long-running sessions on the host: the toolchain's copy, first on PATH like the other tools.
+  if [ -e "$bin/tmux" ] && [ ! -L "$bin/tmux" ]; then
+    echo "mac-setup: $bin/tmux exists and is not our link; leaving it" >&2
+  else
+    ln -sfn "$HOME/agent-tools/tmux/bin/tmux" "$bin/tmux"
+  fi
   agents_md mini "$src/mini-AGENTS.md"
   echo "mac-setup: ~/AGENTS.md written (and hourly); the iOS toolchain is in ~/agent-tools (source ~/agent-tools/env.zsh)"
   echo "mac-setup: build tools ready in $bin; create each workspace with mktemp -d ~/agent-work/task.XXXXXXXX"
