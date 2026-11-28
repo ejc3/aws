@@ -301,6 +301,9 @@ in_ci "
     openssl rand -hex 24 > \$HOME/.ci-keychain-password
     security create-keychain -p \"\$(cat \$HOME/.ci-keychain-password)\" ci.keychain
   fi
+  # Unlocked first: changing a locked keychain's settings asks for its password in a dialog nobody answers, and
+  # tart exec waited on it until killed (2026-11-28, the keychain having locked after its 6 hours).
+  security unlock-keychain -p \"\$(cat \$HOME/.ci-keychain-password)\" \$kc
   security set-keychain-settings -lut 21600 \$kc
   security list-keychains -d user -s \$kc \$(security list-keychains -d user | tr -d '\"' | grep -v ci.keychain)
   security default-keychain -d user -s \$kc

@@ -578,5 +578,14 @@ class SimulatorSlots(unittest.TestCase):
                 self.assertEqual(json.loads(data), ["1", "1", ["test"]])
 
 
+
+class SigningKeychain(unittest.TestCase):
+    def test_the_keychain_is_unlocked_before_its_settings_change(self):
+        # A locked keychain's settings change waits on a password dialog nobody answers (2026-11-28).
+        script = SCRIPT.read_text()
+        self.assertIn("security unlock-keychain -p", script)
+        unlock = script.index('security unlock-keychain -p \\"\\$(cat \\$HOME/.ci-keychain-password)\\" \\$kc')
+        self.assertLess(unlock, script.index("security set-keychain-settings -lut 21600"))
+
 if __name__ == "__main__":
     unittest.main(buffer=True)
