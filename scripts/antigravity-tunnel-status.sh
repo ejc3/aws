@@ -7,6 +7,7 @@ antigravity_tunnel_down() (
     air|mini|colton-mac|colin-mac|colin-pc) endpoint=$1; secret=$1-ssh-access-fcvm ;;
     *) return 1 ;;
   esac
+  set +x
   response=$(
     aws secretsmanager get-secret-value --region us-west-1 --secret-id "$secret" --query SecretString --output text |
       jq -er '"CF-Access-Client-Id: " + .client_id + "\nCF-Access-Client-Secret: " + .client_secret' |
