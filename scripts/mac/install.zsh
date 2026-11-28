@@ -68,6 +68,9 @@ done
 # ~/.local/bin first on PATH in every zsh, non-interactive SSH sessions included: a managed block at the
 # end of ~/.zshenv, whatever else the file does to PATH (otherwise /usr/bin/swift would bypass the cap).
 /bin/sh "$src/set-zshenv.sh" "$HOME/.zshenv" "$mode"
+if [[ -f "$src/antigravity-install.sh" ]]; then
+  /bin/bash "$src/antigravity-install.sh"
+fi
 for t in swift xcodebuild xcrun; do
   got=$(env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/zsh -c "command -v $t")
   [ "$got" = "$bin/$t" ] || { echo "mac-setup: a non-interactive zsh finds $t at $got, not $bin/$t" >&2; exit 1; }

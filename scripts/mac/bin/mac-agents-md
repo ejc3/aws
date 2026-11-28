@@ -19,6 +19,11 @@ tmp=$(mktemp "${out}.XXXXXX") || exit 1
 trap 'rm -f "$tmp"' EXIT
 {
   cat "$template"
+  guide=$HOME/.gemini/config/rules/ejc3-antigravity-models.md
+  if [[ -r $guide ]]; then
+    echo
+    sed '1,3d' "$guide"  # omit Antigravity's YAML frontmatter from ~/AGENTS.md
+  fi
   echo
   echo "## Found: attached devices (\`xcrun devicectl list devices\`)"
   echo

@@ -2094,6 +2094,15 @@ Kept so the next machine goes faster.
   now pins `launchctl` to its stub. If it happens again: `launchctl bootstrap gui/$(id -u)
   ~/Library/LaunchAgents/com.ejcampbell.macbook-ssh.cloudflared.plist`.
 
+## Google Antigravity CLI
+
+`agy` is installed in `~/.local/bin` for `ubuntu` on both jumpboxes and both metal
+boxes, and in the `ejc3`, `colton`, `connor` and `colin` Next.js containers. The Mac setup installs it for
+`mac`, `air`, `mini`, `colton-mac` and `colin-mac`. Run `agy --version` in the account that will use it.
+While fcvm-arm is running it checks those five Macs hourly through their existing SSH routes, so a sleeping
+laptop can receive the install when it wakes. Each account manages its Google sign-in separately. The CLI
+updates itself on use.
+
 ## Start a Codex session
 
 Codex is installed per Unix account on the metal boxes, `jumpbox-2`, and `nextjs-dev`.

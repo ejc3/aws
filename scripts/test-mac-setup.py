@@ -823,6 +823,7 @@ class Files(unittest.TestCase):
             ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$OUT/args"\ncat > "$OUT/files.tar"\n')
             ssh.chmod(0o755)
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
+            agy = {"antigravity-install.sh", "antigravity-models.md"}
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
@@ -831,12 +832,13 @@ class Files(unittest.TestCase):
             cleaner = {"install-artifact-cleaner.py", "bin/mac-artifact-clean"}
             mini = {"ios-toolchain.zsh", "mini-AGENTS.md", "bin/mac-agents-md"}
             for args, names, flag in [
-                (["mini"], build | mini, "--build-only"),
-                ([], build | desktop | cleaner, ""),
+                (["mini"], build | mini | agy, "--build-only"),
+                ([], build | desktop | cleaner | agy, ""),
                 (["mac", "--artifact-cleaner-only"], cleaner | {"bin/mac-build"}, ""),
-                (["colton-mac", "--update-peekaboo"], build | member, "--update-peekaboo"),
-                (["colin-mac"], build | member, ""),
-                (["air"], build | air, ""),
+                (["colton-mac", "--update-peekaboo"], build | member | agy, "--update-peekaboo"),
+                (["colin-mac"], build | member | agy, ""),
+                (["air"], build | air | agy, ""),
+                (["skevh-mac"], build | member, ""),
             ]:
                 subprocess.run([str(setup), *args], env=env, check=True)
                 with tarfile.open(dest / "files.tar") as archive:
@@ -924,6 +926,15 @@ class AgentsMd(Base):
         text = self.out.read_text()
         self.assertIn("None physical right now.", text)
         self.assertIn("None: device builds cannot be signed here yet.", text)
+
+    def test_installed_antigravity_guidance_reaches_agent_instructions_without_rule_frontmatter(self):
+        rule = self.temp / ".gemini/config/rules/ejc3-antigravity-models.md"
+        rule.parent.mkdir(parents=True)
+        guide = (ROOT / "scripts/antigravity-models.md").read_text()
+        rule.write_text("---\ntrigger: always_on\n---\n" + guide)
+        self.assertEqual(self.write().returncode, 0)
+        self.assertIn(guide, self.out.read_text())
+        self.assertNotIn("trigger: always_on", self.out.read_text())
 
     def test_on_a_desktop_mac_lists_the_devices_and_no_mini_sections(self):
         self.env["MAC_AGENTS_HOST"] = "mac"
