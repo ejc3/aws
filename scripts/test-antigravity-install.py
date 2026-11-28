@@ -104,6 +104,30 @@ cp "$HOME/release.tgz" "$2"''')
                 self.assertEqual(installer.wait(timeout=20), 0, installer.stderr.read())
         self.assertEqual(path.read_bytes(), b"user-saved")
 
+    def test_user_save_wins_during_atomic_publication(self):
+        # Interpose at the syscall boundary so the writer lands after the existence check.
+        module = self.home / "ConcurrentSave.pm"
+        module.write_text(textwrap.dedent('''\
+            package ConcurrentSave;
+            BEGIN {
+                *CORE::GLOBAL::link = sub ($$) {
+                    my ($source, $target) = @_;
+                    if ($target eq 'settings.json') {
+                        open(my $file, '>', $target) or die $!;
+                        print {$file} 'personal settings';
+                        close($file) or die $!;
+                    }
+                    return CORE::link($source, $target);
+                };
+            }
+            1;
+        '''))
+        self.env["PERL5OPT"] = f"-I{self.home} -MConcurrentSave"
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = self.home / ".gemini/antigravity-cli/settings.json"
+        self.assertEqual(path.read_bytes(), b"personal settings")
+
     def test_all_platforms_and_noninteractive_zsh(self):
         for platform, package in [
             ("Linux aarch64", "linux-arm/cli_linux_arm64"),
