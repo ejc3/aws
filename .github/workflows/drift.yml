@@ -40,6 +40,9 @@ jobs:
       - name: Verify CI privilege boundaries
         run: python3 scripts/test-ci-security.py
 
+      - name: Evaluate runner budget alarm selection with mixed group policies
+        run: python3 -S -B scripts/test-runner-budget-alarms.py
+
       - name: Verify the Browser Run worker credential boundary
         run: python3 -S -B scripts/test-browser-run-worker.py
 

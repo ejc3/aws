@@ -210,7 +210,7 @@ locals {
   runner_app_vcpu_capped = { for repo, c in local.runner_app_config : repo => c if c.peak_max_vcpus != null }
 
   # The groups with at least one served repo: each gets a bucket, its metrics and its alarms.
-  runner_budget_served = { for name, g in local.runner_budget : name => g if length([for r in g.repos : r if contains(keys(local.runner_app_config), r)]) > 0 }
+  runner_budget_served = { for name, g in local.runner_budget : name => g if var.enable_github_runner && length([for r in g.repos : r if contains(keys(local.runner_app_config), r)]) > 0 }
 
   # Canonical's own account. Its images, and this account's own prebuilt images tagged by runner-app-image.tf's
   # pipeline, are the only ones this controller may launch.
@@ -915,7 +915,7 @@ resource "aws_cloudwatch_metric_alarm" "imagine_runner_hours_daily" {
 # throttled for at least half of it). Throttling is the bucket working, so a short spell is normal; a third of a day
 # means the work no longer fits the budget, and the owner decides whether to raise daily_usd.
 resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" {
-  for_each            = var.enable_github_runner ? local.runner_budget_served : {}
+  for_each            = local.runner_budget_served
   alarm_name          = "github-app-runner-budget-throttled-${each.key}"
   comparison_operator = "GreaterThanOrEqualToThreshold"
   evaluation_periods  = 24
@@ -938,7 +938,7 @@ resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" {
 # while the level is already at zero. So this can fire on legitimate use: it says a week cost more than its budget, and
 # is informational.
 resource "aws_cloudwatch_metric_alarm" "runner_budget_weekly" {
-  for_each            = var.enable_github_runner ? local.runner_budget_served : {}
+  for_each            = local.runner_budget_served
   alarm_name          = "github-app-runner-budget-weekly-${each.key}"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
