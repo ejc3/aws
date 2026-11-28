@@ -55,19 +55,28 @@ if [[ ${1:-} != --binary-only ]]; then
   (
     umask 077
     dir=$HOME/.gemini/antigravity-cli
-    prefs=$dir/settings.json
-    stamp=$dir/.fleet-permission-default-v1
-    [[ ! -e $stamp && ! -L $stamp ]] || exit 0
     mkdir -p "$dir"
-    if [[ -n $stage && ! -e $bin/agy && ! -L $bin/agy && ! -e $prefs && ! -L $prefs ]]; then
-      tmp=$(mktemp "$dir/.agy-settings.XXXXXXXX")
-      trap 'rm -f -- "$tmp"' EXIT
-      printf '%s\n' '{"toolPermission":"always-proceed"}' > "$tmp"
-      # A native settings save can win this race. link never overwrites its file.
-      ln "$tmp" "$prefs" || [[ -e $prefs || -L $prefs ]]
-    fi
-    # Remember this profile even if its owner later removes the settings and binary.
-    (set -C; : > "$stamp") || [[ -f $stamp ]]
+    cd "$dir"
+    # The hourly installer and a manual install can overlap on Macs.
+    perl - "$stage" "$bin/agy" <<'SEED'
+use strict;
+use warnings;
+use Errno qw(EEXIST);
+use Fcntl qw(:flock :DEFAULT O_NOFOLLOW);
+use File::Temp qw(tempfile);
+sysopen(my $lock, '.fleet-permission.lock', O_WRONLY | O_CREAT | O_NOFOLLOW, 0600) or die "Open preferences lock: $!";
+flock($lock, LOCK_EX) or die "Lock preferences: $!";
+my $stamp = '.fleet-permission-default-v1';
+exit 0 if -e $stamp || -l $stamp;
+my ($stage, $binary) = @ARGV;
+if (length($stage) && !-e $binary && !-l $binary && !-e 'settings.json' && !-l 'settings.json') {
+    my ($out, $tmp) = tempfile('.agy-settings-XXXXXXXX', DIR => '.', UNLINK => 1);
+    print {$out} qq({"toolPermission":"always-proceed"}\n) or die "Write settings: $!";
+    close($out) or die "Finish settings: $!";
+    link($tmp, 'settings.json') or $! == EEXIST or die "Publish settings: $!";
+}
+sysopen(my $done, $stamp, O_WRONLY | O_CREAT | O_EXCL, 0600) or die "Record provisioned profile: $!";
+SEED
   )
 fi
 

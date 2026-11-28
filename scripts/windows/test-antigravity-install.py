@@ -38,13 +38,29 @@ class WindowsInstallTest(unittest.TestCase):
             self.addCleanup(winreg.SetValueEx, self.key, "Path", 0, kind, value)
         winreg.SetValueEx(self.key, "Path", 0, winreg.REG_EXPAND_SZ, USER_TOOLS)
 
-    def install(self, guide=GUIDE):
+    def install(self, guide=GUIDE, *, capture_output=False):
         dispatcher = (HERE / "antigravity-stdin.ps1").read_text(encoding="utf-8")
         encoded = base64.b64encode(dispatcher.encode("utf-16le")).decode("ascii")
         command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
         installer = base64.b64encode((HERE / "antigravity-install.ps1").read_bytes())
         payload = installer + b"\n" + base64.b64encode(guide.encode("utf-8"))
-        subprocess.run(command, input=payload, env=self.env, timeout=240, check=True)
+        subprocess.run(command, input=payload, env=self.env, timeout=240, check=True, capture_output=capture_output)
+
+    def test_concurrent_install_retries_without_partially_provisioning(self):
+        cli = self.profile / ".gemini/antigravity-cli"
+        cli.mkdir(parents=True)
+        lock = cli / ".fleet-install.lock"
+        # An outstanding handle prevents a second process from acquiring FileShare.None.
+        with lock.open("w+b"), self.assertRaises(subprocess.CalledProcessError) as failure:
+            self.install(capture_output=True)
+        self.assertIn(b"Another Antigravity installer", failure.exception.stderr)
+        self.assertEqual(list(cli.iterdir()), [lock])
+        executable = self.local / "agy/bin/agy.exe"
+        self.assertFalse(executable.exists())
+        self.install()
+        self.assertTrue(executable.is_file())
+        self.assertTrue((cli / "settings.json").is_file())
+        self.assertTrue((cli / ".fleet-permission-default-v1").is_file())
 
     def test_first_install_preserves_personal_settings(self):
         settings = self.profile / ".gemini/antigravity-cli/settings.json"

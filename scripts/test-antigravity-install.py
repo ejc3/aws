@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Exercise the per-account installer offline with a tiny release archive and real hash checks."""
+import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import tarfile
 import tempfile
@@ -85,9 +87,21 @@ cp "$HOME/release.tgz" "$2"''')
 
     def test_preserves_concurrent_user_settings_save(self):
         path = self.home / ".gemini/antigravity-cli/settings.json"
-        self.tool("ln", 'printf user-saved > "$2"; exec /bin/ln "$@"')
-        result = self.run_installer()
-        self.assertEqual(result.returncode, 0, result.stderr)
+        path.parent.mkdir(parents=True)
+        self.tool("perl", 'echo entering-lock; exec /usr/bin/perl "$@"')
+        with (path.parent / ".fleet-permission.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with subprocess.Popen(["/bin/bash", "-s"], env=self.env, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as installer:
+                try:
+                    installer.stdin.write(self.script)
+                    installer.stdin.close()
+                    self.assertTrue(select.select([installer.stdout], [], [], 120)[0], "installer never reached preferences lock")
+                    self.assertEqual(installer.stdout.readline(), "entering-lock\n")
+                    path.write_bytes(b"user-saved")
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(installer.wait(timeout=20), 0, installer.stderr.read())
         self.assertEqual(path.read_bytes(), b"user-saved")
 
     def test_all_platforms_and_noninteractive_zsh(self):

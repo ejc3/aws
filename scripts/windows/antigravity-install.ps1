@@ -34,51 +34,59 @@ function Get-AgyVersion($path) {
     } catch { Write-Verbose 'Existing executable could not run.' }
   }
 }
-# Google publishes this executable and SHA-512 in its windows_amd64 CLI manifest. agy self-updates.
-$firstInstall = !(Test-Path -LiteralPath $exe)
-$version = Get-AgyVersion $exe
-if (!$version) {
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  [IO.Directory]::CreateDirectory($bin) | Out-Null
-  $tmp = Join-Path $bin ('.agy-' + [Guid]::NewGuid() + '.exe')
-  try {
-    $url = 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18-6386224290725888/windows-x64/cli_windows_x64.exe'
-    $sha = '53605db7013dfed51e8c416d51e0c17a3b5ad0750c13da5669954ba4a281318746be0cf8cde2b256cfdb4bfbdade4badad1a0503931f8458416184549afa06b6'
-    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
-    $hash = [Security.Cryptography.SHA512]::Create()
-    $inputStream = [IO.File]::OpenRead($tmp)
+# Manual setup and the hourly installer share this profile. An OS handle releases on process exit.
+[IO.Directory]::CreateDirectory($settingsDir) | Out-Null
+$lockPath = Join-Path $settingsDir '.fleet-install.lock'
+try { $installLock = [IO.File]::Open($lockPath, 'OpenOrCreate', 'ReadWrite', 'None') }
+catch [IO.IOException] {
+  if (($_.Exception.GetBaseException().HResult -band 0xffff) -ne 32) { throw }
+  throw 'Another Antigravity installer is running for this user. Retry when it finishes.'
+}
+try {
+  # Google publishes this executable and SHA-512 in its windows_amd64 CLI manifest. agy self-updates.
+  $firstInstall = !(Test-Path -LiteralPath $exe)
+  $version = Get-AgyVersion $exe
+  if (!$version) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    [IO.Directory]::CreateDirectory($bin) | Out-Null
+    $tmp = Join-Path $bin ('.agy-' + [Guid]::NewGuid() + '.exe')
     try {
-      $actual = [BitConverter]::ToString($hash.ComputeHash($inputStream)).Replace('-', '')
-    } finally { $inputStream.Dispose(); $hash.Dispose() }
-    if ($actual -ne $sha) { throw 'Antigravity SHA-512 mismatch.' }
-    Unblock-File $tmp
-    $version = Get-AgyVersion $tmp
-    if ($version -ne '1.5.18') { throw 'Unexpected Antigravity version.' }
-    if (!$firstInstall) {
-      Publish-File $tmp $exe
-    } else {
-      # Seed before publishing the verified binary so an interrupted setup can retry.
-      $settings = Join-Path $settingsDir 'settings.json'
-      if (!(Test-Path -LiteralPath $provisioned) -and !(Test-Path -LiteralPath $settings)) {
-        [IO.Directory]::CreateDirectory($settingsDir) | Out-Null
-        $initial = Join-Path $settingsDir ('.agy-' + [Guid]::NewGuid() + '.tmp')
-        try {
-          [IO.File]::WriteAllBytes($initial, [Text.Encoding]::ASCII.GetBytes('{"toolPermission":"always-proceed"}'))
-          [void](Publish-NewFile $initial $settings)
-        } finally { [IO.File]::Delete($initial) }
+      $url = 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18-6386224290725888/windows-x64/cli_windows_x64.exe'
+      $sha = '53605db7013dfed51e8c416d51e0c17a3b5ad0750c13da5669954ba4a281318746be0cf8cde2b256cfdb4bfbdade4badad1a0503931f8458416184549afa06b6'
+      Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
+      $hash = [Security.Cryptography.SHA512]::Create()
+      $inputStream = [IO.File]::OpenRead($tmp)
+      try {
+        $actual = [BitConverter]::ToString($hash.ComputeHash($inputStream)).Replace('-', '')
+      } finally { $inputStream.Dispose(); $hash.Dispose() }
+      if ($actual -ne $sha) { throw 'Antigravity SHA-512 mismatch.' }
+      Unblock-File $tmp
+      $version = Get-AgyVersion $tmp
+      if ($version -ne '1.5.18') { throw 'Unexpected Antigravity version.' }
+      if (!$firstInstall) {
+        Publish-File $tmp $exe
+      } else {
+        # Seed before publishing the verified binary so an interrupted setup can retry.
+        $settings = Join-Path $settingsDir 'settings.json'
+        if (!(Test-Path -LiteralPath $provisioned) -and !(Test-Path -LiteralPath $settings)) {
+          $initial = Join-Path $settingsDir ('.agy-' + [Guid]::NewGuid() + '.tmp')
+          try {
+            [IO.File]::WriteAllBytes($initial, [Text.Encoding]::ASCII.GetBytes('{"toolPermission":"always-proceed"}'))
+            [void](Publish-NewFile $initial $settings)
+          } finally { [IO.File]::Delete($initial) }
+        }
+        if (!(Publish-NewFile $tmp $exe) -and !(Get-AgyVersion $exe)) {
+          throw 'Another installer published an unusable Antigravity binary.'
+        }
       }
-      if (!(Publish-NewFile $tmp $exe) -and !(Get-AgyVersion $exe)) {
-        throw 'Another installer published an unusable Antigravity binary.'
-      }
-    }
-  } finally { if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp } }
-}
-# Remember verified installations even when the user later deletes both the binary and settings.
-if (!(Test-Path -LiteralPath $provisioned)) {
-  [IO.Directory]::CreateDirectory($settingsDir) | Out-Null
-  try { [IO.File]::Open($provisioned, 'CreateNew', 'Write', 'None').Dispose() }
-  catch [IO.IOException] { if (![IO.File]::Exists($provisioned)) { throw } }
-}
+    } finally { if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp } }
+  }
+  # Remember verified installations even when the user later deletes both the binary and settings.
+  if (!(Test-Path -LiteralPath $provisioned)) {
+    try { [IO.File]::Open($provisioned, 'CreateNew', 'Write', 'None').Dispose() }
+    catch [IO.IOException] { if (![IO.File]::Exists($provisioned)) { throw } }
+  }
+} finally { $installLock.Dispose() }
 # Keep literal %VARIABLE% entries and the registry value kind intact across SSH logins.
 $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')
 try {
