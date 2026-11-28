@@ -42,7 +42,9 @@ if Path(sys.argv[0]).name == "ssh":
             sys.exit(255)
         print("no" if config.get("fresh") else "yes")
     elif "cat /Users/admin/runners/" in cmd:
-        sys.stdout.buffer.write(b'\xef\xbb\xbf{"agentId": 717}')
+        name = re.search(r"/runners/(mini-[1-4])/", cmd)[1]
+        agent = 717 if name == "mini-4" else 700 + int(name[-1])
+        sys.stdout.buffer.write(b'\xef\xbb\xbf' + json.dumps({"agentId": agent}).encode())
     elif "./config.sh --unattended" in cmd:
         print(*re.search(r"--name (mini-[1-4]) --labels ([a-z0-9,-]+)", cmd).groups(),
               file=open(os.environ["CALLS"], "a"))
@@ -56,13 +58,15 @@ else:
     elif endpoint.endswith("/labels"):
         assert args[args.index("-X") + 1] == "POST"
         label = args[args.index("-f") + 1]
-        assert label in ("labels[]=mini-simulator", "labels[]=ios-queue"), label
         print("add", endpoint, *([label] if label != "labels[]=mini-simulator" else []), file=open(os.environ["CALLS"], "a"))
     elif "/labels/" in endpoint:
         assert args[args.index("-X") + 1] == "DELETE"
         print("remove", endpoint, file=open(os.environ["CALLS"], "a"))
     elif re.search(r"/runners/[0-9]+$", endpoint):
-        print(config.get("queue_labels", "gww-ios,mini,ios-pool"))
+        # Each runner's labels now: the pool's before this change unless the test says otherwise.
+        runner = endpoint.rsplit("/", 1)[1]
+        default = "gww-ios,mini,ios-pool" + (",mini-simulator,ios-simulator" if runner == "717" else "")
+        print(config.get("labels", {}).get(runner, default))
     else:
         raise RuntimeError("Unexpected GitHub call")
 '''
@@ -132,8 +136,8 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("test: installed CI test slots", result.stdout)
         self.assertEqual(calls, [
-            "mini-1 gww-ios,mini,ios-pool", "mini-2 gww-ios,mini,ios-pool",
-            "mini-3 mini,ios-queue", "mini-4 gww-ios,mini,ios-pool,mini-simulator,ios-simulator",
+            "mini-1 gww-ios,mini,ios-pool,ios-queue", "mini-2 gww-ios,mini,ios-pool,ios-queue",
+            "mini-3 ios-queue", "mini-4 gww-ios,mini,ios-pool,ios-queue,mini-simulator,ios-simulator",
         ])
 
     def test_rust_alone_needs_no_registration_slots_or_vm_setup(self):
@@ -160,31 +164,35 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "test: installed CI test slots")
         self.assertEqual(calls, [])
 
+    # Every runner already relabelled: what each carries once this script has run.
+    DONE = {"701": "gww-ios,mini,ios-pool,ios-queue", "702": "gww-ios,mini,ios-pool,ios-queue", "703": "ios-queue",
+            "717": "gww-ios,mini,ios-pool,ios-queue,mini-simulator,ios-simulator"}
+
     def test_existing_label_is_added_to_the_registered_id_without_replacing_it(self):
-        done = "mini,ios-queue"   # the queue's runner already relabelled
-        result, calls = self.run_setup(queue_labels=done)
+        result, calls = self.run_setup(labels=self.DONE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, ["add orgs/dolphin-labs-hq/actions/runners/717/labels"])
-        result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", queue_labels=done)
+        result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", labels=self.DONE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, [])
 
-    def test_the_queue_runner_registered_before_is_relabelled_after_every_check(self):
-        # mini-3 still has the pool's labels: ios-pool and gww-ios removed, ios-queue added, after mini-4's own label.
+    def test_registered_runners_are_relabelled_after_every_check(self):
+        # Every runner with the pool's old labels: each mini gains ios-queue, and mini-3 keeps it alone (gww-ios, mini
+        # and ios-pool removed: no dolphin-labs PR job and no dolphin-maps job can take it).
         result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue")
         self.assertEqual(result.returncode, 0, result.stderr)
+        r = "add orgs/dolphin-labs-hq/actions/runners/{}/labels labels[]=ios-queue"
         self.assertEqual(calls, [
-            "remove orgs/dolphin-labs-hq/actions/runners/717/labels/gww-ios",
-            "remove orgs/dolphin-labs-hq/actions/runners/717/labels/ios-pool",
-            "add orgs/dolphin-labs-hq/actions/runners/717/labels labels[]=ios-queue",
+            r.format(701), r.format(702),
+            "remove orgs/dolphin-labs-hq/actions/runners/703/labels/gww-ios",
+            "remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini",
+            "remove orgs/dolphin-labs-hq/actions/runners/703/labels/ios-pool",
+            r.format(703), r.format(717),
         ])
-        self.assertIn("mini-3: labels mini,ios-queue", result.stdout)
-        # Half done (ios-pool gone, ios-queue missing): only what is missing.
-        result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", queue_labels="gww-ios,mini")
-        self.assertEqual(calls, [
-            "remove orgs/dolphin-labs-hq/actions/runners/717/labels/gww-ios",
-            "add orgs/dolphin-labs-hq/actions/runners/717/labels labels[]=ios-queue",
-        ])
+        self.assertIn("mini-3: labels ios-queue", result.stdout)
+        # mini-3 as #1109 left it (mini and ios-queue): only mini removed; the others already right.
+        result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", labels={**self.DONE, "703": "mini,ios-queue"})
+        self.assertEqual(calls, ["remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini"])
 
     def test_conflicts_dont_mutate_the_existing_runners(self):
         for case in (dict(slot="81\tother\tonline\tfalse\ttrue"), dict(slot=""),
