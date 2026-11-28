@@ -1959,6 +1959,15 @@ any answer counts as alive, and a probe that fails is logged once and never caus
 running, since a job that touches audio is already stuck. It restarts at most once every 15 minutes, then asks again.
 It logs outcomes and minutes only, to `/Library/Logs/ci-coreaudio-check.log`.
 
+**The CI VM keeps its clock right and its runners running** (#1148). On 2026-11-28 the Air's `air-ci` VM was 17
+minutes behind after the host slept. Every token its runner signed had already expired, GitHub answered with its generic
+"registration has been deleted", and the runner stopped for good (`no retry needed`), its LaunchAgent loaded but not
+running, for seven hours. The same install puts `ci-runner-keepalive` beside the others and loads the root LaunchDaemon
+`com.ejcampbell.ci-runner-keepalive`, every 5 minutes and at load. Each run sets the clock from `time.apple.com` with
+`sntp -sS`, then kickstarts each of the CI user's `actions.runner.*` LaunchAgents that launchd has loaded but is not
+running, at most once every 15 minutes per runner. A runner stopped on purpose (`svc.sh stop` unloads it) is left
+alone. It logs corrections of 5 seconds or more and each kickstart, to `/Library/Logs/ci-runner-keepalive.log`.
+
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to

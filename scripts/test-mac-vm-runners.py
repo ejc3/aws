@@ -29,7 +29,7 @@ if Path(sys.argv[0]).name == "ssh":
     elif "install-ci-sim-slots.sh" in cmd:
         with tarfile.open(fileobj=sys.stdin.buffer, mode="r|") as files:
             assert {item.name for item in files} == {"bin/mac-build", "ci/sim-slot-shim", "ci/ci-disk-clean",
-                                                         "ci/ci-coreaudio-check", "ci/swift-test-shim",
+                                                         "ci/ci-coreaudio-check", "ci/ci-runner-keepalive", "ci/swift-test-shim",
                                                          "install-ci-sim-slots.sh"}
         print("test: installed CI test slots")
     elif "Print :CFBundleShortVersionString" in cmd:
@@ -312,21 +312,32 @@ class SimulatorSlots(unittest.TestCase):
         self.assertEqual(daemon["ProgramArguments"], [str(check)])
         self.assertEqual((daemon["StartInterval"], daemon["RunAtLoad"], daemon["ProcessType"]), (300, True, "Standard"))
         self.assertNotIn("UserName", daemon)  # root: restarting coreaudiod needs it
+        keep = self.daemons / "com.ejcampbell.ci-runner-keepalive.plist"
+        with keep.open("rb") as f:
+            keeper = plistlib.load(f)
+        keepalive = self.mac_build.with_name("ci-runner-keepalive")
+        self.assertTrue(os.access(keepalive, os.X_OK))
+        self.assertEqual(keeper["ProgramArguments"], [str(keepalive)])
+        self.assertEqual((keeper["StartInterval"], keeper["RunAtLoad"]), (300, True))
+        self.assertEqual(keeper["EnvironmentVariables"], {"CI_KEEPALIVE_USER": pwd.getpwuid(uid).pw_name})
+        self.assertNotIn("UserName", keeper)  # root: setting the clock needs it
         self.assertEqual([c for c in self.launchctl() if not c.startswith("print")],
                          ["bootout system/com.ejcampbell.ci-coreaudio-check", f"bootstrap system {audio}",
+                          "bootout system/com.ejcampbell.ci-runner-keepalive", f"bootstrap system {keep}",
                           f"bootout gui/{uid}/com.ejcampbell.ci-disk-clean", f"bootstrap gui/{uid} {plist}"])
         # Unchanged and loaded: nothing is reloaded.
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Disk cleaner unchanged and loaded", result.stdout)
         self.assertIn("coreaudiod check unchanged and loaded", result.stdout)
-        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 2)
+        self.assertIn("Runner keepalive unchanged and loaded", result.stdout)
+        self.assertEqual(sum(c.startswith("bootstrap") for c in self.launchctl()), 3)
         # A changed plist is replaced and reloaded once more, after the old instance has finished exiting.
         plist.write_text(plist.read_text().replace("3600", "60"))
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(sum(c.startswith("bootstrap gui") for c in self.launchctl()), 2)
-        self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 1)
+        self.assertEqual(sum(c.startswith("bootstrap system") for c in self.launchctl()), 2)
         # A changed daemon plist is replaced and reloaded too, after its old instance has gone.
         audio.write_text(audio.read_text().replace("300", "60"))
         before = len(self.launchctl())
