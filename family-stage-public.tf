@@ -1,28 +1,34 @@
-# family-stage-public.tf
-#
-# Family's privacy policy and support pages, public: App Store Connect needs both URLs reachable without a sign-in
-# (the app's privacy policy URL and support URL, for TestFlight external testing and the App Store). The pages are
-# part of Family's web Worker `family-stage` (dolphin-labs-hq/dolphin-labs apps/family/web, routes /privacy/ and
-# /support/), which workers-stage.tf gates with a Worker-native Access application. That application follows every
-# request to the Worker and cannot exempt a path, so the pages get a hostname of their own:
-#
-#   https://family.dolphin-labs.dev/privacy/
-#   https://family.dolphin-labs.dev/support/
-#
-# On that host, two hostname applications ("public" destinations), which take precedence over the Worker-native one:
-#   - family_stage_public_pages: BYPASS for /privacy*, /support* and /_next/static/* (the export's compiled CSS,
-#     JavaScript and fonts, which the two pages load; the same reason family_wall_assets in cloudflare.tf is open);
-#   - family_stage_public_host: the rest of the host, with the same three policies as the staging Workers
-#     (workers-stage.tf), so nothing else on it opens, and it does not fall to the *.dolphin-labs.dev wildcard's
-#     different GitHub-organization gate. Access picks the most specific path, so the bypass wins only on its paths.
-# workers.dev and the version previews stay behind workers-stage.tf as before.
-#
-# The hostname is a Workers custom domain. Wrangler never routes it (the deploy token has no DNS or routes), and a
-# deploy leaves it in place. It is created after both applications, so the host is never open beyond these paths.
-
+# This custom domain serves two standalone HTML documents for App Store Connect.
+# Cloudflare Access public destination paths also match descendants. The dedicated
+# Worker tests the hostname and exact path before selecting a document. It has
+# neither a binding to the Family application nor an upstream origin.
 locals {
   family_stage_public_hostname = "family.dolphin-labs.dev"
-  family_stage_public_paths    = ["privacy*", "support*", "_next/static/*"]
+  # Generated in the private Family app by its export:public command. The two
+  # digests are checked before Terraform includes either document in the Worker.
+  family_stage_public_commit = "a816f5be389943bc9c86218d3cadfdde4e05b777"
+  family_stage_public_digests = {
+    privacy = "cbc1cb2fd7d8715fecac9b4b2b6d72a94463ae6969ea901352562b24b6e3043f"
+    support = "c386a4b18369a96f4db30a6853bcc6f00a20b90ff283b3ae69e853419d8db893"
+  }
+  family_stage_public_html = {
+    for name, page in data.github_repository_file.family_public_page : "/${name}/" => page.content
+  }
+}
+
+data "github_repository_file" "family_public_page" {
+  provider   = github.dolphin_labs_ci
+  for_each   = local.family_stage_public_digests
+  repository = local.dolphin_labs_ci_repository
+  branch     = local.family_stage_public_commit
+  file       = "apps/family/web/legal-release/${each.key}.html"
+
+  lifecycle {
+    postcondition {
+      condition     = sha256(self.content) == each.value
+      error_message = "The Family ${each.key} document differs from its reviewed release digest."
+    }
+  }
 }
 
 resource "cloudflare_zero_trust_access_policy" "family_stage_public_pages" {
@@ -39,10 +45,10 @@ resource "cloudflare_zero_trust_access_application" "family_stage_public_pages" 
   account_id = var.cloudflare_account_id
   name       = "Family privacy and support pages (public)"
   type       = "self_hosted"
-  domain     = "${local.family_stage_public_hostname}/privacy*"
+  domain     = "${local.family_stage_public_hostname}/privacy/"
 
   destinations = [
-    for path in local.family_stage_public_paths : { type = "public", uri = "${local.family_stage_public_hostname}/${path}" }
+    for name in keys(local.family_stage_public_digests) : { type = "public", uri = "${local.family_stage_public_hostname}/${name}/" }
   ]
 
   policies = [
@@ -51,11 +57,14 @@ resource "cloudflare_zero_trust_access_application" "family_stage_public_pages" 
       precedence = 1
     },
   ]
+  # The custom host starts behind Access. Verify these bytes with a service token
+  # before applying the narrower public application.
+  depends_on = [cloudflare_workers_custom_domain.family_stage_public]
 }
 
 resource "cloudflare_zero_trust_access_application" "family_stage_public_host" {
   account_id       = var.cloudflare_account_id
-  name             = "Family staging Worker (custom host)"
+  name             = "Family public information (protected host)"
   type             = "self_hosted"
   domain           = local.family_stage_public_hostname
   session_duration = "24h"
@@ -82,20 +91,37 @@ resource "cloudflare_zero_trust_access_application" "family_stage_public_host" {
   ]
 }
 
+resource "cloudflare_workers_script" "family_public_pages" {
+  account_id         = var.cloudflare_account_id
+  script_name        = "family-public-pages"
+  main_module        = "worker.mjs"
+  compatibility_date = "2026-10-01"
+  content = join("\n", [
+    file("${path.module}/workers/family-public-pages/worker.mjs"),
+    "export default familyPublicPages(${jsonencode(local.family_stage_public_hostname)}, ${jsonencode(local.family_stage_public_html)});",
+  ])
+}
+
+resource "cloudflare_workers_script_subdomain" "family_public_pages" {
+  account_id       = var.cloudflare_account_id
+  script_name      = cloudflare_workers_script.family_public_pages.script_name
+  enabled          = false
+  previews_enabled = false
+}
+
 resource "cloudflare_workers_custom_domain" "family_stage_public" {
   account_id = var.cloudflare_account_id
   zone_id    = var.dolphin_zone_id
   hostname   = local.family_stage_public_hostname
-  service    = "family-stage"
+  service    = cloudflare_workers_script.family_public_pages.script_name
   depends_on = [
     cloudflare_zero_trust_access_application.family_stage_public_host,
-    cloudflare_zero_trust_access_application.family_stage_public_pages,
-    cloudflare_zero_trust_access_application.workers_stage,
+    cloudflare_workers_script_subdomain.family_public_pages,
   ]
 }
 
 output "family_public_urls" {
-  description = "Family's public pages for App Store Connect (privacy policy URL, support URL); the rest of the host is gated"
+  description = "Family's public pages for App Store Connect (privacy policy URL, support URL)"
   value = {
     privacy = "https://${local.family_stage_public_hostname}/privacy/"
     support = "https://${local.family_stage_public_hostname}/support/"

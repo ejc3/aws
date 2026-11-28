@@ -129,6 +129,22 @@ mutable and point the staging task at it. The release function refuses to roll
 a task that still uses the old fixed tag. To roll back after a failed smoke
 check, revert the change on main and deploy that commit through the same workflow.
 
+### Family public pages
+
+App Store Connect uses [Family privacy](https://family.dolphin-labs.dev/privacy/)
+and [Family support](https://family.dolphin-labs.dev/support/). The dedicated
+`family-public-pages` Worker serves these documents with their styles inline.
+Family's staging Worker and its API keep their existing Access policy.
+
+To update the published text, run `pnpm run export:public` in the Family web
+package in `dolphin-labs-hq/dolphin-labs` and review its two
+`apps/family/web/legal-release/*.html` files there. Update the source commit and
+both SHA-256 digests in `family-stage-public.tf`. Terraform verifies each private
+file before publishing. The Worker serves both documents from its own deployment.
+For the first release, target `cloudflare_workers_custom_domain.family_stage_public`
+first and verify both documents with the staging Access service token. Apply the
+public path application after the authenticated responses match the two digests.
+
 ### PatchDoctor: autonomous critical security patches
 
 The owner authorizes PatchDoctor to investigate verified **CRITICAL CVEs**, apply
