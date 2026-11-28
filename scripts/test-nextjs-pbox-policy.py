@@ -63,6 +63,9 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(policy.install_policy(path, CONTENT, create=True), "updated")
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         override = path.with_name("AGENTS.override.md")
+        override.write_text(" \n\t")
+        self.assertEqual(policy.effective_codex_file(self.home), path)
+        self.assertEqual(override.read_text(), " \n\t")
         override.write_text("Private override")
         self.assertEqual(policy.effective_codex_file(self.home), override)
 

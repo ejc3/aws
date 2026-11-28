@@ -61,15 +61,23 @@ sub update_instructions {
     }
 }
 
-my $codex = "$home/.codex/AGENTS.override.md";
-$codex = "$home/.codex/AGENTS.md" unless -e $codex || -l $codex;
 my $claude = "$home/.claude/CLAUDE.md";
-if (-l $codex) {
-    # The fleet starter uses a shared file. Only accept this known instruction
-    # target: a link elsewhere is the user's choice and may point at private data.
-    die "Unexpected Codex instruction link: $codex\n" unless (abs_path($codex) // '') eq $claude;
-    $codex = $claude;
+sub codex_target {
+    my ($path) = @_;
+    return $path unless -l $path;
+    # The fleet starter uses this shared file. Other links can point at private data.
+    die "Unexpected Codex instruction link: $path\n" unless (abs_path($path) // '') eq $claude;
+    return $claude;
 }
+
+my $override = "$home/.codex/AGENTS.override.md";
+my $codex;
+if (-e $override || -l $override) {
+    my $target = codex_target($override);
+    my ($instructions) = read_owned($target);
+    $codex = $target if $instructions =~ /\S/;
+}
+$codex //= codex_target("$home/.codex/AGENTS.md");
 update_instructions($codex);
 update_instructions("$home/.claude/rules/ejc3-antigravity-models.md")
     unless -e $claude && (abs_path($claude) // '') eq $codex;
