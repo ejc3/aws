@@ -395,6 +395,10 @@ populate it with `put-secret-value` on stdin after applying. Tools fetch it when
 `STABILITY_API_KEY`; it is not written into shell profiles or deployed-game environments.
 The secret value is never read by Terraform or stored in state. Apps ship the generated assets.
 
+The Meshy AI key (build-time 3D models and textures, from text or an image) is `games/meshy-api-key` in the same
+region, on exactly Stability's terms: the same two dev roles, populated on stdin with `put-secret-value`, fetched when
+needed as `MESHY_API_KEY`, never written into shell profiles, apps or state.
+
 The run.cloud key (cloud iOS simulators, the fallback when the Macs are busy) is
 `run-cloud/api-key` in the same region, JSON `{"RUN_CLOUD_API_KEY": ...}`, with the same two
 dev-role readers. Terraform creates its empty container; populate it on stdin after applying:

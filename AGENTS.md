@@ -1525,6 +1525,10 @@ Available if a task needs them; neither needs a key on disk.
   generating assets as `STABILITY_API_KEY`; no key in app bundles, profiles or logs.
   Terraform owns only the container and grants. Pricing and capabilities must come from
   the current official API documentation; the web subscription and API credits differ.
+- **Meshy AI** (build-time 3D models and textures, from text or an image; meshy.ai). `games/meshy-api-key` in
+  us-west-1 has the same admin/dev-role read boundary as Stability. Fetch it only when generating assets as
+  `MESHY_API_KEY`, sent to curl on stdin (`-H @-`), never on a command line; no key in app bundles, profiles or logs.
+  Generation spends credits: check the current API docs for prices, and ship the finished assets, not the key.
 
 - **run.cloud** (cloud iOS simulators: create one, install a simulator build, tap, type,
   screenshot, read the pasteboard). The fallback when every Mac simulator is busy.

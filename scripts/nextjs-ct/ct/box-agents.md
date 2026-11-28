@@ -55,6 +55,20 @@ pasteboard, open-URL and accessibility-tree calls, from the `runcloud` CLI or `@
   60 minutes total) once it is 5 minutes old, and sandboxes idle 10 minutes. Tag a session `keep=true` only when
   you must keep it longer, and delete it yourself when done.
 
+## 3D models: Meshy
+
+For a game's 3D models and textures, from a text prompt or a picture, use Meshy (meshy.ai, its REST API at
+`https://api.meshy.ai`, docs at docs.meshy.ai).
+
+- The key is the Secrets Manager secret `games/meshy-api-key` (us-west-1), a plain string. Read it into the environment
+  when you use it, never onto a command line or into a file:
+  `export MESHY_API_KEY=$(aws secretsmanager get-secret-value --region us-west-1 --secret-id games/meshy-api-key --query SecretString --output text)`
+- Send it to curl on stdin, never as an argument (an argument is readable in `/proc/<pid>/cmdline`):
+  `printf 'Authorization: Bearer %s\n' "$MESHY_API_KEY" | curl -sS -H @- https://api.meshy.ai/...`
+- Every generation spends credits from one shared balance. Check the docs for the current endpoints and prices, try one
+  small preview before a batch, and keep the task ids of what you accept.
+- Ship the finished model files (`.glb` and the like) in the game. Never put the key in a game, a commit or a log.
+
 ## The GitHub API is a shared budget: wait on events, don't poll
 
 Every `gh` call you make runs as your GitHub account, and one account has one REST limit (5,000 requests an hour).
