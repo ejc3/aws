@@ -2364,6 +2364,14 @@ def load_budget_app(groups=None):
     return app, ec2
 
 
+def launch_week_groups():
+    # Starts at NOW, lasts exactly one week. The production dates are asserted against Terraform below.
+    return dict(GROUPS, dolphin=dict(GROUPS["dolphin"], daily_usd=120, throttled_vcpus=176, launch_week={
+        "start": NOW.isoformat(), "end": (NOW + timedelta(days=7)).isoformat(),
+        "daily_usd": 192, "throttled_vcpus": 288,
+    }))
+
+
 def bucket(app, group, level, at=NOW, throttled=False, rate=0.0, spend=None, version=1):
     app.fake_dynamo.buckets[group] = {
         "group": {"S": group}, "level_usd": {"N": str(level)}, "updated_at": {"N": str(at.timestamp())},
@@ -2537,6 +2545,55 @@ class BudgetArithmeticTests(unittest.TestCase):
     def step(self, app, stored, listed, now=NOW, g=GROUP):
         return app.bucket_step(stored, now.timestamp(), listed, lambda i: BUDGET_REPOS[IMAGINE], g)
 
+    def test_launch_week_uses_only_the_seconds_in_the_window_on_a_warm_controller(self):
+        app, _ = load_budget_app(launch_week_groups())
+        end = NOW + timedelta(days=7)
+        for boundary, expected_before, expected_after in ((NOW, 176, 288), (end, 288, 176)):
+            with self.subTest(boundary=boundary):
+                before = boundary - timedelta(minutes=30)
+                app.now = lambda: before
+                bucket(app, "dolphin", 37, at=before, throttled=True)
+                app.update_bucket("dolphin", BUDGET_REPOS, [])
+                self.assertEqual(app.budget_groups()["dolphin"]["throttled_vcpus"], expected_before)
+                app.now = lambda: boundary
+                self.assertEqual(app.budget_groups()["dolphin"]["throttled_vcpus"], expected_after)
+                app.now = lambda: boundary + timedelta(minutes=30)
+                state = app.update_bucket("dolphin", BUDGET_REPOS, [])
+                self.assertEqual(state["level_usd"], 37 + 5 / 2 + 8 / 2)
+                self.assertEqual(state["capacity"], 384 if boundary == NOW else 240)
+                self.assertEqual(state["daily_usd"], 192 if boundary == NOW else 120)
+
+    def test_launch_week_deploy_preserves_existing_balance_and_spend_without_retroactive_credit(self):
+        app, _ = load_budget_app(launch_week_groups())
+        app.now = lambda: NOW + timedelta(hours=2)
+        hour = str(int(NOW.timestamp()))
+        bucket(app, "dolphin", 37, at=NOW, throttled=True, rate=2, spend={hour: 9})
+        changed = app.update_bucket("dolphin", BUDGET_REPOS, [])
+        self.assertEqual((changed["level_usd"], changed["spend_7d"], changed["throttled"]), (43, 13, True))
+        app.now = lambda: NOW + timedelta(hours=3)
+        self.assertEqual(app.update_bucket("dolphin", BUDGET_REPOS, [])["level_usd"], 51)
+        # A fresh controller also reads the marker on the item, so changing process cannot restart the launch window.
+        fresh, _ = load_budget_app(launch_week_groups())
+        fresh.fake_dynamo.buckets = app.fake_dynamo.buckets
+        fresh.now = lambda: NOW + timedelta(hours=4)
+        self.assertEqual(fresh.update_bucket("dolphin", BUDGET_REPOS, [])["level_usd"], 59)
+
+    def test_expiry_clamps_the_bank_before_draining_after_the_boundary_and_counts_each_host_once(self):
+        app, _ = load_budget_app(launch_week_groups())
+        end = NOW + timedelta(days=7)
+        before = end - timedelta(hours=1)
+        app.now = lambda: before
+        policy = app.budget_policies()["dolphin"]
+        stored = item(380, before.timestamp(), rate=10, spend={"1": 7})
+        stored["window_start"] = policy["launch_week"]["start"]
+        # Ten dollars per hour of previously running hosts; an L joins halfway through the final hour.
+        host = dict(aged(DOLPHIN, ["l"], 1)[0], LaunchTime=end - timedelta(minutes=30))
+        exact = self.step(app, stored, [host], end, policy)
+        self.assertEqual(exact["level_usd"], 240)
+        later = self.step(app, stored, [host], end + timedelta(hours=1), policy)
+        self.assertAlmostEqual(later["drained"], 20 + 1.5 * RATE["l"])
+        self.assertAlmostEqual(later["level_usd"], 240 + 5 - 10 - RATE["l"])
+
     def test_an_hour_refills_a_twenty_fourth_of_the_budget_and_drains_what_ran(self):
         app, _ = load_budget_app()
         t = NOW.timestamp()
@@ -2633,6 +2690,20 @@ class BudgetLaunchTests(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             result = app.handler({"reconcile": True}, None)
         return result, out.getvalue()
+
+    def test_launch_capacity_returns_to_176_on_expiry_without_restarting_or_terminating(self):
+        app, ec2 = load_budget_app(launch_week_groups())
+        end = NOW + timedelta(days=7)
+        app.now = lambda: end - timedelta(seconds=1)
+        ec2.instances += aged(FILMS, ["l"] * 5, 1)
+        bucket(app, "dolphin", 37, at=app.now(), throttled=True)
+        self.assertEqual(self.ensure(app, DOLPHIN, 100, "l")[0], "launched")  # 160 + 32 fits within 288
+        app.now = lambda: end
+        outcome, message = self.ensure(app, DOLPHIN, 101, "l")
+        self.assertEqual(outcome, "cap")
+        self.assertIn("176 vCPUs", message)
+        self.assertIn("of $240.00", message)
+        self.assertEqual(ec2.terminated, [])
 
     def test_launches_ec2_does_not_list_yet_count_in_the_mode_decision(self):
         # Five xl launches EC2 has not listed yet: the sixth decision counts their claims as burn ($10.46/h with its own),
@@ -2770,7 +2841,8 @@ class BudgetLaunchTests(unittest.TestCase):
         # The cap the reconcile holds the group to, from Terraform's formula at these constants.
         self.assertEqual(math.floor((50 / 24 - 8 * 0.016) / 0.027), 72)
         self.assertEqual(math.floor((50 / 24 - 14 * 0.016) / 0.027), 68)
-        self.assertEqual(math.floor((120 / 24 - 14 * 0.016) / 0.027), 176, "dolphin at $120 a day (runner-app.tf)")
+        self.assertEqual(math.floor((120 / 24 - 14 * 0.016) / 0.027), 176)
+        self.assertEqual(math.floor((192 / 24 - 14 * 0.016) / 0.027), 288, "dolphin at $192 a day (runner-app.tf)")
 
     def test_a_single_large_job_runs_when_its_throttled_group_holds_nothing(self):
         # A $20 a day group's throttled cap is under one xl host's 64 vCPUs; the xl still runs, alone.
@@ -2990,10 +3062,12 @@ class BudgetLaunchTests(unittest.TestCase):
 
 
 class BudgetTerraformTests(unittest.TestCase):
-    def test_imagine_at_50_and_the_dolphin_repos_together_at_80_two_days_deep(self):
+    def test_dolphin_launch_week_and_standing_budgets_are_scoped_to_the_shared_dolphin_group(self):
         groups = re.search(r"runner_budget_groups = \{(.*?)\n  \}", APP_TF, re.S).group(1)
         self.assertIn('imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }', groups)
-        self.assertRegex(groups, r'dolphin = \{\s+(?:#[^\n]*\n\s+)*daily_usd = 120\s+repos\s+= concat\(local.dolphin_runner_pool_repos, '
+        self.assertRegex(groups, r'dolphin = \{\s+(?:#[^\n]*\n\s+)*daily_usd = 120\s+launch_week = \{\s+'
+                                 r'start\s+= "2026-11-28T17:04:30Z"\s+end\s+= "2026-12-05T17:04:30Z"\s+'
+                                 r'daily_usd = 192\s+\}\s+repos\s+= concat\(local.dolphin_runner_pool_repos, '
                                  r'\["dolphin-labs-hq/dolphin-family"\]\)')
         pool = re.search(r"dolphin_runner_pool_repos = concat\(\[(.*?)\], keys\(local.dolphin_runner_pool_expansion_active\)\)", APP_TF, re.S)
         self.assertEqual(set(re.findall(r'"([^"]+)"', pool.group(1))), {DOLPHIN, FILMS, "dolphin-labs-hq/dolphin-maps"})
@@ -3019,11 +3093,14 @@ class BudgetTerraformTests(unittest.TestCase):
 
     def test_the_throttled_vcpu_cap_is_the_refill_rate_less_the_throttled_hosts_overhead(self):
         budget = re.search(r"runner_budget = \{ for name, g in local.runner_budget_groups : name => merge\(.*?\n  \}\) \}", APP_TF, re.S).group()
-        self.assertIn("throttled_vcpus = max(0, floor((g.daily_usd / 24 - sum(concat([0], [for r in g.repos : "
-                      "try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd) / "
-                      "local.runner_cost.vcpu_hour_usd))", budget)
+        self.assertIn("sum(concat([0], [for r in g.repos : try(local.runner_app_repos[r].throttled_max, 0)])) "
+                      "* local.runner_cost.host_hour_usd", APP_TF)
+        for dollars in ("g.daily_usd", "g.launch_week.daily_usd"):
+            self.assertIn(f"throttled_vcpus = max(0, floor(({dollars} / 24 - local.runner_budget_host_cost[name]) "
+                          "/ local.runner_cost.vcpu_hour_usd))", budget)
         fn = re.search(r'resource "aws_lambda_function" "runner_app" \{.*?\n\}', APP_TF, re.S).group()
         self.assertIn("throttled_vcpus = g.throttled_vcpus", fn)
+        self.assertIn("g.launch_week == null ? {} : { launch_week = g.launch_week }", fn)
         self.assertNotIn("throttled_max_vcpus", APP_TF, "the throttled vCPU cap is the group's, not a repo's")
 
     def test_the_bucket_table_and_the_controllers_access_to_it(self):

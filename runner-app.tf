@@ -112,11 +112,14 @@ locals {
   runner_budget_groups = {
     imagine = { daily_usd = 50, repos = ["ejc3/imagine"] }
     dolphin = {
-      # $120 (was $80, 2026-11-24; $50 before 2026-11-22): the group was throttled from 2026-11-22 23:54 UTC for most of
-      # a busy day, and throttled at $80 (115 vCPUs) production deploys waited hours behind queued CI. The owner:
-      # "Raise ... use judgment" (dolphin-labs#2080).
+      # After launch week the controller automatically returns to this standing budget.
       daily_usd = 120
-      repos     = concat(local.dolphin_runner_pool_repos, ["dolphin-labs-hq/dolphin-family"])
+      launch_week = {
+        start     = "2026-11-28T17:04:30Z"
+        end       = "2026-12-05T17:04:30Z"
+        daily_usd = 192
+      }
+      repos = concat(local.dolphin_runner_pool_repos, ["dolphin-labs-hq/dolphin-family"])
     }
 
     # Its own bucket once constellation_token_ready is on (no bucket, metric or alarm before: runner_budget_served).
@@ -125,12 +128,18 @@ locals {
   # throttled_vcpus: the vCPUs the group's repos may hold together while throttled. The refill rate (daily_usd / 24 an
   # hour), less the overhead of every host the throttled caps allow (the sum of the group's throttled_max, each at
   # host_hour_usd), at vcpu_hour_usd, rounded down: imagine 72 vCPUs (8 hosts, $50 a day), dolphin 176 (14 hosts,
-  # $120 a day) and constellation 74 (4 hosts, $50 a day).
+  # $120 a day; 288 at $192 during launch week) and constellation 74 (4 hosts, $50 a day).
   # Held there, the group spends no more than it refills. A group holding nothing may still launch one host of any size
   # (app_runner.py ensure_runner), so a job larger than this cap never waits forever; one `xl` host alone ($1.74/h) is
   # still under the refill ($2.08/h).
+  runner_budget_host_cost = { for name, g in local.runner_budget_groups : name =>
+    sum(concat([0], [for r in g.repos : try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd
+  }
   runner_budget = { for name, g in local.runner_budget_groups : name => merge(local.runner_budget_defaults, g, {
-    throttled_vcpus = max(0, floor((g.daily_usd / 24 - sum(concat([0], [for r in g.repos : try(local.runner_app_repos[r].throttled_max, 0)])) * local.runner_cost.host_hour_usd) / local.runner_cost.vcpu_hour_usd))
+    throttled_vcpus = max(0, floor((g.daily_usd / 24 - local.runner_budget_host_cost[name]) / local.runner_cost.vcpu_hour_usd))
+    launch_week = try(merge(g.launch_week, {
+      throttled_vcpus = max(0, floor((g.launch_week.daily_usd / 24 - local.runner_budget_host_cost[name]) / local.runner_cost.vcpu_hour_usd))
+    }), null)
   }) }
   # repo => its group's name.
   runner_app_budget_group = merge([for name, g in local.runner_budget_groups : { for repo in g.repos : repo => name }]...)
@@ -590,11 +599,11 @@ resource "aws_lambda_function" "runner_app" {
 
       # The budget buckets (locals above): one item per group in BUDGET_TABLE.
       BUDGET_TABLE = aws_dynamodb_table.runner_app_budget[0].name
-      BUDGET_GROUPS = jsonencode({ for name, g in local.runner_budget : name => {
+      BUDGET_GROUPS = jsonencode({ for name, g in local.runner_budget : name => merge({
         daily_usd       = g.daily_usd, capacity_days = g.capacity_days, burst_max = g.burst_max, burst_max_vcpus = g.burst_max_vcpus,
         lookahead_hours = g.lookahead_hours, reserve_fraction = g.reserve_fraction, resume_fraction = g.resume_fraction,
         throttled_vcpus = g.throttled_vcpus
-      } })
+      }, g.launch_week == null ? {} : { launch_week = g.launch_week }) })
       VCPU_HOUR_USD = tostring(local.runner_cost.vcpu_hour_usd)
       HOST_HOUR_USD = tostring(local.runner_cost.host_hour_usd)
     }
@@ -912,7 +921,7 @@ resource "aws_cloudwatch_metric_alarm" "runner_budget_throttled" {
   evaluation_periods  = 24
   datapoints_to_alarm = each.value.throttled_alarm_hours + 1
   threshold           = 0.5
-  alarm_description   = "The ${each.key} runner budget (${each.value.daily_usd} USD a day) was throttled in more than ${each.value.throttled_alarm_hours} of the last 24 hours: its repos ran at their throttled caps. Raise daily_usd in runner-app.tf if the work has grown."
+  alarm_description   = "The ${each.key} runner budget (${each.value.daily_usd} USD a day${each.value.launch_week == null ? "" : " standing budget; launch week has a temporary increase"}) was throttled in more than ${each.value.throttled_alarm_hours} of the last 24 hours: its repos ran at their throttled caps. Raise daily_usd in runner-app.tf if the work has grown."
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"
@@ -934,7 +943,7 @@ resource "aws_cloudwatch_metric_alarm" "runner_budget_weekly" {
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 1
   threshold           = 7 * each.value.daily_usd
-  alarm_description   = "The ${each.key} runners cost more than ${7 * each.value.daily_usd} USD over the last 7 days (the budget bucket's drain at runner-app.tf runner_cost)."
+  alarm_description   = "The ${each.key} runners cost more than ${7 * each.value.daily_usd} USD over the last 7 days (the budget bucket's drain at runner-app.tf runner_cost).${each.value.launch_week == null ? "" : " This standing threshold includes launch-week spend and remains informational."}"
   alarm_actions       = [aws_sns_topic.cost_alerts.arn]
   ok_actions          = [aws_sns_topic.cost_alerts.arn]
   namespace           = "GitHubAppRunner"

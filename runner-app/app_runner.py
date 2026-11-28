@@ -486,8 +486,26 @@ class BucketBusy(Exception):
     """The bucket's conditional write lost BUCKET_WRITE_ATTEMPTS times in a row."""
 
 
+def budget_policies():
+    policies = json.loads(os.environ.get('BUDGET_GROUPS') or '{}')
+    for policy in policies.values():
+        window = policy.get('launch_week')
+        if window:
+            for bound in ('start', 'end'):
+                window[bound] = datetime.fromisoformat(window[bound].replace('Z', '+00:00')).timestamp()
+    return policies
+
+
+def effective_budget(policy, at):
+    window = policy.get('launch_week')
+    if window and window['start'] <= at < window['end']:
+        return {**policy, 'daily_usd': window['daily_usd'], 'throttled_vcpus': window['throttled_vcpus']}
+    return policy
+
+
 def budget_groups():
-    return json.loads(os.environ.get('BUDGET_GROUPS') or '{}')
+    at = now().timestamp()
+    return {name: effective_budget(policy, at) for name, policy in budget_policies().items()}
 
 
 def group_repos(group, repos):
@@ -518,31 +536,46 @@ def would_throttle(level, throttled, burn_h, g):
     return empties or level < float(g['reserve_fraction']) * capacity
 
 
-def bucket_step(item, now_s, listed, cfg_of, g, extra_h=0.0):
+def bucket_step(item, now_s, listed, cfg_of, policy, extra_h=0.0):
     """The bucket's state after refilling and draining up to `now_s`, from its stored `item` (None: start full).
 
     `listed` is every host of the group's repos EC2 lists, in any state; `cfg_of(instance)` is its repo's config.
     `extra_h` is the rate of a host about to be launched, which only the mode decision counts. Pure: no AWS call."""
+    g = effective_budget(policy, now_s)
+    window = policy.get('launch_week')
     capacity = capacity_usd(g)
     rates = [(i, host_rate(i, cfg_of(i)), i['LaunchTime'].timestamp()) for i in listed]
     live = [(i, r, t) for i, r, t in rates if i.get('State', {}).get('Name') in LIVE_STATES]
     live_ids = {i['InstanceId'] for i, _, _ in live}
     burn_h = sum(r for _, r, _ in live)
     if item is None:
-        return {'level_usd': capacity, 'updated_at': now_s, 'rate_usd_h': burn_h, 'spend': {}, 'drained': 0.0,
+        # The launch allowance is earned over time, including if this is the group's first observation.
+        level = capacity_usd(policy)
+        return {'level_usd': level, 'updated_at': now_s, 'rate_usd_h': burn_h, 'spend': {}, 'drained': 0.0,
                 'elapsed': 0.0, 'burn_h': burn_h, 'version': 0, 'new': True,
-                'throttled': would_throttle(capacity, False, burn_h + extra_h, g)}
+                'window_start': window['start'] if window else None,
+                'throttled': would_throttle(level, False, burn_h + extra_h, g)}
     elapsed = min(max(now_s - item['updated_at'], 0.0), MAX_LIFETIME.total_seconds())
     start = now_s - elapsed
-    drained = 0.0
-    for instance, rate, launched in rates:
-        if instance['InstanceId'] in live_ids:
-            drained += rate * max(0.0, now_s - max(start, launched)) / 3600
-        elif launched > start:
-            drained += rate * max(0.0, now_s - launched) / 3600
-    still = sum(r for _, r, t in live if t <= start)
-    drained += max(0.0, item['rate_usd_h'] - still) * elapsed / 3600
-    level = min(capacity, max(0.0, item['level_usd'] + float(g['daily_usd']) * elapsed / 86400 - drained))
+    still = sum(r for _, r, launched in live if launched <= start)
+    unlisted_rate = max(0.0, item['rate_usd_h'] - still)
+    charged = [(r, launched) for i, r, launched in rates if i['InstanceId'] in live_ids or launched > start]
+    # When first deployed into an existing interval, only credit the higher rate from the first write onward.
+    # Once observed, split at both boundaries so neither spillover nor a missed reconcile creates extra credit.
+    observed = window and item.get('window_start') == window['start']
+    boundaries = [t for t in (window['start'], window['end']) if start < t < now_s] if observed else []
+    level, drained, previous = item['level_usd'], 0.0, start
+    for end in [*boundaries, now_s]:
+        segment = effective_budget(policy, previous) if observed else policy
+        seconds = end - previous
+        cost = (unlisted_rate * seconds + sum(r * max(0.0, end - max(previous, launched))
+                                              for r, launched in charged)) / 3600
+        # Clamp when each rate takes effect, before crediting/draining the following interval.
+        limit = capacity_usd(segment)
+        level = min(limit, max(0.0, min(level, limit) + float(segment['daily_usd']) * seconds / 86400 - cost))
+        drained += cost
+        previous = end
+    level = min(level, capacity)  # the new cap also applies exactly at the exclusive end
     hour = str(int(now_s // 3600 * 3600))
     spend = {h: v for h, v in item['spend'].items() if int(h) > now_s - SPEND_WINDOW_HOURS * 3600}
     if drained:
@@ -550,6 +583,7 @@ def bucket_step(item, now_s, listed, cfg_of, g, extra_h=0.0):
     # now_s even when time moved backwards: at most that skew (milliseconds on Lambda) is then counted twice.
     return {'level_usd': level, 'updated_at': now_s, 'rate_usd_h': burn_h, 'spend': spend,
             'drained': drained, 'elapsed': elapsed, 'burn_h': burn_h, 'version': item['version'], 'new': False,
+            'window_start': window['start'] if window else None,
             'throttled': would_throttle(level, item['throttled'], burn_h + extra_h, g)}
 
 
@@ -560,7 +594,8 @@ def read_bucket(group):
     return {'level_usd': float(got['level_usd']['N']), 'updated_at': float(got['updated_at']['N']),
             'rate_usd_h': float(got.get('rate_usd_h', {}).get('N', '0')), 'throttled': bool(got.get('throttled', {}).get('BOOL')),
             'spend': {h: float(v['N']) for h, v in (got.get('spend', {}).get('M') or {}).items()},
-            'version': int(got.get('version', {}).get('N', '0'))}
+            'version': int(got.get('version', {}).get('N', '0')),
+            'window_start': float(got['window_start']['N']) if 'window_start' in got else None}
 
 
 def write_bucket(group, state):
@@ -571,6 +606,8 @@ def write_bucket(group, state):
             'throttled': {'BOOL': bool(state['throttled'])},
             'spend': {'M': {h: {'N': num(v)} for h, v in state['spend'].items()}},
             'version': {'N': str(state['version'] + 1)}}
+    if state.get('window_start') is not None:
+        item['window_start'] = {'N': str(int(state['window_start']))}
     if state['new']:
         dynamodb.put_item(TableName=BUDGET_TABLE, Item=item, ConditionExpression='attribute_not_exists(#g)',
                           ExpressionAttributeNames={'#g': 'group'})
@@ -594,15 +631,17 @@ def group_listing(group, repos):
 
 def update_bucket(group, repos, listed=None, extra_h=0.0):
     """Refill and drain `group`'s bucket to now and store it; the new state. Raises BucketBusy after losing every write."""
-    g = budget_groups()[group]
+    policy = budget_policies()[group]
     listed = group_listing(group, repos) if listed is None else listed
     cfg_of = lambda i: repos.get(tag(i, 'Repo')) or next(iter(repos.values()))
     for _ in range(BUCKET_WRITE_ATTEMPTS):
-        state = bucket_step(read_bucket(group), now().timestamp(), listed, cfg_of, g, extra_h)
+        state = bucket_step(read_bucket(group), now().timestamp(), listed, cfg_of, policy, extra_h)
         try:
             write_bucket(group, state)
         except dynamodb.exceptions.ConditionalCheckFailedException:
             continue
+        g = effective_budget(policy, state['updated_at'])
+        state['daily_usd'] = g['daily_usd']
         state['group'], state['capacity'], state['spend_7d'] = group, capacity_usd(g), sum(state['spend'].values())
         return state
     raise BucketBusy(f'budget {group}: the bucket changed under {BUCKET_WRITE_ATTEMPTS} writes in a row')
@@ -1718,7 +1757,7 @@ def reconcile_buckets(repos):
             continue
         states.append(state)
         print(f"{describe_bucket(state)}; burning ${state['burn_h']:.2f}/h, refilling "
-              f"${float(budget_groups()[group]['daily_usd']) / 24:.2f}/h; 7-day spend ${state['spend_7d']:.2f}")
+              f"${float(state['daily_usd']) / 24:.2f}/h; 7-day spend ${state['spend_7d']:.2f}")
     return states, failed
 
 
