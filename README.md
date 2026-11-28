@@ -1717,7 +1717,8 @@ A Mac whose `host_key` is `""` in that map gets no client anywhere (`local.mac_s
 
 ### SSH to the MacBook Air, and the pool on it: `ssh air`
 
-EJ's second Mac (MacBook Air M2, macOS 27, set up 2026-11-27), built like Colin's (above): Cloudflare Access in front of
+A CI and agent machine (MacBook Air M2, macOS 27, set up 2026-11-27; owner, 2026-11-28: "not a personal machine"; its
+runner is under "The MacBook Air" below), built like Colin's (above): Cloudflare Access in front of
 its Remote Login at `air-ssh.cc-games.dev` (`air-ssh.tf`), a connector LaunchAgent on the Mac, and the `mac-ssh-client.tf`
 installer with alias `air` (user `ejcampbell`, its host key read at the Mac). Clients, each with its own token, are the
 owner's only: fcvm-arm `ubuntu` (`air-ssh-access-fcvm`) and the owner's container (`air-ssh-access-nextjs-ejc3`, denied
@@ -1870,6 +1871,12 @@ with the `games-worth-watching/app-store-connect` key, and `POST /v1/devices` if
 signing (`-allowProvisioningUpdates`) adds a registered phone to the development profile on the next build. Keep
 UDIDs out of this repository.
 
+**The MacBook Air** (owner, 2026-11-28: "not a personal machine") is CI capacity too: its Tart VM `air-ci` (6
+cores, 18 GB, the Air's own copy of Xcode mounted read-only) runs one runner, `air-1`, with the shared pool's
+labels (`ios-pool`, `mini`, `gww-ios`) and `ios-queue`. Keep it with `scripts/mac-vm-setup.sh air-ci --lan air --runners`;
+it retires `air-ci-1`, which dolphin-labs' `ci-vm.sh` registered by hand, and keeps that script's LaunchAgent for the
+VM rather than adding a second. `--simulator-slots` installs the guest's disk cleaner there as on the mini.
+
 **The CI VM's runners** are `mini-3` and `mini-4` (owner, 2026-11-28: two, not four; `mini-1` and `mini-2` are
 retired, and the script deregisters them). To rebuild them, run
 `scripts/mac-vm-setup.sh ci --lan mini-lan --runners` from the LAN Mac described below. It provisions Xcode,
@@ -1884,7 +1891,7 @@ Only `mini-4` also has `mini-simulator`. Use `runs-on: [self-hosted, macOS, mini
 job that boots an iOS simulator. A single runner executes one job at a time across all eligible
 repositories. Three listeners also share `ios-simulator`: `mini-4`, `macbook-kidsports-1` in the MacBook's
 pool VM (`kidsports-ci`, 4 cores and 8 GB, Xcode 27.1 with the iOS 26.5, 27.0 and 27.1 runtimes, as its own `admin`;
-the owner, 2026-11-27: "MacBook Pro can be used for Mac testing"), and `air-ci-1` in the MacBook Air's VM (`air-ci`,
+the owner, 2026-11-27: "MacBook Pro can be used for Mac testing"), and `air-1` in the MacBook Air's VM (`air-ci`,
 6 cores and 18 GB, Xcode 27.2, made by dolphin-labs' `apps/native/scripts/ci-vm.sh` with `GWW_CI_VM=air-ci`; the Air
 is used by nobody, owner 2026-11-27). A job that may run on any Mac's simulator asks
 for `[self-hosted, macOS, ios-pool, ios-simulator]` and takes whichever is free, so three such jobs run at once, one on

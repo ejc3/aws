@@ -37,21 +37,21 @@ if Path(sys.argv[0]).name == "ssh":
     elif ".ci-vm-copied 2>" in cmd:
         print("27.0 27A123")
     elif "test -f" in cmd and ".runner" in cmd:
-        name = re.search(r"/runners/(mini-[1-4])/", cmd)[1]
+        name = re.search(r"/runners/(mini-[1-4]|air-1|air-ci-1)/", cmd)[1]
         if config.get("ssh_failed") and name == "mini-4":
             sys.exit(255)
-        print("no" if config.get("fresh") else "yes")
+        print("no" if config.get("fresh") or name in config.get("absent", []) else "yes")
     elif "cat /Users/admin/runners/" in cmd:
-        name = re.search(r"/runners/(mini-[1-4])/", cmd)[1]
-        agent = 717 if name == "mini-4" else 700 + int(name[-1])
+        name = re.search(r"/runners/(mini-[1-4]|air-1|air-ci-1)/", cmd)[1]
+        agent = {"mini-4": 717, "air-1": 801, "air-ci-1": 12709}.get(name) or 700 + int(name[-1])
         sys.stdout.buffer.write(b'\xef\xbb\xbf' + json.dumps({"agentId": agent}).encode())
     elif "./config.sh remove" in cmd:
-        name = re.search(r"runners/(mini-[1-4])", cmd)[1]
+        name = re.search(r"runners/(mini-[1-4]|air-ci-1)", cmd)[1]
         print("retire", name, file=open(os.environ["CALLS"], "a"))
         if name in config.get("remove_fails", []):
             sys.exit(1)
     elif "./config.sh --unattended" in cmd:
-        print(*re.search(r"--name (mini-[1-4]) --labels ([a-z0-9,-]+)", cmd).groups(),
+        print(*re.search(r"--name (mini-[1-4]|air-1) --labels ([a-z0-9,-]+)", cmd).groups(),
               file=open(os.environ["CALLS"], "a"))
 else:
     endpoint = next(x for x in args if x.startswith("orgs/"))
@@ -134,7 +134,7 @@ if args[0] == "bootstrap" and (loaded or lingering):
 
 
 class MiniRunnerRouting(unittest.TestCase):
-    def run_setup(self, mode="--runners", **config):
+    def run_setup(self, mode="--runners", vm="ci", **config):
         with tempfile.TemporaryDirectory() as d:
             base = Path(d)
             for tool in ("gh", "ssh"):
@@ -145,7 +145,7 @@ class MiniRunnerRouting(unittest.TestCase):
             calls.touch()
             env = dict(os.environ, PATH=d + os.pathsep + os.environ["PATH"],
                        FAKE_RUNNERS=json.dumps(config), CALLS=str(calls))
-            result = subprocess.run(["bash", SCRIPT, "ci", "--lan", "test", mode],
+            result = subprocess.run(["bash", SCRIPT, vm, "--lan", "test", mode],
                                     env=env, capture_output=True, text=True, timeout=30)
             return result, calls.read_text().splitlines()
 
@@ -210,13 +210,31 @@ class MiniRunnerRouting(unittest.TestCase):
         result, calls = self.run_setup(slot="717\tmini-4\tonline\ttrue\ttrue", labels={**self.DONE, "703": "mini,ios-queue"})
         self.assertEqual(calls, ["remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini", *self.RETIRE])
 
+    def test_the_air_registers_air_1_for_this_pool_and_batches_and_retires_its_hand_made_runner(self):
+        # Fresh: one runner, with the shared pool's labels (ios-pool, mini, gww-ios), ios-queue, and ios-simulator
+        # (one of the three simulator listeners); not mini-simulator, the mini's own.
+        result, calls = self.run_setup(vm="air-ci", fresh=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["air-1 gww-ios,mini,ios-pool,ios-queue,ios-simulator"])
+        # As it stands now: air-ci-1 (ios-pool alone, from dolphin-labs' ci-vm.sh) retired; air-1 relabelled.
+        result, calls = self.run_setup(vm="air-ci", labels={"801": "gww-ios,mini,ios-pool,ios-queue"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, ["retire air-ci-1"])
+        # air-ci-1 still holds a job: air-1 is neither registered nor started beside it in the same VM (#1120).
+        result, calls = self.run_setup(vm="air-ci", absent=["air-1"], busy={"12709": "true"})
+        self.assertEqual(result.returncode, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("air-ci-1: running a job; run this again once it ends (its replacement is not registered yet)",
+                      result.stderr)
+        self.assertNotIn("mini-", "\n".join(calls))
+
     def test_retired_runners_are_deregistered_and_a_busy_one_waits_for_a_rerun(self):
         done = dict(slot="717\tmini-4\tonline\ttrue\ttrue", labels=self.DONE)
-        # mini-1 is running a job: left registered, mini-2 retired, and the run says to come back (exit 4).
+        # mini-1 is running a job: the run stops before anything changes and says to come back (exit 4).
         result, calls = self.run_setup(busy={"701": "true"}, **done)
         self.assertEqual(result.returncode, 4)
-        self.assertEqual(calls, ["retire mini-2"])
-        self.assertIn("mini-1: running a job; run this again", result.stderr)
+        self.assertEqual(calls, [])
+        self.assertIn("mini-1: running a job; run this again once it ends", result.stderr)
         # A registration config.sh could not remove is deleted through the API.
         result, calls = self.run_setup(stuck=["702"], **done)
         self.assertEqual(result.returncode, 0, result.stderr)
