@@ -405,6 +405,8 @@ jobs:
 
       - name: "Staging Workers: one Access application over every Worker, URL switches owned by Terraform, Access before URLs"
         run: python3 -S -B scripts/test-workers-stage.py
+      - name: "Family's public privacy and support pages: only those paths bypass Access on the custom host, the rest gated like the staging Workers"
+        run: python3 -S -B scripts/test-family-stage-public.py
 
       - name: "Colton Games production on Cloudflare: one cutover switch (off), hostname Access before cutover, Free-plan zone protection without Bot Fight Mode, one-purpose keys, a loader that never mixes or prints values"
         run: python3 -S -B scripts/test-cloudflare-production.py
