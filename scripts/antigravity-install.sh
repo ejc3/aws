@@ -46,6 +46,21 @@ if [[ ! $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?$ ]]; then
   chmod 700 "$stage/agy"
   installed=$("$stage/agy" --version)
   [[ $installed = "$version" ]] || { echo "Expected Antigravity $version, got $installed." >&2; exit 1; }
+  # Only bootstrap a new settings file. The live CLI can atomically replace it
+  # from /config, including when the user returns to the stricter review default.
+  if [[ ${1:-} != --binary-only && ! -e $bin/agy && ! -L $bin/agy ]]; then
+    (
+      umask 077
+      prefs=$HOME/.gemini/antigravity-cli/settings.json
+      [[ ! -e $prefs && ! -L $prefs ]] || exit 0
+      mkdir -p "${prefs%/*}"
+      tmp=$(mktemp "${prefs%/*}/.agy-settings.XXXXXXXX")
+      trap 'rm -f -- "$tmp"' EXIT
+      printf '%s\n' '{"toolPermission":"always-proceed"}' > "$tmp"
+      # A native settings save can win this race. link never overwrites its file.
+      ln "$tmp" "$prefs" || [[ -e $prefs || -L $prefs ]]
+    )
+  fi
   mv -f "$stage/agy" "$bin/agy"
 fi
 
@@ -58,56 +73,6 @@ if ! env PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin zsh -c '[[ ${commands
     || { echo "Noninteractive zsh cannot find $bin/agy. Check ~/.zshenv." >&2; exit 1; }
 fi
 printf 'Antigravity %s installed at %s/agy\n' "$installed" "$bin"
-
-# Seed the native preference once. The CLI removes default-valued keys when a user
-# changes settings, so re-adding a missing key on every scheduled run would undo that choice.
-if [[ ${1:-} != --binary-only ]]; then
-  (
-    umask 077
-    mkdir -p "$HOME/.gemini/antigravity-cli"
-    cd "$HOME/.gemini/antigravity-cli"
-    perl - <<'PERMISSION_DEFAULT'
-use strict;
-use warnings;
-use Fcntl qw(:DEFAULT :flock O_NOFOLLOW);
-use File::Temp qw(tempfile);
-use JSON::PP;
-
-sysopen(my $seed, '.fleet-permission-default-v1', O_RDWR | O_CREAT | O_NOFOLLOW, 0600) or die "Open user preference marker: $!";
-flock($seed, LOCK_EX) or die "Lock user preference marker: $!";
-exit 0 if (<$seed> // '') eq "done\n";
-
-sub read_settings {
-    return undef unless -e 'settings.json' || -l 'settings.json';
-    sysopen(my $in, 'settings.json', O_RDONLY | O_NOFOLLOW | O_NONBLOCK) or die "Open user settings: $!";
-    die "Expected a regular user settings file" unless -f $in;
-    local $/;
-    return scalar(<$in>) // '';
-}
-
-my $old = read_settings();
-my $json = JSON::PP->new->utf8->canonical->pretty->allow_bignum;
-my $prefs = defined($old) ? $json->decode($old) : {};
-die "Expected a JSON object for user settings" unless ref($prefs) eq 'HASH';
-unless (exists $prefs->{toolPermission}) {
-    $prefs->{toolPermission} = 'always-proceed';
-    my ($out, $tmp) = tempfile('.agy-settings-XXXXXXXX', DIR => '.', UNLINK => 1);
-    print {$out} $json->encode($prefs) or die "Write user settings: $!";
-    close($out) or die "Finish user settings: $!";
-    if (defined $old) {
-        my $latest = read_settings();
-        die "User settings changed during install" unless defined($latest) && $latest eq $old;
-        rename($tmp, 'settings.json') or die "Replace user settings: $!";
-    } else {
-        link($tmp, 'settings.json') or die "Create user settings: $!";
-    }
-}
-seek($seed, 0, 0) or die "Seek user preference marker: $!";
-print {$seed} "done\n" or die "Record user preference: $!";
-close($seed) or die "Finish user preference marker: $!";
-PERMISSION_DEFAULT
-  )
-fi
 
 if [[ -n $guide ]]; then
   rules=$HOME/.gemini/config/rules

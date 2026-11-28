@@ -49,32 +49,32 @@ cp "$HOME/release.tgz" "$2"''')
     def run_installer(self):
         return subprocess.run(["/bin/bash", "-s"], input=self.script, text=True, env=self.env, capture_output=True)
 
-    def test_seeds_native_permission_once_and_preserves_nested_settings(self):
+    def test_new_settings_are_seeded_once(self):
         path = self.home / ".gemini/antigravity-cli/settings.json"
-        path.parent.mkdir(parents=True)
-        original = {"agentMode": "plan", "permissions": {"deny": ["command(touch)"]},
-                    "unknown": [False, {"answer": 42}]}
-        path.write_text(json.dumps(original))
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(path.read_text()), dict(original, toolPermission="always-proceed"))
-        # Resetting the native preference to request-review removes its key.
-        path.write_text(json.dumps(original))
+        self.assertEqual(json.loads(path.read_bytes()), {"toolPermission": "always-proceed"})
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        path.unlink()
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(path.read_text(), json.dumps(original))
+        self.assertFalse(path.exists())
 
-    def test_existing_explicit_permission_and_malformed_json(self):
+    def test_preserves_an_existing_or_concurrently_created_settings_file(self):
         path = self.home / ".gemini/antigravity-cli/settings.json"
         path.parent.mkdir(parents=True)
-        path.write_text("[unfinished")
-        self.assertNotEqual(self.run_installer().returncode, 0)
-        self.assertEqual(path.read_text(), "[unfinished")
-        explicit = '{"toolPermission":"strict"}'
-        path.write_text(explicit)
+        original = b'{"agentMode":"plan","permissions":{"deny":["command(touch)"]}}'
+        path.write_bytes(original)
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(path.read_text(), explicit)
+        self.assertEqual(path.read_bytes(), original)
+
+        self.cli.unlink()
+        path.unlink()
+        self.tool("ln", 'printf user-saved > "$2"; exec /bin/ln "$@"')
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(path.read_bytes(), b"user-saved")
 
     def test_all_platforms_and_noninteractive_zsh(self):
         for platform, package in [

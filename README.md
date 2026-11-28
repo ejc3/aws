@@ -2112,8 +2112,8 @@ The operator installs the reviewed model guide manually on both administration h
 accounts receive it through provisioning. Codex and Claude use their global instruction files even when a
 repository has its own root. Antigravity reads its own global rule in `~/.gemini/config/rules/`.
 
-For new development profiles the installer seeds Antigravity's native `toolPermission` preference
-to `always-proceed` in `~/.gemini/antigravity-cli/settings.json`. A normal `agy` session then runs
+On first installation in a development profile with no CLI settings file, the installer creates
+`~/.gemini/antigravity-cli/settings.json` with `toolPermission` set to `always-proceed`. A normal `agy` session then runs
 tools without an approval prompt, subject to the account's ask and deny rules. Choose another
 Tool Permission in `/config` to change it. Later installs preserve that choice. On an administration
 host, set the preference in the account directly after reviewing it.

@@ -38,48 +38,31 @@ class WindowsInstallTest(unittest.TestCase):
             self.addCleanup(winreg.SetValueEx, self.key, "Path", 0, kind, value)
         winreg.SetValueEx(self.key, "Path", 0, winreg.REG_EXPAND_SZ, USER_TOOLS)
 
-    def install(self, guide=GUIDE, *, expect_success=True):
+    def install(self, guide=GUIDE):
         dispatcher = (HERE / "antigravity-stdin.ps1").read_text(encoding="utf-8")
         encoded = base64.b64encode(dispatcher.encode("utf-16le")).decode("ascii")
         command = ["powershell.exe", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded]
         installer = base64.b64encode((HERE / "antigravity-install.ps1").read_bytes())
         payload = installer + b"\n" + base64.b64encode(guide.encode("utf-8"))
-        result = subprocess.run(command, input=payload, env=self.env, timeout=240)
-        if expect_success:
-            self.assertEqual(result.returncode, 0, "PowerShell installer failed")
-        else:
-            self.assertNotEqual(result.returncode, 0, "Installer accepted invalid settings")
+        subprocess.run(command, input=payload, env=self.env, timeout=240, check=True)
 
-    def test_permission_default_retains_personal_choices(self):
-        cli = self.profile / ".gemini/antigravity-cli"
-        cli.mkdir(parents=True)
-        path = cli / "settings.json"
-        for invalid in (b'{"incomplete":', b"[]"):
-            path.write_bytes(invalid)
-            self.install(expect_success=False)
-            self.assertEqual(path.read_bytes(), invalid)
-
+    def test_first_install_preserves_personal_settings(self):
+        settings = self.profile / ".gemini/antigravity-cli/settings.json"
+        settings.parent.mkdir(parents=True)
         personal = {
             "permissions": {"deny": ["command(touch)"], "ask": ["command(git push)"]},
             "nested": {"personal": [True, "café", None, 2**55 + 1]},
         }
-        original = json.dumps(personal, indent=2, ensure_ascii=False).encode("utf-8")
-        path.write_bytes(original)
-        self.install()
-        self.assertEqual(json.loads(path.read_bytes()), {**personal, "toolPermission": "always-proceed"})
-        # Selecting the native review default can remove the key altogether.
-        path.write_bytes(original)
-        self.install()
-        self.assertEqual(path.read_bytes(), original)
-
-        # An explicitly configured account retains its chosen policy on first setup.
-        another_profile = self.profile.parent / "existing strict profile"
-        self.env["USERPROFILE"] = str(another_profile)
-        strict = another_profile / ".gemini/antigravity-cli/settings.json"
-        strict.parent.mkdir(parents=True)
-        strict.write_bytes(b'{"toolPermission": "strict"}\r\n')
-        self.install()
-        self.assertEqual(strict.read_bytes(), b'{"toolPermission": "strict"}\r\n')
+        for original in (json.dumps(personal, indent=2, ensure_ascii=False).encode("utf-8"),
+                         b'{"unfinished":'):
+            with self.subTest(original=original):
+                settings.write_bytes(original)
+                os.utime(settings, (1_000_000_000, 1_000_000_000))
+                self.install()
+                self.assertEqual(settings.read_bytes(), original)
+                self.assertEqual(settings.stat().st_mtime, 1_000_000_000)
+                # Each subtest starts with an absent executable.
+                (self.local / "agy/bin/agy.exe").unlink()
 
     def test_native_install_rerun_and_instruction_precedence(self):
         rules = self.profile / ".gemini/config/rules"
@@ -129,7 +112,9 @@ class WindowsInstallTest(unittest.TestCase):
         for path in (executable, agy_rule):
             os.utime(path, (1_000_000_000, 1_000_000_000))
         default_content = codex.read_bytes()
+        cli_preferences.unlink()
         self.install()
+        self.assertFalse(cli_preferences.exists(), "Reconciliation recreated user-deleted preferences")
         for path in (executable, agy_rule):
             self.assertEqual(path.stat().st_mtime, 1_000_000_000)
         self.assertEqual(codex.read_bytes(), default_content)
