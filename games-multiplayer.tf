@@ -665,9 +665,10 @@ check "games_mp_lobby_caps_fit_the_launch_ceilings" {
 }
 
 data "archive_file" "games_mp_launch" {
-  type        = "zip"
-  source_file = "${path.module}/games-multiplayer/launch.py"
-  output_path = "${path.module}/.terraform/games-mp-launch.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/games-multiplayer/launch.py"
+  output_path      = "${path.module}/.terraform/games-mp-launch.zip"
 }
 
 resource "aws_cloudwatch_log_group" "games_mp_launch" {
@@ -1735,9 +1736,10 @@ removed {
 # Source: games-multiplayer/sweeper.py (offline test: scripts/test-games-mp-sweeper.py).
 
 data "archive_file" "games_mp_sweeper" {
-  type        = "zip"
-  source_file = "${path.module}/games-multiplayer/sweeper.py"
-  output_path = "${path.module}/.terraform/games-mp-sweeper.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/games-multiplayer/sweeper.py"
+  output_path      = "${path.module}/.terraform/games-mp-sweeper.zip"
 }
 
 resource "aws_cloudwatch_log_group" "games_mp_sweeper" {

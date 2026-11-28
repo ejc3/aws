@@ -383,9 +383,10 @@ resource "aws_iam_role_policy_attachment" "dolphin_maps_pems_dev" {
 # -------------------------------------------------------------------------------------
 
 data "archive_file" "dolphin_maps_loop_placeholder" {
-  type        = "zip"
-  source_file = "${path.module}/dolphin-maps-loop/index.mjs"
-  output_path = "${path.module}/.terraform/dolphin-maps-loop-placeholder.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/dolphin-maps-loop/index.mjs"
+  output_path      = "${path.module}/.terraform/dolphin-maps-loop-placeholder.zip"
 }
 
 resource "aws_cloudwatch_log_group" "dolphin_maps_loop" {

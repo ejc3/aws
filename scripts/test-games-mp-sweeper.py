@@ -271,7 +271,7 @@ class TerraformWiringTests(unittest.TestCase):
         self.tf = (ROOT / "games-multiplayer.tf").read_text()
 
     def test_lambda_packages_this_file(self):
-        self.assertIn('source_file = "${path.module}/games-multiplayer/sweeper.py"', self.tf)
+        self.assertRegex(self.tf, r'source_file\s+= "\$\{path\.module\}/games\-multiplayer/sweeper\.py"')
         self.assertRegex(self.tf, r'handler\s*=\s*"sweeper\.lambda_handler"')
 
     def test_env_limits_match_the_documented_rule(self):

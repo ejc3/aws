@@ -618,9 +618,10 @@ resource "aws_scheduler_schedule" "games_mp_poller" {
 # -------------------------------------------------------------------------------------
 
 data "archive_file" "games_mp_release" {
-  type        = "zip"
-  source_file = "${path.module}/games-multiplayer/release.py"
-  output_path = "${path.module}/.terraform/games-mp-release.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_file      = "${path.module}/games-multiplayer/release.py"
+  output_path      = "${path.module}/.terraform/games-mp-release.zip"
 }
 
 resource "aws_cloudwatch_log_group" "games_mp_release" {

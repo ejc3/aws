@@ -349,9 +349,10 @@ data "archive_file" "fcvm_ami_publish" {
 }
 
 data "archive_file" "fcvm_ami_dispatch" {
-  type        = "zip"
-  source_dir  = "${path.module}/fcvm-fleet-ami-pipeline"
-  output_path = "${path.module}/.terraform/fcvm-fleet-ami-pipeline.zip"
+  type             = "zip"
+  output_file_mode = "0664"
+  source_dir       = "${path.module}/fcvm-fleet-ami-pipeline"
+  output_path      = "${path.module}/.terraform/fcvm-fleet-ami-pipeline.zip"
 }
 
 resource "aws_lambda_function" "fcvm_ami_dispatch" {
