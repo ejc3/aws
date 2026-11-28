@@ -6,10 +6,10 @@ locals {
   family_stage_public_hostname = "family.dolphin-labs.dev"
   # Generated in the private Family app by its export:public command. The two
   # digests are checked before Terraform includes either document in the Worker.
-  family_stage_public_commit = "a816f5be389943bc9c86218d3cadfdde4e05b777"
+  family_stage_public_commit = "67dc399d2c702059e77dc41dbcc31ba292a3950f"
   family_stage_public_digests = {
-    privacy = "cbc1cb2fd7d8715fecac9b4b2b6d72a94463ae6969ea901352562b24b6e3043f"
-    support = "c386a4b18369a96f4db30a6853bcc6f00a20b90ff283b3ae69e853419d8db893"
+    privacy = "c520303be4dd6d7736a10469dca0c2be17e0165b50871200bb78b1f550ea04ba"
+    support = "61d2dbe53b8f756f03fc0bb477f30d82c1ec36c6104af3b880c2367f48f7106a"
   }
   family_stage_public_html = {
     for name, page in data.github_repository_file.family_public_page : "/${name}/" => page.content

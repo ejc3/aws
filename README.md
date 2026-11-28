@@ -131,8 +131,8 @@ check, revert the change on main and deploy that commit through the same workflo
 
 ### Family public pages
 
-App Store Connect uses [Family privacy](https://family.dolphin-labs.dev/privacy/)
-and [Family support](https://family.dolphin-labs.dev/support/). The dedicated
+The Family URLs for App Store Connect are [privacy](https://family.dolphin-labs.dev/privacy/)
+and [support](https://family.dolphin-labs.dev/support/). The dedicated
 `family-public-pages` Worker serves these documents with their styles inline.
 Family's staging Worker and its API keep their existing Access policy.
 
