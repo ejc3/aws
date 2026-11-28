@@ -33,7 +33,12 @@ if (!$version) {
     $url = 'https://storage.googleapis.com/antigravity-public/antigravity-cli/1.5.18-6386224290725888/windows-x64/cli_windows_x64.exe'
     $sha = '53605db7013dfed51e8c416d51e0c17a3b5ad0750c13da5669954ba4a281318746be0cf8cde2b256cfdb4bfbdade4badad1a0503931f8458416184549afa06b6'
     Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $tmp
-    if ((Get-FileHash $tmp -Algorithm SHA512).Hash -ne $sha) { throw 'Antigravity SHA-512 mismatch.' }
+    $hash = [Security.Cryptography.SHA512]::Create()
+    $inputStream = [IO.File]::OpenRead($tmp)
+    try {
+      $actual = [BitConverter]::ToString($hash.ComputeHash($inputStream)).Replace('-', '')
+    } finally { $inputStream.Dispose(); $hash.Dispose() }
+    if ($actual -ne $sha) { throw 'Antigravity SHA-512 mismatch.' }
     Unblock-File $tmp
     $version = Get-AgyVersion $tmp
     if ($version -ne '1.5.18') { throw 'Unexpected Antigravity version.' }

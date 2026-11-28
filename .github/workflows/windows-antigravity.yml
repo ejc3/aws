@@ -24,4 +24,5 @@ jobs:
         with:
           persist-credentials: false
       - name: Check installation and upgrades with Windows PowerShell 5.1
+        shell: cmd
         run: python -B scripts/windows/test-antigravity-install.py
