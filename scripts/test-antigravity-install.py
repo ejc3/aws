@@ -72,7 +72,9 @@ cp "$HOME/release.tgz" "$2"''')
     def test_corrupt_release_fails_before_replacing_an_existing_file(self):
         self.cli.parent.mkdir(parents=True)
         self.cli.write_text("previous")
-        self.release.write_bytes(b"truncated download")
+        replacement = self.tool("different-build", 'echo 1.5.18')
+        with tarfile.open(self.release, "w:gz") as archive:
+            archive.add(replacement, "antigravity", recursive=False)
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("SHA-512 mismatch", result.stderr)
@@ -119,4 +121,4 @@ test "$1" != air''')
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main(verbosity=2, buffer=True)
