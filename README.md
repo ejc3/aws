@@ -107,6 +107,28 @@ Terraform writes a mandatory state backup. Do not repeat the command once state 
 `ejc3/cloudflare`, and never apply a plan made before the migration. The reverse command
 is required when the stack eventually returns to the upstream provider namespace.
 
+### Family API staging releases
+
+Merging `ejc3/constellation` main runs its Family API deployment. The GitHub
+`family-stage` environment supplies `FAMILY_STAGE_DEPLOY_ROLE_ARN`. AWS verifies
+the GitHub-issued environment subject, repository identity and main branch before
+issuing short-lived credentials in the Family account. The ECR push permission
+covers tags in `family/api`, including the rolling tag. The workflow publishes
+an ARM64 image tagged with its full commit SHA to `family/api` and invokes
+`family-stage-api-release` with the commit, image digest and GitHub workflow run number.
+
+The release function checks the commit tag against that digest, moves the
+`family-stage` tag, and requests a fresh deployment of the existing
+`family/family` ECS service. A durable receipt records which deployment the run
+started and rejects stale retries. Its response acknowledges the roll request.
+The workflow verifies the commit and Family route on the public staging hostname.
+
+For the initial cutover, seed the rolling tag from the running API task's image
+digest. Apply the Family app stack from constellation to make only that ECR tag
+mutable and point the staging task at it. The release function refuses to roll
+a task that still uses the old fixed tag. To roll back after a failed smoke
+check, revert the change on main and deploy that commit through the same workflow.
+
 ### PatchDoctor: autonomous critical security patches
 
 The owner authorizes PatchDoctor to investigate verified **CRITICAL CVEs**, apply
