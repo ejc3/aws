@@ -24,6 +24,35 @@ resource "cloudflare_r2_bucket" "dolphin_labs_live_logs" {
   }
 }
 
+# Retention. The provider-call log (dolphin-labs docs/PROVIDER_CALLS.md) writes, under provider-calls/<env>/, one gzipped
+# NDJSON object a provider an hour: the metadata of each call the Workers made to an outside data provider (endpoint,
+# status, timing, size; never a body), and a day's counts under provider-calls/<env>/_daily/. About 160 MB a month at
+# 2026-11 volume, so 400 days (a season and a margin, for year-over-year QA) holds about 2 GB. The capture's own logs
+# under live/ have no expiry: nothing here changes them. A managed lifecycle replaces R2's default rule for a bucket,
+# so that rule (abort multipart uploads after 7 days) is kept here.
+resource "cloudflare_r2_bucket_lifecycle" "dolphin_labs_live_logs" {
+  account_id  = var.cloudflare_account_id
+  bucket_name = cloudflare_r2_bucket.dolphin_labs_live_logs.name
+  rules = [
+    {
+      id         = "abort-multipart-uploads-after-7-days"
+      enabled    = true
+      conditions = { prefix = "" }
+      abort_multipart_uploads_transition = {
+        condition = { type = "Age", max_age = 7 * 24 * 3600 }
+      }
+    },
+    {
+      id         = "provider-calls-expire-after-400-days"
+      enabled    = true
+      conditions = { prefix = "provider-calls/" }
+      delete_objects_transition = {
+        condition = { type = "Age", max_age = 400 * 24 * 3600 }
+      }
+    },
+  ]
+}
+
 # ---------------------------------------------------------------------------------------------------------------------
 # Read access from nextjs-dev (owner, 2026-11-08: "Yes, add a read-only R2 token"): the engine's parity work reads the
 # logs there.
