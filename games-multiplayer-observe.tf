@@ -20,9 +20,8 @@
 # SECRETS_MANAGER/PARAMETER_STORE references, which it returns as names, not values.
 # scripts/test-games-mp-observe.py pins all of this.
 #
-# Both dev roles get it: the metal boxes (dev-server-role) and nextjs-dev, where every
-# account has sudo, so this is a grant to every person on that box. Nothing in it is more
-# than the pipeline's own status and logs.
+# Both dev roles get it: the metal boxes (dev-server-role) and Next.js (nextjs-dev-role).
+# Their alarm access includes the logs needed to investigate github-app-runner failures.
 data "aws_iam_policy_document" "games_mp_observe" {
   statement {
     sid     = "ReadGamesBuilds"
@@ -51,6 +50,7 @@ data "aws_iam_policy_document" "games_mp_observe" {
         aws_cloudwatch_log_group.games_engines.arn,
       ],
       [for g in aws_cloudwatch_log_group.games_mp_launch : g.arn],
+      aws_cloudwatch_log_group.runner_app[*].arn,
     ) : [arn, "${arn}:*"]])
   }
 
