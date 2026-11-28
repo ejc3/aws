@@ -1926,8 +1926,8 @@ It logs outcomes and minutes only, to `/Library/Logs/ci-coreaudio-check.log`.
 As verified on 2026-11-21, the MacBook also has one registered runner, `macbook-kidsports-1` in its
 `kidsports-ci` VM, with custom labels `ios-pool` and `macbook`. A job requesting
 `[self-hosted, macOS, ios-pool]` can go to an available runner on either Mac. Add `mini` to that list to
-require the mini. The Default runner group allows three private repositories, `dolphin-labs`,
-`dolphin-films` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
+require the mini. The Default runner group allows four private repositories, `dolphin-labs`,
+`dolphin-films`, `dolphin-maps` and `kid-sports-highlights`. A new repository needs access to the group before its labels can
 match. An organization runner administrator can grant access with
 `gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
 `gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
