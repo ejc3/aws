@@ -10,19 +10,20 @@
 #   mini-4               the Mac mini's CI VM `ci` (scripts/mac-vm-setup.sh), which also keeps `mini-simulator`
 #   macbook-kidsports-1  the MacBook's pool VM `kidsports-ci` (kid-sports-highlights scripts/ci-vm.sh, under
 #                        TART_HOME=/Volumes/Scratch/.tart-kidsports), its own user `admin`, never the owner's session
-#   air-ci-1             the MacBook Air's VM `air-ci` (dolphin-labs apps/native/scripts/ci-vm.sh, GWW_CI_VM=air-ci,
-#                        6 cores / 18 GB; owner, 2026-11-27: the Air is not used by anyone, so the VM takes most of it)
+#   air-1                the MacBook Air's VM `air-ci` (scripts/mac-vm-setup.sh air-ci, 6 cores / 18 GB; owner,
+#                        2026-11-28: the Air "is not a personal machine"). It replaced air-ci-1, which dolphin-labs'
+#                        ci-vm.sh registered by hand.
 # Each runner runs one job at a time, so three listeners take three simulator jobs at once, one on each Mac.
 #
 # It only labels: it never registers, replaces or removes a runner, and needs no registration token. A listener that
 # is not registered stops it with an error (register it where its VM is made). Re-registering a runner with
-# `config.sh --replace` resets its labels, so run this again after one (mac-vm-setup.sh --runners gives mini-4 the
+# `config.sh --replace` resets its labels, so run this again after one (mac-vm-setup.sh --runners gives mini-4 and air-1 the
 # label itself). Needs a gh login with the admin:org scope (gh auth refresh -h github.com -s admin:org).
 set -euo pipefail
 
 CI_ORG=dolphin-labs-hq
 LABEL=ios-simulator
-LISTENERS=(mini-4 macbook-kidsports-1 air-ci-1)
+LISTENERS=(mini-4 macbook-kidsports-1 air-1)
 
 DRY=""
 case "${1:-}" in

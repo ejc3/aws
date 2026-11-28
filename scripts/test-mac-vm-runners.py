@@ -208,10 +208,11 @@ class MiniRunnerRouting(unittest.TestCase):
         self.assertEqual(calls, ["remove orgs/dolphin-labs-hq/actions/runners/703/labels/mini", *self.RETIRE])
 
     def test_the_air_registers_air_1_for_this_pool_and_batches_and_retires_its_hand_made_runner(self):
-        # Fresh: one runner, with the shared pool's labels (ios-pool, mini, gww-ios) and ios-queue; no simulator.
+        # Fresh: one runner, with the shared pool's labels (ios-pool, mini, gww-ios), ios-queue, and ios-simulator
+        # (one of the three simulator listeners); not mini-simulator, the mini's own.
         result, calls = self.run_setup(vm="air-ci", fresh=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, ["air-1 gww-ios,mini,ios-pool,ios-queue"])
+        self.assertEqual(calls, ["air-1 gww-ios,mini,ios-pool,ios-queue,ios-simulator"])
         # As it stands now: air-ci-1 (ios-pool alone, from dolphin-labs' ci-vm.sh) retired; air-1 relabelled.
         result, calls = self.run_setup(vm="air-ci", labels={"801": "gww-ios,mini,ios-pool,ios-queue"})
         self.assertEqual(result.returncode, 0, result.stderr)

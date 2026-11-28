@@ -100,6 +100,8 @@ case "$VM" in
   # One runner, not two: a swift test wants every core it can get, and this VM is two thirds of the mini's ci.
   air-ci) CPU=6 MEMORY_MB=18432 DISK_GB=120 DIRS='--dir=xcode:$HOME/Applications/Xcode.app:ro'
     CI_RUNNERS="air-1"
+    # One of the three ios-simulator listeners (scripts/simulator-listeners.sh): its VM has the simulator runtimes.
+    EXTRA_LABELS=",$SHARED_SIMULATOR_LABEL"
     # The VM was first set up by hand with dolphin-labs' apps/native/scripts/ci-vm.sh (2026-11-27), which registered
     # air-ci-1 with ios-pool alone: retired for air-1.
     RETIRED_RUNNERS="air-ci-1"
@@ -346,6 +348,7 @@ registered_ids=""
 for name in $CI_RUNNERS; do
   labels=$CI_LABELS
   [[ $name == "$QUEUE_RUNNER" ]] && labels=$QUEUE_LABELS
+  labels+=${EXTRA_LABELS:-}
   if [[ $name == "$SIMULATOR_RUNNER" ]]; then
     labels+=",$SIMULATOR_LABEL,$SHARED_SIMULATOR_LABEL"
     # One listener must serve every simulator-testing job across repositories. Refuse a conflicting

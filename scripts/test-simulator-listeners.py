@@ -46,7 +46,7 @@ class SimulatorListeners(unittest.TestCase):
         result, calls = self.run_script([
             runner(717, "mini-4", "ios-pool", "mini", "mini-simulator"),
             runner(318, "macbook-kidsports-1", "ios-pool", "macbook"),
-            runner(330, "air-ci-1", "ios-pool"),
+            runner(330, "air-1", "ios-pool"),
             runner(701, "mini-1", "ios-pool", "mini"),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -60,7 +60,7 @@ class SimulatorListeners(unittest.TestCase):
         result, calls = self.run_script([
             runner(717, "mini-4", "ios-simulator"),
             runner(318, "macbook-kidsports-1", "ios-simulator"),
-            runner(330, "air-ci-1", "ios-simulator"),
+            runner(330, "air-1", "ios-simulator"),
             runner(702, "mini-2", "ios-simulator"),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -70,7 +70,7 @@ class SimulatorListeners(unittest.TestCase):
         result, calls = self.run_script([
             runner(717, "mini-4", "ios-simulator"),
             runner(318, "macbook-kidsports-1", "ios-simulator"),
-            runner(330, "air-ci-1", "ios-simulator"),
+            runner(330, "air-1", "ios-simulator"),
         ])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, [])
@@ -78,9 +78,9 @@ class SimulatorListeners(unittest.TestCase):
 
     def test_a_missing_or_doubled_listener_changes_nothing(self):
         for runners in (
-            [runner(717, "mini-4"), runner(330, "air-ci-1")],
+            [runner(717, "mini-4"), runner(330, "air-1")],
             [runner(717, "mini-4"), runner(318, "macbook-kidsports-1"), runner(319, "macbook-kidsports-1"),
-             runner(330, "air-ci-1")],
+             runner(330, "air-1")],
         ):
             result, calls = self.run_script(runners)
             self.assertEqual(result.returncode, 1)
@@ -89,17 +89,17 @@ class SimulatorListeners(unittest.TestCase):
         # The Air's runner missing (its VM not registered yet) changes nothing either.
         result, calls = self.run_script([runner(717, "mini-4"), runner(318, "macbook-kidsports-1")])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("air-ci-1 is registered 0 times", result.stderr)
+        self.assertIn("air-1 is registered 0 times", result.stderr)
         self.assertEqual(calls, [])
 
     def test_a_dry_run_says_and_does_not_change(self):
         result, calls = self.run_script([runner(717, "mini-4"), runner(318, "macbook-kidsports-1"),
-                                         runner(330, "air-ci-1")], "--dry-run")
+                                         runner(330, "air-1")], "--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(calls, [])
         self.assertIn("mini-4: add ios-simulator", result.stdout)
         self.assertIn("macbook-kidsports-1: add ios-simulator", result.stdout)
-        self.assertIn("air-ci-1: add ios-simulator", result.stdout)
+        self.assertIn("air-1: add ios-simulator", result.stdout)
 
     def test_anything_else_is_refused(self):
         result, _ = self.run_script([], "--now")
