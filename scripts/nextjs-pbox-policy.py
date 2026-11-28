@@ -39,7 +39,11 @@ def effective_codex_file(home, *, create_directory=False):
         directory.mkdir(mode=0o700, exist_ok=True)
     override = directory / "AGENTS.override.md"
     # A symlink or non-regular override is not permission to silently edit a fallback.
-    return override if override.exists() or override.is_symlink() else directory / "AGENTS.md"
+    if override.exists() or override.is_symlink():
+        _, content = read_instructions(override)
+        if content.strip():
+            return override
+    return directory / "AGENTS.md"
 
 
 def fingerprint(info):
