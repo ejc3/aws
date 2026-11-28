@@ -30,6 +30,7 @@ case "$(uname -sm)" in
   *) echo "Antigravity does not have a pinned build for $(uname -sm)." >&2; exit 1 ;;
 esac
 
+stage=""
 installed=$("$bin/agy" --version 2>/dev/null) || installed=""
 if [[ ! $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?$ ]]; then
   mkdir -p "$bin"
@@ -46,21 +47,31 @@ if [[ ! $installed =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][a-zA-Z0-9.+-]+)?$ ]]; then
   chmod 700 "$stage/agy"
   installed=$("$stage/agy" --version)
   [[ $installed = "$version" ]] || { echo "Expected Antigravity $version, got $installed." >&2; exit 1; }
-  # Only bootstrap a new settings file. The live CLI can atomically replace it
-  # from /config, including when the user returns to the stricter review default.
-  if [[ ${1:-} != --binary-only && ! -e $bin/agy && ! -L $bin/agy ]]; then
-    (
-      umask 077
-      prefs=$HOME/.gemini/antigravity-cli/settings.json
-      [[ ! -e $prefs && ! -L $prefs ]] || exit 0
-      mkdir -p "${prefs%/*}"
-      tmp=$(mktemp "${prefs%/*}/.agy-settings.XXXXXXXX")
+fi
+
+# Only bootstrap a new settings file. The live CLI can atomically replace it
+# from /config, including when the user returns to the stricter review default.
+if [[ ${1:-} != --binary-only ]]; then
+  (
+    umask 077
+    dir=$HOME/.gemini/antigravity-cli
+    prefs=$dir/settings.json
+    stamp=$dir/.fleet-permission-default-v1
+    [[ ! -e $stamp && ! -L $stamp ]] || exit 0
+    mkdir -p "$dir"
+    if [[ -n $stage && ! -e $bin/agy && ! -L $bin/agy && ! -e $prefs && ! -L $prefs ]]; then
+      tmp=$(mktemp "$dir/.agy-settings.XXXXXXXX")
       trap 'rm -f -- "$tmp"' EXIT
       printf '%s\n' '{"toolPermission":"always-proceed"}' > "$tmp"
       # A native settings save can win this race. link never overwrites its file.
       ln "$tmp" "$prefs" || [[ -e $prefs || -L $prefs ]]
-    )
-  fi
+    fi
+    # Remember this profile even if its owner later removes the settings and binary.
+    (set -C; : > "$stamp") || [[ -f $stamp ]]
+  )
+fi
+
+if [[ -n $stage ]]; then
   mv -f "$stage/agy" "$bin/agy"
 fi
 

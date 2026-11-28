@@ -61,8 +61,9 @@ class WindowsInstallTest(unittest.TestCase):
                 self.install()
                 self.assertEqual(settings.read_bytes(), original)
                 self.assertEqual(settings.stat().st_mtime, 1_000_000_000)
-                # Each subtest starts with an absent executable.
+                # Start the next fixture as a fresh profile.
                 (self.local / "agy/bin/agy.exe").unlink()
+                (settings.parent / ".fleet-permission-default-v1").unlink()
 
     def test_native_install_rerun_and_instruction_precedence(self):
         rules = self.profile / ".gemini/config/rules"
@@ -83,6 +84,8 @@ class WindowsInstallTest(unittest.TestCase):
         self.install()
         executable = self.local / "agy/bin/agy.exe"
         cli_preferences = self.profile / ".gemini/antigravity-cli/settings.json"
+        marker = cli_preferences.parent / ".fleet-permission-default-v1"
+        self.assertTrue(marker.is_file())
         self.assertEqual(json.loads(cli_preferences.read_bytes()), {"toolPermission": "always-proceed"})
         fresh_shell = r"""
             $ErrorActionPreference = 'Stop'
@@ -112,9 +115,11 @@ class WindowsInstallTest(unittest.TestCase):
         for path in (executable, agy_rule):
             os.utime(path, (1_000_000_000, 1_000_000_000))
         default_content = codex.read_bytes()
+        marker.unlink()  # Simulate upgrading a profile from before the marker existed.
         cli_preferences.unlink()
         self.install()
         self.assertFalse(cli_preferences.exists(), "Reconciliation recreated user-deleted preferences")
+        self.assertTrue(marker.is_file())
         for path in (executable, agy_rule):
             self.assertEqual(path.stat().st_mtime, 1_000_000_000)
         self.assertEqual(codex.read_bytes(), default_content)
@@ -130,7 +135,10 @@ class WindowsInstallTest(unittest.TestCase):
         begin = b"<!-- BEGIN ejc3-antigravity-models (managed) -->"
         override.write_bytes(codecs.BOM_UTF8 + default_content[default_content.index(begin):] + after)
         next_guide = GUIDE.rstrip() + "\n\nUpdated smoke-test guidance.\n"
+        executable.unlink()
         self.install(next_guide)
+        self.assertTrue(executable.is_file())
+        self.assertFalse(cli_preferences.exists(), "Binary reinstall recreated user-deleted preferences")
         self.assertTrue(override.read_bytes().startswith(codecs.BOM_UTF8 + begin))
         self.assertTrue(override.read_bytes().endswith(after))
         self.assertEqual(override.read_text(encoding="utf-8").count(next_guide.rstrip()), 1)

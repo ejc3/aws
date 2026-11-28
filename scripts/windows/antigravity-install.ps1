@@ -7,6 +7,8 @@ $guide = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::
 if ([string]::IsNullOrWhiteSpace($guide)) { throw 'Empty model guide.' }
 $bin = Join-Path $env:LOCALAPPDATA 'agy\bin'
 $exe = Join-Path $bin 'agy.exe'
+$settingsDir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
+$provisioned = Join-Path $settingsDir '.fleet-permission-default-v1'
 # File.Replace preserves the previous complete file if a running process denies the update.
 function Publish-File($source, $target) {
   if ([IO.File]::Exists($target)) {
@@ -56,11 +58,10 @@ if (!$version) {
       Publish-File $tmp $exe
     } else {
       # Seed before publishing the verified binary so an interrupted setup can retry.
-      $dir = Join-Path $env:USERPROFILE '.gemini\antigravity-cli'
-      $settings = Join-Path $dir 'settings.json'
-      if (!(Test-Path -LiteralPath $settings)) {
-        [IO.Directory]::CreateDirectory($dir) | Out-Null
-        $initial = Join-Path $dir ('.agy-' + [Guid]::NewGuid() + '.tmp')
+      $settings = Join-Path $settingsDir 'settings.json'
+      if (!(Test-Path -LiteralPath $provisioned) -and !(Test-Path -LiteralPath $settings)) {
+        [IO.Directory]::CreateDirectory($settingsDir) | Out-Null
+        $initial = Join-Path $settingsDir ('.agy-' + [Guid]::NewGuid() + '.tmp')
         try {
           [IO.File]::WriteAllBytes($initial, [Text.Encoding]::ASCII.GetBytes('{"toolPermission":"always-proceed"}'))
           [void](Publish-NewFile $initial $settings)
@@ -71,6 +72,12 @@ if (!$version) {
       }
     }
   } finally { if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp } }
+}
+# Remember verified installations even when the user later deletes both the binary and settings.
+if (!(Test-Path -LiteralPath $provisioned)) {
+  [IO.Directory]::CreateDirectory($settingsDir) | Out-Null
+  try { [IO.File]::Open($provisioned, 'CreateNew', 'Write', 'None').Dispose() }
+  catch [IO.IOException] { if (![IO.File]::Exists($provisioned)) { throw } }
 }
 # Keep literal %VARIABLE% entries and the registry value kind intact across SSH logins.
 $envKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey('Environment')

@@ -59,8 +59,22 @@ cp "$HOME/release.tgz" "$2"''')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(path.exists())
+        self.cli.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(path.exists())
 
-    def test_preserves_an_existing_or_concurrently_created_settings_file(self):
+    def test_existing_install_remembers_user_profile_without_seeding(self):
+        self.cli.parent.mkdir(parents=True)
+        self.tool(".local/bin/agy", "echo 1.5.18")
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.cli.unlink()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.home / ".gemini/antigravity-cli/settings.json").exists())
+
+    def test_preserves_existing_settings_file(self):
         path = self.home / ".gemini/antigravity-cli/settings.json"
         path.parent.mkdir(parents=True)
         original = b'{"agentMode":"plan","permissions":{"deny":["command(touch)"]}}'
@@ -69,8 +83,8 @@ cp "$HOME/release.tgz" "$2"''')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(path.read_bytes(), original)
 
-        self.cli.unlink()
-        path.unlink()
+    def test_preserves_concurrent_user_settings_save(self):
+        path = self.home / ".gemini/antigravity-cli/settings.json"
         self.tool("ln", 'printf user-saved > "$2"; exec /bin/ln "$@"')
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -136,10 +150,9 @@ cp "$HOME/release.tgz" "$2"''')
         tf = (ROOT / "antigravity.tf").read_text()
         self.assertIn('startswith(each.key, "jumpbox") ? "--binary-only" : ""', tf)
         self.assertIn('each.key == "fcvm-metal-x86" ? local.antigravity_owner_models : ""', tf)
-        self.cli.parent.mkdir(parents=True)
-        self.tool(".local/bin/agy", "echo 1.5.18")
         subprocess.run(["/bin/bash", "-s", "--", "--binary-only"], input=self.script, text=True, env=self.env,
                        capture_output=True, check=True)
+        self.assertEqual(subprocess.check_output([str(self.cli), "--version"], text=True).strip(), "1.5.18")
         self.assertFalse((self.home / ".gemini").exists())
 
     def test_global_guidance_preserves_private_files_and_respects_codex_override(self):
