@@ -100,3 +100,34 @@ resource "cloudflare_ruleset" "gww_redirects" {
     },
   ]
 }
+
+# The Free plan's one rate-limiting rule: per address (and data centre), 10 s window, 10 s block, on the two anonymous
+# routes that read or write per request with no cache in front of a varied query: Photos' team search
+# (/api/media/search, dolphin-labs-hq/dolphin-labs#1609: each distinct query reads up to about 18 game records) and the
+# app-health beacon (/api/app-health, #1885: each report counts toward the alarms the app's decode errors raise). The
+# busiest address on either route over 2026-11-27/28 made 10 requests in a minute (GraphQL analytics,
+# httpRequestsAdaptiveGroups by address and minute), so 60 in 10 s is six times a whole busy minute packed into ten
+# seconds, room for many phones behind one carrier address, and far below a script varying the query to miss the cache.
+resource "cloudflare_ruleset" "gww_rate_limit" {
+  zone_id     = var.gww_zone_id
+  name        = "gamesworthwatching.com rate limiting"
+  description = "Anonymous per-request routes (gamesworthwatching-zone.tf)"
+  kind        = "zone"
+  phase       = "http_ratelimit"
+
+  rules = [
+    {
+      ref         = "anonymous_routes_per_address"
+      description = "/api/media/search and /api/app-health: at most 60 requests per address in 10 s"
+      expression  = "(http.request.uri.path in {\"/api/media/search\" \"/api/app-health\"})"
+      action      = "block"
+      ratelimit = {
+        characteristics     = ["ip.src", "cf.colo.id"]
+        period              = 10
+        requests_per_period = 60
+        mitigation_timeout  = 10
+      }
+      enabled = true
+    },
+  ]
+}

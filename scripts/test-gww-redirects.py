@@ -32,6 +32,27 @@ class RedirectTests(unittest.TestCase):
         self.assertIn("preserve_query_string = true", rules)
 
 
+class RateLimitTests(unittest.TestCase):
+    """The anonymous per-request routes are limited per address at the edge (dolphin-labs#1609, #1885), and nothing
+    else on the site is."""
+
+    def test_two_anonymous_routes_are_limited_per_address(self):
+        rules = block("cloudflare_ruleset", "gww_rate_limit")
+        self.assertIn("zone_id     = var.gww_zone_id", rules)
+        self.assertIn('phase       = "http_ratelimit"', rules)
+        self.assertEqual(rules.count("ref "), 1)
+        self.assertIn('expression  = "(http.request.uri.path in {\\"/api/media/search\\" \\"/api/app-health\\"})"', rules)
+        self.assertIn('action      = "block"', rules)
+        # The Free plan's only shape: address and data centre, a 10 s period and a 10 s block.
+        self.assertIn('characteristics     = ["ip.src", "cf.colo.id"]', rules)
+        self.assertIn("period              = 10\n", rules)
+        self.assertIn("mitigation_timeout  = 10\n", rules)
+        self.assertIn("requests_per_period = 60\n", rules)
+
+    def test_no_other_rate_limit_ruleset_on_this_zone(self):
+        self.assertEqual(TF.count('phase       = "http_ratelimit"'), 1)
+
+
 class ServingTests(unittest.TestCase):
     """The Worker dolphin-labs-prod is the only shape: proxied records with no origin, routes, and no switch back to
     Vercel (the dolphin-labs Vercel team is being deleted)."""
