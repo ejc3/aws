@@ -406,6 +406,7 @@ resource "aws_secretsmanager_secret_policy" "app_store_connect" {
         aws_iam_role.dolphin_labs_testflight.arn,
         aws_iam_role.kid_sports_highlights_testflight.arn,
         aws_iam_role.dolphin_maps_testflight.arn,
+        aws_iam_role.dolphin_labs_family_testflight.arn,
         aws_iam_role.dev_server.arn,
       ]) } }
     }]

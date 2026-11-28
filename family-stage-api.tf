@@ -12,21 +12,47 @@ resource "aws_iam_openid_connect_provider" "family_github" {
   client_id_list = ["sts.amazonaws.com"]
 }
 
+# TRUST: the Family API deploy workflow, on main, in the `family-stage` GitHub environment, in each of two
+# repositories while Family moves into dolphin-labs-hq/dolphin-labs (its docs/MONOREPO-MOVE.md, phase 5):
+#   - ejc3/constellation, .github/workflows/deploy-family-api.yml: today's deployer. It stays trusted until
+#     phase 8 removes it (part B), so a rollback to constellation as deployer stays open. Phase 6 disables
+#     that workflow before the first deploy from dolphin-labs, so only one repository deploys at a time.
+#   - dolphin-labs-hq/dolphin-labs, .github/workflows/family-deploy-api.yml: the new deployer. Phase 5 lands a
+#     probe at that path (workflow_dispatch, `aws sts get-caller-identity`); phase 6 replaces it with the deploy.
+# One statement per repository, so each subject is admitted only with its own workflow file. sub is GitHub's
+# immutable form (owner and repository ids) with the environment; ref pins main; job_workflow_ref narrows the
+# environment to the one workflow file, so another workflow that names `family-stage` gets nothing.
 resource "aws_iam_role" "family_stage_api_ci" {
   provider = aws.family
   name     = "family-stage-api-ci"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Federated = aws_iam_openid_connect_provider.family_github.arn }
-      Action    = "sts:AssumeRoleWithWebIdentity"
-      Condition = { StringEquals = {
-        "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        "token.actions.githubusercontent.com:sub" = "repo:ejc3@1694850/constellation@1427792887:environment:family-stage"
-        "token.actions.githubusercontent.com:ref" = "refs/heads/main"
-      } }
-    }]
+    Statement = [
+      {
+        Sid       = "ConstellationDeployFamilyApi"
+        Effect    = "Allow"
+        Principal = { Federated = aws_iam_openid_connect_provider.family_github.arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = { StringEquals = {
+          "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub"              = "repo:ejc3@1694850/constellation@1427792887:environment:family-stage"
+          "token.actions.githubusercontent.com:ref"              = "refs/heads/main"
+          "token.actions.githubusercontent.com:job_workflow_ref" = "ejc3/constellation/.github/workflows/deploy-family-api.yml@refs/heads/main"
+        } }
+      },
+      {
+        Sid       = "DolphinLabsFamilyDeployApi"
+        Effect    = "Allow"
+        Principal = { Federated = aws_iam_openid_connect_provider.family_github.arn }
+        Action    = "sts:AssumeRoleWithWebIdentity"
+        Condition = { StringEquals = {
+          "token.actions.githubusercontent.com:aud"              = "sts.amazonaws.com"
+          "token.actions.githubusercontent.com:sub"              = "repo:dolphin-labs-hq@316189183/dolphin-labs@1330391842:environment:family-stage"
+          "token.actions.githubusercontent.com:ref"              = "refs/heads/main"
+          "token.actions.githubusercontent.com:job_workflow_ref" = "dolphin-labs-hq/dolphin-labs/.github/workflows/family-deploy-api.yml@refs/heads/main"
+        } }
+      },
+    ]
   })
 }
 

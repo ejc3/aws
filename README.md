@@ -129,6 +129,14 @@ mutable and point the staging task at it. The release function refuses to roll
 a task that still uses the old fixed tag. To roll back after a failed smoke
 check, revert the change on main and deploy that commit through the same workflow.
 
+**Moving into `dolphin-labs-hq/dolphin-labs`** (its `docs/MONOREPO-MOVE.md`, phases 5 to 8). During the
+cutover `family-stage-api-ci` trusts two workflows, each on `main` in its repository's `family-stage`
+environment and pinned by `job_workflow_ref`: constellation's `deploy-family-api.yml` and dolphin-labs'
+`family-deploy-api.yml`. Both repositories have the main-only `family-stage` environment with
+`FAMILY_STAGE_DEPLOY_ROLE_ARN` (`family-stage-github.tf`). dolphin-labs sends `run_number + 1000` to the
+release function, because run numbers count per workflow. Phase 6 disables constellation's workflow before
+the first deploy from dolphin-labs. Phase 8 removes constellation's subject and environment.
+
 ### Family public pages
 
 The Family URLs for App Store Connect are [privacy](https://family.dolphin-labs.dev/privacy/)
@@ -1999,6 +2007,15 @@ require the mini. The Default runner group allows four private repositories, `do
 match. An organization runner administrator can grant access with
 `gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
 `gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
+
+**Family's TestFlight job (`dolphin-labs-hq/dolphin-labs`, `testflight-family.yml`).** It runs on the
+organization's pool (`[self-hosted, macOS, ios-pool]`), which already serves dolphin-labs, and signs with the CI
+VM's build keychain, as GWW's `testflight.yml` does. Its role, `dolphin-labs-family-testflight`
+(`dolphin-labs-family-testflight.tf`), admits only that workflow on `main` in the `testflight-family`
+environment. Terraform creates that environment, limited to `main`, with the variables
+`FAMILY_TESTFLIGHT_ROLE_ARN`, `FAMILY_BUNDLE_ID`, `FAMILY_API` and `FAMILY_ZERO_URL`. The role's variable is not
+named `AWS_TESTFLIGHT_ROLE_ARN`, because that name is GWW's repository variable. The environment holds no
+secrets. The beta review contact is set in App Store Connect itself.
 
 #### Agent builds on the physical mini
 
