@@ -27,7 +27,7 @@ MODULE = (ROOT / "modules" / "pbox-fallback-site" / "main.tf").read_text()
 
 # vCPU of each size suffix the flavors use; a plain .metal is the whole host, so it is per type
 SIZE_VCPU = {"8xlarge": 32, "12xlarge": 48, "24xlarge": 96, "48xlarge": 192, "metal-24xl": 96, "metal-48xl": 192}
-METAL_VCPU = {"g5g.metal": 64, "g4dn.metal": 96}
+METAL_VCPU = {"c7g.metal": 64, "m7g.metal": 64, "r7g.metal": 64, "g5g.metal": 64, "g4dn.metal": 96}
 X86_TYPES = {"g4dn.metal"}  # the one x86_64 type; every other is Graviton
 
 
@@ -83,7 +83,8 @@ class Menu(unittest.TestCase):
         for shape in ("compute", "general", "memory", "storage"):
             self.assertEqual([n for n in names if n.startswith(shape + "-")],
                              [f"{shape}-{s}" for s in (32, 48, 96, 192)])
-        self.assertEqual([n for n in names if n.startswith("kvm-")], ["kvm-96", "kvm-192", "kvm-gpu-64", "kvm-gpu-96"])
+        self.assertEqual([n for n in names if n.startswith("kvm-")],
+                         ["kvm-64", "kvm-96", "kvm-192", "kvm-gpu-64", "kvm-gpu-96"])
 
     def test_no_flavor_is_under_24_vcpu_and_every_type_has_the_flavors_size(self):
         for f, (vcpu, mem, _, _, types) in script_menu().items():
@@ -997,7 +998,8 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual(self.launched_types(), [])
 
     def test_local_nvme_requires_kvm_up_or_capacity_before_aws_calls(self):
-        for args in (("up", "storage-96"), ("capacity", "kvm-gpu-64"), ("status",), ("up",)):
+        for args in (("up", "storage-96"), ("up", "kvm-64"), ("capacity", "kvm-64"),
+                     ("capacity", "kvm-gpu-64"), ("status",), ("up",)):
             with self.subTest(args=args):
                 rc, _, err = self.pbox(*args, "--local-nvme")
                 self.assertEqual(rc, 2, err)
@@ -1048,7 +1050,7 @@ class ScriptRuns(unittest.TestCase):
         self.assertEqual(rc, 2, err)
         self.assertEqual(self.calls(), [])
         self.assertNotIn("kvm-", err)
-        for f in ("kvm-96", "kvm-gpu-64"):
+        for f in ("kvm-64", "kvm-96", "kvm-gpu-64"):
             rc, _, err = self.pbox("up", f, user="colin")
             self.assertEqual(rc, 2, err)
             self.assertEqual(self.launched_types(), [])

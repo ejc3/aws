@@ -2280,6 +2280,8 @@ pbox flavors               # the menu: vCPU, memory, local disk, what each is fo
 pbox status                # every box, with the flavor each runs as
 pbox up compute-48         # launch box 1 as a flavor (required), then connect
 pbox up 3 memory-96        # launch box 3 (independent volume and lifecycle; 1-8)
+pbox capacity 3 kvm-64     # score Spot locations for a 64-core KVM host without launching
+pbox up 3 kvm-64 --regions us-east-1,us-west-2  # try home first, then these regions with disposable storage
 pbox up 3 kvm-96 --local-nvme   # require disposable local NVMe for a KVM workload
 pbox up 3 kvm-192 --local-nvme  # the same on 192 vCPU
 pbox up 3 kvm-96 --local-nvme --min-memory 384  # of those, only the types with at least 384 GiB
@@ -2304,8 +2306,14 @@ the next run would remove.
 `up` needs a flavor (`pbox-flavors.tf`), and with none it prints the menu and launches nothing. A flavor is a shape and
 a size: `compute` (2 GiB per vCPU, CPU-bound work), `general` (4 GiB), `memory` (8 GiB, memory-bound work), `storage`
 (8 GiB plus local NVMe at `/mnt/nvme`, gone with the box: local-disk-bound work), each in 32, 48, 96 and 192 vCPU, and
-`kvm-96` / `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
+`kvm-64`, `kvm-96` and `kvm-192` (bare metal with `/dev/kvm`, slow to boot, the owner's slots only). Pick the smallest that fits the
 work: a smaller box costs less and finds Spot capacity more often.
+
+For a single VM or a test lane, `kvm-64` tries `c7g.metal` (128 GiB), `m7g.metal` (256 GiB), then
+`r7g.metal` (512 GiB). All three use Graviton3 and EBS scratch. The fifth candidate for `kvm-96`, `r8g.metal-24xl`, also uses EBS
+and has 768 GiB of RAM. CPU KVM launches try the home AZ first, where the slot keeps its persistent `/mnt/work`.
+Pass `--fallback` to try all configured fallback regions, or `--regions` to limit that search. A fallback box gets a
+fresh `/mnt/work` that is deleted with the box. Copy results out before termination.
 
 Use `--local-nvme` with `pbox up N kvm-96` or `pbox up N kvm-192` when a workload needs both KVM and disposable local
 disks. With kvm-96 the flag tries only `c8gd.metal-24xl` and `m8gd.metal-24xl`; with kvm-192 only `c8gd.metal-48xl`,
