@@ -3,9 +3,9 @@
 # Family's own AWS account (ejc3/constellation docs/APP-ACCOUNTS.md: one account per app, Family
 # first), from modules/app-account: the account and its OU, guardrails (us-west-1 only, no leaving
 # the organization, no IAM users or keys), its state bucket and apply role `family-terraform`, a
-# budget, the /infra/family pointer, its staging host, and the SES sending domain for its sign-in codes.
-# What runs in the account is
-# ejc3/constellation's (infra/apps/family, from infra/modules/app), applied there with that role.
+# budget, the /infra/family pointer, its staging host, and the SES sending domain for its sign-in
+# codes. What runs in the account is ejc3/constellation's (infra/apps/family, from
+# infra/modules/app), applied there with that role.
 #
 # First apply, as for every account: the provider alias below needs the account id, so apply the
 # account first (-target=module.family_account.aws_organizations_account.this), then everything.
