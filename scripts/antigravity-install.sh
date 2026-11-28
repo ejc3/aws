@@ -4,7 +4,10 @@
 set -euo pipefail
 [[ $(id -u) != 0 ]] || { echo "Run the Antigravity installer as the intended user." >&2; exit 1; }
 guide=${AGY_MODEL_GUIDE:-}
-if [[ -z $guide && -n ${BASH_SOURCE[0]:-} ]]; then
+if [[ ${1:-} == --binary-only ]]; then
+  # Control-plane instructions are installed by an administrator after review.
+  guide=""
+elif [[ -z $guide && -n ${BASH_SOURCE[0]:-} ]]; then
   guide=$(cat "$(dirname "${BASH_SOURCE[0]}")/antigravity-models.md")
 fi
 cd "$HOME"

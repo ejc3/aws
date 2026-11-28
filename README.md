@@ -2103,6 +2103,10 @@ While fcvm-arm is running it checks those five Macs hourly through their existin
 laptop can receive the install when it wakes. Each account manages its Google sign-in separately. The CLI
 updates itself on use.
 
+The operator installs the reviewed model guide manually on both administration hosts. The other selected
+accounts receive it through provisioning. Codex and Claude use their global instruction files even when a
+repository has its own root. Antigravity reads its own global rule in `~/.gemini/config/rules/`.
+
 ## Start a Codex session
 
 Codex is installed per Unix account on the metal boxes, `jumpbox-2`, and `nextjs-dev`.

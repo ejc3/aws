@@ -64,7 +64,8 @@ for f in "${files[@]}"; do
 done
 # One SSH session: the files as a tar stream on stdin, unpacked into a private temporary directory.
 case "$alias_:$cleaner_only" in
-  mac:|air:|mini:|colton-mac:|colin-mac:) files+=(-C "$here/.." antigravity-install.sh antigravity-models.md) ;;
+  mac:|air:|mini:|colton-mac:|colin-mac:)
+    files+=(-C "$here/.." antigravity-install.sh antigravity-models.md antigravity-owner-models.pl) ;;
 esac
 tar -C "$here" -cf - "${files[@]}" | ssh -o BatchMode=yes -o ConnectTimeout=20 "$alias_" \
   '/bin/zsh -c '\''d=$(mktemp -d /tmp/mac-setup.XXXXXXXX) && tar -C "$d" -xf - && '"$entry"' "$d" '"$mode"'; rc=$?; rm -rf "$d"; exit $rc'\'''

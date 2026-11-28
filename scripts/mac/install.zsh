@@ -70,6 +70,7 @@ done
 /bin/sh "$src/set-zshenv.sh" "$HOME/.zshenv" "$mode"
 if [[ -f "$src/antigravity-install.sh" ]]; then
   /bin/bash "$src/antigravity-install.sh"
+  /usr/bin/perl "$src/antigravity-owner-models.pl"
 fi
 for t in swift xcodebuild xcrun; do
   got=$(env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/zsh -c "command -v $t")

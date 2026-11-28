@@ -7,6 +7,14 @@ locals {
     )
     ${file("${path.module}/scripts/antigravity-install.sh")}
   SETUP
+
+  # These clients can start in a Git checkout with its own root. Install the guide
+  # in their effective global instructions, retaining personal settings.
+  antigravity_owner_models = <<-SETUP
+    /usr/bin/perl - <<'OWNER_MODELS'
+    ${file("${path.module}/scripts/antigravity-owner-models.pl")}
+    OWNER_MODELS
+  SETUP
 }
 
 # As on the Codex refresh, give each ubuntu host its own SSM delivery so a stopped
@@ -26,8 +34,9 @@ resource "aws_ssm_association" "antigravity_install" {
   parameters = {
     commands         = <<-CMD
       cd /home/ubuntu || exit 1
-      exec runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -s <<'AGY_INSTALL'
-      ${local.antigravity_setup}
+      exec runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -s -- ${startswith(each.key, "jumpbox") ? "--binary-only" : ""} <<'AGY_INSTALL'
+      ${startswith(each.key, "jumpbox") ? file("${path.module}/scripts/antigravity-install.sh") : local.antigravity_setup}
+      ${each.key == "fcvm-metal-x86" ? local.antigravity_owner_models : ""}
       AGY_INSTALL
     CMD
     executionTimeout = "600"
@@ -81,11 +90,15 @@ resource "aws_ssm_association" "antigravity_macs" {
     commands         = <<-CMD
       cd /home/ubuntu || exit 1
       exec runuser -u ubuntu -- env HOME=/home/ubuntu PATH=/usr/local/bin:/usr/bin:/bin /bin/bash -s <<'MACS'
+      ${file("${path.module}/scripts/antigravity-tunnel-status.sh")}
+      errors=$(mktemp) || exit 1
+      trap 'rm -f -- "$errors"' EXIT
       failed=0
       for mac in mac air mini colton-mac colin-mac; do
-        echo "Checking $mac"
-        timeout 180 ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o ForwardAgent=no "$mac" '/bin/bash -s' <<'AGY_INSTALL' || failed=1
+        rc=0
+        timeout 180 ssh -T -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=yes -o ForwardAgent=no "$mac" '/bin/bash -s || exit 42' 2>"$errors" <<'AGY_INSTALL' || rc=$?
       ${local.antigravity_setup}
+      ${local.antigravity_owner_models}
       # mac-setup owns the renderer and template. Update the renderer on an already set-up
       # Mac as it returns online; the normal LaunchAgent also refreshes ~/AGENTS.md hourly.
       renderer=$HOME/.local/bin/mac-agents-md
@@ -101,6 +114,15 @@ resource "aws_ssm_association" "antigravity_macs" {
         fi
       fi
       AGY_INSTALL
+        if [[ $rc == 0 ]]; then
+          echo "$mac: installed"
+        elif [[ $rc == 255 ]] && grep -Fxq 'websocket: bad handshake' "$errors" && antigravity_tunnel_down "$mac"; then
+          echo "$mac: deferred (Cloudflare 1033, tunnel down)"
+        else
+          cat "$errors" >&2
+          echo "$mac: install failed (exit $rc)" >&2
+          failed=1
+        fi
       done
       exit "$failed"
       MACS

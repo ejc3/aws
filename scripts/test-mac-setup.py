@@ -823,7 +823,7 @@ class Files(unittest.TestCase):
             ssh.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$OUT/args"\ncat > "$OUT/files.tar"\n')
             ssh.chmod(0o755)
             env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"], OUT=tmp)
-            agy = {"antigravity-install.sh", "antigravity-models.md"}
+            agy = {"antigravity-install.sh", "antigravity-models.md", "antigravity-owner-models.pl"}
             build = {"install.zsh", "set-zshenv.sh", "bin/mac-build", "bin/mac-build-shim"}
             desktop = {"peekaboo-install.sh", "bin/mac-gui", "bin/mac-lease", "bin/peekaboo", "bin/mac-agents-md",
                        "mac-AGENTS.md"}
