@@ -125,6 +125,7 @@ class Cleaner(unittest.TestCase):
         self.capacity = 1000 * MIB
         self.m.usage = lambda volume: (10_000 * MIB, self.free())
         self.m.MAX_USED = 2.0  # the percentage rule has its own test
+        self.m.EMERGENCY_FREE = 0  # the fake volume is far under 15 GiB: the emergency tier has its own tests
         self.now = time.time() + 30 * HOUR  # every file is past both ages unless it is given a later mtime
 
     def used(self):
@@ -385,6 +386,54 @@ class Cleaner(unittest.TestCase):
         self.worker(10)
         result, erased, out = self.run_clean(min_free_mib=10_000)
         self.assertEqual(erased, [udid(1)])
+
+    def test_an_emergency_erases_a_busy_runners_old_device_no_process_names(self):
+        # #1112: all four runners busy around the clock, so a busy runner's devices never went and the volume filled.
+        # Under EMERGENCY_FREE a device older than any job (SIM_AGE > JOB_CAP) that no process names is erased anyway.
+        self.m.EMERGENCY_FREE = 10_000 * MIB
+        self.sim(1, "Shutdown", 4, 12)   # mini-1 busy, its device 12 hours old, named by nothing: erased
+        self.sim(2, "Shutdown", 3, 12)   # mini-2 busy, but its job's xcodebuild names the device: kept
+        self.sim(3, "Shutdown", 2, 2)    # mini-3 busy, its device 2 hours old (a running job's): kept
+        for n in (1, 2, 3):
+            self.worker(n)
+        os.environ["FAKE_PS"] += f";/usr/bin/xcodebuild test -destination id={udid(2)}"
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [udid(1)])
+        self.assertTrue((self.devices / udid(2) / "data/Containers/app").exists())
+        self.assertTrue((self.devices / udid(3) / "data/Containers/app").exists())
+        self.assertIn("1 by the emergency tier (under", out)
+        self.assertGreater(self.m.SIM_AGE, self.m.JOB_CAP)
+
+    def test_an_emergency_removes_derived_data_past_every_jobs_start_without_the_locks(self):
+        # A held slot lock kept DerivedData forever under steady CI. In an emergency an entry untouched for
+        # EMERGENCY_CACHE_AGE (past JOB_CAP) and open in no process goes; a younger or an open one stays.
+        self.m.EMERGENCY_FREE = 10_000 * MIB
+        old = self.blob(self.derived / "GWW-old/Build/x", 2, mtime=self.now - 6 * HOUR)
+        os.utime(old.parent.parent, (self.now - 6 * HOUR,) * 2)
+        young = self.blob(self.derived / "GWW-young/Build/x", 2, mtime=self.now - 3 * HOUR)
+        opened = self.blob(self.derived / "GWW-open/Build/x", 2, mtime=self.now - 6 * HOUR)
+        os.environ["FAKE_OPEN"] = str(opened)
+        holder = self.hold(self.home / ".local/state/sim-slots/mac-build/slot.1", fcntl.LOCK_EX)
+        try:
+            result, erased, out = self.run_clean(min_free_mib=10_000)
+        finally:
+            holder.communicate("")
+        self.assertFalse((self.derived / "GWW-old").exists())
+        self.assertTrue(young.exists())
+        self.assertTrue(opened.exists())
+        self.assertGreater(self.m.EMERGENCY_CACHE_AGE, self.m.JOB_CAP)
+
+    def test_above_the_emergency_line_the_guards_apply_as_before(self):
+        # Between EMERGENCY_FREE and MIN_FREE nothing changes: a busy runner's device waits, and a held lock keeps
+        # DerivedData younger than CACHE_AGE.
+        self.m.EMERGENCY_FREE = 0
+        self.sim(1, "Shutdown", 4, 12)
+        self.worker(1)
+        kept = self.blob(self.derived / "GWW-6h/Build/x", 2, mtime=self.now - 6 * HOUR)
+        result, erased, out = self.run_clean(min_free_mib=10_000)
+        self.assertEqual(erased, [])
+        self.assertTrue(kept.exists())
+        self.assertNotIn("emergency tier", out)
 
     def clock(self, step):
         """The cleaner's monotonic clock advances `step` seconds at each reading."""
