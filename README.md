@@ -1984,15 +1984,16 @@ match. An organization runner administrator can grant access with
 `gh api -X PUT orgs/dolphin-labs-hq/actions/runner-groups/1/repositories/<repo-id>` and verify it with
 `gh api orgs/dolphin-labs-hq/actions/runner-groups/1/repositories --jq '.repositories[].full_name'`.
 
-**Family's TestFlight job (`ejc3/constellation`, `testflight-family.yml`).** It asks for
-`[self-hosted, macOS, ios-pool]` and signs with the CI VM's build keychain, but `ejc3/constellation` is a
-user-owned repository: the organization's runner group (`dolphin-labs-hq`) cannot serve it, and it has no
-self-hosted runner of its own. Before the first run, the operator registers a repository-level runner for it in
-the CI VM (a registration token from `gh api -X POST repos/ejc3/constellation/actions/runners/registration-token`,
-labels `self-hosted,macOS,ARM64,ios-pool`), and the owner creates the GitHub environment `testflight-family` in
-`ejc3/constellation` (deployment branches: `main` only) with the variable `AWS_TESTFLIGHT_ROLE_ARN` from the
-output `constellation_family_testflight` (`constellation-family-testflight.tf`), plus `FAMILY_BUNDLE_ID`,
-`FAMILY_API` and `FAMILY_ZERO_URL`. A runner of that repository takes only its jobs.
+**Family's TestFlight job (`dolphin-labs-hq/dolphin-labs`, `testflight-family.yml`).** It runs on the
+organization's pool (`[self-hosted, macOS, ios-pool]`), which already serves dolphin-labs, and signs with the CI
+VM's build keychain, as GWW's `testflight.yml` does. Its role, `dolphin-labs-family-testflight`
+(`dolphin-labs-family-testflight.tf`), admits only that workflow on `main` in the `testflight-family`
+environment. Terraform creates that environment, limited to `main`, with the variables
+`FAMILY_TESTFLIGHT_ROLE_ARN`, `FAMILY_BUNDLE_ID`, `FAMILY_API` and `FAMILY_ZERO_URL`. The role's variable is not
+named `AWS_TESTFLIGHT_ROLE_ARN`, because that name is GWW's repository variable. Terraform also writes the
+secrets `REVIEW_CONTACT_*` from the Secrets Manager secret `family/testflight-review-contact`, which it creates
+with empty values. The owner fills that secret before the first run with `set_review_details`, and the next
+apply copies the values.
 
 #### Agent builds on the physical mini
 
