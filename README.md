@@ -1990,10 +1990,8 @@ VM's build keychain, as GWW's `testflight.yml` does. Its role, `dolphin-labs-fam
 (`dolphin-labs-family-testflight.tf`), admits only that workflow on `main` in the `testflight-family`
 environment. Terraform creates that environment, limited to `main`, with the variables
 `FAMILY_TESTFLIGHT_ROLE_ARN`, `FAMILY_BUNDLE_ID`, `FAMILY_API` and `FAMILY_ZERO_URL`. The role's variable is not
-named `AWS_TESTFLIGHT_ROLE_ARN`, because that name is GWW's repository variable. Terraform also writes the
-secrets `REVIEW_CONTACT_*` from the Secrets Manager secret `family/testflight-review-contact`, which it creates
-with empty values. The owner fills that secret before the first run with `set_review_details`, and the next
-apply copies the values.
+named `AWS_TESTFLIGHT_ROLE_ARN`, because that name is GWW's repository variable. The environment holds no
+secrets. The beta review contact is set in App Store Connect itself.
 
 #### Agent builds on the physical mini
 

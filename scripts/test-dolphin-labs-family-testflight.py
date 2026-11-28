@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """dolphin-labs-family-testflight.tf: only dolphin-labs' testflight-family.yml on main, in its own environment, can
 assume the role; the role reads the App Store Connect key and nothing else; the key's own policy admits it; the
-environment is main-only with Family's variables (not GWW's AWS_TESTFLIGHT_ROLE_ARN); and the review contact
-secret is readable by administration only."""
+environment is main-only with Family's variables (not GWW's AWS_TESTFLIGHT_ROLE_ARN), and holds no secrets."""
 import re
 import unittest
 from pathlib import Path
@@ -69,24 +68,11 @@ class FamilyTestflightRoleTests(unittest.TestCase):
         self.assertIn("for_each      = local.family_testflight_variables", var)
         self.assertIn("github_repository_environment.dolphin_labs_testflight_family.environment", var)
 
-    def test_review_contact_is_administration_read_only_and_copied_into_the_environment(self):
-        policy = block("aws_secretsmanager_secret_policy", "family_testflight_review_contact")
-        allows = [s for s in policy.split("Sid") if '"Allow"' in s]
-        self.assertEqual(len(allows), 1)
-        self.assertIn('Action    = "secretsmanager:PutSecretValue"', allows[0])
-        self.assertNotIn("GetSecretValue", allows[0])
-        read_deny = policy.split('"OnlyAdministrationCanRead"')[1].split("Sid")[0]
-        self.assertIn('"secretsmanager:GetSecretValue"', read_deny)
-        self.assertIn('ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals }', read_deny)
-        self.assertIn('name                    = "family/testflight-review-contact"', code(TF))
-        secret = block("github_actions_environment_secret", "dolphin_labs_testflight_family_review_contact")
-        self.assertIn("github_repository_environment.dolphin_labs_testflight_family.environment", secret)
-        self.assertIn("for_each        = toset(local.family_review_contact_keys)", secret)
-        keys = re.search(r"family_review_contact_keys = \[([^\]]+)\]", code(TF)).group(1)
-        self.assertEqual(re.findall(r'"(\w+)"', keys), [
-            "REVIEW_CONTACT_FIRST_NAME", "REVIEW_CONTACT_LAST_NAME", "REVIEW_CONTACT_PHONE", "REVIEW_CONTACT_EMAIL"])
-        seed = block("aws_secretsmanager_secret_version", "family_testflight_review_contact_empty")
-        self.assertIn("ignore_changes = [secret_string]", seed)
+    def test_the_environment_holds_no_secrets_and_the_role_reads_no_other_secret(self):
+        # The beta review contact is kept in App Store Connect, not here.
+        self.assertNotIn("github_actions_environment_secret", code(TF))
+        self.assertNotIn("aws_secretsmanager", code(TF))
+        self.assertNotIn("REVIEW_CONTACT", TF)
 
 
 if __name__ == "__main__":

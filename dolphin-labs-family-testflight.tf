@@ -54,7 +54,6 @@ locals {
     FAMILY_API                 = local.family_stage_url
     FAMILY_ZERO_URL            = local.family_stage_url
   }
-  family_review_contact_keys = ["REVIEW_CONTACT_FIRST_NAME", "REVIEW_CONTACT_LAST_NAME", "REVIEW_CONTACT_PHONE", "REVIEW_CONTACT_EMAIL"]
 }
 
 resource "github_repository_environment" "dolphin_labs_testflight_family" {
@@ -85,81 +84,8 @@ resource "github_actions_environment_variable" "dolphin_labs_testflight_family" 
   value         = each.value
 }
 
-# The beta review contact for Family's TestFlight record (App Store Connect's beta app review details): personal
-# data, so it lives here and not in any repository. JSON with the four REVIEW_CONTACT_* keys. Terraform creates it
-# with those keys empty; the owner fills it before the first run with set_review_details (MONOREPO-MOVE.md,
-# phase 7), from a 0600 file:
-#   aws secretsmanager put-secret-value --region us-west-1 --secret-id family/testflight-review-contact \
-#     --secret-string file://<file>
-# or from the owner's Next.js container session (local.family_apple_owner_session), which may set it but not
-# read it. The next apply copies the four values into the environment's secrets of the same names; an empty value
-# is an unset secret, which testflight-notes.mjs refuses for a run that asks to set the review details.
-resource "aws_secretsmanager_secret" "family_testflight_review_contact" {
-  name                    = "family/testflight-review-contact"
-  description             = "Family's TestFlight beta review contact (JSON: REVIEW_CONTACT_FIRST_NAME, REVIEW_CONTACT_LAST_NAME, REVIEW_CONTACT_PHONE, REVIEW_CONTACT_EMAIL). Filled by the owner; see dolphin-labs-family-testflight.tf."
-  recovery_window_in_days = 7
-  tags                    = { Name = "family/testflight-review-contact", Project = "dolphin-labs" }
-}
-
-# The empty first value, so the copy below has something to read on the first apply. Never overwritten.
-resource "aws_secretsmanager_secret_version" "family_testflight_review_contact_empty" {
-  secret_id     = aws_secretsmanager_secret.family_testflight_review_contact.id
-  secret_string = jsonencode({ for k in local.family_review_contact_keys : k => "" })
-  lifecycle {
-    ignore_changes = [secret_string]
-  }
-}
-
-resource "aws_secretsmanager_secret_policy" "family_testflight_review_contact" {
-  secret_arn = aws_secretsmanager_secret.family_testflight_review_contact.arn
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "OwnerContainerSet"
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.nextjs_dev.arn }
-        Action    = "secretsmanager:PutSecretValue"
-        Resource  = aws_secretsmanager_secret.family_testflight_review_contact.arn
-        Condition = { StringEquals = { "aws:userid" = local.family_apple_owner_session } }
-      },
-      {
-        Sid       = "OnlyAdministrationCanRead"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = ["secretsmanager:GetSecretValue", "secretsmanager:UpdateSecret", "secretsmanager:UpdateSecretVersionStage"]
-        Resource  = aws_secretsmanager_secret.family_testflight_review_contact.arn
-        Condition = { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } }
-      },
-      {
-        Sid       = "OnlyAdministrationAndOwnerCanSet"
-        Effect    = "Deny"
-        Principal = "*"
-        Action    = "secretsmanager:PutSecretValue"
-        Resource  = aws_secretsmanager_secret.family_testflight_review_contact.arn
-        # As family-apple-signing.tf: on rollback to the shared host, only administration is exempt.
-        Condition = merge(
-          { ArnNotLike = { "aws:PrincipalArn" = local.games_mp_admin_principals } },
-          local.nextjs_ct_serving ? { StringNotEquals = { "aws:userid" = local.family_apple_owner_session } } : {},
-        )
-      },
-    ]
-  })
-}
-
-data "aws_secretsmanager_secret_version" "family_testflight_review_contact" {
-  secret_id  = aws_secretsmanager_secret.family_testflight_review_contact.id
-  depends_on = [aws_secretsmanager_secret_version.family_testflight_review_contact_empty]
-}
-
-resource "github_actions_environment_secret" "dolphin_labs_testflight_family_review_contact" {
-  for_each        = toset(local.family_review_contact_keys)
-  provider        = github.dolphin_labs_ci
-  repository      = local.dolphin_labs_ci_repository
-  environment     = github_repository_environment.dolphin_labs_testflight_family.environment
-  secret_name     = each.key
-  plaintext_value = lookup(jsondecode(data.aws_secretsmanager_secret_version.family_testflight_review_contact.secret_string), each.key, "")
-}
+# No review contact here: Family's beta review contact is set in App Store Connect itself (the app record's
+# beta app review details), and the workflow does not send one.
 
 output "dolphin_labs_family_testflight" {
   description = "Variables of the testflight-family environment in dolphin-labs-hq/dolphin-labs (no credentials)"
